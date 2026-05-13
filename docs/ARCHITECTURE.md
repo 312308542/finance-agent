@@ -1349,6 +1349,15 @@ contract/
 6. FastAPI 空服务。
 7. `result.json` 和 `report.md` writer。
 
+已落地：
+
+- `pyproject.toml` 和 `src/finance_agent` 基础包。
+- `docker-compose.yml` 启动 PostgreSQL + TimescaleDB。
+- `src/finance_agent/storage/db.py` 数据库连接工厂。
+- `src/finance_agent/storage/orm.py` M0 ORM 模型。
+- `src/finance_agent/storage/migrations/versions/20260514_0001_create_m0_schema.py` M0 Alembic 迁移。
+- `docs/DATABASE_SETUP.md` 数据库启动和迁移说明。
+
 ### M0B：领域模型
 
 1. 按 `DOMAIN_PROTOCOLS.md` 建 Pydantic 模型。

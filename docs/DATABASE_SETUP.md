@@ -1,0 +1,58 @@
+# 数据库环境搭建
+
+本文档说明本地和其他环境如何启动 PostgreSQL + TimescaleDB，并执行 M0 数据库迁移。
+
+## 1. 启动数据库
+
+```bash
+docker compose up -d postgres
+```
+
+默认连接信息：
+
+```text
+host: localhost
+port: 5432
+database: finance_agent
+user: finance_agent
+password: finance_agent
+```
+
+容器初始化脚本会执行：
+
+```sql
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+```
+
+## 2. 安装后端依赖
+
+```bash
+python -m pip install -e ".[dev]"
+```
+
+## 3. 执行迁移
+
+```bash
+alembic upgrade head
+```
+
+连接地址可通过环境变量覆盖：
+
+```bash
+export FINANCE_AGENT_DATABASE_URL=postgresql+psycopg://finance_agent:finance_agent@localhost:5432/finance_agent
+```
+
+Windows PowerShell：
+
+```powershell
+$env:FINANCE_AGENT_DATABASE_URL = "postgresql+psycopg://finance_agent:finance_agent@localhost:5432/finance_agent"
+alembic upgrade head
+```
+
+## 4. 设计约束
+
+- 全环境必须使用 PostgreSQL + TimescaleDB。
+- 不使用 SQLite 作为应用运行环境或测试环境。
+- `market_bars` 是 TimescaleDB hypertable，唯一约束必须包含 `timestamp`。
+- 指标、因子、信号和评分保存的是推荐链路快照，不是实时指标流水。
+

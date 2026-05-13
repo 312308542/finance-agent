@@ -579,10 +579,12 @@ finance-agent/
 
 ### M0：项目骨架
 
-- Python 包结构。
-- 配置系统。
+- Python 包结构：已建立 `src/finance_agent`。
+- 配置系统：已建立数据库环境变量和 `.env.example`。
 - CLI 骨架。
-- 数据库连接。
+- 数据库连接：已建立 SQLAlchemy 连接工厂。
+- 数据库迁移：已建立 Alembic 和 M0 推荐主链路迁移。
+- 数据库运行环境：已建立 PostgreSQL + TimescaleDB 的 `docker-compose.yml`。
 - 基础日志。
 - `result.json` 和 `report.md` 输出规范。
 

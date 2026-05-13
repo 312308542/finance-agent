@@ -1,0 +1,23 @@
+services:
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    container_name: finance-agent-timescaledb
+    environment:
+      POSTGRES_DB: finance_agent
+      POSTGRES_USER: finance_agent
+      POSTGRES_PASSWORD: finance_agent
+      TZ: Asia/Shanghai
+    ports:
+      - "5432:5432"
+    volumes:
+      - finance_agent_postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finance_agent -d finance_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  finance_agent_postgres_data:
+

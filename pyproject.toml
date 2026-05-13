@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finance-agent"
+version = "0.1.0"
+description = "A 股和数字货币 AI 标的推荐系统"
+readme = "docs/PLAN.md"
+requires-python = ">=3.11"
+dependencies = [
+  "alembic>=1.13,<2.0",
+  "psycopg[binary]>=3.2,<4.0",
+  "sqlalchemy>=2.0,<3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.8,<1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
