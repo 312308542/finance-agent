@@ -17,7 +17,7 @@
 数据库目标：
 
 - 支撑 A 股和数字货币共用一套推荐链路。
-- 生产环境使用 PostgreSQL + TimescaleDB：业务实体用普通 PostgreSQL 表，行情和衍生品时间序列用 TimescaleDB hypertable。
+- 全环境统一使用 PostgreSQL + TimescaleDB：业务实体用普通 PostgreSQL 表，行情和衍生品时间序列用 TimescaleDB hypertable。
 - 保留原始数据，方便追溯和审计。
 - 结构化字段用于查询、筛选、排序和索引。
 - 复杂协议全文保存到 `payload JSON`，方便协议升级。
@@ -27,15 +27,16 @@
 
 ### 1.1 存储选型
 
-生产方案：
+统一方案：
 
 - PostgreSQL：保存资产、候选池、因子、评分、推荐、证据、回测等业务数据。
 - TimescaleDB：保存 K 线、资金费率、未平仓量、多空比等时间序列数据。
 
-开发/轻量模式：
+环境要求：
 
-- 可以使用普通 PostgreSQL 表。
-- SQLite 只用于非常轻量的本地原型，不作为推荐链路的生产方案。
+- 开发、测试、演示和生产都使用 PostgreSQL + TimescaleDB，保持 schema、约束、hypertable 行为一致。
+- 不为主链路提供 SQLite 或普通 PostgreSQL 降级模式，避免开发环境绕过 TimescaleDB 的唯一约束、时间分区和压缩策略。
+- SQLite 只能用于完全脱离推荐主链路的一次性脚本实验，不能作为应用运行环境或测试环境。
 
 需要使用 TimescaleDB hypertable 的表：
 
@@ -348,7 +349,7 @@ M0 可以先统一使用 1 个月 chunk，后续根据数据量调整。
 
 ### 4.2 market_bars
 
-标准 OHLCV 行情表，A 股和数字货币共用。生产环境使用 TimescaleDB hypertable。
+标准 OHLCV 行情表，A 股和数字货币共用。全环境使用 TimescaleDB hypertable。
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -514,7 +515,7 @@ A 股资金流快照。
 
 ### 5.3 crypto_derivative_snapshots
 
-数字货币衍生品快照，用于合约风险和拥挤度分析。生产环境使用 TimescaleDB hypertable。
+数字货币衍生品快照，用于合约风险和拥挤度分析。全环境使用 TimescaleDB hypertable。
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |

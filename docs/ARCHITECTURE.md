@@ -495,7 +495,7 @@ def start_scheduler() -> BackgroundScheduler:
 
 ## 9. 存储架构
 
-生产环境使用 PostgreSQL + TimescaleDB。业务实体使用普通 PostgreSQL 表，K 线和数字货币衍生品快照使用 TimescaleDB hypertable。领域模型和 ORM 模型分开，避免数据库字段污染业务协议。
+全环境统一使用 PostgreSQL + TimescaleDB。业务实体使用普通 PostgreSQL 表，K 线和数字货币衍生品快照使用 TimescaleDB hypertable。开发、测试、演示和生产保持同一套数据库能力，不提供 SQLite 或普通 PostgreSQL 降级模式，避免本地绕过 hypertable、唯一约束和压缩策略。领域模型和 ORM 模型分开，避免数据库字段污染业务协议。
 
 详细表结构、主键、索引和建表优先级见：`docs/DATABASE_DESIGN.md`。本节只说明存储层原则和示例。
 

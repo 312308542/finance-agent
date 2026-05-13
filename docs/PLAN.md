@@ -83,7 +83,7 @@ flowchart TD
 技术栈：
 
 - 后端：Python、FastAPI、LangGraph、Pydantic、SQLAlchemy。
-- 数据库：PostgreSQL + TimescaleDB。业务表使用 PostgreSQL，K 线和衍生品时间序列表使用 TimescaleDB hypertable；SQLite 只作为轻量原型选项。
+- 数据库：全环境统一 PostgreSQL + TimescaleDB。业务表使用 PostgreSQL，K 线和衍生品时间序列表使用 TimescaleDB hypertable；开发、测试、演示和生产不提供 SQLite 或普通 PostgreSQL 降级模式。
 - 任务调度：APScheduler 或 Celery Beat，第一版优先 APScheduler。
 - 前端：React、ECharts、TradingView Lightweight Charts。
 - CLI：Typer 或 Click，优先 Typer。
