@@ -1,0 +1,1388 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hermes Finance Agent Dashboard Prototype</title>
+    <style>
+      :root {
+        --bg: #070a12;
+        --panel: #0d1320;
+        --panel-2: #111827;
+        --panel-3: #151d2b;
+        --line: #263244;
+        --line-soft: rgba(148, 163, 184, 0.16);
+        --text: #f8fafc;
+        --muted: #94a3b8;
+        --faint: #64748b;
+        --green: #22c55e;
+        --green-soft: rgba(34, 197, 94, 0.12);
+        --red: #ef4444;
+        --red-soft: rgba(239, 68, 68, 0.14);
+        --amber: #d97706;
+        --amber-soft: rgba(217, 119, 6, 0.16);
+        --blue: #38bdf8;
+        --blue-soft: rgba(56, 189, 248, 0.12);
+        --purple: #a78bfa;
+        --radius: 8px;
+        --shadow: 0 22px 50px rgba(0, 0, 0, 0.34);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        min-height: 100%;
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          Inter, "Fira Sans", "Microsoft YaHei UI", "Microsoft YaHei", Arial,
+          sans-serif;
+        letter-spacing: 0;
+      }
+
+      body {
+        min-width: 1180px;
+      }
+
+      button {
+        font: inherit;
+      }
+
+      .app {
+        display: grid;
+        grid-template-columns: 248px minmax(920px, 1fr);
+        min-height: 100vh;
+        background:
+          linear-gradient(180deg, rgba(56, 189, 248, 0.06), transparent 260px),
+          radial-gradient(circle at top left, rgba(34, 197, 94, 0.08), transparent 380px),
+          var(--bg);
+      }
+
+      .sidebar {
+        border-right: 1px solid var(--line-soft);
+        background: rgba(6, 10, 18, 0.88);
+        padding: 18px 14px;
+        position: sticky;
+        top: 0;
+        height: 100vh;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 8px 18px;
+        border-bottom: 1px solid var(--line-soft);
+      }
+
+      .brand-mark {
+        width: 34px;
+        height: 34px;
+        border-radius: 8px;
+        display: grid;
+        place-items: center;
+        background: linear-gradient(135deg, #22c55e, #38bdf8);
+        color: #07111e;
+        font-weight: 900;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.18) inset;
+      }
+
+      .brand-title {
+        font-weight: 760;
+        line-height: 1.1;
+      }
+
+      .brand-subtitle {
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 3px;
+      }
+
+      .nav {
+        margin-top: 18px;
+        display: grid;
+        gap: 4px;
+      }
+
+      .nav-section {
+        color: var(--faint);
+        font-size: 11px;
+        font-weight: 700;
+        margin: 18px 10px 6px;
+        text-transform: uppercase;
+      }
+
+      .nav-item {
+        height: 38px;
+        border-radius: 8px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 10px;
+        color: #cbd5e1;
+        font-size: 14px;
+        cursor: pointer;
+        transition: background 180ms ease, color 180ms ease;
+      }
+
+      .nav-item:hover,
+      .nav-item.active {
+        background: rgba(56, 189, 248, 0.12);
+        color: var(--text);
+      }
+
+      .icon {
+        width: 17px;
+        height: 17px;
+        flex: 0 0 auto;
+        color: currentColor;
+      }
+
+      .content {
+        padding: 18px 22px 28px;
+      }
+
+      .topbar {
+        height: 54px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 14px;
+      }
+
+      .page-title {
+        display: flex;
+        align-items: baseline;
+        gap: 12px;
+      }
+
+      h1 {
+        font-size: 22px;
+        line-height: 1;
+        margin: 0;
+        font-weight: 780;
+      }
+
+      .as-of {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .top-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .source-health {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        height: 34px;
+        padding: 0 10px;
+        border: 1px solid rgba(217, 119, 6, 0.42);
+        border-radius: 8px;
+        color: #fed7aa;
+        background: rgba(217, 119, 6, 0.1);
+        font-size: 12px;
+      }
+
+      .pulse-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 99px;
+        background: var(--amber);
+        box-shadow: 0 0 0 0 rgba(217, 119, 6, 0.6);
+        animation: pulse 2s infinite;
+      }
+
+      @keyframes pulse {
+        0% {
+          box-shadow: 0 0 0 0 rgba(217, 119, 6, 0.45);
+        }
+        70% {
+          box-shadow: 0 0 0 8px rgba(217, 119, 6, 0);
+        }
+        100% {
+          box-shadow: 0 0 0 0 rgba(217, 119, 6, 0);
+        }
+      }
+
+      .segmented,
+      .btn {
+        height: 34px;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(15, 23, 42, 0.76);
+        color: var(--text);
+      }
+
+      .segmented {
+        padding: 3px;
+      }
+
+      .segment {
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: var(--muted);
+        height: 26px;
+        padding: 0 11px;
+        cursor: pointer;
+      }
+
+      .segment.active {
+        background: var(--green-soft);
+        color: #bbf7d0;
+      }
+
+      .btn {
+        padding: 0 12px;
+        cursor: pointer;
+        transition: border 180ms ease, background 180ms ease;
+      }
+
+      .btn.primary {
+        border-color: rgba(34, 197, 94, 0.6);
+        background: rgba(34, 197, 94, 0.14);
+        color: #dcfce7;
+      }
+
+      .btn.warning {
+        border-color: rgba(217, 119, 6, 0.7);
+        background: rgba(217, 119, 6, 0.14);
+        color: #fed7aa;
+      }
+
+      .status-strip {
+        display: grid;
+        grid-template-columns: 1.1fr 1fr 1fr 1fr;
+        gap: 10px;
+        margin-bottom: 12px;
+      }
+
+      .status-item {
+        min-height: 58px;
+        padding: 10px 12px;
+        border: 1px solid var(--line-soft);
+        background: rgba(13, 19, 32, 0.82);
+        border-radius: var(--radius);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+
+      .label {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .metric {
+        font-size: 20px;
+        font-weight: 780;
+        margin-top: 4px;
+      }
+
+      .delta {
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .positive {
+        color: var(--green);
+      }
+
+      .negative {
+        color: var(--red);
+      }
+
+      .attention {
+        color: #f59e0b;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 360px;
+        gap: 12px;
+        align-items: start;
+      }
+
+      .main-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 260px;
+        gap: 12px;
+      }
+
+      .panel {
+        background: rgba(13, 19, 32, 0.92);
+        border: 1px solid var(--line-soft);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        min-width: 0;
+      }
+
+      .panel-header {
+        min-height: 46px;
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--line-soft);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .panel-title {
+        font-size: 14px;
+        font-weight: 760;
+      }
+
+      .panel-meta {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .panel-body {
+        padding: 14px;
+      }
+
+      .chart-wrap {
+        min-height: 332px;
+        position: relative;
+      }
+
+      .chart-tabs {
+        display: flex;
+        gap: 6px;
+      }
+
+      .tiny-tab {
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        color: var(--muted);
+        background: transparent;
+        height: 26px;
+        padding: 0 9px;
+        cursor: pointer;
+      }
+
+      .tiny-tab.active {
+        color: #e0f2fe;
+        border-color: rgba(56, 189, 248, 0.55);
+        background: var(--blue-soft);
+      }
+
+      .kline {
+        width: 100%;
+        height: 285px;
+      }
+
+      .chart-legend {
+        position: absolute;
+        left: 14px;
+        bottom: 12px;
+        display: flex;
+        gap: 12px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 99px;
+        display: inline-block;
+        margin-right: 6px;
+      }
+
+      .dot.green {
+        background: var(--green);
+      }
+
+      .dot.red {
+        background: var(--red);
+      }
+
+      .dot.blue {
+        background: var(--blue);
+      }
+
+      .summary-card {
+        padding: 14px;
+      }
+
+      .health-score {
+        height: 96px;
+        display: grid;
+        place-items: center;
+        position: relative;
+      }
+
+      .ring {
+        width: 84px;
+        height: 84px;
+        border-radius: 50%;
+        background:
+          radial-gradient(circle, #111827 58%, transparent 60%),
+          conic-gradient(var(--amber) 0 68%, rgba(148, 163, 184, 0.18) 68% 100%);
+        display: grid;
+        place-items: center;
+      }
+
+      .ring strong {
+        font-size: 21px;
+      }
+
+      .risk-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 9px 0;
+        border-top: 1px solid var(--line-soft);
+        font-size: 13px;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        height: 22px;
+        border-radius: 999px;
+        padding: 0 8px;
+        font-size: 12px;
+        font-weight: 720;
+        white-space: nowrap;
+      }
+
+      .badge.green {
+        background: var(--green-soft);
+        color: #86efac;
+      }
+
+      .badge.red {
+        background: var(--red-soft);
+        color: #fca5a5;
+      }
+
+      .badge.amber {
+        background: var(--amber-soft);
+        color: #fcd34d;
+      }
+
+      .badge.blue {
+        background: var(--blue-soft);
+        color: #bae6fd;
+      }
+
+      .right-stack,
+      .left-stack {
+        display: grid;
+        gap: 12px;
+      }
+
+      .recommendation {
+        border-left: 3px solid var(--green);
+        padding: 12px;
+        background: rgba(17, 24, 39, 0.72);
+        border-radius: 8px;
+      }
+
+      .recommendation + .recommendation {
+        margin-top: 10px;
+      }
+
+      .rec-top {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        align-items: center;
+      }
+
+      .symbol {
+        font-size: 16px;
+        font-weight: 780;
+      }
+
+      .rec-copy {
+        margin: 9px 0 0;
+        color: #cbd5e1;
+        font-size: 13px;
+        line-height: 1.55;
+      }
+
+      .rec-meta {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      .mini {
+        border: 1px solid var(--line-soft);
+        background: rgba(2, 6, 23, 0.22);
+        border-radius: 6px;
+        padding: 8px;
+      }
+
+      .mini strong {
+        display: block;
+        font-size: 13px;
+        margin-top: 3px;
+      }
+
+      .risk-alert {
+        display: grid;
+        gap: 10px;
+      }
+
+      .risk-item {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        gap: 10px;
+        align-items: start;
+        padding: 11px;
+        border: 1px solid var(--line-soft);
+        background: rgba(17, 24, 39, 0.64);
+        border-radius: 8px;
+      }
+
+      .severity {
+        width: 8px;
+        height: 42px;
+        border-radius: 99px;
+      }
+
+      .severity.high {
+        background: var(--red);
+      }
+
+      .severity.medium {
+        background: var(--amber);
+      }
+
+      .severity.low {
+        background: var(--blue);
+      }
+
+      .risk-name {
+        font-weight: 740;
+        font-size: 13px;
+      }
+
+      .risk-desc {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.45;
+        margin-top: 4px;
+      }
+
+      .order-draft {
+        border: 1px solid rgba(217, 119, 6, 0.35);
+        background: linear-gradient(180deg, rgba(217, 119, 6, 0.12), rgba(17, 24, 39, 0.72));
+        border-radius: 8px;
+        padding: 12px;
+      }
+
+      .draft-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+        margin: 12px 0;
+      }
+
+      .draft-actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+
+      .table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+
+      .table-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 10px;
+      }
+
+      .filters {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+      }
+
+      .filter-pill {
+        height: 28px;
+        display: inline-flex;
+        align-items: center;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 0 10px;
+        color: var(--muted);
+        background: rgba(2, 6, 23, 0.24);
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .filter-pill.active {
+        color: #dcfce7;
+        background: var(--green-soft);
+        border-color: rgba(34, 197, 94, 0.42);
+      }
+
+      .export-btn {
+        min-width: 62px;
+        justify-content: center;
+      }
+
+      .table th,
+      .table td {
+        padding: 11px 10px;
+        border-bottom: 1px solid var(--line-soft);
+        text-align: left;
+        white-space: nowrap;
+      }
+
+      .table th {
+        color: var(--muted);
+        font-weight: 680;
+        font-size: 12px;
+      }
+
+      .table td.num,
+      .table th.num {
+        text-align: right;
+      }
+
+      .bottom-grid {
+        display: grid;
+        grid-template-columns: 1fr 360px;
+        gap: 12px;
+        margin-top: 12px;
+      }
+
+      .timeline {
+        display: grid;
+        gap: 10px;
+      }
+
+      .event {
+        display: grid;
+        grid-template-columns: 68px 1fr;
+        gap: 10px;
+        padding-bottom: 10px;
+        border-bottom: 1px solid var(--line-soft);
+      }
+
+      .event:last-child {
+        border-bottom: 0;
+        padding-bottom: 0;
+      }
+
+      .event-time {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .event-title {
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .event-copy {
+        color: var(--muted);
+        margin-top: 4px;
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .spark {
+        width: 100%;
+        height: 78px;
+      }
+
+      .evidence-link {
+        color: #bae6fd;
+        border-bottom: 1px dotted rgba(186, 230, 253, 0.55);
+        cursor: pointer;
+      }
+
+      .screen-note {
+        color: var(--faint);
+        font-size: 12px;
+        margin-top: 12px;
+        text-align: right;
+      }
+
+      .overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(2, 6, 23, 0.62);
+        pointer-events: none;
+      }
+
+      body.clean-state .overlay,
+      body.clean-state .drawer,
+      body.clean-state .modal {
+        display: none;
+      }
+
+      .drawer {
+        position: fixed;
+        top: 0;
+        right: 0;
+        width: 410px;
+        height: 100vh;
+        border-left: 1px solid var(--line);
+        background: rgba(10, 15, 26, 0.98);
+        box-shadow: -24px 0 60px rgba(0, 0, 0, 0.45);
+        padding: 18px;
+        display: grid;
+        grid-template-rows: auto 1fr;
+        gap: 14px;
+      }
+
+      .drawer-header,
+      .modal-header {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: flex-start;
+      }
+
+      .close-btn {
+        width: 30px;
+        height: 30px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: rgba(15, 23, 42, 0.86);
+        color: var(--muted);
+        display: grid;
+        place-items: center;
+        cursor: pointer;
+      }
+
+      .evidence-list {
+        display: grid;
+        gap: 10px;
+        align-content: start;
+        overflow: hidden;
+      }
+
+      .evidence-card {
+        border: 1px solid var(--line-soft);
+        border-radius: 8px;
+        padding: 12px;
+        background: rgba(17, 24, 39, 0.72);
+      }
+
+      .evidence-title {
+        font-weight: 740;
+        font-size: 13px;
+      }
+
+      .evidence-meta {
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 5px;
+      }
+
+      .modal {
+        position: fixed;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        width: 540px;
+        border: 1px solid rgba(217, 119, 6, 0.45);
+        border-radius: 10px;
+        background: #0d1320;
+        box-shadow: 0 30px 90px rgba(0, 0, 0, 0.58);
+      }
+
+      .modal-body {
+        padding: 16px;
+      }
+
+      .confirm-summary {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 8px;
+        margin: 12px 0;
+      }
+
+      .risk-box {
+        border: 1px solid rgba(239, 68, 68, 0.36);
+        background: var(--red-soft);
+        color: #fecaca;
+        border-radius: 8px;
+        padding: 10px;
+        font-size: 13px;
+        line-height: 1.55;
+      }
+
+      .checkbox-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: #cbd5e1;
+        font-size: 13px;
+        margin-top: 12px;
+      }
+
+      .modal-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+        border-top: 1px solid var(--line-soft);
+        padding: 12px 16px;
+      }
+
+      @media (max-width: 900px) {
+        body {
+          min-width: 0;
+        }
+
+        .app,
+        .grid,
+        .main-grid,
+        .bottom-grid,
+        .status-strip {
+          grid-template-columns: 1fr;
+        }
+
+        .sidebar {
+          display: none;
+        }
+
+        .topbar {
+          height: auto;
+          align-items: flex-start;
+          flex-direction: column;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">H</div>
+          <div>
+            <div class="brand-title">Hermes Finance</div>
+            <div class="brand-subtitle">AI 投资助理工作台</div>
+          </div>
+        </div>
+
+        <nav class="nav">
+          <div class="nav-section">总览</div>
+          <div class="nav-item active">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 13h8V3H3v10Z"/><path d="M13 21h8V11h-8v10Z"/><path d="M13 3v6h8V3h-8Z"/><path d="M3 21h8v-6H3v6Z"/></svg>
+            首页总览
+          </div>
+          <div class="nav-item">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5"/><path d="M4 19h16"/><path d="m7 15 4-4 3 3 5-7"/></svg>
+            持仓体检
+          </div>
+          <div class="nav-item">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v18"/><path d="M5 8h14"/><path d="M7 16h10"/></svg>
+            AI 推荐
+          </div>
+          <div class="nav-section">分析</div>
+          <div class="nav-item">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20V10"/><path d="M9 20V4"/><path d="M14 20v-7"/><path d="M19 20V8"/></svg>
+            信号中心
+          </div>
+          <div class="nav-item">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-5"/></svg>
+            风险中心
+          </div>
+          <div class="nav-item">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 18 10 9l4 5 6-10"/><path d="M4 22h16"/></svg>
+            回测中心
+          </div>
+          <div class="nav-section">执行</div>
+          <div class="nav-item">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 7h12"/><path d="M8 12h12"/><path d="M8 17h12"/><path d="M4 7h.01"/><path d="M4 12h.01"/><path d="M4 17h.01"/></svg>
+            订单草案
+          </div>
+          <div class="nav-item">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16c0 1.1.9 2 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/></svg>
+            证据中心
+          </div>
+        </nav>
+      </aside>
+
+      <main class="content">
+        <header class="topbar">
+          <div class="page-title">
+            <h1>首页总览</h1>
+            <span class="as-of">数据截至 2026-05-12 14:45 CST，2 个数据源部分降级</span>
+          </div>
+          <div class="top-actions">
+            <div class="segmented" aria-label="阅读模式">
+              <button class="segment active">小白模式</button>
+              <button class="segment">专业模式</button>
+            </div>
+            <button class="btn">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg>
+              刷新
+            </button>
+            <div class="source-health"><span class="pulse-dot"></span>AKShare partial · Binance available</div>
+            <button class="btn warning">2 个订单待确认</button>
+          </div>
+        </header>
+
+        <section class="status-strip">
+          <div class="status-item">
+            <div>
+              <div class="label">组合权益</div>
+              <div class="metric">¥ 286,420</div>
+            </div>
+            <div class="delta positive">+2.84% 本周</div>
+          </div>
+          <div class="status-item">
+            <div>
+              <div class="label">组合风险</div>
+              <div class="metric attention">中高</div>
+            </div>
+            <span class="badge amber">需降 BTC 仓位</span>
+          </div>
+          <div class="status-item">
+            <div>
+              <div class="label">最大回撤</div>
+              <div class="metric negative">-8.7%</div>
+            </div>
+            <div class="delta">阈值 -12%</div>
+          </div>
+          <div class="status-item">
+            <div>
+              <div class="label">今日建议</div>
+              <div class="metric">7 条</div>
+            </div>
+            <span class="badge blue">4 持有 / 2 观察 / 1 减仓</span>
+          </div>
+        </section>
+
+        <section class="grid">
+          <div class="left-stack">
+            <div class="main-grid">
+              <article class="panel">
+                <div class="panel-header">
+                  <div>
+                    <div class="panel-title">核心资产走势与信号叠加</div>
+                    <div class="panel-meta">BTCUSDT · 4H · 技术信号偏多，组合风险偏空</div>
+                  </div>
+                  <div class="chart-tabs">
+                    <button class="tiny-tab active">BTC</button>
+                    <button class="tiny-tab">茅台</button>
+                    <button class="tiny-tab">宁德</button>
+                    <button class="tiny-tab">ETH</button>
+                  </div>
+                </div>
+                <div class="panel-body chart-wrap">
+                  <svg class="kline" viewBox="0 0 760 285" role="img" aria-label="BTC K 线原型图">
+                    <defs>
+                      <linearGradient id="area" x1="0" x2="0" y1="0" y2="1">
+                        <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.25"/>
+                        <stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
+                      </linearGradient>
+                    </defs>
+                    <g stroke="#263244" stroke-width="1">
+                      <path d="M40 20V245"/>
+                      <path d="M40 245H740"/>
+                      <path d="M40 60H740"/>
+                      <path d="M40 105H740"/>
+                      <path d="M40 150H740"/>
+                      <path d="M40 195H740"/>
+                    </g>
+                    <g fill="#64748b" font-size="10">
+                      <text x="8" y="63">68k</text>
+                      <text x="8" y="108">65k</text>
+                      <text x="8" y="153">62k</text>
+                      <text x="8" y="198">59k</text>
+                      <text x="8" y="246">56k</text>
+                    </g>
+                    <path d="M46 219 C110 198 144 206 190 172 C226 145 260 156 300 129 C344 99 382 122 430 90 C486 54 528 80 572 74 C634 66 676 58 732 44 L732 245 L46 245Z" fill="url(#area)"/>
+                    <path d="M46 219 C110 198 144 206 190 172 C226 145 260 156 300 129 C344 99 382 122 430 90 C486 54 528 80 572 74 C634 66 676 58 732 44" fill="none" stroke="#38bdf8" stroke-width="2.4"/>
+                    <g>
+                      <g stroke="#22c55e" stroke-width="2"><path d="M70 188V226"/><rect x="62" y="196" width="16" height="21" fill="#22c55e"/></g>
+                      <g stroke="#ef4444" stroke-width="2"><path d="M102 178V220"/><rect x="94" y="185" width="16" height="25" fill="#0d1320" stroke="#ef4444"/></g>
+                      <g stroke="#22c55e" stroke-width="2"><path d="M134 170V210"/><rect x="126" y="176" width="16" height="21" fill="#22c55e"/></g>
+                      <g stroke="#22c55e" stroke-width="2"><path d="M166 151V194"/><rect x="158" y="160" width="16" height="26" fill="#22c55e"/></g>
+                      <g stroke="#ef4444" stroke-width="2"><path d="M198 137V178"/><rect x="190" y="144" width="16" height="21" fill="#0d1320" stroke="#ef4444"/></g>
+                      <g stroke="#22c55e" stroke-width="2"><path d="M230 128V168"/><rect x="222" y="135" width="16" height="22" fill="#22c55e"/></g>
+                      <g stroke="#22c55e" stroke-width="2"><path d="M262 118V160"/><rect x="254" y="126" width="16" height="24" fill="#22c55e"/></g>
+                      <g stroke="#ef4444" stroke-width="2"><path d="M294 111V151"/><rect x="286" y="119" width="16" height="20" fill="#0d1320" stroke="#ef4444"/></g>
+                      <g stroke="#22c55e" stroke-width="2"><path d="M326 98V139"/><rect x="318" y="106" width="16" height="22" fill="#22c55e"/></g>
+                      <g stroke="#22c55e" stroke-width="2"><path d="M358 87V129"/><rect x="350" y="96" width="16" height="20" fill="#22c55e"/></g>
+                      <g stroke="#ef4444" stroke-width="2"><path d="M390 78V120"/><rect x="382" y="86" width="16" height="23" fill="#0d1320" stroke="#ef4444"/></g>
+                      <g stroke="#22c55e" stroke-width="2"><path d="M422 74V112"/><rect x="414" y="82" width="16" height="19" fill="#22c55e"/></g>
+                      <g stroke="#22c55e" stroke-width="2"><path d="M454 62V104"/><rect x="446" y="70" width="16" height="22" fill="#22c55e"/></g>
+                      <g stroke="#ef4444" stroke-width="2"><path d="M486 58V103"/><rect x="478" y="66" width="16" height="24" fill="#0d1320" stroke="#ef4444"/></g>
+                      <g stroke="#22c55e" stroke-width="2"><path d="M518 53V96"/><rect x="510" y="62" width="16" height="22" fill="#22c55e"/></g>
+                      <g stroke="#ef4444" stroke-width="2"><path d="M550 56V99"/><rect x="542" y="64" width="16" height="23" fill="#0d1320" stroke="#ef4444"/></g>
+                      <g stroke="#22c55e" stroke-width="2"><path d="M582 48V88"/><rect x="574" y="56" width="16" height="20" fill="#22c55e"/></g>
+                      <g stroke="#22c55e" stroke-width="2"><path d="M614 42V82"/><rect x="606" y="50" width="16" height="21" fill="#22c55e"/></g>
+                      <g stroke="#ef4444" stroke-width="2"><path d="M646 44V86"/><rect x="638" y="52" width="16" height="20" fill="#0d1320" stroke="#ef4444"/></g>
+                      <g stroke="#22c55e" stroke-width="2"><path d="M678 36V78"/><rect x="670" y="44" width="16" height="22" fill="#22c55e"/></g>
+                    </g>
+                    <g>
+                      <circle cx="454" cy="62" r="5" fill="#22c55e"/>
+                      <path d="M454 62 l16 -18" stroke="#22c55e" stroke-width="1.5"/>
+                      <rect x="466" y="28" width="76" height="22" rx="5" fill="rgba(34,197,94,.18)" stroke="rgba(34,197,94,.35)"/>
+                      <text x="476" y="43" fill="#bbf7d0" font-size="11">买入候选</text>
+                      <circle cx="646" cy="44" r="5" fill="#d97706"/>
+                      <path d="M646 44 l16 -22" stroke="#d97706" stroke-width="1.5"/>
+                      <rect x="660" y="10" width="88" height="22" rx="5" fill="rgba(217,119,6,.16)" stroke="rgba(217,119,6,.4)"/>
+                      <text x="670" y="25" fill="#fcd34d" font-size="11">资金费率升高</text>
+                    </g>
+                  </svg>
+                  <div class="chart-legend">
+                    <span><span class="dot green"></span>偏多信号</span>
+                    <span><span class="dot red"></span>风险回撤</span>
+                    <span><span class="dot blue"></span>趋势线</span>
+                  </div>
+                </div>
+              </article>
+
+              <article class="panel summary-card">
+                <div class="panel-title">组合健康体检</div>
+                <div class="health-score">
+                  <div class="ring"><strong>68</strong></div>
+                </div>
+                <div class="risk-row">
+                  <span>仓位集中度</span>
+                  <span class="badge amber">偏高</span>
+                </div>
+                <div class="risk-row">
+                  <span>杠杆风险</span>
+                  <span class="badge green">可控</span>
+                </div>
+                <div class="risk-row">
+                  <span>数据完整度</span>
+                  <span class="badge amber">部分降级</span>
+                </div>
+                <div class="risk-row">
+                  <span>建议动作</span>
+                  <span class="badge blue">先减风险</span>
+                </div>
+              </article>
+            </div>
+
+            <div class="bottom-grid">
+              <article class="panel">
+                <div class="panel-header">
+                  <div>
+                    <div class="panel-title">持仓体检</div>
+                    <div class="panel-meta">按风险贡献排序，数值为原型样例</div>
+                  </div>
+                  <span class="badge blue">6 个资产</span>
+                </div>
+                <div class="panel-body">
+                  <div class="table-toolbar">
+                    <div class="filters">
+                      <span class="filter-pill active">全部</span>
+                      <span class="filter-pill">高风险</span>
+                      <span class="filter-pill">A 股</span>
+                      <span class="filter-pill">数字货币</span>
+                      <span class="filter-pill">仅看可执行</span>
+                    </div>
+                    <button class="btn export-btn">导出</button>
+                  </div>
+                  <table class="table">
+                    <thead>
+                      <tr>
+                        <th>资产</th>
+                        <th>市场</th>
+                        <th class="num">仓位</th>
+                        <th class="num">浮盈亏</th>
+                        <th>信号</th>
+                        <th>风险</th>
+                        <th>建议</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <td>BTCUSDT</td>
+                        <td>币安现货</td>
+                        <td class="num">42%</td>
+                        <td class="num positive">+¥18,420</td>
+                        <td><span class="badge green">偏多 72</span></td>
+                        <td><span class="badge amber">集中度高</span></td>
+                        <td>持有，不加仓</td>
+                      </tr>
+                      <tr>
+                        <td>600519</td>
+                        <td>A 股</td>
+                        <td class="num">18%</td>
+                        <td class="num negative">-¥3,260</td>
+                        <td><span class="badge blue">中性 58</span></td>
+                        <td><span class="badge blue">估值需确认</span></td>
+                        <td>观察</td>
+                      </tr>
+                      <tr>
+                        <td>ETHUSDT</td>
+                        <td>币安现货</td>
+                        <td class="num">13%</td>
+                        <td class="num positive">+¥6,900</td>
+                        <td><span class="badge green">偏多 69</span></td>
+                        <td><span class="badge green">可控</span></td>
+                        <td>小幅加仓候选</td>
+                      </tr>
+                      <tr>
+                        <td>300750</td>
+                        <td>A 股</td>
+                        <td class="num">9%</td>
+                        <td class="num negative">-¥1,120</td>
+                        <td><span class="badge amber">冲突 51</span></td>
+                        <td><span class="badge amber">行业波动</span></td>
+                        <td>观察</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+
+              <article class="panel">
+                <div class="panel-header">
+                  <div>
+                    <div class="panel-title">事件与证据</div>
+                    <div class="panel-meta">影响推荐置信度的最新证据</div>
+                  </div>
+                </div>
+                <div class="panel-body timeline">
+                  <div class="event">
+                    <div class="event-time">14:20</div>
+                    <div>
+                      <div class="event-title">Binance 资金费率略升</div>
+                      <div class="event-copy">BTC 多头拥挤度上升，合约信号从可用降为部分谨慎。</div>
+                    </div>
+                  </div>
+                  <div class="event">
+                    <div class="event-time">11:35</div>
+                    <div>
+                      <div class="event-title">A 股财务数据部分缺失</div>
+                      <div class="event-copy">部分现金流字段未返回，基本面信号标记为 partial。</div>
+                    </div>
+                  </div>
+                  <div class="event">
+                    <div class="event-time">09:45</div>
+                    <div>
+                      <div class="event-title">组合回撤仍在阈值内</div>
+                      <div class="event-copy">最大回撤 -8.7%，低于用户阈值 -12%，但集中度偏高。</div>
+                    </div>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </div>
+
+          <aside class="right-stack">
+            <article class="panel">
+              <div class="panel-header">
+                <div>
+                  <div class="panel-title">今日推荐</div>
+                  <div class="panel-meta">AI 综合信号、回测和风险后生成</div>
+                </div>
+                <span class="badge green">3 条重点</span>
+              </div>
+              <div class="panel-body">
+                <div class="recommendation">
+                  <div class="rec-top">
+                    <div>
+                      <div class="symbol">BTCUSDT</div>
+                      <div class="label">波段 · 持有</div>
+                    </div>
+                    <span class="badge amber">不加仓</span>
+                  </div>
+                  <p class="rec-copy">技术信号偏多，但当前仓位 42% 已超过平衡成长画像建议上限。建议继续持有，先不要追高。</p>
+                  <div class="rec-meta">
+                    <div class="mini"><span class="label">建议仓位</span><strong>30% - 35%</strong></div>
+                    <div class="mini"><span class="label">置信度</span><strong>0.64</strong></div>
+                  </div>
+                </div>
+                <div class="recommendation" style="border-left-color: var(--green)">
+                  <div class="rec-top">
+                    <div>
+                      <div class="symbol">ETHUSDT</div>
+                      <div class="label">波段 · 买入候选</div>
+                    </div>
+                    <span class="badge green">分批</span>
+                  </div>
+                  <p class="rec-copy">趋势和动量改善，回测结果支持小仓位参与。若 BTC 仓位降低，可转移 3% 至 ETH。</p>
+                  <div class="rec-meta">
+                    <div class="mini"><span class="label">建议仓位</span><strong>13% → 16%</strong></div>
+                    <div class="mini"><span class="label">证据</span><strong><span class="evidence-link">5 条</span></strong></div>
+                  </div>
+                </div>
+              </div>
+            </article>
+
+            <article class="panel">
+              <div class="panel-header">
+                <div>
+                  <div class="panel-title">风险预警</div>
+                  <div class="panel-meta">按影响程度排序</div>
+                </div>
+              </div>
+              <div class="panel-body risk-alert">
+                <div class="risk-item">
+                  <div class="severity high"></div>
+                  <div>
+                    <div class="risk-name">BTC 持仓过度集中</div>
+                    <div class="risk-desc">若 BTC 回撤 15%，组合可能损失约 6.3%。</div>
+                  </div>
+                  <span class="badge red">高</span>
+                </div>
+                <div class="risk-item">
+                  <div class="severity medium"></div>
+                  <div>
+                    <div class="risk-name">A 股基本面数据缺失</div>
+                    <div class="risk-desc">现金流字段缺失，相关推荐置信度降低。</div>
+                  </div>
+                  <span class="badge amber">中</span>
+                </div>
+                <div class="risk-item">
+                  <div class="severity low"></div>
+                  <div>
+                    <div class="risk-name">组合回撤接近关注区</div>
+                    <div class="risk-desc">仍低于阈值，但需要持续观察。</div>
+                  </div>
+                  <span class="badge blue">低</span>
+                </div>
+              </div>
+            </article>
+
+            <article class="panel">
+              <div class="panel-header">
+                <div>
+                  <div class="panel-title">订单草案</div>
+                  <div class="panel-meta">未确认，不会自动下单</div>
+                </div>
+                <span class="badge amber">2 待确认</span>
+              </div>
+              <div class="panel-body">
+                <div class="order-draft">
+                  <div class="rec-top">
+                    <div>
+                      <div class="symbol">ETHUSDT 限价买入</div>
+                      <div class="label">来源：推荐 rec:ETH:swing</div>
+                    </div>
+                    <span class="badge amber">warning</span>
+                  </div>
+                  <div class="draft-grid">
+                    <div class="mini"><span class="label">数量</span><strong>0.28 ETH</strong></div>
+                    <div class="mini"><span class="label">限价</span><strong>3,180 USDT</strong></div>
+                    <div class="mini"><span class="label">止损</span><strong>-5.0%</strong></div>
+                    <div class="mini"><span class="label">手续费估算</span><strong>0.89 USDT</strong></div>
+                  </div>
+                  <div class="risk-desc">风险提示：需先确认 BTC 仓位是否降低，否则组合波动会上升。</div>
+                  <div class="draft-actions" style="margin-top: 12px">
+                    <button class="btn">查看证据</button>
+                    <button class="btn primary">进入确认</button>
+                  </div>
+                </div>
+              </div>
+            </article>
+
+            <article class="panel">
+              <div class="panel-header">
+                <div class="panel-title">回测摘要</div>
+                <span class="badge blue">momentum_v1</span>
+              </div>
+              <div class="panel-body">
+                <svg class="spark" viewBox="0 0 320 78" aria-label="回测收益曲线">
+                  <path d="M0 62 C38 54 48 58 76 40 C110 18 128 37 158 28 C198 16 222 23 250 14 C282 4 300 13 320 8" fill="none" stroke="#22c55e" stroke-width="2.5"/>
+                  <path d="M0 62 C38 54 48 58 76 40 C110 18 128 37 158 28 C198 16 222 23 250 14 C282 4 300 13 320 8 L320 78 L0 78Z" fill="rgba(34,197,94,.12)"/>
+                </svg>
+                <div class="rec-meta">
+                  <div class="mini"><span class="label">年化</span><strong class="positive">18.4%</strong></div>
+                  <div class="mini"><span class="label">最大回撤</span><strong class="negative">-11.2%</strong></div>
+                </div>
+              </div>
+            </article>
+          </aside>
+        </section>
+
+        <div class="screen-note">静态原型 · 首页总览 · UI/UX v0.1</div>
+      </main>
+    </div>
+
+    <div class="overlay" aria-hidden="true"></div>
+
+    <aside class="drawer" aria-label="证据抽屉">
+      <div class="drawer-header">
+        <div>
+          <div class="panel-title">证据抽屉</div>
+          <div class="panel-meta">ETHUSDT 买入候选 · 5 条证据 · as_of 14:45</div>
+        </div>
+        <button class="close-btn" aria-label="关闭">×</button>
+      </div>
+      <div class="evidence-list">
+        <div class="evidence-card">
+          <div class="evidence-title">K 线趋势：4H 动量改善</div>
+          <div class="evidence-meta">来源 Binance · status available · 最近 120 根 K 线</div>
+          <p class="risk-desc">MACD 柱体转正，RSI 处于 58，未进入极端过热区。</p>
+        </div>
+        <div class="evidence-card">
+          <div class="evidence-title">回测：动量模板支持小仓位</div>
+          <div class="evidence-meta">来源 bt_adapter · momentum_v1 · 交易成本已计入</div>
+          <p class="risk-desc">过去 180 日样例回测年化 18.4%，最大回撤 -11.2%。</p>
+        </div>
+        <div class="evidence-card">
+          <div class="evidence-title">组合风险：BTC 仓位偏高</div>
+          <div class="evidence-meta">来源 AccountSnapshot · severity high</div>
+          <p class="risk-desc">若不降低 BTC 仓位，继续买入 ETH 会抬高整体波动。</p>
+        </div>
+      </div>
+    </aside>
+
+    <section class="modal" aria-label="订单确认弹窗">
+      <div class="panel-header modal-header">
+        <div>
+          <div class="panel-title">确认订单草案</div>
+          <div class="panel-meta">确认后才会提交到交易所；当前为 warning 状态</div>
+        </div>
+        <button class="close-btn" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="symbol">ETHUSDT 限价买入</div>
+        <div class="confirm-summary">
+          <div class="mini"><span class="label">数量</span><strong>0.28 ETH</strong></div>
+          <div class="mini"><span class="label">限价</span><strong>3,180 USDT</strong></div>
+          <div class="mini"><span class="label">止损</span><strong>-5.0%</strong></div>
+        </div>
+        <div class="risk-box">风险摘要：该订单会增加数字货币敞口。系统建议先把 BTC 仓位从 42% 降到 35% 以下，再确认 ETH 买入。</div>
+        <label class="checkbox-row">
+          <input type="checkbox" />
+          我已阅读风险、价格、数量、费用和来源推荐，确认这不是自动下单。
+        </label>
+      </div>
+      <div class="modal-actions">
+        <button class="btn">取消</button>
+        <button class="btn warning">暂存草案</button>
+        <button class="btn primary">确认提交</button>
+      </div>
+    </section>
+    <script>
+      const params = new URLSearchParams(window.location.search);
+      if (params.get("state") === "clean") {
+        document.body.classList.add("clean-state");
+      }
+    </script>
+  </body>
+</html>

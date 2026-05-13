@@ -1,0 +1,299 @@
+# ui-ux-pro-max 使用记录与采纳决策
+
+本文档记录本项目如何使用本地 `ui-ux-pro-max` skill，以及哪些建议被采纳、哪些被拒绝。
+
+Skill 路径：
+
+```text
+C:\Users\Administrator\.codex\skills\ui-ux-pro-max\SKILL.md
+```
+
+项目级原始输出：
+
+```text
+docs/ui-ux-pro-max-output/design-system/hermes-finance-agent/MASTER.md
+docs/ui-ux-pro-max-output/design-system/hermes-finance-agent/pages/overview.md
+docs/ui-ux-pro-max-output/design-system/hermes-finance-agent/pages/recommendations.md
+docs/ui-ux-pro-max-output/design-system/hermes-finance-agent/pages/risk-center.md
+docs/ui-ux-pro-max-output/design-system/hermes-finance-agent/pages/order-drafts.md
+docs/ui-ux-pro-max-output/design-system/hermes-finance-agent/pages/signal-center.md
+```
+
+## 1. 已使用能力
+
+已使用的 skill 能力：
+
+- `--design-system`：生成项目级设计系统。
+- `--persist`：持久化 Master + Page Overrides。
+- `--page`：生成页面级 override。
+- `--domain product`：产品类型检索。
+- `--domain style`：视觉风格检索。
+- `--domain color`：色彩方案检索。
+- `--domain typography`：字体搭配检索。
+- `--domain google-fonts`：字体库检索。
+- `--domain chart`：图表类型检索。
+- `--domain ux`：交互与反馈规则检索。
+- `--domain icons`：图标系统检索。
+- `--domain web`：应用界面规则检索。
+- `--stack react`：React 实现规则检索。
+- `--stack shadcn`：数据表、主题、图表封装规则参考。
+
+## 2. 核心命中结果
+
+### 2.1 产品类型
+
+`Financial Dashboard` 命中结果：
+
+- 推荐风格：`Dark Mode (OLED) + Data-Dense`
+- 辅助风格：`Minimalism`、`Accessible & Ethical`
+- 色彩重点：深色背景、红/绿风险和收益提示、信任蓝
+
+采纳：
+
+- 采纳深色金融工作台。
+- 采纳数据密集但可扫描。
+- 采纳高对比和可访问性要求。
+
+不采纳：
+
+- 不做营销页。
+- 不做大 Hero。
+
+### 2.2 风格
+
+`Data-Dense Dashboard` 命中结果：
+
+- 12 列网格。
+- KPI 卡片。
+- 数据表排序和过滤。
+- Loading 状态。
+- 导出功能。
+- 紧凑卡片。
+- 表格行高约 36px。
+
+采纳：
+
+- 采用紧凑信息密度。
+- 持仓、信号、推荐、订单都必须支持过滤和排序。
+- 长表格需要虚拟化。
+- 加入导出能力预留。
+
+`Dark Mode (OLED)` 命中结果：
+
+- 深黑、暗灰、午夜蓝。
+- 高对比。
+- 少量状态色。
+- 避免过度发光。
+
+采纳：
+
+- 深色作为默认主视觉。
+- 绿色、红色、琥珀色只用于状态和风险。
+- 不使用赛博朋克式霓虹。
+
+`Drill-Down Analytics` 命中结果：
+
+- 摘要到详情。
+- breadcrumb。
+- 展开/收起。
+- 保留上下文。
+
+采纳：
+
+- 信号、风险、证据必须能从摘要钻取到详情。
+- 推荐卡片必须能一键打开证据抽屉。
+
+`Real-Time Monitoring` 命中结果：
+
+- 连接状态。
+- 自动刷新提示。
+- 告警突出。
+- 离线 fallback。
+
+采纳：
+
+- 顶部状态条显示数据源健康和更新时间。
+- `stale`、`partial`、`unavailable` 必须可见。
+
+## 3. 页面级输出筛选
+
+Skill 自动生成了页面 override，但部分输出偏 landing page，需要项目化筛选。
+
+### 3.1 Overview
+
+采纳：
+
+- Real-time / operations 风格。
+- 关键指标优先。
+- 状态色清晰。
+
+调整：
+
+- 不使用 landing sections。
+- 首屏固定为：组合风险、推荐动作、订单草案、关键图表、持仓表。
+
+### 3.2 Recommendations
+
+Skill 部分命中 `AI Personalization Landing` 和夸张极简风格。
+
+不采纳：
+
+- 不使用大标题、大留白、个性化营销 CTA。
+- 不使用紫色 AI 渐变。
+
+采纳：
+
+- 个性化只用于推荐理由和风险画像。
+- 推荐页仍保持金融工作台布局。
+
+### 3.3 Risk Center
+
+采纳：
+
+- 深色实时监控。
+- 告警优先排序。
+- 风险按 severity 分层。
+
+### 3.4 Order Drafts
+
+Skill 命中 confirmation dialog 和 submit feedback。
+
+采纳：
+
+- 订单提交必须确认。
+- 提交必须有 loading、success、error。
+- 订单草案不能静默提交。
+
+不采纳：
+
+- 不使用 vibrant/block-based 活泼视觉。
+- 不使用营销 CTA。
+
+### 3.5 Signal Center
+
+采纳：
+
+- Data-dense。
+- Drill-down。
+- 图表 + 表格双入口。
+
+不采纳：
+
+- Portfolio Grid 或作品集式布局。
+
+## 4. 字体决策
+
+Skill 推荐：
+
+- `Fira Code + Fira Sans`：数据 Dashboard。
+- `Noto Sans SC`：简体中文。
+- `IBM Plex Sans`：金融信任感。
+- `JetBrains Mono`：数字和代码数据。
+
+项目采纳：
+
+- 中文正文：系统字体优先，后续可选 `Noto Sans SC`。
+- 英文/数字：`Inter` 或 `IBM Plex Sans`。
+- 数字、价格、代码、ID：`JetBrains Mono` 或 `Fira Code`。
+
+原因：
+
+- 中文界面不能只用 Fira 系列。
+- 金融数字需要等宽字体增强扫描效率。
+- Web 字体应按需加载，避免首屏变慢。
+
+## 5. 图表决策
+
+Skill 图表建议：
+
+- K 线：Candlestick Chart，最多 500 根可见 K 线，提供 OHLC 表格 fallback。
+- 热力图：用于相关性、风险矩阵、资金流强度，必须有数值 legend。
+- Bullet Chart：适合多个 KPI 对目标阈值的紧凑比较。
+- Gauge：适合单个健康分，但多个 KPI 时不如 bullet chart。
+
+项目采纳：
+
+- K 线用 TradingView Lightweight Charts。
+- 组合、收益、回撤、热力图用 ECharts。
+- 多 KPI 健康度后续优先使用 bullet chart。
+- 所有图表需要数值摘要或表格 fallback。
+
+## 6. UX 决策
+
+Skill UX 建议：
+
+- Loading：异步操作必须有 skeleton 或 spinner。
+- Empty State：不能空白，必须说明下一步。
+- Confirmation Dialog：破坏性或不可逆动作必须确认。
+- Submit Feedback：提交必须有 loading、success、error。
+- Table Handling：移动端宽表需要横向滚动或卡片化。
+- Hover/Active：所有可点击元素必须有反馈。
+
+项目采纳：
+
+- 订单确认弹窗必须有 focus trap、风险摘要、确认前勾选或明确二次确认。
+- 数据刷新必须显示加载状态。
+- Provider 失败必须展示 `partial/unavailable/stale`。
+- 空持仓、空推荐、空证据都要有引导。
+
+## 7. React 实现决策
+
+Skill React 建议：
+
+- 长列表超过 100 行使用虚拟化。
+- 路由和重组件 lazy load。
+- 使用 Suspense 或 skeleton 避免整页阻塞。
+- 避免不必要 state，能 derive 就 derive。
+- 复杂状态用 reducer。
+- 表格筛选和排序等昂贵计算用 `useMemo`。
+- Modal 必须管理 focus。
+
+项目采纳：
+
+- 路由页懒加载。
+- 持仓表、证据表、订单表使用 TanStack Table 或 Ant Design Table；大数据时接虚拟滚动。
+- K 线、热力图等重图表按页面懒加载。
+- Agent 执行轨迹和日志列表虚拟化。
+- 使用 TanStack Query 管理服务端状态。
+
+## 8. 图标决策
+
+Skill 图标结果偏 Phosphor。
+
+项目不直接采纳 Phosphor，原因：
+
+- 当前项目规范优先 Lucide。
+- 需要保持单一图标系统，避免风格混杂。
+
+采纳原则：
+
+- 图标语义参考 skill 结果。
+- 实际实现使用 Lucide React。
+- 不使用 emoji 作为功能图标。
+
+## 9. 对当前原型的影响
+
+已采纳：
+
+- 深色金融工作台。
+- 数据密集首页。
+- 推荐、风险、订单草案分层。
+- K 线信号叠加。
+- 风险状态色。
+
+下一版需要补强：
+
+- 表格筛选条。
+- 数据源健康状态。
+- Loading skeleton 和空状态样例。
+- 订单确认弹窗原型。
+- 证据抽屉原型。
+- Bullet chart 替代部分环形健康分。
+- 移动端卡片化表格原型。
+
+## 10. 关键结论
+
+- `ui-ux-pro-max` 应作为设计检索和规则来源，不应作为无条件生成器。
+- 自动 page override 需要人工筛选，因为金融操作页不能套营销页模式。
+- 最终项目规范以 `UI_UX_GUIDELINES.md` 为准。
+- 原始 skill 输出保留在 `docs/ui-ux-pro-max-output/` 供追溯。
