@@ -66,6 +66,14 @@ python scripts/storage/smoke_repositories.py
 
 该脚本可以重复运行，用于验证 Repository 的幂等写入和基础查询。
 
+也可以运行真实数据源到数据库的冒烟脚本：
+
+```bash
+python scripts/data/smoke_providers.py
+```
+
+该脚本会尝试读取 AKShare A 股日线和 ccxt Binance K 线。公网接口可能因为网络、SSL 或数据源限流失败；失败时 Provider 应返回结构化 `error`，不能让异常穿透到推荐链路。
+
 ## 5. 设计约束
 
 - 全环境必须使用 PostgreSQL + TimescaleDB。
