@@ -49,10 +49,26 @@ $env:FINANCE_AGENT_DATABASE_URL = "postgresql+psycopg://finance_agent:finance_ag
 alembic upgrade head
 ```
 
-## 4. 设计约束
+## 4. 验证仓储层
+
+数据库启动并迁移完成后，可以运行仓储层冒烟脚本：
+
+```bash
+python scripts/storage/smoke_repositories.py
+```
+
+脚本会写入：
+
+- 一个 A 股样例资产。
+- 一个数字货币样例资产。
+- 一个混合候选池。
+- A 股日线和数字货币 1h K 线。
+
+该脚本可以重复运行，用于验证 Repository 的幂等写入和基础查询。
+
+## 5. 设计约束
 
 - 全环境必须使用 PostgreSQL + TimescaleDB。
 - 不使用 SQLite 作为应用运行环境或测试环境。
 - `market_bars` 是 TimescaleDB hypertable，唯一约束必须包含 `timestamp`。
 - 指标、因子、信号和评分保存的是推荐链路快照，不是实时指标流水。
-

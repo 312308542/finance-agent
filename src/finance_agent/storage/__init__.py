@@ -6,9 +6,17 @@ from finance_agent.storage.db import (
     get_database_url,
 )
 from finance_agent.storage.orm import Base
+from finance_agent.storage.repositories import (
+    AssetRepository,
+    MarketDataRepository,
+    UniverseRepository,
+)
 
 __all__ = [
+    "AssetRepository",
     "Base",
+    "MarketDataRepository",
+    "UniverseRepository",
     "create_engine_from_settings",
     "create_session_factory",
     "get_database_url",
