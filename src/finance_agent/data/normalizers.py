@@ -44,6 +44,34 @@ def normalize_ashare_spot(df: pd.DataFrame, *, limit: int | None = None) -> list
     return assets
 
 
+def normalize_ashare_spot_tx(df: pd.DataFrame, *, limit: int | None = None) -> list[AssetData]:
+    """归一化腾讯 A 股实时列表。"""
+
+    assets: list[AssetData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        raw_code = str(row.get("code", "")).strip().lower()
+        symbol = strip_ashare_exchange_prefix(raw_code)
+        if not symbol:
+            continue
+        assets.append(
+            AssetData(
+                asset_id=f"ashare:{symbol}",
+                symbol=symbol,
+                name=str(row.get("name", symbol)).strip(),
+                market="ashare",
+                asset_type="stock",
+                exchange=(
+                    infer_ashare_exchange_from_prefixed(raw_code) or infer_ashare_exchange(symbol)
+                ),
+                currency="CNY",
+                tradable=True,
+                payload={"raw": row, "source_symbol": raw_code},
+            )
+        )
+    return assets
+
+
 def normalize_ashare_hist(
     df: pd.DataFrame,
     *,
@@ -73,6 +101,48 @@ def normalize_ashare_hist(
                 source=source,
                 adjustment=adjustment,
                 is_closed=True,
+            )
+        )
+    return bars
+
+
+def normalize_ashare_hist_tx(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    timeframe: str,
+    source: str,
+    adjustment: str,
+) -> list[MarketBarData]:
+    """归一化腾讯 A 股历史行情。
+
+    腾讯历史行情返回的 `amount` 更接近成交量字段，但官方列名只叫 amount。
+    为避免把语义写错，第一版同时写入 `volume` 和 `amount`，并在
+    `source` 中保留腾讯来源，后续可按真实含义再做字段修正。
+    """
+
+    bars: list[MarketBarData] = []
+    clean_symbol = strip_ashare_exchange_prefix(symbol)
+    for row in df.to_dict("records"):
+        timestamp = pd.Timestamp(row["date"]).to_pydatetime().replace(tzinfo=UTC)
+        amount = to_decimal(row.get("amount"))
+        bars.append(
+            MarketBarData(
+                asset_id=f"ashare:{clean_symbol}",
+                symbol=clean_symbol,
+                market="ashare",
+                timeframe=timeframe,
+                timestamp=timestamp,
+                open_price=to_decimal(row.get("open")),
+                high=to_decimal(row.get("high")),
+                low=to_decimal(row.get("low")),
+                close=to_decimal(row.get("close")),
+                volume=amount,
+                amount=amount,
+                source=source,
+                adjustment=adjustment,
+                is_closed=True,
+                status="partial",
             )
         )
     return bars
@@ -227,6 +297,44 @@ def infer_ashare_exchange(symbol: str) -> str:
     if symbol.startswith(("4", "8")):
         return "BSE"
     return "UNKNOWN"
+
+
+def infer_ashare_exchange_from_prefixed(symbol: str) -> str | None:
+    """根据带市场前缀的 A 股代码推断交易所。"""
+
+    normalized = symbol.lower().strip()
+    if normalized.startswith("sh"):
+        return "SSE"
+    if normalized.startswith("sz"):
+        return "SZSE"
+    if normalized.startswith("bj"):
+        return "BSE"
+    return None
+
+
+def with_ashare_exchange_prefix(symbol: str) -> str:
+    """转换为腾讯接口需要的带交易所前缀代码。"""
+
+    normalized = symbol.strip().lower()
+    if normalized.startswith(("sh", "sz", "bj")):
+        return normalized
+    exchange = infer_ashare_exchange(normalized)
+    if exchange == "SSE":
+        return f"sh{normalized}"
+    if exchange == "SZSE":
+        return f"sz{normalized}"
+    if exchange == "BSE":
+        return f"bj{normalized}"
+    return normalized
+
+
+def strip_ashare_exchange_prefix(symbol: str) -> str:
+    """去掉腾讯等接口返回的 A 股市场前缀。"""
+
+    normalized = symbol.strip().lower()
+    if normalized.startswith(("sh", "sz", "bj")):
+        return normalized[2:]
+    return normalized
 
 
 def timeframe_to_timedelta(timeframe: str) -> timedelta | None:

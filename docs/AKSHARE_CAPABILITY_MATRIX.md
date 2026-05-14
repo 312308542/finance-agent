@@ -32,11 +32,20 @@ AKShare 在本系统里应视为 **A 股数据 Provider 族**，不是单一 K �
 
 - AKShare 只在 `finance_agent/data/providers/` 适配层调用。
 - Provider 输出统一模型，不把 AKShare 原始 DataFrame 传给 application、agents 或 API。
+- AKShare 接口必须先登记到 `finance_agent/data/akshare_capabilities.py`，再进入 Provider、任务调度或因子服务。
 - 所有原始响应进入 `raw_records`，用于追溯和排错。
 - 高频查询字段单独结构化，扩展字段放入 `payload`。
 - 不可靠接口必须有 `status`、`error_message` 和 fallback。
 - 东方财富接口优先使用 AKShare；若本机触发断连，可用 `curl_cffi` 或腾讯接口兜底。
 - 腾讯接口可作为 A 股行情 fallback，尤其是实时行情和日线行情。
+- 腾讯实时行情 fallback 受分页和网络稳定性影响，第一版用于降级保底；完整全 A 主源仍优先使用东方财富或后续专门的股票列表接口。
+
+工程上采用“注册表尽量全、执行分批接”的方式：
+
+- `akshare_capabilities.py` 尽可能登记 AKShare 股票数据对推荐系统有价值的接口，记录 Provider、数据域、推荐链路位置、落库表、因子组、优先级和 fallback。
+- P0/P1 接口优先做真实调用、落库和健康检查，保证 A 股推荐主链路可用。
+- P2/P3 接口先进入注册表和健康检查，再按因子、风险、事件和报告质量逐批接入。
+- 不按 AKShare 模块机械建表，仍以 `fundamental_snapshots`、`capital_flow_snapshots`、`event_records`、`risk_findings`、`evidence` 等通用表承载。
 
 ## 2. Provider 拆分
 
@@ -205,6 +214,8 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 
 - `AkshareProvider.fetch_assets`
 - `AkshareProvider.fetch_ohlcv`
+- `finance_agent/data/akshare_capabilities.py`
+- `scripts/data/check_akshare_capabilities.py`
 - `AssetRepository`
 - `UniverseRepository`
 - `MarketDataRepository`
@@ -212,8 +223,8 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 
 下一步应补：
 
-1. A 股行情 fallback：东方财富失败时切腾讯，必要时使用 `curl_cffi`。
-2. 拆出 A 股 Provider 族，不继续把所有能力塞进单个 `AkshareProvider`。
+1. 将 P1 Provider 族拆出来，不继续把所有能力塞进单个 `AkshareProvider`。
+2. 为注册表中的 P0/P1 接口建立真实采集任务和 Raw Store 归档。
 3. 补 `fundamental_snapshots`、`capital_flow_snapshots`、`event_records` 三类表和仓储。
-4. 建立 AKShare endpoint registry，记录接口名、用途、优先级、状态、fallback。
-5. 建立数据健康检查脚本，定期输出哪些 AKShare 接口可用、哪些降级。
+4. 将 P2 财务、估值、风险、情绪接口逐批转成因子和证据。
+5. 定期运行数据健康检查脚本，输出哪些 AKShare 接口可用、哪些降级。

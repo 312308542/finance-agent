@@ -12,6 +12,7 @@ dependencies = [
   "alembic>=1.13,<2.0",
   "akshare>=1.16,<2.0",
   "ccxt>=4.4,<5.0",
+  "curl_cffi>=0.7,<1.0",
   "pandas>=2.2,<3.0",
   "psycopg[binary]>=3.2,<4.0",
   "requests>=2.32,<3.0",
