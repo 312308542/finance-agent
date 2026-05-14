@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
+from hashlib import sha1
 from typing import Any
 
 import pandas as pd
 
-from finance_agent.data.models import AssetData, CryptoDerivativeSnapshotData, MarketBarData
+from finance_agent.data.models import (
+    AssetData,
+    CapitalFlowSnapshotData,
+    CryptoDerivativeSnapshotData,
+    EventRecordData,
+    EvidenceData,
+    MarketBarData,
+    UniverseSeedData,
+)
 
 
 def to_decimal(value: Any) -> Decimal:
@@ -17,6 +26,20 @@ def to_decimal(value: Any) -> Decimal:
     if value is None or pd.isna(value):
         return Decimal("0")
     return Decimal(str(value).replace(",", ""))
+
+
+def nullable_decimal(value: Any) -> Decimal | None:
+    """把第三方可缺失数值安全转成 Decimal 或 None。"""
+
+    if value is None or pd.isna(value):
+        return None
+    normalized = str(value).replace(",", "").strip()
+    if not normalized or normalized in {"-", "--"}:
+        return None
+    try:
+        return Decimal(normalized)
+    except Exception:
+        return None
 
 
 def normalize_ashare_spot(df: pd.DataFrame, *, limit: int | None = None) -> list[AssetData]:
@@ -146,6 +169,213 @@ def normalize_ashare_hist_tx(
             )
         )
     return bars
+
+
+def normalize_ashare_board_members(
+    df: pd.DataFrame,
+    *,
+    source_name: str,
+    source_type: str,
+    as_of: datetime,
+    limit: int | None = None,
+) -> list[UniverseSeedData]:
+    """归一化 AKShare 行业/概念板块成分。"""
+
+    seeds: list[UniverseSeedData] = []
+    rows = df.head(limit) if limit else df
+    for index, row in enumerate(rows.to_dict("records"), start=1):
+        symbol = _first_present(row, ["代码", "股票代码", "code"])
+        symbol = strip_ashare_exchange_prefix(str(symbol or ""))
+        if not symbol:
+            continue
+        name = str(_first_present(row, ["名称", "股票名称", "name"]) or symbol).strip()
+        seeds.append(
+            UniverseSeedData(
+                seed_id=stable_id("seed", source_type, source_name, symbol),
+                source_name=source_name,
+                source_type=source_type,
+                symbol=symbol,
+                name=name,
+                market="ashare",
+                asset_id=f"ashare:{symbol}",
+                rank_hint=index,
+                as_of=as_of,
+                payload={"raw": row},
+            )
+        )
+    return seeds
+
+
+def normalize_ashare_fund_flow_rank(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    window: str,
+    as_of: datetime,
+    limit: int | None = None,
+) -> list[CapitalFlowSnapshotData]:
+    """归一化 AKShare 个股资金流排名。"""
+
+    snapshots: list[CapitalFlowSnapshotData] = []
+    rows = df.head(limit) if limit else df
+    for index, row in enumerate(rows.to_dict("records"), start=1):
+        symbol = strip_ashare_exchange_prefix(str(_first_present(row, ["代码", "股票代码"]) or ""))
+        if not symbol:
+            continue
+        main_net_inflow = _first_decimal(
+            row,
+            [
+                "主力净流入",
+                "今日主力净流入-净额",
+                "5日主力净流入-净额",
+                "10日主力净流入-净额",
+                "净额",
+            ],
+        )
+        amount = _first_decimal(row, ["成交额", "今日成交额"])
+        turnover_rate = _first_decimal(row, ["换手率", "今日换手率"])
+        snapshots.append(
+            CapitalFlowSnapshotData(
+                snapshot_id=stable_id("capital_flow", source, window, symbol, as_of.isoformat()),
+                asset_id=f"ashare:{symbol}",
+                symbol=symbol,
+                market="ashare",
+                window=window,
+                source=source,
+                as_of=as_of,
+                main_net_inflow=main_net_inflow,
+                turnover_rate=turnover_rate,
+                amount=amount,
+                status="available",
+                payload={"raw": row, "rank_hint": index},
+            )
+        )
+    return snapshots
+
+
+def normalize_ashare_stock_news(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    source: str,
+    collected_at: datetime,
+    limit: int | None = None,
+) -> tuple[list[EventRecordData], list[EvidenceData]]:
+    """归一化 AKShare 个股新闻。"""
+
+    events: list[EventRecordData] = []
+    evidence: list[EvidenceData] = []
+    clean_symbol = strip_ashare_exchange_prefix(symbol)
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        title = str(_first_present(row, ["新闻标题", "标题", "title"]) or "").strip()
+        if not title:
+            continue
+        summary = str(_first_present(row, ["新闻内容", "摘要", "内容"]) or "").strip() or None
+        url = str(_first_present(row, ["新闻链接", "链接", "url"]) or "").strip() or None
+        published_at = parse_ashare_datetime(_first_present(row, ["发布时间", "时间", "日期"]))
+        event_id = stable_id("event", source, clean_symbol, title, published_at or collected_at)
+        evidence_id = stable_id("evidence", source, event_id)
+        events.append(
+            EventRecordData(
+                event_id=event_id,
+                asset_id=f"ashare:{clean_symbol}",
+                symbol=clean_symbol,
+                market="ashare",
+                event_type="news",
+                title=title[:255],
+                summary=summary,
+                sentiment="unknown",
+                importance="medium",
+                source=source,
+                url=url,
+                published_at=published_at,
+                collected_at=collected_at,
+                payload={"raw": row},
+            )
+        )
+        evidence.append(
+            EvidenceData(
+                evidence_id=evidence_id,
+                evidence_type="news",
+                asset_id=f"ashare:{clean_symbol}",
+                source=source,
+                title=title[:255],
+                summary=summary,
+                data_ref=event_id,
+                url=url,
+                reliability="medium",
+                as_of=published_at,
+                collected_at=collected_at,
+                payload={"event_id": event_id},
+            )
+        )
+    return events, evidence
+
+
+def normalize_ashare_notice_reports(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    collected_at: datetime,
+    limit: int | None = None,
+) -> tuple[list[EventRecordData], list[EvidenceData]]:
+    """归一化 AKShare 公告披露。"""
+
+    events: list[EventRecordData] = []
+    evidence: list[EvidenceData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        symbol = strip_ashare_exchange_prefix(str(_first_present(row, ["代码", "股票代码"]) or ""))
+        title = str(_first_present(row, ["公告标题", "标题"]) or "").strip()
+        if not title:
+            continue
+        url = str(_first_present(row, ["公告链接", "链接", "url"]) or "").strip() or None
+        published_at = parse_ashare_datetime(_first_present(row, ["公告日期", "发布时间", "日期"]))
+        asset_id = f"ashare:{symbol}" if symbol else None
+        event_id = stable_id(
+            "event",
+            source,
+            symbol or "market",
+            title,
+            published_at or collected_at,
+        )
+        evidence_id = stable_id("evidence", source, event_id)
+        events.append(
+            EventRecordData(
+                event_id=event_id,
+                asset_id=asset_id,
+                symbol=symbol or None,
+                market="ashare",
+                event_type="announcement",
+                title=title[:255],
+                summary=None,
+                sentiment="unknown",
+                importance="medium",
+                source=source,
+                url=url,
+                published_at=published_at,
+                collected_at=collected_at,
+                payload={"raw": row},
+            )
+        )
+        evidence.append(
+            EvidenceData(
+                evidence_id=evidence_id,
+                evidence_type="announcement",
+                asset_id=asset_id,
+                source=source,
+                title=title[:255],
+                summary=None,
+                data_ref=event_id,
+                url=url,
+                reliability="high",
+                as_of=published_at,
+                collected_at=collected_at,
+                payload={"event_id": event_id},
+            )
+        )
+    return events, evidence
 
 
 def normalize_crypto_markets(
@@ -299,6 +529,30 @@ def infer_ashare_exchange(symbol: str) -> str:
     return "UNKNOWN"
 
 
+def stable_id(*parts: Any) -> str:
+    """生成稳定短 ID。"""
+
+    normalized = ":".join(str(part) for part in parts if part is not None)
+    digest = sha1(normalized.encode("utf-8")).hexdigest()[:16]
+    prefix = str(parts[0]) if parts else "id"
+    return f"{prefix}:{digest}"
+
+
+def parse_ashare_datetime(value: Any) -> datetime | None:
+    """解析 AKShare 常见日期时间字段。"""
+
+    if value is None or pd.isna(value):
+        return None
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    if isinstance(parsed, pd.Timestamp):
+        if parsed.tzinfo is not None:
+            return parsed.to_pydatetime().astimezone(UTC)
+        return datetime.combine(parsed.date(), parsed.time() or time.min, tzinfo=UTC)
+    return None
+
+
 def infer_ashare_exchange_from_prefixed(symbol: str) -> str | None:
     """根据带市场前缀的 A 股代码推断交易所。"""
 
@@ -365,6 +619,27 @@ def _nullable_decimal(value: Any) -> Decimal | None:
     if not normalized:
         return None
     return Decimal(normalized)
+
+
+def _first_present(row: dict[str, Any], names: list[str]) -> Any:
+    """按候选列名读取第一个非空值。"""
+
+    for name in names:
+        if name in row and row[name] is not None and not pd.isna(row[name]):
+            return row[name]
+    return None
+
+
+def _first_decimal(row: dict[str, Any], names: list[str]) -> Decimal | None:
+    """按候选列名读取第一个可转 Decimal 的值。"""
+
+    for name in names:
+        if name not in row:
+            continue
+        value = nullable_decimal(row[name])
+        if value is not None:
+            return value
+    return None
 
 
 def _datetime_from_milliseconds(value: Any) -> datetime | None:

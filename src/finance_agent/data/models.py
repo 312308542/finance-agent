@@ -74,6 +74,79 @@ class CryptoDerivativeSnapshotData:
 
 
 @dataclass(frozen=True)
+class UniverseSeedData:
+    """Provider 返回的候选池种子成员。"""
+
+    seed_id: str
+    source_name: str
+    source_type: str
+    symbol: str
+    name: str
+    market: str
+    asset_id: str
+    rank_hint: int | None = None
+    as_of: datetime | None = None
+    payload: JsonDict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CapitalFlowSnapshotData:
+    """Provider 返回的 A 股资金流快照。"""
+
+    snapshot_id: str
+    asset_id: str
+    symbol: str
+    market: str
+    window: str
+    source: str
+    as_of: datetime
+    main_net_inflow: Decimal | None = None
+    northbound_net_inflow: Decimal | None = None
+    turnover_rate: Decimal | None = None
+    amount: Decimal | None = None
+    status: str = "available"
+    payload: JsonDict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EventRecordData:
+    """Provider 返回的事件记录。"""
+
+    event_id: str
+    market: str
+    event_type: str
+    title: str
+    source: str
+    collected_at: datetime
+    asset_id: str | None = None
+    symbol: str | None = None
+    summary: str | None = None
+    sentiment: str = "unknown"
+    importance: str = "medium"
+    url: str | None = None
+    published_at: datetime | None = None
+    payload: JsonDict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EvidenceData:
+    """Provider 返回的推荐证据索引。"""
+
+    evidence_id: str
+    evidence_type: str
+    source: str
+    title: str
+    reliability: str
+    collected_at: datetime
+    asset_id: str | None = None
+    summary: str | None = None
+    data_ref: str | None = None
+    url: str | None = None
+    as_of: datetime | None = None
+    payload: JsonDict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ProviderResult:
     """Provider 调用结果包装。"""
 
@@ -103,3 +176,25 @@ class CryptoDerivativeSnapshotResult(ProviderResult):
     """数字货币衍生品快照结果。"""
 
     snapshot: CryptoDerivativeSnapshotData | None = None
+
+
+@dataclass(frozen=True)
+class UniverseSeedsResult(ProviderResult):
+    """候选池种子结果。"""
+
+    seeds: list[UniverseSeedData] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CapitalFlowSnapshotsResult(ProviderResult):
+    """资金流快照结果。"""
+
+    snapshots: list[CapitalFlowSnapshotData] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class EventRecordsResult(ProviderResult):
+    """事件记录结果。"""
+
+    events: list[EventRecordData] = field(default_factory=list)
+    evidence: list[EvidenceData] = field(default_factory=list)

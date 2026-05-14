@@ -214,17 +214,34 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 
 - `AkshareProvider.fetch_assets`
 - `AkshareProvider.fetch_ohlcv`
+- `AshareSectorProvider.fetch_industry_members`
+- `AshareSectorProvider.fetch_concept_members`
+- `AshareCapitalFlowProvider.fetch_flow_rank`
+- `AshareEventProvider.fetch_stock_news`
+- `AshareEventProvider.fetch_notice_reports`
 - `finance_agent/data/akshare_capabilities.py`
 - `scripts/data/check_akshare_capabilities.py`
+- `scripts/data/smoke_akshare_p1.py`
 - `AssetRepository`
 - `UniverseRepository`
 - `MarketDataRepository`
+- `CapitalFlowRepository`
+- `EventRepository`
+- `fundamental_snapshots`
+- `capital_flow_snapshots`
+- `event_records`
 - `market_bars` TimescaleDB 存储
+
+当前真实运行态：
+
+- `alembic current` 已到 `20260515_0003`。
+- `smoke_akshare_p1.py` 已能把 `stock_news_em` 写入 `event_records` 和 `evidence`。
+- 当前网络下 `stock_board_industry_cons_em` 和 `stock_individual_fund_flow_rank` 仍可能被东方财富上游断开，Provider 会返回结构化 `error`，不会让推荐链路崩溃。
 
 下一步应补：
 
-1. 将 P1 Provider 族拆出来，不继续把所有能力塞进单个 `AkshareProvider`。
-2. 为注册表中的 P0/P1 接口建立真实采集任务和 Raw Store 归档。
-3. 补 `fundamental_snapshots`、`capital_flow_snapshots`、`event_records` 三类表和仓储。
-4. 将 P2 财务、估值、风险、情绪接口逐批转成因子和证据。
+1. 为 P1 Provider 补 Raw Store 归档，把成功和失败响应都写入 `raw_records`。
+2. 给行业/概念和资金流接口补 `curl_cffi` 或备用源 fallback，降低东方财富断连影响。
+3. 将 P2 财务、估值、风险、情绪接口逐批转成 Provider、快照和证据。
+4. 建立采集任务，把 P0/P1 数据按日刷新到标准化表。
 5. 定期运行数据健康检查脚本，输出哪些 AKShare 接口可用、哪些降级。

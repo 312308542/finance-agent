@@ -284,6 +284,95 @@ class EvidenceORM(Base):
     )
 
 
+class FundamentalSnapshotORM(Base):
+    """A 股财务和估值快照表。"""
+
+    __tablename__ = "fundamental_snapshots"
+    __table_args__ = (
+        Index("idx_fundamental_asset_period", "asset_id", "report_period"),
+        Index("idx_fundamental_as_of", "as_of"),
+        Index("idx_fundamental_status", "status"),
+        Index("idx_fundamental_source", "source"),
+    )
+
+    snapshot_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    report_period: Mapped[str | None] = mapped_column(String(32))
+    pe_ttm: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    pb: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    roe: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    revenue_growth_yoy: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    net_profit_growth_yoy: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    debt_to_asset: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    operating_cashflow: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    missing_fields: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class CapitalFlowSnapshotORM(Base):
+    """A 股资金流快照表。"""
+
+    __tablename__ = "capital_flow_snapshots"
+    __table_args__ = (
+        Index("idx_capital_flow_asset_window_asof", "asset_id", "window", "as_of"),
+        Index("idx_capital_flow_symbol_asof", "symbol", "as_of"),
+        Index("idx_capital_flow_source", "source"),
+    )
+
+    snapshot_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    main_net_inflow: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    northbound_net_inflow: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    turnover_rate: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    window: Mapped[str] = mapped_column(String(32), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class EventRecordORM(Base):
+    """新闻、公告、监管、链上和市场事件表。"""
+
+    __tablename__ = "event_records"
+    __table_args__ = (
+        Index("idx_events_asset_published", "asset_id", "published_at"),
+        Index("idx_events_market_type", "market", "event_type"),
+        Index("idx_events_importance", "importance"),
+        Index("idx_events_source", "source"),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    asset_id: Mapped[str | None] = mapped_column(String(128))
+    symbol: Mapped[str | None] = mapped_column(String(64))
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text)
+    sentiment: Mapped[str] = mapped_column(String(32), nullable=False)
+    importance: Mapped[str] = mapped_column(String(32), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    url: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
 class IndicatorFrameORM(Base):
     """推荐链路使用的技术指标快照表。"""
 

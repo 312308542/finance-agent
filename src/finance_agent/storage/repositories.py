@@ -19,7 +19,11 @@ from finance_agent.storage.orm import (
     AssetORM,
     AssetUniverseMemberORM,
     AssetUniverseORM,
+    CapitalFlowSnapshotORM,
     CryptoDerivativeSnapshotORM,
+    EventRecordORM,
+    EvidenceORM,
+    FundamentalSnapshotORM,
     MarketBarORM,
 )
 
@@ -386,6 +390,213 @@ class MarketDataRepository:
                 statement.order_by(MarketBarORM.asset_id, MarketBarORM.timestamp)
             )
         )
+
+
+class FundamentalDataRepository:
+    """A 股财务估值快照仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_fundamental_snapshot(
+        self,
+        *,
+        snapshot_id: str,
+        asset_id: str,
+        symbol: str,
+        source: str,
+        status: str,
+        as_of: datetime,
+        report_period: str | None = None,
+        pe_ttm: Decimal | None = None,
+        pb: Decimal | None = None,
+        roe: Decimal | None = None,
+        revenue_growth_yoy: Decimal | None = None,
+        net_profit_growth_yoy: Decimal | None = None,
+        debt_to_asset: Decimal | None = None,
+        operating_cashflow: Decimal | None = None,
+        missing_fields: list[str] | None = None,
+        payload: JsonDict | None = None,
+    ) -> FundamentalSnapshotORM:
+        """按 `snapshot_id` 幂等写入财务估值快照。"""
+
+        values = {
+            "snapshot_id": snapshot_id,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "report_period": report_period,
+            "pe_ttm": pe_ttm,
+            "pb": pb,
+            "roe": roe,
+            "revenue_growth_yoy": revenue_growth_yoy,
+            "net_profit_growth_yoy": net_profit_growth_yoy,
+            "debt_to_asset": debt_to_asset,
+            "operating_cashflow": operating_cashflow,
+            "source": source,
+            "status": status,
+            "missing_fields": missing_fields or [],
+            "as_of": as_of,
+            "payload": payload or {},
+        }
+        statement = insert(FundamentalSnapshotORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "snapshot_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[FundamentalSnapshotORM.snapshot_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(FundamentalSnapshotORM, snapshot_id)
+
+
+class CapitalFlowRepository:
+    """A 股资金流快照仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_capital_flow_snapshot(
+        self,
+        *,
+        snapshot_id: str,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        window: str,
+        source: str,
+        status: str,
+        as_of: datetime,
+        main_net_inflow: Decimal | None = None,
+        northbound_net_inflow: Decimal | None = None,
+        turnover_rate: Decimal | None = None,
+        amount: Decimal | None = None,
+        payload: JsonDict | None = None,
+    ) -> CapitalFlowSnapshotORM:
+        """按 `snapshot_id` 幂等写入资金流快照。"""
+
+        values = {
+            "snapshot_id": snapshot_id,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "main_net_inflow": main_net_inflow,
+            "northbound_net_inflow": northbound_net_inflow,
+            "turnover_rate": turnover_rate,
+            "amount": amount,
+            "window": window,
+            "source": source,
+            "status": status,
+            "as_of": as_of,
+            "payload": payload or {},
+        }
+        statement = insert(CapitalFlowSnapshotORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "snapshot_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[CapitalFlowSnapshotORM.snapshot_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(CapitalFlowSnapshotORM, snapshot_id)
+
+
+class EventRepository:
+    """事件和证据仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_event(
+        self,
+        *,
+        event_id: str,
+        market: str,
+        event_type: str,
+        title: str,
+        sentiment: str,
+        importance: str,
+        source: str,
+        collected_at: datetime,
+        asset_id: str | None = None,
+        symbol: str | None = None,
+        summary: str | None = None,
+        url: str | None = None,
+        published_at: datetime | None = None,
+        payload: JsonDict | None = None,
+    ) -> EventRecordORM:
+        """按 `event_id` 幂等写入事件记录。"""
+
+        values = {
+            "event_id": event_id,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "event_type": event_type,
+            "title": title,
+            "summary": summary,
+            "sentiment": sentiment,
+            "importance": importance,
+            "source": source,
+            "url": url,
+            "published_at": published_at,
+            "collected_at": collected_at,
+            "payload": payload or {},
+        }
+        statement = insert(EventRecordORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "event_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[EventRecordORM.event_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(EventRecordORM, event_id)
+
+    def upsert_evidence(
+        self,
+        *,
+        evidence_id: str,
+        evidence_type: str,
+        source: str,
+        title: str,
+        reliability: str,
+        collected_at: datetime,
+        asset_id: str | None = None,
+        summary: str | None = None,
+        data_ref: str | None = None,
+        url: str | None = None,
+        as_of: datetime | None = None,
+        payload: JsonDict | None = None,
+    ) -> EvidenceORM:
+        """按 `evidence_id` 幂等写入证据索引。"""
+
+        values = {
+            "evidence_id": evidence_id,
+            "evidence_type": evidence_type,
+            "asset_id": asset_id,
+            "source": source,
+            "title": title,
+            "summary": summary,
+            "data_ref": data_ref,
+            "url": url,
+            "reliability": reliability,
+            "as_of": as_of,
+            "collected_at": collected_at,
+            "payload": payload or {},
+        }
+        statement = insert(EvidenceORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "evidence_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[EvidenceORM.evidence_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(EvidenceORM, evidence_id)
 
 
 class DerivativeDataRepository:
