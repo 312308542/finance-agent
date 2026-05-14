@@ -19,6 +19,7 @@ from finance_agent.storage.orm import (
     AssetORM,
     AssetUniverseMemberORM,
     AssetUniverseORM,
+    CryptoDerivativeSnapshotORM,
     MarketBarORM,
 )
 
@@ -385,3 +386,123 @@ class MarketDataRepository:
                 statement.order_by(MarketBarORM.asset_id, MarketBarORM.timestamp)
             )
         )
+
+
+class DerivativeDataRepository:
+    """数字货币衍生品快照仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_crypto_derivative_snapshot(
+        self,
+        *,
+        snapshot_id: str,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        source: str,
+        as_of: datetime,
+        funding_rate: Decimal | None = None,
+        next_funding_time: datetime | None = None,
+        open_interest: Decimal | None = None,
+        open_interest_value: Decimal | None = None,
+        long_short_ratio: Decimal | None = None,
+        basis_rate: Decimal | None = None,
+        liquidation_risk_score: Decimal | None = None,
+        status: str = "available",
+        payload: JsonDict | None = None,
+    ) -> CryptoDerivativeSnapshotORM:
+        """按 `asset_id + as_of + source` 幂等写入衍生品快照。"""
+
+        values = {
+            "snapshot_id": snapshot_id,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "source": source,
+            "as_of": as_of,
+            "funding_rate": funding_rate,
+            "next_funding_time": next_funding_time,
+            "open_interest": open_interest,
+            "open_interest_value": open_interest_value,
+            "long_short_ratio": long_short_ratio,
+            "basis_rate": basis_rate,
+            "liquidation_risk_score": liquidation_risk_score,
+            "status": status,
+            "payload": payload or {},
+        }
+        statement = insert(CryptoDerivativeSnapshotORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"asset_id", "as_of", "source"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[
+                    CryptoDerivativeSnapshotORM.asset_id,
+                    CryptoDerivativeSnapshotORM.as_of,
+                    CryptoDerivativeSnapshotORM.source,
+                ],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.get_snapshot(asset_id=asset_id, as_of=as_of, source=source)
+
+    def get_snapshot(
+        self,
+        *,
+        asset_id: str,
+        as_of: datetime,
+        source: str,
+    ) -> CryptoDerivativeSnapshotORM:
+        """根据复合键查询单条衍生品快照。"""
+
+        return self.session.get_one(
+            CryptoDerivativeSnapshotORM,
+            {
+                "asset_id": asset_id,
+                "as_of": as_of,
+                "source": source,
+            },
+        )
+
+    def get_latest_snapshot(
+        self,
+        *,
+        asset_id: str,
+        source: str | None = None,
+    ) -> CryptoDerivativeSnapshotORM | None:
+        """查询单标的最新衍生品快照。"""
+
+        statement = select(CryptoDerivativeSnapshotORM).where(
+            CryptoDerivativeSnapshotORM.asset_id == asset_id
+        )
+        if source:
+            statement = statement.where(CryptoDerivativeSnapshotORM.source == source)
+        return self.session.scalars(
+            statement.order_by(CryptoDerivativeSnapshotORM.as_of.desc()).limit(1)
+        ).one_or_none()
+
+    def list_recent_snapshots(
+        self,
+        *,
+        asset_id: str,
+        limit: int,
+        source: str | None = None,
+    ) -> list[CryptoDerivativeSnapshotORM]:
+        """查询单标的最近 N 条衍生品快照，返回时间升序结果。"""
+
+        statement = select(CryptoDerivativeSnapshotORM).where(
+            CryptoDerivativeSnapshotORM.asset_id == asset_id
+        )
+        if source:
+            statement = statement.where(CryptoDerivativeSnapshotORM.source == source)
+        rows = list(
+            self.session.scalars(
+                statement.order_by(CryptoDerivativeSnapshotORM.as_of.desc()).limit(limit)
+            )
+        )
+        return list(reversed(rows))

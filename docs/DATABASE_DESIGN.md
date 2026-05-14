@@ -56,6 +56,7 @@ A 股和数字货币都属于 `assets`。市场差异通过 `market`、`exchange
 - `asset_universe_members`
 - `raw_records`
 - `market_bars`
+- `crypto_derivative_snapshots`
 - `market_calendars`
 - `indicator_frames`
 - `factor_frames`
@@ -199,7 +200,7 @@ M0 可以先统一使用 1 个月 chunk，后续根据数据量调整。
 | 原始与行情 | `market_calendars` | 交易日历、开收盘和休市信息 | M0 |
 | A 股数据 | `fundamental_snapshots` | 财务和估值快照 | M1 |
 | A 股数据 | `capital_flow_snapshots` | 资金流快照 | M1 |
-| 数字货币数据 | `crypto_derivative_snapshots` | 资金费率、未平仓量、多空比，TimescaleDB hypertable | M1 |
+| 数字货币数据 | `crypto_derivative_snapshots` | 资金费率、未平仓量、多空比，TimescaleDB hypertable | M0 |
 | 事件与证据 | `event_records` | 新闻、公告、监管、链上事件 | M1 |
 | 事件与证据 | `evidence` | 推荐证据索引 | M0 |
 | 因子与信号 | `indicator_frames` | 技术指标计算结果和输入窗口 | M0 |
@@ -555,6 +556,7 @@ A 股资金流快照。
 
 - `crypto_derivative_snapshots` 是 TimescaleDB hypertable，不使用单列 `snapshot_id` 作为主键。
 - `snapshot_id` 仍保留为业务引用字段，可按 ID 在日志、证据和报告中展示。
+- 该表在 M0 提前实现，因为数字货币推荐需要资金费率、未平仓量和多空比来识别合约拥挤度。
 
 索引：
 
@@ -1155,6 +1157,7 @@ M0 目标：
 
 - 能构建 A 股和数字货币候选池。
 - 能写入标准行情。
+- 能写入数字货币资金费率、未平仓量和多空比，支撑合约拥挤度分析。
 - 能保存推荐时点的指标快照、因子、逐标的筛选、评分、风险反驳和推荐结果。
 - 能审计每个 Agent 的输入、输出、状态和单标的分析摘要。
 - 能生成 `result.json` 和 `report.md`。
@@ -1165,7 +1168,6 @@ M0 目标：
 
 - `fundamental_snapshots`
 - `capital_flow_snapshots`
-- `crypto_derivative_snapshots`
 - `event_records`
 - `backtest_results`
 - `performance_reports`
@@ -1173,7 +1175,7 @@ M0 目标：
 M1 目标：
 
 - A 股补充财务、估值和资金流。
-- 数字货币补充资金费率、未平仓量、多空比。
+- 数字货币继续增强交易所深度、链上数据和更多衍生品历史序列。
 - 推荐补充更完整的事件、财务、资金流、衍生品和回测依据。
 - 推荐榜可以展示回测和绩效依据。
 
@@ -1233,4 +1235,4 @@ src/finance_agent/storage/
 3. 建立 `IndicatorRepository`、`FactorRepository`、`ScreeningRepository`、`ScoreRepository`。
 4. 建立 `RiskRepository`、`AgentAnalysisRepository`、`RecommendationRepository`。
 5. 跑通一次 `recommend assets` 的写入、读取、证据追溯和中文报告生成。
-6. 再补 M1 专属快照、事件、回测和绩效表。
+6. 再补 A 股专属快照、事件、回测和绩效表。

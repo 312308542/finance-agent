@@ -193,6 +193,41 @@ class MarketBarORM(Base):
     )
 
 
+class CryptoDerivativeSnapshotORM(Base):
+    """数字货币衍生品快照表，迁移中会转换为 TimescaleDB hypertable。"""
+
+    __tablename__ = "crypto_derivative_snapshots"
+    __table_args__ = (
+        Index("idx_crypto_derivatives_snapshot_id", "snapshot_id"),
+        Index("idx_crypto_derivatives_asset_asof", "asset_id", "as_of"),
+        Index("idx_crypto_derivatives_symbol_asof", "symbol", "as_of"),
+        Index("idx_crypto_derivatives_status", "status"),
+    )
+
+    asset_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    source: Mapped[str] = mapped_column(String(64), primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(String(192), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    funding_rate: Mapped[Decimal | None] = mapped_column(Numeric(18, 10))
+    next_funding_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    open_interest: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    open_interest_value: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    long_short_ratio: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    basis_rate: Mapped[Decimal | None] = mapped_column(Numeric(18, 10))
+    liquidation_risk_score: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'available'"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class MarketCalendarORM(Base):
     """交易日历表。"""
 

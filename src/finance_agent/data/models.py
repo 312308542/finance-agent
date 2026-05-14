@@ -53,6 +53,27 @@ class MarketBarData:
 
 
 @dataclass(frozen=True)
+class CryptoDerivativeSnapshotData:
+    """Provider 返回的数字货币衍生品快照。"""
+
+    snapshot_id: str
+    asset_id: str
+    symbol: str
+    market: str
+    source: str
+    as_of: datetime
+    funding_rate: Decimal | None = None
+    next_funding_time: datetime | None = None
+    open_interest: Decimal | None = None
+    open_interest_value: Decimal | None = None
+    long_short_ratio: Decimal | None = None
+    basis_rate: Decimal | None = None
+    liquidation_risk_score: Decimal | None = None
+    status: str = "available"
+    payload: JsonDict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ProviderResult:
     """Provider 调用结果包装。"""
 
@@ -75,3 +96,10 @@ class MarketBarsResult(ProviderResult):
     """K 线结果。"""
 
     bars: list[MarketBarData] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CryptoDerivativeSnapshotResult(ProviderResult):
+    """数字货币衍生品快照结果。"""
+
+    snapshot: CryptoDerivativeSnapshotData | None = None

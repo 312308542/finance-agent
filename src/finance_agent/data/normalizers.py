@@ -8,7 +8,7 @@ from typing import Any
 
 import pandas as pd
 
-from finance_agent.data.models import AssetData, MarketBarData
+from finance_agent.data.models import AssetData, CryptoDerivativeSnapshotData, MarketBarData
 
 
 def to_decimal(value: Any) -> Decimal:
@@ -155,6 +155,68 @@ def normalize_crypto_ohlcv(
     return bars
 
 
+def normalize_binance_derivative_snapshot(
+    *,
+    symbol: str,
+    source: str,
+    premium_index: dict[str, Any] | None,
+    open_interest: dict[str, Any] | None,
+    long_short_ratio: dict[str, Any] | None,
+    collected_at: datetime,
+) -> CryptoDerivativeSnapshotData:
+    """归一化 Binance U 本位合约衍生品快照。"""
+
+    compact_symbol = symbol.replace("/", "").upper()
+    premium_index = premium_index or {}
+    open_interest = open_interest or {}
+    long_short_ratio = long_short_ratio or {}
+
+    premium_time = _datetime_from_milliseconds(premium_index.get("time"))
+    oi_time = _datetime_from_milliseconds(open_interest.get("time"))
+    ratio_time = _datetime_from_milliseconds(long_short_ratio.get("timestamp"))
+    as_of = max(
+        [value for value in [premium_time, oi_time, ratio_time, collected_at] if value is not None]
+    )
+
+    funding_rate = _nullable_decimal(premium_index.get("lastFundingRate"))
+    mark_price = _nullable_decimal(premium_index.get("markPrice"))
+    index_price = _nullable_decimal(premium_index.get("indexPrice"))
+    oi_amount = _nullable_decimal(open_interest.get("openInterest"))
+    open_interest_value = None
+    if oi_amount is not None and mark_price is not None:
+        open_interest_value = oi_amount * mark_price
+
+    basis_rate = None
+    if mark_price is not None and index_price not in {None, Decimal("0")}:
+        basis_rate = (mark_price - index_price) / index_price
+
+    snapshot_id = (
+        f"crypto_derivative:{compact_symbol}:{source}:{as_of.strftime('%Y%m%dT%H%M%SZ')}"
+    )
+    return CryptoDerivativeSnapshotData(
+        snapshot_id=snapshot_id,
+        asset_id=f"crypto_future:{compact_symbol}",
+        symbol=compact_symbol,
+        market="crypto_future",
+        source=source,
+        as_of=as_of,
+        funding_rate=funding_rate,
+        next_funding_time=_datetime_from_milliseconds(premium_index.get("nextFundingTime")),
+        open_interest=oi_amount,
+        open_interest_value=open_interest_value,
+        long_short_ratio=_nullable_decimal(long_short_ratio.get("longShortRatio")),
+        basis_rate=basis_rate,
+        liquidation_risk_score=None,
+        status="available",
+        payload={
+            "schema_version": "1.0",
+            "premium_index": premium_index,
+            "open_interest": open_interest,
+            "long_short_ratio": long_short_ratio,
+        },
+    )
+
+
 def infer_ashare_exchange(symbol: str) -> str:
     """根据 A 股代码推断交易所。"""
 
@@ -184,3 +246,25 @@ def timeframe_to_timedelta(timeframe: str) -> timedelta | None:
     if unit == "w":
         return timedelta(weeks=amount)
     return None
+
+
+def _nullable_decimal(value: Any) -> Decimal | None:
+    """把可缺失的第三方数值转成 Decimal。"""
+
+    if value is None or pd.isna(value):
+        return None
+    normalized = str(value).replace(",", "").strip()
+    if not normalized:
+        return None
+    return Decimal(normalized)
+
+
+def _datetime_from_milliseconds(value: Any) -> datetime | None:
+    """把毫秒时间戳转换为 UTC datetime。"""
+
+    if value is None or pd.isna(value):
+        return None
+    timestamp_ms = int(value)
+    if timestamp_ms <= 0:
+        return None
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC)

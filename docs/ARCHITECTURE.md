@@ -75,7 +75,7 @@ UniverseService
 | 调度 | APScheduler | 本地定时刷新 | `finance_agent/scheduler/` |
 | Agent | LangGraph | 多 Agent 编排 | `finance_agent/agents/` |
 | A 股数据 | AKShare | 免费 A 股行情、财务、资金流 | `finance_agent/data/providers/akshare_provider.py` |
-| 数字货币 | ccxt + Binance API | K 线、成交量、资金费率、未平仓量、多空比例 | `finance_agent/data/providers/ccxt_provider.py` |
+| 数字货币 | ccxt + Binance API | K 线、成交量、资金费率、未平仓量、多空比例 | `finance_agent/data/providers/ccxt_binance_provider.py`、`finance_agent/data/providers/binance_native_provider.py` |
 | 技术指标 | ta-lib-python | 主指标引擎，导入名 `talib` | `finance_agent/indicators/talib_adapter.py` |
 | 指标兜底 | ta | 纯 Python 备用指标 | `finance_agent/indicators/ta_fallback_adapter.py` |
 | 回测 | bt | 组合回测 | `finance_agent/backtesting/bt_adapter.py` |
@@ -149,8 +149,8 @@ finance-agent/
         normalizers.py
         providers/
           akshare_provider.py
-          ccxt_provider.py
-          binance_provider.py
+          ccxt_binance_provider.py
+          binance_native_provider.py
 
       indicators/
         registry.py
@@ -629,10 +629,10 @@ class AkshareProvider:
 
 ### 10.3 ccxt / Binance 调用
 
-ccxt 用于交易所统一接口。Binance 特有字段通过 Binance adapter 补充。
+ccxt 用于交易所统一接口，主要读取 markets、OHLCV、ticker 这类跨交易所通用数据。Binance 原生 Provider 只补充 U 本位合约专属公开行情，例如资金费率、标记价/指数价、未平仓量和多空账户比；它不包含账户、持仓或下单能力。
 
 ```python
-# src/finance_agent/data/providers/ccxt_provider.py
+# src/finance_agent/data/providers/ccxt_binance_provider.py
 import ccxt
 import pandas as pd
 
@@ -661,6 +661,20 @@ class CcxtBinanceProvider:
     def fetch_balance(self) -> dict:
         """获取账户余额，原始结果只能在 adapter 内部处理。"""
         return self.exchange.fetch_balance()
+```
+
+当前项目里 `CcxtBinanceProvider` 只实现公开行情读取，不实现账户余额读取。衍生品补充数据使用单独的 Binance 原生 Provider：
+
+```python
+# src/finance_agent/data/providers/binance_native_provider.py
+class BinanceNativeProvider:
+    """读取 Binance U 本位合约专属公开行情。"""
+
+    provider_name = "binance_native"
+
+    def fetch_derivative_snapshot(self, symbol: str):
+        """返回资金费率、未平仓量、多空比等衍生品快照。"""
+        ...
 ```
 
 交易调用只允许在 `execution` 中出现：

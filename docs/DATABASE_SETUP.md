@@ -74,9 +74,18 @@ python scripts/data/smoke_providers.py
 
 该脚本会尝试读取 AKShare A 股日线和 ccxt Binance K 线。公网接口可能因为网络、SSL 或数据源限流失败；失败时 Provider 应返回结构化 `error`，不能让异常穿透到推荐链路。
 
+数字货币衍生品数据使用 Binance 原生公开接口，可以单独运行：
+
+```bash
+python scripts/data/smoke_binance_native.py
+```
+
+该脚本会读取 BTCUSDT U 本位合约的资金费率、标记价/指数价、未平仓量和多空账户比，并写入 `crypto_derivative_snapshots`。Binance 公网接口可能因为地区、网络或限流返回错误；这类错误应表现为结构化 `error`。
+
 ## 5. 设计约束
 
 - 全环境必须使用 PostgreSQL + TimescaleDB。
 - 不使用 SQLite 作为应用运行环境或测试环境。
 - `market_bars` 是 TimescaleDB hypertable，唯一约束必须包含 `timestamp`。
+- `crypto_derivative_snapshots` 是 TimescaleDB hypertable，主键必须包含 `as_of`。
 - 指标、因子、信号和评分保存的是推荐链路快照，不是实时指标流水。

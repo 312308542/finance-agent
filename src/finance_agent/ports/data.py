@@ -7,7 +7,11 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from finance_agent.data.models import AssetListResult, MarketBarsResult
+from finance_agent.data.models import (
+    AssetListResult,
+    CryptoDerivativeSnapshotResult,
+    MarketBarsResult,
+)
 
 
 class UniverseProvider(Protocol):
@@ -34,3 +38,12 @@ class MarketDataProvider(Protocol):
         limit: int | None = None,
     ) -> MarketBarsResult:
         """获取标准 OHLCV K 线。"""
+
+
+class CryptoDerivativesProvider(Protocol):
+    """数字货币衍生品 Provider 接口。"""
+
+    provider_name: str
+
+    def fetch_derivative_snapshot(self, *, symbol: str) -> CryptoDerivativeSnapshotResult:
+        """获取资金费率、未平仓量和多空比等合约快照。"""
