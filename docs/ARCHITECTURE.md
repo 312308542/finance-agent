@@ -10,6 +10,7 @@
 
 - `docs/PLAN.md`：总体计划和里程碑。
 - `docs/DOMAIN_PROTOCOLS.md`：金融领域模型、信号、推荐、风控、订单草案和证据协议。
+- `docs/AKSHARE_CAPABILITY_MATRIX.md`：AKShare A 股数据能力与推荐链路映射。
 
 ## 1. 架构结论
 
@@ -74,7 +75,7 @@ UniverseService
 | 迁移 | Alembic | 数据库 schema 迁移 | `finance_agent/storage/migrations/` |
 | 调度 | APScheduler | 本地定时刷新 | `finance_agent/scheduler/` |
 | Agent | LangGraph | 多 Agent 编排 | `finance_agent/agents/` |
-| A 股数据 | AKShare | 免费 A 股行情、财务、资金流 | `finance_agent/data/providers/akshare_provider.py` |
+| A 股数据 | AKShare + 腾讯 fallback + curl_cffi fallback | A 股行情、财务、估值、资金流、板块、公告新闻、风险事件 | `finance_agent/data/providers/akshare_provider.py` |
 | 数字货币 | ccxt + Binance API | K 线、成交量、资金费率、未平仓量、多空比例 | `finance_agent/data/providers/ccxt_binance_provider.py`、`finance_agent/data/providers/binance_native_provider.py` |
 | 技术指标 | ta-lib-python | 主指标引擎，导入名 `talib` | `finance_agent/indicators/talib_adapter.py` |
 | 指标兜底 | ta | 纯 Python 备用指标 | `finance_agent/indicators/ta_fallback_adapter.py` |
@@ -149,6 +150,10 @@ finance-agent/
         normalizers.py
         providers/
           akshare_provider.py
+          ashare_market_provider.py
+          ashare_fundamental_provider.py
+          ashare_capital_flow_provider.py
+          ashare_event_provider.py
           ccxt_binance_provider.py
           binance_native_provider.py
 
@@ -595,7 +600,7 @@ class AccountProvider(Protocol):
 
 ### 10.2 AKShare 调用
 
-AKShare 只在 adapter 中调用。
+AKShare 只在 adapter 中调用。A 股能力不能只按 K 线处理，应按 `docs/AKSHARE_CAPABILITY_MATRIX.md` 拆成 Provider 族：行情、候选池、基本面/估值、资金流、板块、事件和风险。东方财富接口如果在当前网络环境下被断开，Provider 必须自动切到腾讯接口或 `curl_cffi` 兜底。
 
 ```python
 # src/finance_agent/data/providers/akshare_provider.py

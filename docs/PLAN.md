@@ -515,6 +515,7 @@ finance-agent dashboard serve
 
 - `ccxt`：交易所统一 API。
 - `AKShare`：A 股免费数据主源。
+- `docs/AKSHARE_CAPABILITY_MATRIX.md`：AKShare A 股能力与选股推荐链路映射。
 - `Qlib`：后续因子研究和 ML 实验平台。
 - `Hummingbot`：连接器和执行模型参考。
 - `vn.py`：国内交易网关和事件驱动架构参考。
@@ -597,6 +598,8 @@ finance-agent/
 - Canonical Store。
 - Provider 健康状态。
 - 数据可用性状态。
+
+A 股接入按 `docs/AKSHARE_CAPABILITY_MATRIX.md` 分批实现：先让行情和候选池稳定可用，再补资金流、板块、公告新闻、财报估值和风险事件。东方财富接口失败时必须自动降级到腾讯或 `curl_cffi`，不能让单一数据源故障阻断推荐链路。
 
 ### M2：因子与信号层
 

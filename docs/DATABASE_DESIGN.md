@@ -14,6 +14,8 @@
  -> 中文解释报告
 ```
 
+AKShare A 股数据能力与推荐链路映射见：`docs/AKSHARE_CAPABILITY_MATRIX.md`。
+
 数据库目标：
 
 - 支撑 A 股和数字货币共用一套推荐链路。
