@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from finance_agent.storage.orm import (
     AssetORM,
+    AssetScoreORM,
     AssetUniverseMemberORM,
     AssetUniverseORM,
     CapitalFlowSnapshotORM,
@@ -32,6 +33,9 @@ from finance_agent.storage.orm import (
     MarketBarORM,
     RawRecordORM,
     RiskFindingORM,
+    ScreeningResultItemORM,
+    ScreeningResultORM,
+    SignalSnapshotORM,
 )
 
 JsonDict = dict[str, Any]
@@ -679,6 +683,287 @@ class FactorFrameRepository:
         )
         return self.session.scalars(
             statement.order_by(FactorFrameORM.as_of.desc()).limit(1)
+        ).one_or_none()
+
+
+class ScreeningRepository:
+    """候选池初筛结果仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_screening_result(
+        self,
+        *,
+        screening_id: str,
+        universe_id: str,
+        strategy: str,
+        market: str,
+        passed_count: int,
+        removed_count: int,
+        rules: JsonDict,
+        status: str,
+        as_of: datetime,
+        payload: JsonDict | None = None,
+    ) -> ScreeningResultORM:
+        """按 `screening_id` 幂等写入初筛汇总。"""
+
+        values = {
+            "screening_id": screening_id,
+            "universe_id": universe_id,
+            "strategy": strategy,
+            "market": market,
+            "passed_count": passed_count,
+            "removed_count": removed_count,
+            "rules": _json_safe(rules),
+            "status": status,
+            "as_of": as_of,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(ScreeningResultORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "screening_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[ScreeningResultORM.screening_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(ScreeningResultORM, screening_id)
+
+    def upsert_screening_item(
+        self,
+        *,
+        screening_item_id: str,
+        screening_id: str,
+        universe_id: str,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        passed: bool,
+        data_status: str,
+        as_of: datetime,
+        removed_reason: str | None = None,
+        failed_rules: list[str] | None = None,
+        passed_rules: list[str] | None = None,
+        liquidity_status: str | None = None,
+        payload: JsonDict | None = None,
+    ) -> ScreeningResultItemORM:
+        """按 `screening_id + asset_id` 幂等写入初筛明细。"""
+
+        values = {
+            "screening_item_id": screening_item_id,
+            "screening_id": screening_id,
+            "universe_id": universe_id,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "passed": passed,
+            "removed_reason": removed_reason,
+            "failed_rules": failed_rules or [],
+            "passed_rules": passed_rules or [],
+            "data_status": data_status,
+            "liquidity_status": liquidity_status,
+            "as_of": as_of,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(ScreeningResultItemORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"screening_item_id", "screening_id", "asset_id"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="uq_screening_items_screening_asset",
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.get_screening_item(screening_id=screening_id, asset_id=asset_id)
+
+    def get_screening_result(self, screening_id: str) -> ScreeningResultORM:
+        """查询初筛汇总。"""
+
+        return self.session.get_one(ScreeningResultORM, screening_id)
+
+    def get_screening_item(
+        self,
+        *,
+        screening_id: str,
+        asset_id: str,
+    ) -> ScreeningResultItemORM:
+        """查询单条初筛明细。"""
+
+        statement = select(ScreeningResultItemORM).where(
+            ScreeningResultItemORM.screening_id == screening_id,
+            ScreeningResultItemORM.asset_id == asset_id,
+        )
+        return self.session.scalars(statement).one()
+
+    def list_items(
+        self,
+        *,
+        screening_id: str,
+        passed_only: bool = False,
+    ) -> list[ScreeningResultItemORM]:
+        """查询初筛明细。"""
+
+        statement = select(ScreeningResultItemORM).where(
+            ScreeningResultItemORM.screening_id == screening_id
+        )
+        if passed_only:
+            statement = statement.where(ScreeningResultItemORM.passed.is_(True))
+        return list(self.session.scalars(statement.order_by(ScreeningResultItemORM.symbol)))
+
+
+class AssetScoreRepository:
+    """标的透明评分仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_asset_score(
+        self,
+        *,
+        score_id: str,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        universe_id: str,
+        screening_id: str,
+        factor_frame_id: str,
+        horizon: str,
+        total_score: Decimal,
+        rank: int,
+        confidence: Decimal,
+        rule_version: str,
+        status: str,
+        as_of: datetime,
+        risk_penalty: Decimal,
+        missing_penalty: Decimal,
+        technical_score: Decimal | None = None,
+        fundamental_score: Decimal | None = None,
+        valuation_score: Decimal | None = None,
+        flow_score: Decimal | None = None,
+        derivatives_score: Decimal | None = None,
+        event_score: Decimal | None = None,
+        rank_in_universe: int | None = None,
+        payload: JsonDict | None = None,
+    ) -> AssetScoreORM:
+        """按 `score_id` 幂等写入评分结果。"""
+
+        values = {
+            "score_id": score_id,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "universe_id": universe_id,
+            "screening_id": screening_id,
+            "factor_frame_id": factor_frame_id,
+            "horizon": horizon,
+            "total_score": total_score,
+            "technical_score": technical_score,
+            "fundamental_score": fundamental_score,
+            "valuation_score": valuation_score,
+            "flow_score": flow_score,
+            "derivatives_score": derivatives_score,
+            "event_score": event_score,
+            "risk_penalty": risk_penalty,
+            "rank": rank,
+            "rank_in_universe": rank_in_universe,
+            "confidence": confidence,
+            "missing_penalty": missing_penalty,
+            "rule_version": rule_version,
+            "status": status,
+            "as_of": as_of,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(AssetScoreORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "score_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[AssetScoreORM.score_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(AssetScoreORM, score_id)
+
+    def list_scores_for_screening(self, screening_id: str) -> list[AssetScoreORM]:
+        """查询一次初筛对应的评分结果。"""
+
+        statement = (
+            select(AssetScoreORM)
+            .where(AssetScoreORM.screening_id == screening_id)
+            .order_by(AssetScoreORM.rank)
+        )
+        return list(self.session.scalars(statement))
+
+
+class SignalSnapshotRepository:
+    """信号快照仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_signal_snapshot(
+        self,
+        *,
+        signal_id: str,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        horizon: str,
+        direction: str,
+        score: Decimal,
+        confidence: Decimal,
+        rule_version: str,
+        status: str,
+        as_of: datetime,
+        payload: JsonDict | None = None,
+    ) -> SignalSnapshotORM:
+        """按 `signal_id` 幂等写入信号快照。"""
+
+        values = {
+            "signal_id": signal_id,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "horizon": horizon,
+            "direction": direction,
+            "score": score,
+            "confidence": confidence,
+            "rule_version": rule_version,
+            "status": status,
+            "as_of": as_of,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(SignalSnapshotORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "signal_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[SignalSnapshotORM.signal_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(SignalSnapshotORM, signal_id)
+
+    def get_latest_signal(
+        self,
+        *,
+        asset_id: str,
+        horizon: str,
+    ) -> SignalSnapshotORM | None:
+        """查询单标的最新信号。"""
+
+        statement = select(SignalSnapshotORM).where(
+            SignalSnapshotORM.asset_id == asset_id,
+            SignalSnapshotORM.horizon == horizon,
+        )
+        return self.session.scalars(
+            statement.order_by(SignalSnapshotORM.as_of.desc()).limit(1)
         ).one_or_none()
 
 

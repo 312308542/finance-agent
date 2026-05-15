@@ -8,20 +8,26 @@ from finance_agent.storage.db import (
 from finance_agent.storage.orm import Base
 from finance_agent.storage.repositories import (
     AssetRepository,
+    AssetScoreRepository,
     DerivativeDataRepository,
     FactorFrameRepository,
     IndicatorFrameRepository,
     MarketDataRepository,
+    ScreeningRepository,
+    SignalSnapshotRepository,
     UniverseRepository,
 )
 
 __all__ = [
+    "AssetScoreRepository",
     "AssetRepository",
     "Base",
     "DerivativeDataRepository",
     "FactorFrameRepository",
     "IndicatorFrameRepository",
     "MarketDataRepository",
+    "ScreeningRepository",
+    "SignalSnapshotRepository",
     "UniverseRepository",
     "create_engine_from_settings",
     "create_session_factory",
