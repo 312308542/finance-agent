@@ -251,6 +251,10 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 - `smoke_akshare_p2.py` 已能把 `stock_financial_analysis_indicator_em` 和 `stock_value_em` 写入 `fundamental_snapshots`。
 - 当前网络下 `stock_board_industry_cons_em` 和 `stock_board_concept_cons_em` 仍可能被东方财富上游断开；Provider 会先记录东财失败链路，再降级到同花顺首屏成分，并把 `actual_source`、`fallback_trace`、`source_coverage` 写入 `raw_records`。
 - 当前网络下 `stock_yjbb_em` 如果请求东财 datacenter 超时，可以走 `eastmoney:curl_cffi` fallback；成功和失败响应都会写入 `raw_records`。
+- `AshareRiskSentimentCollector` 已接入第一批 P2 风险/情绪数据，并可通过 `collect_base_data.py --group ashare-risk` 统一采集。
+- 当前网络下 `stock_hot_rank_em` 可用；若 AKShare 普通请求断连，可走仓库侧 `eastmoney:curl_cffi:stock_hot_rank_em` fallback。该 fallback 在报价段断连时会降级为 `source_coverage=rank_only`，只作为热度种子，不承诺实时价格字段完整。
+- 当前网络下 `stock_zt_pool_em`、`stock_lhb_detail_em`、`stock_dzjy_mrmx`、`stock_margin_sse`、`stock_margin_szse` 可用，分别写入候选池、事件、证据和 `risk_findings`。
+- 当前网络下 `stock_zh_a_stop_em` 仍可能被 Eastmoney `clist/get` 上游断开；AKShare 失败和仓库侧 `curl_cffi` fallback 失败都会进入 `raw_records`，后续需要补充停复牌/退市替代源。
 
 下一步应补：
 

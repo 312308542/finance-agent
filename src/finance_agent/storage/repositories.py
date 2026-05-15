@@ -29,6 +29,7 @@ from finance_agent.storage.orm import (
     FundamentalSnapshotORM,
     MarketBarORM,
     RawRecordORM,
+    RiskFindingORM,
 )
 
 JsonDict = dict[str, Any]
@@ -710,6 +711,54 @@ class EventRepository:
         )
         self.session.flush()
         return self.session.get_one(EvidenceORM, evidence_id)
+
+
+class RiskRepository:
+    """风险发现仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_risk_finding(
+        self,
+        *,
+        risk_id: str,
+        scope: str,
+        risk_type: str,
+        severity: str,
+        title: str,
+        as_of: datetime,
+        asset_id: str | None = None,
+        score: Decimal | None = None,
+        description: str | None = None,
+        evidence_ids: list[str] | None = None,
+        payload: JsonDict | None = None,
+    ) -> RiskFindingORM:
+        """按 `risk_id` 幂等写入风险发现。"""
+
+        values = {
+            "risk_id": risk_id,
+            "asset_id": asset_id,
+            "scope": scope,
+            "risk_type": risk_type,
+            "severity": severity,
+            "score": score,
+            "title": title,
+            "description": description,
+            "as_of": as_of,
+            "evidence_ids": evidence_ids or [],
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(RiskFindingORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "risk_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[RiskFindingORM.risk_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(RiskFindingORM, risk_id)
 
 
 class DerivativeDataRepository:

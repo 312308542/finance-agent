@@ -169,6 +169,23 @@ class EvidenceData:
 
 
 @dataclass(frozen=True)
+class RiskFindingData:
+    """Provider 返回的风险发现。"""
+
+    risk_id: str
+    scope: str
+    risk_type: str
+    severity: str
+    title: str
+    as_of: datetime
+    asset_id: str | None = None
+    score: Decimal | None = None
+    description: str | None = None
+    evidence_ids: list[str] = field(default_factory=list)
+    payload: JsonDict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ProviderResult:
     """Provider 调用结果包装。"""
 
@@ -226,4 +243,23 @@ class EventRecordsResult(ProviderResult):
     """事件记录结果。"""
 
     events: list[EventRecordData] = field(default_factory=list)
+    evidence: list[EvidenceData] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RiskFindingsResult(ProviderResult):
+    """风险发现结果。"""
+
+    risks: list[RiskFindingData] = field(default_factory=list)
+    evidence: list[EvidenceData] = field(default_factory=list)
+    events: list[EventRecordData] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SentimentSignalsResult(ProviderResult):
+    """情绪种子和风险信号结果。"""
+
+    seeds: list[UniverseSeedData] = field(default_factory=list)
+    events: list[EventRecordData] = field(default_factory=list)
+    risks: list[RiskFindingData] = field(default_factory=list)
     evidence: list[EvidenceData] = field(default_factory=list)

@@ -10,6 +10,10 @@ from finance_agent.data.providers.akshare_p2_provider import (
     AshareValuationProvider,
 )
 from finance_agent.data.providers.akshare_provider import AkshareProvider
+from finance_agent.data.providers.akshare_risk_sentiment_provider import (
+    AshareRiskProvider,
+    AshareSentimentProvider,
+)
 from finance_agent.data.providers.binance_native_provider import BinanceNativeProvider
 from finance_agent.data.providers.ccxt_binance_provider import CcxtBinanceProvider
 
@@ -18,7 +22,9 @@ __all__ = [
     "AshareCapitalFlowProvider",
     "AshareEventProvider",
     "AshareFundamentalProvider",
+    "AshareRiskProvider",
     "AshareSectorProvider",
+    "AshareSentimentProvider",
     "AshareValuationProvider",
     "BinanceNativeProvider",
     "CcxtBinanceProvider",

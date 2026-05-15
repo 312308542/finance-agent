@@ -17,6 +17,7 @@ from finance_agent.data.models import (
     EvidenceData,
     FundamentalSnapshotData,
     MarketBarData,
+    RiskFindingData,
     UniverseSeedData,
 )
 
@@ -579,6 +580,381 @@ def normalize_ashare_dividend_yield(
             )
         )
     return snapshots
+
+
+def normalize_ashare_stop_list(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    collected_at: datetime,
+    limit: int | None = None,
+) -> tuple[list[RiskFindingData], list[EventRecordData]]:
+    """归一化 A 股停牌/两网及退市列表为交易状态风险和事件。"""
+
+    risks: list[RiskFindingData] = []
+    events: list[EventRecordData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        symbol = normalize_ashare_symbol(str(_first_present(row, ["代码", "股票代码"]) or ""))
+        if not symbol:
+            continue
+        name = str(_first_present(row, ["名称", "股票简称", "股票名称"]) or symbol).strip()
+        stop_at = parse_ashare_datetime(
+            _first_present(row, ["停牌时间", "停牌日期", "日期", "公告日期"])
+        )
+        as_of = stop_at or collected_at
+        reason = str(_first_present(row, ["停牌原因", "原因"]) or "交易状态异常").strip()
+        title = f"{name}({symbol}) 交易状态异常"
+        event_id = stable_id("event", source, "stop", symbol, as_of.isoformat())
+        risk_id = stable_id("risk", source, "trading_status", symbol, as_of.isoformat())
+        asset_id = f"ashare:{symbol}"
+        events.append(
+            EventRecordData(
+                event_id=event_id,
+                asset_id=asset_id,
+                symbol=symbol,
+                market="ashare",
+                event_type="trading_status",
+                title=title[:255],
+                summary=reason,
+                sentiment="negative",
+                importance="high",
+                source=source,
+                published_at=stop_at,
+                collected_at=collected_at,
+                payload={"raw": row},
+            )
+        )
+        risks.append(
+            RiskFindingData(
+                risk_id=risk_id,
+                asset_id=asset_id,
+                scope="asset",
+                risk_type="trading_status",
+                severity="high",
+                score=Decimal("1.0"),
+                title=title[:255],
+                description=reason,
+                as_of=as_of,
+                evidence_ids=[event_id],
+                payload={"raw": row, "event_id": event_id},
+            )
+        )
+    return risks, events
+
+
+def normalize_ashare_hot_rank(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    as_of: datetime,
+    limit: int | None = None,
+) -> tuple[list[UniverseSeedData], list[EventRecordData]]:
+    """归一化东方财富人气榜为热度种子和情绪事件。"""
+
+    seeds: list[UniverseSeedData] = []
+    events: list[EventRecordData] = []
+    rows = df.head(limit) if limit else df
+    for index, row in enumerate(rows.to_dict("records"), start=1):
+        symbol = normalize_ashare_symbol(str(_first_present(row, ["代码", "股票代码"]) or ""))
+        if not symbol:
+            continue
+        name = str(_first_present(row, ["股票名称", "名称"]) or symbol).strip()
+        rank_hint = int(_first_present(row, ["当前排名", "排名"]) or index)
+        asset_id = f"ashare:{symbol}"
+        seeds.append(
+            UniverseSeedData(
+                seed_id=stable_id("seed", "sentiment_hot_rank", symbol, as_of.isoformat()),
+                source_name="东方财富人气榜",
+                source_type="sentiment_hot_rank",
+                symbol=symbol,
+                name=name,
+                market="ashare",
+                asset_id=asset_id,
+                rank_hint=rank_hint,
+                as_of=as_of,
+                payload={"raw": row},
+            )
+        )
+        events.append(
+            EventRecordData(
+                event_id=stable_id("event", source, "hot_rank", symbol, as_of.isoformat()),
+                asset_id=asset_id,
+                symbol=symbol,
+                market="ashare",
+                event_type="sentiment_hot_rank",
+                title=f"{name}({symbol}) 人气榜排名第 {rank_hint}",
+                summary="热度榜用于候选池种子和情绪拥挤度参考，不直接构成推荐。",
+                sentiment="positive",
+                importance="medium",
+                source=source,
+                published_at=as_of,
+                collected_at=as_of,
+                payload={"raw": row, "rank_hint": rank_hint},
+            )
+        )
+    return seeds, events
+
+
+def normalize_ashare_zt_pool(
+    df: pd.DataFrame,
+    *,
+    date: str,
+    source: str,
+    collected_at: datetime,
+    limit: int | None = None,
+) -> tuple[list[UniverseSeedData], list[EventRecordData], list[RiskFindingData]]:
+    """归一化涨停池为强势种子、情绪事件和过热风险。"""
+
+    seeds: list[UniverseSeedData] = []
+    events: list[EventRecordData] = []
+    risks: list[RiskFindingData] = []
+    rows = df.head(limit) if limit else df
+    as_of = parse_ashare_datetime(date) or collected_at
+    for index, row in enumerate(rows.to_dict("records"), start=1):
+        symbol = normalize_ashare_symbol(str(_first_present(row, ["代码", "股票代码"]) or ""))
+        if not symbol:
+            continue
+        name = str(_first_present(row, ["名称", "股票名称"]) or symbol).strip()
+        asset_id = f"ashare:{symbol}"
+        consecutive = _first_decimal(row, ["连板数"])
+        burst_count = _first_decimal(row, ["炸板次数"])
+        industry = _first_present(row, ["所属行业"])
+        seeds.append(
+            UniverseSeedData(
+                seed_id=stable_id("seed", "zt_pool", symbol, as_of.isoformat()),
+                source_name="涨停池",
+                source_type="sentiment_zt_pool",
+                symbol=symbol,
+                name=name,
+                market="ashare",
+                asset_id=asset_id,
+                rank_hint=index,
+                as_of=as_of,
+                payload={"raw": row},
+            )
+        )
+        event_id = stable_id("event", source, "zt_pool", symbol, as_of.isoformat())
+        events.append(
+            EventRecordData(
+                event_id=event_id,
+                asset_id=asset_id,
+                symbol=symbol,
+                market="ashare",
+                event_type="limit_up",
+                title=f"{name}({symbol}) 进入涨停池",
+                summary=(
+                    f"连板数 {consecutive}，炸板次数 {burst_count}，行业 {industry}。"
+                    "该事件用于短线情绪解释。"
+                ),
+                sentiment="positive",
+                importance="medium",
+                source=source,
+                published_at=as_of,
+                collected_at=collected_at,
+                payload={"raw": row},
+            )
+        )
+        if (consecutive is not None and consecutive >= Decimal("2")) or (
+            burst_count is not None and burst_count > Decimal("0")
+        ):
+            severity = (
+                "high"
+                if consecutive is not None and consecutive >= Decimal("3")
+                else "medium"
+            )
+            risks.append(
+                RiskFindingData(
+                    risk_id=stable_id(
+                        "risk",
+                        source,
+                        "sentiment_crowding",
+                        symbol,
+                        as_of.isoformat(),
+                    ),
+                    asset_id=asset_id,
+                    scope="asset",
+                    risk_type="sentiment_crowding",
+                    severity=severity,
+                    score=Decimal("0.7") if severity == "high" else Decimal("0.45"),
+                    title=f"{name}({symbol}) 短线情绪拥挤",
+                    description="连续涨停或炸板记录提示短线交易拥挤，后续推荐需降低追高置信度。",
+                    as_of=as_of,
+                    evidence_ids=[event_id],
+                    payload={"raw": row, "event_id": event_id},
+                )
+            )
+    return seeds, events, risks
+
+
+def normalize_ashare_lhb_detail(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    collected_at: datetime,
+    limit: int | None = None,
+) -> tuple[list[RiskFindingData], list[EvidenceData]]:
+    """归一化龙虎榜明细为异常交易风险和证据。"""
+
+    risks: list[RiskFindingData] = []
+    evidence: list[EvidenceData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        symbol = normalize_ashare_symbol(str(_first_present(row, ["代码", "股票代码"]) or ""))
+        if not symbol:
+            continue
+        name = str(_first_present(row, ["名称", "股票名称"]) or symbol).strip()
+        as_of = parse_ashare_datetime(_first_present(row, ["上榜日", "日期"])) or collected_at
+        reason = str(_first_present(row, ["上榜原因", "解读"]) or "龙虎榜上榜").strip()
+        net_buy = _first_decimal(row, ["龙虎榜净买额"])
+        turnover_ratio = _first_decimal(row, ["成交额占总成交比"])
+        severity = (
+            "high"
+            if turnover_ratio is not None and turnover_ratio >= Decimal("30")
+            else "medium"
+        )
+        evidence_id = stable_id("evidence", source, "lhb", symbol, as_of.isoformat(), reason)
+        risk_id = stable_id("risk", source, "lhb_activity", symbol, as_of.isoformat(), reason)
+        asset_id = f"ashare:{symbol}"
+        summary = (
+            f"龙虎榜原因：{reason}；净买额：{net_buy}；"
+            f"成交额占总成交比：{turnover_ratio}。"
+        )
+        evidence.append(
+            EvidenceData(
+                evidence_id=evidence_id,
+                evidence_type="lhb",
+                asset_id=asset_id,
+                source=source,
+                title=f"{name}({symbol}) 龙虎榜记录",
+                summary=summary,
+                data_ref=risk_id,
+                reliability="high",
+                as_of=as_of,
+                collected_at=collected_at,
+                payload={"raw": row},
+            )
+        )
+        risks.append(
+            RiskFindingData(
+                risk_id=risk_id,
+                asset_id=asset_id,
+                scope="asset",
+                risk_type="lhb_activity",
+                severity=severity,
+                score=Decimal("0.65") if severity == "high" else Decimal("0.4"),
+                title=f"{name}({symbol}) 龙虎榜交易活跃",
+                description=summary,
+                as_of=as_of,
+                evidence_ids=[evidence_id],
+                payload={"raw": row},
+            )
+        )
+    return risks, evidence
+
+
+def normalize_ashare_block_trades(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    collected_at: datetime,
+    limit: int | None = None,
+) -> tuple[list[RiskFindingData], list[EvidenceData]]:
+    """归一化大宗交易明细为折溢价风险和证据。"""
+
+    risks: list[RiskFindingData] = []
+    evidence: list[EvidenceData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        symbol = normalize_ashare_symbol(str(_first_present(row, ["证券代码", "代码"]) or ""))
+        if not symbol:
+            continue
+        name = str(_first_present(row, ["证券简称", "名称"]) or symbol).strip()
+        as_of = parse_ashare_datetime(_first_present(row, ["交易日期", "日期"])) or collected_at
+        premium = _first_decimal(row, ["折溢率"])
+        amount = _first_decimal(row, ["成交额"])
+        severity = "medium"
+        score = Decimal("0.35")
+        if premium is not None and premium <= Decimal("-0.05"):
+            severity = "high"
+            score = Decimal("0.65")
+        elif premium is not None and abs(premium) >= Decimal("0.03"):
+            severity = "medium"
+            score = Decimal("0.45")
+        evidence_id = stable_id("evidence", source, "block_trade", symbol, as_of.isoformat())
+        risk_id = stable_id("risk", source, "block_trade", symbol, as_of.isoformat())
+        asset_id = f"ashare:{symbol}"
+        summary = f"大宗交易成交额：{amount}；折溢率：{premium}。"
+        evidence.append(
+            EvidenceData(
+                evidence_id=evidence_id,
+                evidence_type="block_trade",
+                asset_id=asset_id,
+                source=source,
+                title=f"{name}({symbol}) 大宗交易记录",
+                summary=summary,
+                data_ref=risk_id,
+                reliability="high",
+                as_of=as_of,
+                collected_at=collected_at,
+                payload={"raw": row},
+            )
+        )
+        risks.append(
+            RiskFindingData(
+                risk_id=risk_id,
+                asset_id=asset_id,
+                scope="asset",
+                risk_type="block_trade",
+                severity=severity,
+                score=score,
+                title=f"{name}({symbol}) 大宗交易异动",
+                description=summary,
+                as_of=as_of,
+                evidence_ids=[evidence_id],
+                payload={"raw": row},
+            )
+        )
+    return risks, evidence
+
+
+def normalize_ashare_margin_summary(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    market_scope: str,
+    collected_at: datetime,
+    limit: int | None = None,
+) -> list[RiskFindingData]:
+    """归一化交易所融资融券汇总为市场杠杆情绪风险。"""
+
+    risks: list[RiskFindingData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        as_of = parse_ashare_datetime(_first_present(row, ["信用交易日期", "日期"])) or collected_at
+        balance = _first_decimal(row, ["融资融券余额"])
+        margin_balance = _first_decimal(row, ["融资余额"])
+        short_balance = _first_decimal(row, ["融券余额", "融券余量金额"])
+        risk_id = stable_id("risk", source, market_scope, as_of.isoformat())
+        risks.append(
+            RiskFindingData(
+                risk_id=risk_id,
+                asset_id=None,
+                scope="market",
+                risk_type="margin_leverage",
+                severity="medium",
+                score=Decimal("0.35"),
+                title=f"{market_scope} 融资融券余额快照",
+                description=(
+                    f"融资融券余额：{balance}；融资余额：{margin_balance}；"
+                    f"融券余额/余量金额：{short_balance}。"
+                ),
+                as_of=as_of,
+                evidence_ids=[],
+                payload={"raw": row, "market_scope": market_scope},
+            )
+        )
+    return risks
 
 
 def normalize_crypto_markets(

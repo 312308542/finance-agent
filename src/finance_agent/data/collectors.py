@@ -20,15 +20,19 @@ from finance_agent.data.models import (
     FundamentalSnapshotsResult,
     MarketBarsResult,
     ProviderResult,
+    RiskFindingsResult,
+    SentimentSignalsResult,
     UniverseSeedsResult,
 )
 from finance_agent.data.providers import (
+    AkshareProvider,
     AshareCapitalFlowProvider,
     AshareEventProvider,
     AshareFundamentalProvider,
+    AshareRiskProvider,
     AshareSectorProvider,
+    AshareSentimentProvider,
     AshareValuationProvider,
-    AkshareProvider,
     BinanceNativeProvider,
     CcxtBinanceProvider,
 )
@@ -40,6 +44,7 @@ from finance_agent.storage.repositories import (
     FundamentalDataRepository,
     MarketDataRepository,
     RawRecordRepository,
+    RiskRepository,
     UniverseRepository,
 )
 
@@ -83,6 +88,15 @@ def archive_provider_result(
         payload["snapshots"] = [snapshot.__dict__ for snapshot in result.snapshots]
     elif isinstance(result, EventRecordsResult):
         payload["events"] = [event.__dict__ for event in result.events]
+        payload["evidence"] = [item.__dict__ for item in result.evidence]
+    elif isinstance(result, RiskFindingsResult):
+        payload["risks"] = [risk.__dict__ for risk in result.risks]
+        payload["evidence"] = [item.__dict__ for item in result.evidence]
+        payload["events"] = [event.__dict__ for event in result.events]
+    elif isinstance(result, SentimentSignalsResult):
+        payload["seeds"] = [seed.__dict__ for seed in result.seeds]
+        payload["events"] = [event.__dict__ for event in result.events]
+        payload["risks"] = [risk.__dict__ for risk in result.risks]
         payload["evidence"] = [item.__dict__ for item in result.evidence]
 
     record = raw_records.insert_raw_record(
@@ -921,4 +935,326 @@ class AshareP2Collector:
                 missing_fields=snapshot.missing_fields,
                 as_of=snapshot.as_of,
                 payload=snapshot.payload | {"raw_record_id": raw_record_id},
+            )
+
+
+class AshareRiskSentimentCollector:
+    """A 股风险和短线情绪采集编排器。"""
+
+    def __init__(
+        self,
+        session: Session,
+        *,
+        risk_provider: AshareRiskProvider | None = None,
+        sentiment_provider: AshareSentimentProvider | None = None,
+    ) -> None:
+        self.assets = AssetRepository(session)
+        self.universes = UniverseRepository(session)
+        self.events = EventRepository(session)
+        self.risks = RiskRepository(session)
+        self.raw_records = RawRecordRepository(session)
+        self.risk_provider = risk_provider or AshareRiskProvider()
+        self.sentiment_provider = sentiment_provider or AshareSentimentProvider()
+
+    def collect_stop_list(self, *, limit: int | None = None) -> ArchivedProviderResult:
+        """采集停牌列表，失败也会写入原始响应归档。"""
+
+        result = self.risk_provider.fetch_stop_list(limit=limit)
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_zh_a_stop_em",
+            request_params={"limit": limit},
+        )
+        self._persist_risk_result(result, raw_record_id=raw_record_id)
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def collect_hot_rank(
+        self,
+        *,
+        universe_id: str,
+        universe_name: str,
+        strategy_context: str,
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集人气榜，并写入热度候选种子和事件。"""
+
+        result = self.sentiment_provider.fetch_hot_rank(limit=limit)
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_hot_rank_em",
+            request_params={"limit": limit},
+        )
+        self._persist_sentiment_result(
+            result,
+            raw_record_id=raw_record_id,
+            universe_id=universe_id,
+            universe_name=universe_name,
+            universe_source="akshare:stock_hot_rank_em",
+            strategy_context=strategy_context,
+        )
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def collect_zt_pool(
+        self,
+        *,
+        date: str,
+        universe_id: str,
+        universe_name: str,
+        strategy_context: str,
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集涨停池，并写入强势候选种子、事件和过热风险。"""
+
+        result = self.sentiment_provider.fetch_zt_pool(date=date, limit=limit)
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_zt_pool_em",
+            request_params={"date": date, "limit": limit},
+        )
+        self._persist_sentiment_result(
+            result,
+            raw_record_id=raw_record_id,
+            universe_id=universe_id,
+            universe_name=universe_name,
+            universe_source="akshare:stock_zt_pool_em",
+            strategy_context=strategy_context,
+        )
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def collect_lhb_detail(
+        self,
+        *,
+        start_date: str,
+        end_date: str,
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集龙虎榜明细，并写入风险发现和证据。"""
+
+        result = self.risk_provider.fetch_lhb_detail(
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+        )
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_lhb_detail_em",
+            request_params={"start_date": start_date, "end_date": end_date, "limit": limit},
+        )
+        self._persist_risk_result(result, raw_record_id=raw_record_id)
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def collect_block_trades(
+        self,
+        *,
+        start_date: str,
+        end_date: str,
+        symbol: str = "A股",
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集大宗交易明细，并写入风险发现和证据。"""
+
+        result = self.risk_provider.fetch_block_trades(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+        )
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_dzjy_mrmx",
+            request_params={
+                "symbol": symbol,
+                "start_date": start_date,
+                "end_date": end_date,
+                "limit": limit,
+            },
+        )
+        self._persist_risk_result(result, raw_record_id=raw_record_id)
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def collect_margin_sse(
+        self,
+        *,
+        start_date: str,
+        end_date: str,
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集上交所两融汇总，并写入市场级风险发现。"""
+
+        result = self.risk_provider.fetch_margin_sse(
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+        )
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_margin_sse",
+            request_params={"start_date": start_date, "end_date": end_date, "limit": limit},
+        )
+        self._persist_risk_result(result, raw_record_id=raw_record_id)
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def collect_margin_szse(self, *, date: str, limit: int | None = None) -> ArchivedProviderResult:
+        """采集深交所两融汇总，并写入市场级风险发现。"""
+
+        result = self.risk_provider.fetch_margin_szse(date=date, limit=limit)
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_margin_szse",
+            request_params={"date": date, "limit": limit},
+        )
+        self._persist_risk_result(result, raw_record_id=raw_record_id)
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def _persist_sentiment_result(
+        self,
+        result: SentimentSignalsResult,
+        *,
+        raw_record_id: str,
+        universe_id: str,
+        universe_name: str,
+        universe_source: str,
+        strategy_context: str,
+    ) -> None:
+        """把情绪种子、事件和风险发现写入标准表。"""
+
+        self.universes.upsert_universe(
+            universe_id=universe_id,
+            name=universe_name,
+            source=universe_source,
+            market="ashare",
+            strategy_context=strategy_context,
+            as_of=result.collected_at,
+            total_before_filter=len(result.seeds),
+            total_after_filter=len(result.seeds),
+            status=result.status,
+            payload={
+                "provider_payload": result.payload,
+                "raw_record_id": raw_record_id,
+                "error": result.error_message,
+            },
+        )
+        if result.status != "available":
+            return
+
+        for seed in result.seeds:
+            self.assets.upsert_asset(
+                asset_id=seed.asset_id,
+                symbol=seed.symbol,
+                name=seed.name,
+                market=seed.market,
+                asset_type="stock",
+                payload=seed.payload | {"raw_record_id": raw_record_id},
+            )
+        self.universes.replace_members(
+            universe_id=universe_id,
+            members=[
+                {
+                    "member_id": f"universe_member:{universe_id}:{seed.symbol}",
+                    "asset_id": seed.asset_id,
+                    "symbol": seed.symbol,
+                    "market": seed.market,
+                    "as_of": seed.as_of or result.collected_at,
+                    "rank_hint": seed.rank_hint,
+                    "payload": seed.payload | {"raw_record_id": raw_record_id},
+                }
+                for seed in result.seeds
+            ],
+        )
+        self._persist_events(result.events, raw_record_id=raw_record_id)
+        self._persist_evidence(result.evidence, raw_record_id=raw_record_id)
+        self._persist_risks(result.risks, raw_record_id=raw_record_id)
+
+    def _persist_risk_result(
+        self,
+        result: RiskFindingsResult,
+        *,
+        raw_record_id: str,
+    ) -> None:
+        """把风险结果写入风险、证据和事件表。"""
+
+        if result.status != "available":
+            return
+        self._persist_events(result.events, raw_record_id=raw_record_id)
+        self._persist_evidence(result.evidence, raw_record_id=raw_record_id)
+        self._persist_risks(result.risks, raw_record_id=raw_record_id)
+
+    def _persist_events(
+        self,
+        events: list[Any],
+        *,
+        raw_record_id: str,
+    ) -> None:
+        """写入事件记录。"""
+
+        for event in events:
+            self.events.upsert_event(
+                event_id=event.event_id,
+                asset_id=event.asset_id,
+                symbol=event.symbol,
+                market=event.market,
+                event_type=event.event_type,
+                title=event.title,
+                summary=event.summary,
+                sentiment=event.sentiment,
+                importance=event.importance,
+                source=event.source,
+                url=event.url,
+                published_at=event.published_at,
+                collected_at=event.collected_at,
+                payload=event.payload | {"raw_record_id": raw_record_id},
+            )
+
+    def _persist_evidence(
+        self,
+        evidence: list[Any],
+        *,
+        raw_record_id: str,
+    ) -> None:
+        """写入证据索引。"""
+
+        for item in evidence:
+            self.events.upsert_evidence(
+                evidence_id=item.evidence_id,
+                evidence_type=item.evidence_type,
+                asset_id=item.asset_id,
+                source=item.source,
+                title=item.title,
+                summary=item.summary,
+                data_ref=item.data_ref,
+                url=item.url,
+                reliability=item.reliability,
+                as_of=item.as_of,
+                collected_at=item.collected_at,
+                payload=item.payload | {"raw_record_id": raw_record_id},
+            )
+
+    def _persist_risks(
+        self,
+        risks: list[Any],
+        *,
+        raw_record_id: str,
+    ) -> None:
+        """写入风险发现。"""
+
+        for risk in risks:
+            self.risks.upsert_risk_finding(
+                risk_id=risk.risk_id,
+                asset_id=risk.asset_id,
+                scope=risk.scope,
+                risk_type=risk.risk_type,
+                severity=risk.severity,
+                score=risk.score,
+                title=risk.title,
+                description=risk.description,
+                as_of=risk.as_of,
+                evidence_ids=risk.evidence_ids,
+                payload=risk.payload | {"raw_record_id": raw_record_id},
             )

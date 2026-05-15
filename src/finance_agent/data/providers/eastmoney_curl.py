@@ -60,6 +60,185 @@ def fetch_fund_flow_rank(indicator: str, *, limit: int | None = None) -> pd.Data
         return _fetch_ths_fund_flow_rank(indicator, limit=limit)
 
 
+def fetch_stop_list(*, limit: int | None = None) -> pd.DataFrame:
+    """获取两网及退市/交易状态异常列表。"""
+
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    params = {
+        "pn": "1",
+        "pz": "100",
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f3",
+        "fs": "m:0 s:3",
+        "fields": (
+            "f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,"
+            "f18,f20,f21,f23,f24,f25,f22,f11,f62,f128,f136,f115,f152"
+        ),
+    }
+    temp_df = _fetch_clist_pages(url, params, max_rows=limit)
+    temp_df.columns = [
+        "序号",
+        "最新价",
+        "涨跌幅",
+        "涨跌额",
+        "成交量",
+        "成交额",
+        "振幅",
+        "换手率",
+        "市盈率-动态",
+        "量比",
+        "_",
+        "代码",
+        "_",
+        "名称",
+        "最高",
+        "最低",
+        "今开",
+        "昨收",
+        "_",
+        "_",
+        "_",
+        "市净率",
+        "_",
+        "_",
+        "_",
+        "_",
+        "_",
+        "_",
+        "_",
+        "_",
+        "_",
+    ]
+    result = temp_df[
+        [
+            "序号",
+            "代码",
+            "名称",
+            "最新价",
+            "涨跌幅",
+            "涨跌额",
+            "成交量",
+            "成交额",
+            "振幅",
+            "最高",
+            "最低",
+            "今开",
+            "昨收",
+            "量比",
+            "换手率",
+            "市盈率-动态",
+            "市净率",
+        ]
+    ]
+    result.attrs["actual_source"] = "eastmoney:curl_cffi:stock_zh_a_stop_em"
+    return _to_numeric(
+        result,
+        [
+            "最新价",
+            "涨跌幅",
+            "涨跌额",
+            "成交量",
+            "成交额",
+            "振幅",
+            "最高",
+            "最低",
+            "今开",
+            "量比",
+            "换手率",
+            "市盈率-动态",
+            "市净率",
+        ],
+    )
+
+
+def fetch_hot_rank(*, limit: int | None = None) -> pd.DataFrame:
+    """获取东方财富个股人气榜。"""
+
+    page_size = limit or 100
+    rank_response = curl_requests.post(
+        "https://emappdata.eastmoney.com/stockrank/getAllCurrentList",
+        json={
+            "appId": "appId01",
+            "globalId": "786e4c21-70dc-435a-93bb-38",
+            "marketType": "",
+            "pageNo": 1,
+            "pageSize": page_size,
+        },
+        timeout=20,
+        impersonate="chrome120",
+        headers=EASTMONEY_HEADERS | {"Referer": "https://guba.eastmoney.com/rank/"},
+    )
+    rank_response.raise_for_status()
+    rank_df = pd.DataFrame((rank_response.json() or {}).get("data") or [])
+    if rank_df.empty:
+        return pd.DataFrame()
+    if limit is not None:
+        rank_df = rank_df.head(limit)
+
+    rank_df["mark"] = [
+        "0" + "." + item[2:] if "SZ" in item else "1" + "." + item[2:]
+        for item in rank_df["sc"]
+    ]
+    quote_params = {
+        "ut": "f057cbcbce2a86e2866ab8877db1d059",
+        "fltt": "2",
+        "invt": "2",
+        "fields": "f14,f3,f12,f2",
+        "secids": ",".join(rank_df["mark"]),
+    }
+    try:
+        quote_json = _curl_get_json_any(
+            [
+                "https://push2.eastmoney.com/api/qt/ulist.np/get",
+                "https://20.push2.eastmoney.com/api/qt/ulist.np/get",
+                "https://29.push2.eastmoney.com/api/qt/ulist.np/get",
+                "https://push2his.eastmoney.com/api/qt/ulist.np/get",
+            ],
+            params=quote_params,
+        )
+        quote_df = pd.DataFrame(((quote_json.get("data") or {}).get("diff")) or [])
+    except Exception:
+        quote_df = pd.DataFrame()
+    if quote_df.empty:
+        clean_codes = [str(item)[2:] for item in rank_df["sc"]]
+        result = pd.DataFrame(
+            {
+                "当前排名": pd.to_numeric(rank_df["rk"], errors="coerce"),
+                "代码": clean_codes,
+                "股票名称": clean_codes,
+                "最新价": None,
+                "涨跌额": None,
+                "涨跌幅": None,
+            }
+        )
+        result.attrs["actual_source"] = "eastmoney:curl_cffi:stock_hot_rank_em"
+        result.attrs["source_coverage"] = "rank_only"
+        return result
+    quote_df.columns = ["股票名称", "涨跌幅", "代码", "最新价"]
+    quote_df["最新价"] = pd.to_numeric(quote_df["最新价"], errors="coerce")
+    quote_df["涨跌幅"] = pd.to_numeric(quote_df["涨跌幅"], errors="coerce")
+    quote_df["涨跌额"] = quote_df["最新价"] * quote_df["涨跌幅"] / 100
+    quote_df["当前排名"] = pd.to_numeric(rank_df["rk"], errors="coerce").to_list()
+    quote_df["代码"] = rank_df["sc"].to_list()
+    result = quote_df[
+        [
+            "当前排名",
+            "代码",
+            "股票名称",
+            "最新价",
+            "涨跌额",
+            "涨跌幅",
+        ]
+    ]
+    result.attrs["actual_source"] = "eastmoney:curl_cffi:stock_hot_rank_em"
+    result.attrs["source_coverage"] = "rank_with_quote"
+    return result
+
+
 def _fetch_eastmoney_fund_flow_rank(
     indicator: str,
     *,
@@ -764,6 +943,20 @@ def _curl_get_json(url: str, *, params: JsonDict) -> JsonDict:
     )
     response.raise_for_status()
     return response.json()
+
+
+def _curl_get_json_any(urls: list[str], *, params: JsonDict) -> JsonDict:
+    """按顺序尝试多个 Eastmoney 子域名，全部失败时抛出最后一个错误。"""
+
+    last_error: Exception | None = None
+    for url in urls:
+        try:
+            return _curl_get_json(url, params=params)
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise ValueError("未提供可请求的 Eastmoney URL")
 
 
 def _rename_fund_flow_columns(temp_df: pd.DataFrame, *, indicator: str) -> pd.DataFrame:
