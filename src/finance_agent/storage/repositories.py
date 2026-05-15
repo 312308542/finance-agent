@@ -6,12 +6,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -25,9 +28,48 @@ from finance_agent.storage.orm import (
     EvidenceORM,
     FundamentalSnapshotORM,
     MarketBarORM,
+    RawRecordORM,
 )
 
 JsonDict = dict[str, Any]
+
+
+def _json_safe(value: Any) -> Any:
+    """把第三方响应转换成 PostgreSQL JSONB 可接受的结构。"""
+
+    if value is None or isinstance(value, str | bool | int):
+        return value
+    if isinstance(value, float):
+        return None if math.isnan(value) or math.isinf(value) else value
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime | date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, set):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return _json_safe(value.item())
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _stable_json_hash(value: Any) -> str:
+    """按稳定 JSON 表达计算 sha1，便于请求和内容追溯。"""
+
+    safe_value = _json_safe(value)
+    encoded = json.dumps(
+        safe_value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()
 
 
 class AssetRepository:
@@ -98,6 +140,77 @@ class AssetRepository:
         if only_tradable:
             statement = statement.where(AssetORM.tradable.is_(True))
         return list(self.session.scalars(statement.order_by(AssetORM.symbol)))
+
+
+class RawRecordRepository:
+    """Provider 原始响应归档仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def insert_raw_record(
+        self,
+        *,
+        provider: str,
+        endpoint: str,
+        request_params: JsonDict,
+        response_payload: JsonDict,
+        status: str,
+        collected_at: datetime,
+        asset_id: str | None = None,
+        symbol: str | None = None,
+        market: str | None = None,
+        provider_version: str | None = None,
+        latency_ms: int | None = None,
+        retry_count: int = 0,
+        error_message: str | None = None,
+        as_of: datetime | None = None,
+        raw_record_id: str | None = None,
+    ) -> RawRecordORM:
+        """追加写入一条原始响应记录。
+
+        `raw_records` 是审计表，默认不按请求覆盖历史。调用方如需要幂等，
+        可以显式传入 `raw_record_id`。
+        """
+
+        safe_request = _json_safe(request_params)
+        safe_response = _json_safe(response_payload)
+        request_hash = _stable_json_hash(safe_request)
+        content_hash = _stable_json_hash(safe_response)
+        record_id = raw_record_id or (
+            f"raw:{provider}:{endpoint}:{collected_at.isoformat()}:{request_hash[:12]}:"
+            f"{content_hash[:12]}"
+        )
+        values = {
+            "raw_record_id": record_id,
+            "provider": provider,
+            "endpoint": endpoint,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "request_params": safe_request,
+            "request_hash": request_hash,
+            "response_payload": safe_response,
+            "content_hash": content_hash,
+            "provider_version": provider_version,
+            "latency_ms": latency_ms,
+            "retry_count": retry_count,
+            "status": status,
+            "error_message": error_message,
+            "as_of": as_of,
+            "collected_at": collected_at,
+        }
+        self.session.execute(insert(RawRecordORM).values(**values))
+        self.session.flush()
+        return self.session.get_one(RawRecordORM, record_id)
+
+    def count_by_provider(self, provider: str) -> int:
+        """统计某个 Provider 已归档的原始记录数量。"""
+
+        statement = select(func.count()).select_from(RawRecordORM).where(
+            RawRecordORM.provider == provider
+        )
+        return int(self.session.scalar(statement) or 0)
 
 
 class UniverseRepository:
