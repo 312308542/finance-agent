@@ -14,18 +14,22 @@ from sqlalchemy.orm import Session
 from finance_agent.data.models import (
     CapitalFlowSnapshotsResult,
     EventRecordsResult,
+    FundamentalSnapshotsResult,
     ProviderResult,
     UniverseSeedsResult,
 )
 from finance_agent.data.providers import (
     AshareCapitalFlowProvider,
     AshareEventProvider,
+    AshareFundamentalProvider,
     AshareSectorProvider,
+    AshareValuationProvider,
 )
 from finance_agent.storage.repositories import (
     AssetRepository,
     CapitalFlowRepository,
     EventRepository,
+    FundamentalDataRepository,
     RawRecordRepository,
     UniverseRepository,
 )
@@ -41,12 +45,48 @@ class ArchivedProviderResult:
     raw_record_id: str
 
 
-class AshareP1Collector:
-    """A 股 P1 数据采集编排器。
+def archive_provider_result(
+    raw_records: RawRecordRepository,
+    result: ProviderResult,
+    *,
+    endpoint: str,
+    request_params: JsonDict,
+    symbol: str | None = None,
+    market: str | None = "ashare",
+) -> str:
+    """把 Provider 返回结果归档到 raw_records。"""
 
-    当前覆盖行业/概念种子、资金流排名、新闻公告事件。后续接入财务/估值
-    P2 时，可以沿用同样的归档和落表模式。
-    """
+    payload = result.payload | {
+        "status": result.status,
+        "error_message": result.error_message,
+    }
+    if isinstance(result, UniverseSeedsResult):
+        payload["seeds"] = [seed.__dict__ for seed in result.seeds]
+    elif isinstance(result, CapitalFlowSnapshotsResult):
+        payload["snapshots"] = [snapshot.__dict__ for snapshot in result.snapshots]
+    elif isinstance(result, FundamentalSnapshotsResult):
+        payload["snapshots"] = [snapshot.__dict__ for snapshot in result.snapshots]
+    elif isinstance(result, EventRecordsResult):
+        payload["events"] = [event.__dict__ for event in result.events]
+        payload["evidence"] = [item.__dict__ for item in result.evidence]
+
+    record = raw_records.insert_raw_record(
+        provider=result.provider_name,
+        endpoint=endpoint,
+        symbol=symbol,
+        market=market,
+        request_params=request_params,
+        response_payload=payload,
+        status=result.status,
+        error_message=result.error_message,
+        as_of=result.collected_at,
+        collected_at=result.collected_at,
+    )
+    return record.raw_record_id
+
+
+class AshareP1Collector:
+    """A 股 P1 数据采集编排器。"""
 
     def __init__(
         self,
@@ -65,43 +105,6 @@ class AshareP1Collector:
         self.flow_provider = flow_provider or AshareCapitalFlowProvider()
         self.event_provider = event_provider or AshareEventProvider()
 
-    def archive_provider_result(
-        self,
-        result: ProviderResult,
-        *,
-        endpoint: str,
-        request_params: JsonDict,
-        symbol: str | None = None,
-        market: str | None = "ashare",
-    ) -> str:
-        """把 Provider 返回结果归档到 raw_records。"""
-
-        payload = result.payload | {
-            "status": result.status,
-            "error_message": result.error_message,
-        }
-        if isinstance(result, UniverseSeedsResult):
-            payload["seeds"] = [seed.__dict__ for seed in result.seeds]
-        elif isinstance(result, CapitalFlowSnapshotsResult):
-            payload["snapshots"] = [snapshot.__dict__ for snapshot in result.snapshots]
-        elif isinstance(result, EventRecordsResult):
-            payload["events"] = [event.__dict__ for event in result.events]
-            payload["evidence"] = [item.__dict__ for item in result.evidence]
-
-        record = self.raw_records.insert_raw_record(
-            provider=result.provider_name,
-            endpoint=endpoint,
-            symbol=symbol,
-            market=market,
-            request_params=request_params,
-            response_payload=payload,
-            status=result.status,
-            error_message=result.error_message,
-            as_of=result.collected_at,
-            collected_at=result.collected_at,
-        )
-        return record.raw_record_id
-
     def collect_industry_members(
         self,
         *,
@@ -117,7 +120,8 @@ class AshareP1Collector:
             industry_name=industry_name,
             limit=limit,
         )
-        raw_record_id = self.archive_provider_result(
+        raw_record_id = archive_provider_result(
+            self.raw_records,
             result,
             endpoint="stock_board_industry_cons_em",
             request_params={"symbol": industry_name, "limit": limit},
@@ -177,7 +181,8 @@ class AshareP1Collector:
         """采集个股资金流排名，并写入资金流快照。"""
 
         result = self.flow_provider.fetch_flow_rank(indicator=indicator, limit=limit)
-        raw_record_id = self.archive_provider_result(
+        raw_record_id = archive_provider_result(
+            self.raw_records,
             result,
             endpoint="stock_individual_fund_flow_rank",
             request_params={"indicator": indicator, "limit": limit},
@@ -221,7 +226,8 @@ class AshareP1Collector:
         """采集个股新闻，并写入事件和证据表。"""
 
         result = self.event_provider.fetch_stock_news(symbol=symbol, limit=limit)
-        raw_record_id = self.archive_provider_result(
+        raw_record_id = archive_provider_result(
+            self.raw_records,
             result,
             endpoint="stock_news_em",
             request_params={"symbol": symbol, "limit": limit},
@@ -271,3 +277,152 @@ class AshareP1Collector:
                 payload=item.payload | {"raw_record_id": raw_record_id},
             )
         return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+
+class AshareP2Collector:
+    """A 股 P2 财务和估值采集编排器。"""
+
+    def __init__(
+        self,
+        session: Session,
+        *,
+        fundamental_provider: AshareFundamentalProvider | None = None,
+        valuation_provider: AshareValuationProvider | None = None,
+    ) -> None:
+        self.assets = AssetRepository(session)
+        self.fundamentals = FundamentalDataRepository(session)
+        self.raw_records = RawRecordRepository(session)
+        self.fundamental_provider = fundamental_provider or AshareFundamentalProvider()
+        self.valuation_provider = valuation_provider or AshareValuationProvider()
+
+    def collect_financial_indicators(
+        self,
+        *,
+        symbol: str,
+        asset_name: str | None = None,
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集个股主要财务指标并写入财务快照。"""
+
+        result = self.fundamental_provider.fetch_financial_indicators(
+            symbol=symbol,
+            limit=limit,
+        )
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_financial_analysis_indicator_em",
+            request_params={"symbol": symbol, "indicator": "按报告期", "limit": limit},
+            symbol=symbol,
+        )
+        self._persist_fundamental_snapshots(
+            result,
+            raw_record_id=raw_record_id,
+            asset_name=asset_name,
+        )
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def collect_valuation(
+        self,
+        *,
+        symbol: str,
+        asset_name: str | None = None,
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集个股估值序列并写入财务估值快照。"""
+
+        result = self.valuation_provider.fetch_valuation(symbol=symbol, limit=limit)
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_value_em",
+            request_params={"symbol": symbol, "limit": limit},
+            symbol=symbol,
+        )
+        self._persist_fundamental_snapshots(
+            result,
+            raw_record_id=raw_record_id,
+            asset_name=asset_name,
+        )
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def collect_performance_report(
+        self,
+        *,
+        date: str,
+        report_type: str = "业绩报表",
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集业绩报表、快报或预告并写入财务快照。"""
+
+        result = self.fundamental_provider.fetch_performance_report(
+            date=date,
+            report_type=report_type,
+            limit=limit,
+        )
+        endpoint = str(result.payload.get("endpoint") or "stock_yjbb_em")
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint=endpoint,
+            request_params={"date": date, "report_type": report_type, "limit": limit},
+        )
+        self._persist_fundamental_snapshots(result, raw_record_id=raw_record_id)
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def collect_dividend_yield(
+        self,
+        *,
+        universe: str = "上证A股",
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集股息率数据并写入财务估值快照。"""
+
+        result = self.valuation_provider.fetch_dividend_yield(universe=universe, limit=limit)
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_a_gxl_lg",
+            request_params={"symbol": universe, "limit": limit},
+        )
+        self._persist_fundamental_snapshots(result, raw_record_id=raw_record_id)
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def _persist_fundamental_snapshots(
+        self,
+        result: FundamentalSnapshotsResult,
+        *,
+        raw_record_id: str,
+        asset_name: str | None = None,
+    ) -> None:
+        """把财务估值快照写入标准表。"""
+
+        if result.status != "available":
+            return
+        for snapshot in result.snapshots:
+            self.assets.upsert_asset(
+                asset_id=snapshot.asset_id,
+                symbol=snapshot.symbol,
+                name=asset_name or snapshot.symbol,
+                market="ashare",
+                asset_type="stock",
+                payload={"source": snapshot.source},
+            )
+            self.fundamentals.upsert_fundamental_snapshot(
+                snapshot_id=snapshot.snapshot_id,
+                asset_id=snapshot.asset_id,
+                symbol=snapshot.symbol,
+                report_period=snapshot.report_period,
+                pe_ttm=snapshot.pe_ttm,
+                pb=snapshot.pb,
+                roe=snapshot.roe,
+                revenue_growth_yoy=snapshot.revenue_growth_yoy,
+                net_profit_growth_yoy=snapshot.net_profit_growth_yoy,
+                debt_to_asset=snapshot.debt_to_asset,
+                operating_cashflow=snapshot.operating_cashflow,
+                source=snapshot.source,
+                status=snapshot.status,
+                missing_fields=snapshot.missing_fields,
+                as_of=snapshot.as_of,
+                payload=snapshot.payload | {"raw_record_id": raw_record_id},
+            )

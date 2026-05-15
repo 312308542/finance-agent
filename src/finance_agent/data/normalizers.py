@@ -15,6 +15,7 @@ from finance_agent.data.models import (
     CryptoDerivativeSnapshotData,
     EventRecordData,
     EvidenceData,
+    FundamentalSnapshotData,
     MarketBarData,
     UniverseSeedData,
 )
@@ -378,6 +379,208 @@ def normalize_ashare_notice_reports(
     return events, evidence
 
 
+def normalize_ashare_financial_indicator(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    source: str,
+    as_of: datetime,
+    limit: int | None = None,
+) -> list[FundamentalSnapshotData]:
+    """归一化 AKShare 东方财富主要财务指标。"""
+
+    snapshots: list[FundamentalSnapshotData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        clean_symbol = normalize_ashare_symbol(
+            str(_first_present(row, ["SECURITY_CODE", "股票代码", "代码"]) or symbol)
+        )
+        if not clean_symbol:
+            continue
+        report_at = parse_ashare_datetime(_first_present(row, ["REPORT_DATE", "报告期", "日期"]))
+        report_period = report_at.strftime("%Y%m%d") if report_at else None
+        revenue_growth_yoy = _first_decimal(row, ["TOTALOPERATEREVETZ", "营业总收入同比增长"])
+        net_profit_growth_yoy = _first_decimal(row, ["PARENTNETPROFITTZ", "净利润同比增长"])
+        roe = _first_decimal(row, ["ROE_DILUTED", "净资产收益率", "加权净资产收益率"])
+        operating_cashflow = _first_decimal(row, ["PER_NETCASH", "每股经营性现金流"])
+        missing_fields = _missing_fields(
+            {
+                "roe": roe,
+                "revenue_growth_yoy": revenue_growth_yoy,
+                "net_profit_growth_yoy": net_profit_growth_yoy,
+                "operating_cashflow": operating_cashflow,
+            }
+        )
+        snapshots.append(
+            FundamentalSnapshotData(
+                snapshot_id=stable_id(
+                    "fundamental",
+                    source,
+                    clean_symbol,
+                    report_period or as_of.isoformat(),
+                ),
+                asset_id=f"ashare:{clean_symbol}",
+                symbol=clean_symbol,
+                report_period=report_period,
+                roe=roe,
+                revenue_growth_yoy=revenue_growth_yoy,
+                net_profit_growth_yoy=net_profit_growth_yoy,
+                operating_cashflow=operating_cashflow,
+                source=source,
+                status="partial" if missing_fields else "available",
+                missing_fields=missing_fields,
+                as_of=report_at or as_of,
+                payload={"raw": row},
+            )
+        )
+    return snapshots
+
+
+def normalize_ashare_valuation(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    source: str,
+    as_of: datetime,
+    limit: int | None = None,
+) -> list[FundamentalSnapshotData]:
+    """归一化 AKShare 个股估值序列。"""
+
+    snapshots: list[FundamentalSnapshotData] = []
+    clean_symbol = normalize_ashare_symbol(symbol)
+    rows = df.tail(limit) if limit else df
+    for row in rows.to_dict("records"):
+        value_at = parse_ashare_datetime(_first_present(row, ["数据日期", "日期"]))
+        pe_ttm = _first_decimal(row, ["PE(TTM)", "市盈率TTM", "滚动市盈率"])
+        pb = _first_decimal(row, ["市净率", "PB"])
+        missing_fields = _missing_fields({"pe_ttm": pe_ttm, "pb": pb})
+        snapshots.append(
+            FundamentalSnapshotData(
+                snapshot_id=stable_id(
+                    "fundamental",
+                    source,
+                    clean_symbol,
+                    value_at.isoformat() if value_at else as_of.isoformat(),
+                ),
+                asset_id=f"ashare:{clean_symbol}",
+                symbol=clean_symbol,
+                pe_ttm=pe_ttm,
+                pb=pb,
+                source=source,
+                status="partial" if missing_fields else "available",
+                missing_fields=missing_fields,
+                as_of=value_at or as_of,
+                payload={
+                    "raw": row,
+                    "market_value": _first_decimal(row, ["总市值"]),
+                    "float_market_value": _first_decimal(row, ["流通市值"]),
+                    "ps": _first_decimal(row, ["市销率"]),
+                    "pcf": _first_decimal(row, ["市现率"]),
+                    "peg": _first_decimal(row, ["PEG值"]),
+                },
+            )
+        )
+    return snapshots
+
+
+def normalize_ashare_performance_report(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    as_of: datetime,
+    limit: int | None = None,
+) -> list[FundamentalSnapshotData]:
+    """归一化 AKShare 业绩报表/快报/预告列表。"""
+
+    snapshots: list[FundamentalSnapshotData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        symbol = normalize_ashare_symbol(
+            str(_first_present(row, ["股票代码", "SECURITY_CODE", "代码"]) or "")
+        )
+        if not symbol:
+            continue
+        report_at = parse_ashare_datetime(
+            _first_present(row, ["REPORT_DATE", "报告期", "公告日期", "最新公告日期"])
+        )
+        report_period = report_at.strftime("%Y%m%d") if report_at else None
+        revenue_growth_yoy = _first_decimal(
+            row,
+            ["营业收入-同比增长", "营业总收入同比增长", "TOTALOPERATEREVETZ"],
+        )
+        net_profit_growth_yoy = _first_decimal(
+            row,
+            ["净利润-同比增长", "归属净利润同比增长", "PARENTNETPROFITTZ"],
+        )
+        missing_fields = _missing_fields(
+            {
+                "revenue_growth_yoy": revenue_growth_yoy,
+                "net_profit_growth_yoy": net_profit_growth_yoy,
+            }
+        )
+        snapshots.append(
+            FundamentalSnapshotData(
+                snapshot_id=stable_id(
+                    "fundamental",
+                    source,
+                    symbol,
+                    report_period or as_of.isoformat(),
+                ),
+                asset_id=f"ashare:{symbol}",
+                symbol=symbol,
+                report_period=report_period,
+                revenue_growth_yoy=revenue_growth_yoy,
+                net_profit_growth_yoy=net_profit_growth_yoy,
+                source=source,
+                status="partial" if missing_fields else "available",
+                missing_fields=missing_fields,
+                as_of=report_at or as_of,
+                payload={"raw": row},
+            )
+        )
+    return snapshots
+
+
+def normalize_ashare_dividend_yield(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    as_of: datetime,
+    limit: int | None = None,
+) -> list[FundamentalSnapshotData]:
+    """归一化 AKShare A 股股息率数据。"""
+
+    snapshots: list[FundamentalSnapshotData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        symbol = normalize_ashare_symbol(
+            str(_first_present(row, ["股票代码", "代码", "symbol"]) or "")
+        )
+        if not symbol:
+            continue
+        snapshot_at = parse_ashare_datetime(_first_present(row, ["日期", "数据日期", "报告期"]))
+        dividend_yield = _first_decimal(row, ["股息率", "股息率TTM", "股利支付率"])
+        missing_fields = _missing_fields({"dividend_yield": dividend_yield})
+        snapshots.append(
+            FundamentalSnapshotData(
+                snapshot_id=stable_id(
+                    "fundamental",
+                    source,
+                    symbol,
+                    snapshot_at.isoformat() if snapshot_at else as_of.isoformat(),
+                ),
+                asset_id=f"ashare:{symbol}",
+                symbol=symbol,
+                source=source,
+                status="partial" if missing_fields else "available",
+                missing_fields=missing_fields,
+                as_of=snapshot_at or as_of,
+                payload={"raw": row, "dividend_yield": dividend_yield},
+            )
+        )
+    return snapshots
+
+
 def normalize_crypto_markets(
     markets: dict[str, dict[str, Any]],
     *,
@@ -591,6 +794,17 @@ def strip_ashare_exchange_prefix(symbol: str) -> str:
     return normalized
 
 
+def normalize_ashare_symbol(symbol: str) -> str:
+    """统一 A 股代码格式，输出不带市场前后缀的 6 位代码。"""
+
+    normalized = strip_ashare_exchange_prefix(symbol)
+    for suffix in (".sh", ".sz", ".bj"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return normalized.strip()
+
+
 def timeframe_to_timedelta(timeframe: str) -> timedelta | None:
     """将常见 K 线周期转换成时间长度。"""
 
@@ -640,6 +854,12 @@ def _first_decimal(row: dict[str, Any], names: list[str]) -> Decimal | None:
         if value is not None:
             return value
     return None
+
+
+def _missing_fields(values: dict[str, Any]) -> list[str]:
+    """返回缺失字段名列表。"""
+
+    return [name for name, value in values.items() if value is None]
 
 
 def _datetime_from_milliseconds(value: Any) -> datetime | None:

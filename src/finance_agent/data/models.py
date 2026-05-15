@@ -109,6 +109,28 @@ class CapitalFlowSnapshotData:
 
 
 @dataclass(frozen=True)
+class FundamentalSnapshotData:
+    """Provider 返回的 A 股财务和估值快照。"""
+
+    snapshot_id: str
+    asset_id: str
+    symbol: str
+    source: str
+    status: str
+    as_of: datetime
+    report_period: str | None = None
+    pe_ttm: Decimal | None = None
+    pb: Decimal | None = None
+    roe: Decimal | None = None
+    revenue_growth_yoy: Decimal | None = None
+    net_profit_growth_yoy: Decimal | None = None
+    debt_to_asset: Decimal | None = None
+    operating_cashflow: Decimal | None = None
+    missing_fields: list[str] = field(default_factory=list)
+    payload: JsonDict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class EventRecordData:
     """Provider 返回的事件记录。"""
 
@@ -190,6 +212,13 @@ class CapitalFlowSnapshotsResult(ProviderResult):
     """资金流快照结果。"""
 
     snapshots: list[CapitalFlowSnapshotData] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class FundamentalSnapshotsResult(ProviderResult):
+    """财务估值快照结果。"""
+
+    snapshots: list[FundamentalSnapshotData] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

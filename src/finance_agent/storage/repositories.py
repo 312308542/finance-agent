@@ -110,7 +110,7 @@ class AssetRepository:
             "quote_asset": quote_asset,
             "tradable": tradable,
             "status": status,
-            "payload": payload or {},
+            "payload": _json_safe(payload or {}),
             "updated_at": datetime.now().astimezone(),
         }
         statement = insert(AssetORM).values(**values)
@@ -250,10 +250,10 @@ class UniverseRepository:
             "base_universe_id": base_universe_id,
             "total_before_filter": total_before_filter,
             "total_after_filter": total_after_filter,
-            "filters": filters or {},
+            "filters": _json_safe(filters or {}),
             "status": status,
             "as_of": as_of,
-            "payload": payload or {},
+            "payload": _json_safe(payload or {}),
         }
         statement = insert(AssetUniverseORM).values(**values)
         update_values = {
@@ -296,7 +296,7 @@ class UniverseRepository:
             "removed_reason": removed_reason,
             "rank_hint": rank_hint,
             "as_of": as_of,
-            "payload": payload or {},
+            "payload": _json_safe(payload or {}),
         }
         statement = insert(AssetUniverseMemberORM).values(**values)
         update_values = {
@@ -549,7 +549,7 @@ class FundamentalDataRepository:
             "status": status,
             "missing_fields": missing_fields or [],
             "as_of": as_of,
-            "payload": payload or {},
+            "payload": _json_safe(payload or {}),
         }
         statement = insert(FundamentalSnapshotORM).values(**values)
         update_values = {key: statement.excluded[key] for key in values if key != "snapshot_id"}
@@ -601,7 +601,7 @@ class CapitalFlowRepository:
             "source": source,
             "status": status,
             "as_of": as_of,
-            "payload": payload or {},
+            "payload": _json_safe(payload or {}),
         }
         statement = insert(CapitalFlowSnapshotORM).values(**values)
         update_values = {key: statement.excluded[key] for key in values if key != "snapshot_id"}
@@ -655,7 +655,7 @@ class EventRepository:
             "url": url,
             "published_at": published_at,
             "collected_at": collected_at,
-            "payload": payload or {},
+            "payload": _json_safe(payload or {}),
         }
         statement = insert(EventRecordORM).values(**values)
         update_values = {key: statement.excluded[key] for key in values if key != "event_id"}
@@ -698,7 +698,7 @@ class EventRepository:
             "reliability": reliability,
             "as_of": as_of,
             "collected_at": collected_at,
-            "payload": payload or {},
+            "payload": _json_safe(payload or {}),
         }
         statement = insert(EvidenceORM).values(**values)
         update_values = {key: statement.excluded[key] for key in values if key != "evidence_id"}
@@ -754,7 +754,7 @@ class DerivativeDataRepository:
             "basis_rate": basis_rate,
             "liquidation_risk_score": liquidation_risk_score,
             "status": status,
-            "payload": payload or {},
+            "payload": _json_safe(payload or {}),
         }
         statement = insert(CryptoDerivativeSnapshotORM).values(**values)
         update_values = {

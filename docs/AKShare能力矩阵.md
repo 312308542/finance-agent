@@ -219,14 +219,22 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 - `AshareCapitalFlowProvider.fetch_flow_rank`
 - `AshareEventProvider.fetch_stock_news`
 - `AshareEventProvider.fetch_notice_reports`
+- `AshareFundamentalProvider.fetch_financial_indicators`
+- `AshareFundamentalProvider.fetch_performance_report`
+- `AshareValuationProvider.fetch_valuation`
+- `AshareValuationProvider.fetch_dividend_yield`
+- `AshareP1Collector`
+- `AshareP2Collector`
 - `finance_agent/data/akshare_capabilities.py`
 - `scripts/data/check_akshare_capabilities.py`
 - `scripts/data/smoke_akshare_p1.py`
+- `scripts/data/smoke_akshare_p2.py`
 - `AssetRepository`
 - `UniverseRepository`
 - `MarketDataRepository`
 - `CapitalFlowRepository`
 - `EventRepository`
+- `FundamentalDataRepository`
 - `fundamental_snapshots`
 - `capital_flow_snapshots`
 - `event_records`
@@ -236,12 +244,13 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 
 - `alembic current` 已到 `20260515_0003`。
 - `smoke_akshare_p1.py` 已能把 `stock_news_em` 写入 `event_records` 和 `evidence`。
+- `smoke_akshare_p2.py` 已能把 `stock_financial_analysis_indicator_em` 和 `stock_value_em` 写入 `fundamental_snapshots`。
 - 当前网络下 `stock_board_industry_cons_em` 和 `stock_individual_fund_flow_rank` 仍可能被东方财富上游断开，Provider 会返回结构化 `error`，不会让推荐链路崩溃。
+- 当前网络下 `stock_yjbb_em` 可能请求东财 datacenter 超时，失败响应会写入 `raw_records`，不影响财务指标和估值链路落库。
 
 下一步应补：
 
-1. 为 P1 Provider 补 Raw Store 归档，把成功和失败响应都写入 `raw_records`。
-2. 给行业/概念和资金流接口补 `curl_cffi` 或备用源 fallback，降低东方财富断连影响。
-3. 将 P2 财务、估值、风险、情绪接口逐批转成 Provider、快照和证据。
-4. 建立采集任务，把 P0/P1 数据按日刷新到标准化表。
-5. 定期运行数据健康检查脚本，输出哪些 AKShare 接口可用、哪些降级。
+1. 给行业/概念、资金流和业绩报表接口补 `curl_cffi` 或备用源 fallback，降低东方财富断连影响。
+2. 将 P2 风险、情绪接口逐批转成 Provider、快照和证据。
+3. 建立采集任务，把 P0/P1/P2 数据按日刷新到标准化表。
+4. 定期运行数据健康检查脚本，输出哪些 AKShare 接口可用、哪些降级。
