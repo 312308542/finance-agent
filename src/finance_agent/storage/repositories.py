@@ -26,7 +26,9 @@ from finance_agent.storage.orm import (
     CryptoDerivativeSnapshotORM,
     EventRecordORM,
     EvidenceORM,
+    FactorFrameORM,
     FundamentalSnapshotORM,
+    IndicatorFrameORM,
     MarketBarORM,
     RawRecordORM,
     RiskFindingORM,
@@ -506,6 +508,180 @@ class MarketDataRepository:
         )
 
 
+class IndicatorFrameRepository:
+    """技术指标结果仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_indicator_frame(
+        self,
+        *,
+        indicator_frame_id: str,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        timeframe: str,
+        horizon: str,
+        library: str,
+        input_start_at: datetime,
+        input_end_at: datetime,
+        bar_count: int,
+        status: str,
+        as_of: datetime,
+        library_version: str | None = None,
+        rsi_14: Decimal | None = None,
+        macd: Decimal | None = None,
+        macd_signal: Decimal | None = None,
+        macd_hist: Decimal | None = None,
+        atr_14: Decimal | None = None,
+        bb_percent_b: Decimal | None = None,
+        ma_20: Decimal | None = None,
+        ma_60: Decimal | None = None,
+        payload: JsonDict | None = None,
+    ) -> IndicatorFrameORM:
+        """按指标输入唯一键幂等写入技术指标结果。"""
+
+        values = {
+            "indicator_frame_id": indicator_frame_id,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "timeframe": timeframe,
+            "horizon": horizon,
+            "library": library,
+            "library_version": library_version,
+            "input_start_at": input_start_at,
+            "input_end_at": input_end_at,
+            "bar_count": bar_count,
+            "rsi_14": rsi_14,
+            "macd": macd,
+            "macd_signal": macd_signal,
+            "macd_hist": macd_hist,
+            "atr_14": atr_14,
+            "bb_percent_b": bb_percent_b,
+            "ma_20": ma_20,
+            "ma_60": ma_60,
+            "status": status,
+            "as_of": as_of,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(IndicatorFrameORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key
+            not in {
+                "indicator_frame_id",
+                "asset_id",
+                "timeframe",
+                "horizon",
+                "library",
+                "input_end_at",
+            }
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="uq_indicator_frames_input",
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.get_latest_indicator_frame(
+            asset_id=asset_id,
+            timeframe=timeframe,
+            horizon=horizon,
+            library=library,
+        )
+
+    def get_latest_indicator_frame(
+        self,
+        *,
+        asset_id: str,
+        timeframe: str,
+        horizon: str,
+        library: str | None = None,
+    ) -> IndicatorFrameORM | None:
+        """查询单标的最新技术指标结果。"""
+
+        statement = select(IndicatorFrameORM).where(
+            IndicatorFrameORM.asset_id == asset_id,
+            IndicatorFrameORM.timeframe == timeframe,
+            IndicatorFrameORM.horizon == horizon,
+        )
+        if library:
+            statement = statement.where(IndicatorFrameORM.library == library)
+        return self.session.scalars(
+            statement.order_by(IndicatorFrameORM.input_end_at.desc()).limit(1)
+        ).one_or_none()
+
+
+class FactorFrameRepository:
+    """推荐因子结果仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_factor_frame(
+        self,
+        *,
+        factor_frame_id: str,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        horizon: str,
+        status: str,
+        total_available_groups: int,
+        missing_groups: list[str],
+        source_ids: list[str],
+        as_of: datetime,
+        indicator_frame_id: str | None = None,
+        payload: JsonDict | None = None,
+    ) -> FactorFrameORM:
+        """按 `factor_frame_id` 幂等写入因子结果。"""
+
+        values = {
+            "factor_frame_id": factor_frame_id,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "horizon": horizon,
+            "status": status,
+            "total_available_groups": total_available_groups,
+            "missing_groups": missing_groups,
+            "source_ids": source_ids,
+            "indicator_frame_id": indicator_frame_id,
+            "as_of": as_of,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(FactorFrameORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "factor_frame_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[FactorFrameORM.factor_frame_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(FactorFrameORM, factor_frame_id)
+
+    def get_latest_factor_frame(
+        self,
+        *,
+        asset_id: str,
+        horizon: str,
+    ) -> FactorFrameORM | None:
+        """查询单标的最新因子结果。"""
+
+        statement = select(FactorFrameORM).where(
+            FactorFrameORM.asset_id == asset_id,
+            FactorFrameORM.horizon == horizon,
+        )
+        return self.session.scalars(
+            statement.order_by(FactorFrameORM.as_of.desc()).limit(1)
+        ).one_or_none()
+
+
 class FundamentalDataRepository:
     """A 股财务估值快照仓储。"""
 
@@ -563,6 +739,16 @@ class FundamentalDataRepository:
         self.session.flush()
         return self.session.get_one(FundamentalSnapshotORM, snapshot_id)
 
+    def get_latest_snapshot(self, *, asset_id: str) -> FundamentalSnapshotORM | None:
+        """查询单标的最新财务估值快照。"""
+
+        statement = select(FundamentalSnapshotORM).where(
+            FundamentalSnapshotORM.asset_id == asset_id
+        )
+        return self.session.scalars(
+            statement.order_by(FundamentalSnapshotORM.as_of.desc()).limit(1)
+        ).one_or_none()
+
 
 class CapitalFlowRepository:
     """A 股资金流快照仓储。"""
@@ -614,6 +800,23 @@ class CapitalFlowRepository:
         )
         self.session.flush()
         return self.session.get_one(CapitalFlowSnapshotORM, snapshot_id)
+
+    def get_latest_snapshot(
+        self,
+        *,
+        asset_id: str,
+        window: str | None = None,
+    ) -> CapitalFlowSnapshotORM | None:
+        """查询单标的最新资金流快照。"""
+
+        statement = select(CapitalFlowSnapshotORM).where(
+            CapitalFlowSnapshotORM.asset_id == asset_id
+        )
+        if window:
+            statement = statement.where(CapitalFlowSnapshotORM.window == window)
+        return self.session.scalars(
+            statement.order_by(CapitalFlowSnapshotORM.as_of.desc()).limit(1)
+        ).one_or_none()
 
 
 class EventRepository:
@@ -712,6 +915,20 @@ class EventRepository:
         self.session.flush()
         return self.session.get_one(EvidenceORM, evidence_id)
 
+    def list_recent_events(self, *, asset_id: str, limit: int = 20) -> list[EventRecordORM]:
+        """查询单标的最近事件。"""
+
+        statement = (
+            select(EventRecordORM)
+            .where(EventRecordORM.asset_id == asset_id)
+            .order_by(
+                EventRecordORM.published_at.desc().nullslast(),
+                EventRecordORM.collected_at.desc(),
+            )
+            .limit(limit)
+        )
+        return list(self.session.scalars(statement))
+
 
 class RiskRepository:
     """风险发现仓储。"""
@@ -759,6 +976,17 @@ class RiskRepository:
         )
         self.session.flush()
         return self.session.get_one(RiskFindingORM, risk_id)
+
+    def list_recent_risks(self, *, asset_id: str, limit: int = 20) -> list[RiskFindingORM]:
+        """查询单标的最近风险发现。"""
+
+        statement = (
+            select(RiskFindingORM)
+            .where(RiskFindingORM.asset_id == asset_id)
+            .order_by(RiskFindingORM.as_of.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(statement))
 
 
 class DerivativeDataRepository:

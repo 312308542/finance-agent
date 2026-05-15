@@ -114,8 +114,8 @@ AKShare 官方股票文档包含同花顺技术选股榜单，例如创新高、
 | 归一化和落库 | 满足 | SQLAlchemy、psycopg、TimescaleDB 已接入 |
 | 基础技术因子 | 满足 | `numpy` 已显式依赖；收益率、均线、波动率、回撤由 pandas/numpy 计算 |
 | 完整技术指标 | 满足 | 主路径固定为 `TA-Lib/talib`，本地已验证 `talib 0.6.8` 可用 |
-| A 股资金/财务/估值因子 | 部分满足 | 数据输入已有，分位和评分可用 pandas/numpy；仍缺因子服务代码 |
-| 数字货币衍生品因子 | 部分满足 | 数据输入已有，z-score 和变化率可用 pandas/numpy；仍缺批量窗口计算 |
+| A 股资金/财务/估值因子 | 部分满足 | 数据输入已有，`FactorService` 基础版已能合并最新快照；历史分位、行业分组和完整评分口径待补 |
+| 数字货币衍生品因子 | 部分满足 | 数据输入已有，`FactorService` 基础版已能合并最新快照；z-score、变化率和批量窗口计算待补 |
 | 机器学习因子 | 不满足，且第一版不建议 | 缺 scipy/sklearn；第一版不需要 ML 主链路 |
 
 依赖建议：
@@ -127,8 +127,8 @@ AKShare 官方股票文档包含同花顺技术选股榜单，例如创新高、
 
 ## 7. 实施顺序建议
 
-1. 先补 `factor_spec` 或等价配置，定义第一版系统计算因子、输入表、窗口参数、缺失策略和输出字段。
-2. 实现 `IndicatorService`：读取 `market_bars`，计算基础技术指标，写入 `indicator_frames`。
-3. 实现 `FactorService`：合并技术指标、资金流、基本面、估值、事件、风险和数字货币衍生品，写入 `factor_frames`。
+1. 已实现 `IndicatorService` 基础版：读取 `market_bars`，用 TA-Lib + pandas/numpy 计算基础技术指标，写入 `indicator_frames`。
+2. 已实现 `FactorService` 基础版：合并技术指标、资金流、基本面、估值、事件、风险和数字货币衍生品快照，写入 `factor_frames`，并记录缺失因子组和部分可用因子组。
+3. 下一步补 `factor_spec` 或等价配置，把第一版系统计算因子、输入表、窗口参数、缺失策略和输出字段固化下来。
 4. 把 AKShare 技术选股榜单作为 `technical_tags` 或候选池种子，不直接替代 `indicator_frames`。
-5. 再实现初筛和多维评分。
+5. 再实现初筛、多维评分和推荐排序。

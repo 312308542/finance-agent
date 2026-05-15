@@ -9,6 +9,8 @@ from finance_agent.storage.orm import Base
 from finance_agent.storage.repositories import (
     AssetRepository,
     DerivativeDataRepository,
+    FactorFrameRepository,
+    IndicatorFrameRepository,
     MarketDataRepository,
     UniverseRepository,
 )
@@ -17,6 +19,8 @@ __all__ = [
     "AssetRepository",
     "Base",
     "DerivativeDataRepository",
+    "FactorFrameRepository",
+    "IndicatorFrameRepository",
     "MarketDataRepository",
     "UniverseRepository",
     "create_engine_from_settings",
