@@ -21,6 +21,7 @@ from finance_agent.data.normalizers import (
     normalize_ashare_notice_reports,
     normalize_ashare_stock_news,
 )
+from finance_agent.data.providers import eastmoney_curl
 
 
 class AshareSectorProvider:
@@ -37,23 +38,47 @@ class AshareSectorProvider:
         """获取行业板块成分作为候选池种子。"""
 
         collected_at = datetime.now(tz=UTC)
+        fallback_trace: list[dict[str, str]] = []
+        primary_source = "akshare:stock_board_industry_cons_em"
         try:
             df = ak.stock_board_industry_cons_em(symbol=industry_name)
-            seeds = normalize_ashare_board_members(
-                df,
-                source_name=industry_name,
-                source_type="industry",
-                as_of=collected_at,
-                limit=limit,
-            )
+            actual_source = primary_source
         except Exception as exc:
-            return UniverseSeedsResult(
-                provider_name=self.provider_name,
-                status="error",
-                collected_at=collected_at,
-                error_message=str(exc),
-                payload={"endpoint": "stock_board_industry_cons_em", "symbol": industry_name},
-            )
+            fallback_trace.append({"source": primary_source, "error_message": str(exc)})
+            try:
+                df = eastmoney_curl.fetch_industry_members(industry_name)
+                actual_source = str(
+                    df.attrs.get(
+                        "actual_source",
+                        "eastmoney:curl_cffi:stock_board_industry_cons_em",
+                    )
+                )
+            except Exception as fallback_exc:
+                fallback_trace.append(
+                    {
+                        "source": "eastmoney:curl_cffi:stock_board_industry_cons_em",
+                        "error_message": str(fallback_exc),
+                    }
+                )
+                return UniverseSeedsResult(
+                    provider_name=self.provider_name,
+                    status="error",
+                    collected_at=collected_at,
+                    error_message=str(fallback_exc),
+                    payload={
+                        "endpoint": "stock_board_industry_cons_em",
+                        "symbol": industry_name,
+                        "primary_source": primary_source,
+                        "fallback_trace": fallback_trace,
+                    },
+                )
+        seeds = normalize_ashare_board_members(
+            df,
+            source_name=industry_name,
+            source_type="industry",
+            as_of=collected_at,
+            limit=limit,
+        )
         return UniverseSeedsResult(
             provider_name=self.provider_name,
             status="available" if seeds else "unavailable",
@@ -63,6 +88,10 @@ class AshareSectorProvider:
                 "endpoint": "stock_board_industry_cons_em",
                 "symbol": industry_name,
                 "row_count": len(seeds),
+                "primary_source": primary_source,
+                "actual_source": actual_source,
+                "fallback_used": actual_source != primary_source,
+                "fallback_trace": fallback_trace,
             },
         )
 
@@ -75,23 +104,47 @@ class AshareSectorProvider:
         """获取概念板块成分作为候选池种子。"""
 
         collected_at = datetime.now(tz=UTC)
+        fallback_trace: list[dict[str, str]] = []
+        primary_source = "akshare:stock_board_concept_cons_em"
         try:
             df = ak.stock_board_concept_cons_em(symbol=concept_name)
-            seeds = normalize_ashare_board_members(
-                df,
-                source_name=concept_name,
-                source_type="concept",
-                as_of=collected_at,
-                limit=limit,
-            )
+            actual_source = primary_source
         except Exception as exc:
-            return UniverseSeedsResult(
-                provider_name=self.provider_name,
-                status="error",
-                collected_at=collected_at,
-                error_message=str(exc),
-                payload={"endpoint": "stock_board_concept_cons_em", "symbol": concept_name},
-            )
+            fallback_trace.append({"source": primary_source, "error_message": str(exc)})
+            try:
+                df = eastmoney_curl.fetch_concept_members(concept_name)
+                actual_source = str(
+                    df.attrs.get(
+                        "actual_source",
+                        "eastmoney:curl_cffi:stock_board_concept_cons_em",
+                    )
+                )
+            except Exception as fallback_exc:
+                fallback_trace.append(
+                    {
+                        "source": "eastmoney:curl_cffi:stock_board_concept_cons_em",
+                        "error_message": str(fallback_exc),
+                    }
+                )
+                return UniverseSeedsResult(
+                    provider_name=self.provider_name,
+                    status="error",
+                    collected_at=collected_at,
+                    error_message=str(fallback_exc),
+                    payload={
+                        "endpoint": "stock_board_concept_cons_em",
+                        "symbol": concept_name,
+                        "primary_source": primary_source,
+                        "fallback_trace": fallback_trace,
+                    },
+                )
+        seeds = normalize_ashare_board_members(
+            df,
+            source_name=concept_name,
+            source_type="concept",
+            as_of=collected_at,
+            limit=limit,
+        )
         return UniverseSeedsResult(
             provider_name=self.provider_name,
             status="available" if seeds else "unavailable",
@@ -101,6 +154,10 @@ class AshareSectorProvider:
                 "endpoint": "stock_board_concept_cons_em",
                 "symbol": concept_name,
                 "row_count": len(seeds),
+                "primary_source": primary_source,
+                "actual_source": actual_source,
+                "fallback_used": actual_source != primary_source,
+                "fallback_trace": fallback_trace,
             },
         )
 
@@ -119,26 +176,47 @@ class AshareCapitalFlowProvider:
         """获取个股资金流排名快照。"""
 
         collected_at = datetime.now(tz=UTC)
+        fallback_trace: list[dict[str, str]] = []
+        primary_source = "akshare:stock_individual_fund_flow_rank"
         try:
             df = ak.stock_individual_fund_flow_rank(indicator=indicator)
-            snapshots = normalize_ashare_fund_flow_rank(
-                df,
-                source="akshare:stock_individual_fund_flow_rank",
-                window=indicator,
-                as_of=collected_at,
-                limit=limit,
-            )
+            actual_source = primary_source
         except Exception as exc:
-            return CapitalFlowSnapshotsResult(
-                provider_name=self.provider_name,
-                status="error",
-                collected_at=collected_at,
-                error_message=str(exc),
-                payload={
-                    "endpoint": "stock_individual_fund_flow_rank",
-                    "indicator": indicator,
-                },
-            )
+            fallback_trace.append({"source": primary_source, "error_message": str(exc)})
+            try:
+                df = eastmoney_curl.fetch_fund_flow_rank(indicator, limit=limit)
+                actual_source = str(
+                    df.attrs.get(
+                        "actual_source",
+                        "eastmoney:curl_cffi:stock_individual_fund_flow_rank",
+                    )
+                )
+            except Exception as fallback_exc:
+                fallback_trace.append(
+                    {
+                        "source": "eastmoney:curl_cffi:stock_individual_fund_flow_rank",
+                        "error_message": str(fallback_exc),
+                    }
+                )
+                return CapitalFlowSnapshotsResult(
+                    provider_name=self.provider_name,
+                    status="error",
+                    collected_at=collected_at,
+                    error_message=str(fallback_exc),
+                    payload={
+                        "endpoint": "stock_individual_fund_flow_rank",
+                        "indicator": indicator,
+                        "primary_source": primary_source,
+                        "fallback_trace": fallback_trace,
+                    },
+                )
+        snapshots = normalize_ashare_fund_flow_rank(
+            df,
+            source=actual_source,
+            window=indicator,
+            as_of=collected_at,
+            limit=limit,
+        )
         return CapitalFlowSnapshotsResult(
             provider_name=self.provider_name,
             status="available" if snapshots else "unavailable",
@@ -148,6 +226,10 @@ class AshareCapitalFlowProvider:
                 "endpoint": "stock_individual_fund_flow_rank",
                 "indicator": indicator,
                 "row_count": len(snapshots),
+                "primary_source": primary_source,
+                "actual_source": actual_source,
+                "fallback_used": actual_source != primary_source,
+                "fallback_trace": fallback_trace,
             },
         )
 

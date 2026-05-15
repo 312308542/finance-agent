@@ -18,6 +18,7 @@ from finance_agent.data.normalizers import (
     normalize_ashare_performance_report,
     normalize_ashare_valuation,
 )
+from finance_agent.data.providers import eastmoney_curl
 
 
 class AshareFundamentalProvider:
@@ -86,22 +87,48 @@ class AshareFundamentalProvider:
             "业绩预告": ("stock_yjyg_em", ak.stock_yjyg_em),
         }
         endpoint, function = endpoint_map[report_type]
+        primary_source = f"akshare:{endpoint}"
+        fallback_trace: list[dict[str, str]] = []
         try:
             df = function(date=date)
-            snapshots = normalize_ashare_performance_report(
-                df,
-                source=f"akshare:{endpoint}",
-                as_of=collected_at,
-                limit=limit,
-            )
+            actual_source = primary_source
         except Exception as exc:
-            return FundamentalSnapshotsResult(
-                provider_name=self.provider_name,
-                status="error",
-                collected_at=collected_at,
-                error_message=str(exc),
-                payload={"endpoint": endpoint, "date": date, "report_type": report_type},
-            )
+            fallback_trace.append({"source": primary_source, "error_message": str(exc)})
+            try:
+                df = eastmoney_curl.fetch_performance_report(
+                    date,
+                    report_type=report_type,
+                    limit=limit,
+                )
+                actual_source = str(
+                    df.attrs.get("actual_source", f"eastmoney:curl_cffi:{endpoint}")
+                )
+            except Exception as fallback_exc:
+                fallback_trace.append(
+                    {
+                        "source": f"eastmoney:curl_cffi:{endpoint}",
+                        "error_message": str(fallback_exc),
+                    }
+                )
+                return FundamentalSnapshotsResult(
+                    provider_name=self.provider_name,
+                    status="error",
+                    collected_at=collected_at,
+                    error_message=str(fallback_exc),
+                    payload={
+                        "endpoint": endpoint,
+                        "date": date,
+                        "report_type": report_type,
+                        "primary_source": primary_source,
+                        "fallback_trace": fallback_trace,
+                    },
+                )
+        snapshots = normalize_ashare_performance_report(
+            df,
+            source=actual_source,
+            as_of=collected_at,
+            limit=limit,
+        )
         return FundamentalSnapshotsResult(
             provider_name=self.provider_name,
             status="available" if snapshots else "unavailable",
@@ -112,6 +139,10 @@ class AshareFundamentalProvider:
                 "date": date,
                 "report_type": report_type,
                 "row_count": len(snapshots),
+                "primary_source": primary_source,
+                "actual_source": actual_source,
+                "fallback_used": actual_source != primary_source,
+                "fallback_trace": fallback_trace,
             },
         )
 

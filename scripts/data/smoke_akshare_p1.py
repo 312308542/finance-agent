@@ -32,7 +32,7 @@ def main() -> None:
             strategy_context="p1_smoke",
             limit=5,
         )
-        flow_archive = collector.collect_flow_rank(indicator="今日", limit=5)
+        flow_archive = collector.collect_flow_rank(indicator="5日", limit=5)
         news_archive = collector.collect_stock_news(symbol="000001", asset_name="平安银行", limit=3)
 
     industry = industry_archive.result

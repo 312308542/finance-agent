@@ -243,14 +243,14 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 当前真实运行态：
 
 - `alembic current` 已到 `20260515_0003`。
-- `smoke_akshare_p1.py` 已能把 `stock_news_em` 写入 `event_records` 和 `evidence`。
+- `smoke_akshare_p1.py` 已能把 `stock_news_em` 写入 `event_records` 和 `evidence`，并能通过同花顺轻量 fallback 把 5 日个股资金流写入 `capital_flow_snapshots`。
 - `smoke_akshare_p2.py` 已能把 `stock_financial_analysis_indicator_em` 和 `stock_value_em` 写入 `fundamental_snapshots`。
-- 当前网络下 `stock_board_industry_cons_em` 和 `stock_individual_fund_flow_rank` 仍可能被东方财富上游断开，Provider 会返回结构化 `error`，不会让推荐链路崩溃。
-- 当前网络下 `stock_yjbb_em` 可能请求东财 datacenter 超时，失败响应会写入 `raw_records`，不影响财务指标和估值链路落库。
+- 当前网络下 `stock_board_industry_cons_em` 仍可能被东方财富上游断开，Provider 会返回结构化 `error`，不会让推荐链路崩溃。
+- 当前网络下 `stock_yjbb_em` 如果请求东财 datacenter 超时，可以走 `eastmoney:curl_cffi` fallback；成功和失败响应都会写入 `raw_records`。
 
 下一步应补：
 
-1. 给行业/概念、资金流和业绩报表接口补 `curl_cffi` 或备用源 fallback，降低东方财富断连影响。
+1. 给行业/概念成分接口补非东财备用源，降低东方财富板块成分接口断连影响。
 2. 将 P2 风险、情绪接口逐批转成 Provider、快照和证据。
 3. 建立采集任务，把 P0/P1/P2 数据按日刷新到标准化表。
 4. 定期运行数据健康检查脚本，输出哪些 AKShare 接口可用、哪些降级。
