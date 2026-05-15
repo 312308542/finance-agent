@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm import Session
 
 from finance_agent.data.models import (
@@ -27,6 +28,7 @@ from finance_agent.data.providers import (
     AshareFundamentalProvider,
     AshareSectorProvider,
     AshareValuationProvider,
+    AkshareProvider,
     BinanceNativeProvider,
     CcxtBinanceProvider,
 )
@@ -345,6 +347,171 @@ def _split_crypto_symbol(symbol: str) -> tuple[str, str | None]:
         if normalized.endswith(quote) and len(normalized) > len(quote):
             return normalized[: -len(quote)], quote
     return normalized, None
+
+
+class AshareP0Collector:
+    """A 股 P0 资产和行情采集编排器。"""
+
+    def __init__(
+        self,
+        session: Session,
+        *,
+        provider: AkshareProvider | None = None,
+    ) -> None:
+        self.assets = AssetRepository(session)
+        self.universes = UniverseRepository(session)
+        self.market_data = MarketDataRepository(session)
+        self.raw_records = RawRecordRepository(session)
+        self.provider = provider or AkshareProvider()
+
+    def collect_assets(
+        self,
+        *,
+        universe_id: str,
+        universe_name: str,
+        strategy_context: str,
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集 A 股资产列表，并写入全 A 候选池种子。"""
+
+        result = self.provider.fetch_assets(limit=limit)
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_zh_a_spot",
+            request_params={"limit": limit},
+            market="ashare",
+        )
+        self.universes.upsert_universe(
+            universe_id=universe_id,
+            name=universe_name,
+            source="akshare:stock_zh_a_spot",
+            market="ashare",
+            strategy_context=strategy_context,
+            as_of=result.collected_at,
+            total_before_filter=len(result.assets),
+            total_after_filter=len(result.assets),
+            status=result.status,
+            payload={
+                "provider_payload": result.payload,
+                "raw_record_id": raw_record_id,
+                "error": result.error_message,
+            },
+        )
+        if result.status != "available":
+            return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+        for asset in result.assets:
+            self.assets.upsert_asset(
+                asset_id=asset.asset_id,
+                symbol=asset.symbol,
+                name=asset.name,
+                market=asset.market,
+                asset_type=asset.asset_type,
+                exchange=asset.exchange,
+                currency=asset.currency,
+                sector=asset.sector,
+                base_asset=asset.base_asset,
+                quote_asset=asset.quote_asset,
+                tradable=asset.tradable,
+                status=asset.status,
+                payload=asset.payload | {"raw_record_id": raw_record_id},
+            )
+        self.universes.replace_members(
+            universe_id=universe_id,
+            members=[
+                {
+                    "member_id": f"universe_member:{universe_id}:{asset.symbol}",
+                    "asset_id": asset.asset_id,
+                    "symbol": asset.symbol,
+                    "market": asset.market,
+                    "as_of": result.collected_at,
+                    "rank_hint": index,
+                    "payload": asset.payload | {"raw_record_id": raw_record_id},
+                }
+                for index, asset in enumerate(result.assets, start=1)
+            ],
+        )
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def collect_ohlcv(
+        self,
+        *,
+        symbol: str,
+        timeframe: str = "1d",
+        start: str | None = None,
+        end: str | None = None,
+        limit: int | None = None,
+        adjust: str = "qfq",
+    ) -> ArchivedProviderResult:
+        """采集 A 股 K 线，并写入 `market_bars`。"""
+
+        result = self.provider.fetch_ohlcv(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+            limit=limit,
+            adjust=adjust,
+        )
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_zh_a_hist",
+            request_params={
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "start": start,
+                "end": end,
+                "limit": limit,
+                "adjust": adjust,
+            },
+            symbol=symbol,
+            market="ashare",
+        )
+        if result.status != "available":
+            return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+        for bar in result.bars:
+            self._ensure_asset_stub(asset_id=bar.asset_id, symbol=bar.symbol, source=bar.source)
+            self.market_data.upsert_bar(
+                asset_id=bar.asset_id,
+                symbol=bar.symbol,
+                market=bar.market,
+                timeframe=bar.timeframe,
+                timestamp=bar.timestamp,
+                end_timestamp=bar.end_timestamp,
+                open_price=bar.open_price,
+                high=bar.high,
+                low=bar.low,
+                close=bar.close,
+                volume=bar.volume,
+                amount=bar.amount,
+                source=bar.source,
+                adjustment=bar.adjustment,
+                is_closed=bar.is_closed,
+                raw_record_id=raw_record_id,
+                status=bar.status,
+            )
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def _ensure_asset_stub(self, *, asset_id: str, symbol: str, source: str) -> None:
+        """仅在资产不存在时写入占位资产，避免覆盖已有名称和交易所信息。"""
+
+        try:
+            self.assets.get_asset(asset_id)
+            return
+        except NoResultFound:
+            pass
+        self.assets.upsert_asset(
+            asset_id=asset_id,
+            symbol=symbol,
+            name=symbol,
+            market="ashare",
+            asset_type="stock",
+            currency="CNY",
+            payload={"source": source},
+        )
 
 
 class AshareP1Collector:
