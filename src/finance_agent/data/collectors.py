@@ -12,9 +12,12 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from finance_agent.data.models import (
+    AssetListResult,
     CapitalFlowSnapshotsResult,
+    CryptoDerivativeSnapshotResult,
     EventRecordsResult,
     FundamentalSnapshotsResult,
+    MarketBarsResult,
     ProviderResult,
     UniverseSeedsResult,
 )
@@ -24,12 +27,16 @@ from finance_agent.data.providers import (
     AshareFundamentalProvider,
     AshareSectorProvider,
     AshareValuationProvider,
+    BinanceNativeProvider,
+    CcxtBinanceProvider,
 )
 from finance_agent.storage.repositories import (
     AssetRepository,
     CapitalFlowRepository,
+    DerivativeDataRepository,
     EventRepository,
     FundamentalDataRepository,
+    MarketDataRepository,
     RawRecordRepository,
     UniverseRepository,
 )
@@ -60,7 +67,13 @@ def archive_provider_result(
         "status": result.status,
         "error_message": result.error_message,
     }
-    if isinstance(result, UniverseSeedsResult):
+    if isinstance(result, AssetListResult):
+        payload["assets"] = [asset.__dict__ for asset in result.assets]
+    elif isinstance(result, MarketBarsResult):
+        payload["bars"] = [bar.__dict__ for bar in result.bars]
+    elif isinstance(result, CryptoDerivativeSnapshotResult):
+        payload["snapshot"] = result.snapshot.__dict__ if result.snapshot else None
+    elif isinstance(result, UniverseSeedsResult):
         payload["seeds"] = [seed.__dict__ for seed in result.seeds]
     elif isinstance(result, CapitalFlowSnapshotsResult):
         payload["snapshots"] = [snapshot.__dict__ for snapshot in result.snapshots]
@@ -83,6 +96,255 @@ def archive_provider_result(
         collected_at=result.collected_at,
     )
     return record.raw_record_id
+
+
+class CryptoDataCollector:
+    """数字货币基础数据采集编排器。
+
+    这里仅采集公开行情和衍生品公开快照，不包含账户、下单或交易执行能力。
+    """
+
+    def __init__(
+        self,
+        session: Session,
+        *,
+        spot_provider: CcxtBinanceProvider | None = None,
+        future_provider: CcxtBinanceProvider | None = None,
+        derivative_provider: BinanceNativeProvider | None = None,
+    ) -> None:
+        self.assets = AssetRepository(session)
+        self.universes = UniverseRepository(session)
+        self.market_data = MarketDataRepository(session)
+        self.derivatives = DerivativeDataRepository(session)
+        self.raw_records = RawRecordRepository(session)
+        self.spot_provider = spot_provider or CcxtBinanceProvider(default_type="spot")
+        self.future_provider = future_provider or CcxtBinanceProvider(default_type="future")
+        self.derivative_provider = derivative_provider or BinanceNativeProvider()
+
+    def collect_markets(
+        self,
+        *,
+        market_type: str = "spot",
+        universe_id: str,
+        universe_name: str,
+        strategy_context: str,
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集 Binance 交易对列表，并写入币种候选池。"""
+
+        provider = self._ccxt_provider(market_type)
+        result = provider.fetch_assets(limit=limit)
+        market = self._crypto_market_name(market_type)
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="ccxt_binance_load_markets",
+            request_params={"market_type": market_type, "limit": limit},
+            market=market,
+        )
+
+        self.universes.upsert_universe(
+            universe_id=universe_id,
+            name=universe_name,
+            source=f"ccxt:binance:{market_type}:load_markets",
+            market=market,
+            strategy_context=strategy_context,
+            as_of=result.collected_at,
+            total_before_filter=len(result.assets),
+            total_after_filter=len(result.assets),
+            status=result.status,
+            payload={
+                "provider_payload": result.payload,
+                "raw_record_id": raw_record_id,
+                "error": result.error_message,
+            },
+        )
+        if result.status != "available":
+            return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+        for asset in result.assets:
+            self.assets.upsert_asset(
+                asset_id=asset.asset_id,
+                symbol=asset.symbol,
+                name=asset.name,
+                market=asset.market,
+                asset_type=asset.asset_type,
+                exchange=asset.exchange,
+                currency=asset.currency,
+                sector=asset.sector,
+                base_asset=asset.base_asset,
+                quote_asset=asset.quote_asset,
+                tradable=asset.tradable,
+                status=asset.status,
+                payload=asset.payload | {"raw_record_id": raw_record_id},
+            )
+        self.universes.replace_members(
+            universe_id=universe_id,
+            members=[
+                {
+                    "member_id": f"universe_member:{universe_id}:{asset.symbol}",
+                    "asset_id": asset.asset_id,
+                    "symbol": asset.symbol,
+                    "market": asset.market,
+                    "as_of": result.collected_at,
+                    "rank_hint": index,
+                    "payload": asset.payload | {"raw_record_id": raw_record_id},
+                }
+                for index, asset in enumerate(result.assets, start=1)
+            ],
+        )
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def collect_ohlcv(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        market_type: str = "spot",
+        start: str | None = None,
+        end: str | None = None,
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集数字货币 K 线，并写入 `market_bars`。"""
+
+        provider = self._ccxt_provider(market_type)
+        result = provider.fetch_ohlcv(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+            limit=limit,
+        )
+        market = self._crypto_market_name(market_type)
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="ccxt_binance_fetch_ohlcv",
+            request_params={
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "market_type": market_type,
+                "start": start,
+                "end": end,
+                "limit": limit,
+            },
+            symbol=symbol.replace("/", "").upper(),
+            market=market,
+        )
+        if result.status != "available":
+            return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+        for bar in result.bars:
+            self._upsert_crypto_asset_stub(
+                asset_id=bar.asset_id,
+                symbol=bar.symbol,
+                market=bar.market,
+                source=bar.source,
+            )
+            self.market_data.upsert_bar(
+                asset_id=bar.asset_id,
+                symbol=bar.symbol,
+                market=bar.market,
+                timeframe=bar.timeframe,
+                timestamp=bar.timestamp,
+                end_timestamp=bar.end_timestamp,
+                open_price=bar.open_price,
+                high=bar.high,
+                low=bar.low,
+                close=bar.close,
+                volume=bar.volume,
+                amount=bar.amount,
+                source=bar.source,
+                adjustment=bar.adjustment,
+                is_closed=bar.is_closed,
+                raw_record_id=raw_record_id,
+                status=bar.status,
+            )
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def collect_derivative_snapshot(self, *, symbol: str) -> ArchivedProviderResult:
+        """采集 Binance U 本位合约衍生品公开快照。"""
+
+        compact_symbol = symbol.replace("/", "").upper()
+        result = self.derivative_provider.fetch_derivative_snapshot(symbol=compact_symbol)
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="binance_derivative_snapshot",
+            request_params={"symbol": compact_symbol},
+            symbol=compact_symbol,
+            market="crypto_future",
+        )
+        if result.status != "available" or result.snapshot is None:
+            return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+        snapshot = result.snapshot
+        self._upsert_crypto_asset_stub(
+            asset_id=snapshot.asset_id,
+            symbol=snapshot.symbol,
+            market=snapshot.market,
+            source=snapshot.source,
+        )
+        self.derivatives.upsert_crypto_derivative_snapshot(
+            snapshot_id=snapshot.snapshot_id,
+            asset_id=snapshot.asset_id,
+            symbol=snapshot.symbol,
+            market=snapshot.market,
+            source=snapshot.source,
+            as_of=snapshot.as_of,
+            funding_rate=snapshot.funding_rate,
+            next_funding_time=snapshot.next_funding_time,
+            open_interest=snapshot.open_interest,
+            open_interest_value=snapshot.open_interest_value,
+            long_short_ratio=snapshot.long_short_ratio,
+            basis_rate=snapshot.basis_rate,
+            liquidation_risk_score=snapshot.liquidation_risk_score,
+            status=snapshot.status,
+            payload=snapshot.payload | {"raw_record_id": raw_record_id},
+        )
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def _ccxt_provider(self, market_type: str) -> CcxtBinanceProvider:
+        if market_type in {"future", "swap"}:
+            return self.future_provider
+        return self.spot_provider
+
+    @staticmethod
+    def _crypto_market_name(market_type: str) -> str:
+        return "crypto_future" if market_type in {"future", "swap"} else "crypto_spot"
+
+    def _upsert_crypto_asset_stub(
+        self,
+        *,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        source: str,
+    ) -> None:
+        base_asset, quote_asset = _split_crypto_symbol(symbol)
+        self.assets.upsert_asset(
+            asset_id=asset_id,
+            symbol=symbol,
+            name=f"{base_asset} / {quote_asset}" if quote_asset else symbol,
+            market=market,
+            asset_type="crypto",
+            exchange="Binance",
+            currency=quote_asset,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            payload={"source": source},
+        )
+
+
+def _split_crypto_symbol(symbol: str) -> tuple[str, str | None]:
+    """把 BTCUSDT 或 BTC/USDT 拆成基础币和计价币。"""
+
+    normalized = symbol.replace("/", "").upper()
+    common_quotes = ["USDT", "USDC", "BUSD", "BTC", "ETH", "USD"]
+    for quote in common_quotes:
+        if normalized.endswith(quote) and len(normalized) > len(quote):
+            return normalized[: -len(quote)], quote
+    return normalized, None
 
 
 class AshareP1Collector:
