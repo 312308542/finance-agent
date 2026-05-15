@@ -8,7 +8,8 @@
 
 - AKShare 可以承担 A 股基础数据、A 股资金/财务/估值/风险/情绪数据，以及部分同花顺技术选股榜单。
 - AKShare 不能替代本系统的统一因子计算层，因为系统需要同时覆盖 A 股和数字货币，并且需要统一口径、可追溯快照、缺失标记和跨市场评分。
-- 当前依赖能支撑基础数据层，但还不能完整支撑第一版因子计算。当前环境有 `pandas`、`numpy`、`akshare`、`ccxt`，缺少 `talib`、`ta`、`pandas_ta`、`scipy`、`sklearn`。
+- 第一版因子计算直接使用 `TA-Lib` 作为技术指标主引擎，配合 `pandas/numpy` 做数据整理、窗口聚合、收益率、分位数、z-score 以及资金流/估值/衍生品派生计算。
+- 当前依赖已经把 `TA-Lib` 和 `numpy` 纳入默认依赖，本地虚拟环境已验证 `talib 0.6.8` 可 import，并可计算 RSI、ATR 等基础指标。
 
 ## 1. 重合边界
 
@@ -17,7 +18,7 @@
 | 原始行情、资金、财务、估值、风险、情绪 | 直接使用 | Provider 归一化后写入标准表 | AKShare 是 A 股数据源，必须保留 raw 归档和 fallback |
 | 同花顺技术选股榜单 | 使用，但只作辅助标签 | 写入候选池、事件或标签，不作为最终技术因子本体 | 榜单口径外部不可控，且只覆盖 A 股 |
 | Yang-Zhang 已实现波动率 | 可使用，但只作补充 | 可作为 A 股波动率参考；统一波动率仍建议系统按 OHLCV 自算 | AKShare 指标计算能力较窄，不覆盖完整技术指标体系和数字货币 |
-| RSI、MACD、均线、ATR、布林带、动量、回撤 | 不依赖 AKShare | 系统使用指标库或 pandas/numpy 计算 | 需要跨 A 股和数字货币统一口径 |
+| RSI、MACD、均线、ATR、布林带、动量、回撤 | 不依赖 AKShare | 系统使用 TA-Lib 计算技术指标，pandas/numpy 负责序列整理和派生计算 | 需要跨 A 股和数字货币统一口径 |
 | 估值分位、财务质量、成长评分 | 部分使用 AKShare 输入 | 系统按历史窗口、行业分组或市场分位计算 | AKShare 给原始指标或估值序列，评分口径应由系统控制 |
 | 多维评分和推荐排序 | 不使用 AKShare | 系统根据因子、风险、缺失情况和策略权重计算 | 推荐排序是系统核心决策层，不能交给数据源 |
 
@@ -66,8 +67,8 @@ AKShare 官方股票文档包含同花顺技术选股榜单，例如创新高、
 
 | 因子组 | 系统计算因子 | 输入表 | 需要组件 |
 | --- | --- | --- | --- |
-| 技术面 | `return_1d`、`return_5d`、`return_20d`、`momentum_20d`、`ma_20`、`ma_60`、`ma_slope`、`rsi_14`、`macd`、`atr_14`、`bb_percent_b` | `market_bars` | `pandas/numpy` 可做基础版；`talib` 或 `ta` 更完整 |
-| 波动与风险 | `volatility_20d`、`realized_volatility`、`max_drawdown_20d`、`downside_volatility` | `market_bars` | `pandas/numpy` 可做基础版；YZ 波动率可参考 AKShare |
+| 技术面 | `return_1d`、`return_5d`、`return_20d`、`momentum_20d`、`ma_20`、`ma_60`、`ma_slope`、`rsi_14`、`macd`、`atr_14`、`bb_percent_b` | `market_bars` | `TA-Lib` 计算核心技术指标；`pandas/numpy` 计算收益率、窗口聚合和派生指标 |
+| 波动与风险 | `volatility_20d`、`realized_volatility`、`max_drawdown_20d`、`downside_volatility` | `market_bars` | `pandas/numpy` 计算窗口统计；ATR 等技术波动指标走 `TA-Lib`；YZ 波动率可参考 AKShare |
 | 流动性 | `amount_avg_20d`、`turnover_avg_20d`、`volume_zscore`、`illiquidity_score` | `market_bars`、实时行情 | `pandas/numpy` |
 | 资金流 | `main_net_inflow_strength`、`flow_rank_percentile`、`flow_continuity`、`flow_price_divergence` | `capital_flow_snapshots`、`market_bars` | `pandas/numpy` |
 | 基本面 | `roe_score`、`revenue_growth_score`、`profit_growth_score`、`cashflow_quality`、`debt_risk_score` | `fundamental_snapshots` | `pandas/numpy` |
@@ -101,9 +102,9 @@ AKShare 官方股票文档包含同花顺技术选股榜单，例如创新高、
 
 当前 `pyproject.toml` 依赖：
 
-- 已有：`akshare`、`ccxt`、`curl_cffi`、`pandas`、`psycopg`、`redis`、`requests`、`sqlalchemy`、`alembic`。
-- 运行环境实测可 import：`pandas`、`numpy`、`akshare`、`ccxt`。
-- 运行环境实测不可 import：`talib`、`ta`、`pandas_ta`、`scipy`、`sklearn`。
+- 已有：`akshare`、`ccxt`、`curl_cffi`、`numpy`、`pandas`、`TA-Lib`、`psycopg`、`redis`、`requests`、`sqlalchemy`、`alembic`。
+- 运行环境实测可 import：`pandas`、`numpy`、`akshare`、`ccxt`、`talib`。
+- 运行环境实测不可 import：`ta`、`pandas_ta`、`scipy`、`sklearn`；这些不进入第一版默认主链路。
 
 评估结论：
 
@@ -111,18 +112,18 @@ AKShare 官方股票文档包含同花顺技术选股榜单，例如创新高、
 | --- | --- | --- |
 | 基础数据采集 | 满足 | AKShare、ccxt、curl_cffi、pandas 已足够 |
 | 归一化和落库 | 满足 | SQLAlchemy、psycopg、TimescaleDB 已接入 |
-| 基础技术因子 | 部分满足 | pandas/numpy 能算收益率、均线、波动率、回撤；RSI/MACD/ATR/布林带可手写但不建议长期手写 |
-| 完整技术指标 | 不满足 | 缺 `TA-Lib` 或 `ta` |
+| 基础技术因子 | 满足 | `numpy` 已显式依赖；收益率、均线、波动率、回撤由 pandas/numpy 计算 |
+| 完整技术指标 | 满足 | 主路径固定为 `TA-Lib/talib`，本地已验证 `talib 0.6.8` 可用 |
 | A 股资金/财务/估值因子 | 部分满足 | 数据输入已有，分位和评分可用 pandas/numpy；仍缺因子服务代码 |
 | 数字货币衍生品因子 | 部分满足 | 数据输入已有，z-score 和变化率可用 pandas/numpy；仍缺批量窗口计算 |
 | 机器学习因子 | 不满足，且第一版不建议 | 缺 scipy/sklearn；第一版不需要 ML 主链路 |
 
 依赖建议：
 
-1. 第一版因子服务先显式依赖 `numpy`，不要只依赖 pandas 的传递依赖。
-2. 增加纯 Python 技术指标 fallback：`ta>=0.11,<1.0`，降低 Windows 安装门槛。
-3. `TA-Lib` 作为可选增强依赖，不作为当前阻塞项；等指标服务骨架稳定后再决定是否进入默认依赖。
-4. 暂不引入 `pandas_ta`、`scipy`、`sklearn`、`vectorbt`，避免第一版复杂度扩散。
+1. 第一版因子服务显式依赖 `numpy`，不要只依赖 pandas 的传递依赖。
+2. 第一版技术指标主路径固定为 `TA-Lib`，代码导入名为 `talib`，进入默认依赖。
+3. `pandas/numpy` 配合 `TA-Lib` 使用：负责数据清洗、窗口聚合、收益率、分位数、z-score、资金流、估值、基本面和数字货币衍生品派生因子。
+4. `ta` 暂不作为默认依赖，仅作为未来备用方案评估；当前不引入 `pandas_ta`、`scipy`、`sklearn`、`vectorbt`，避免第一版复杂度扩散。
 
 ## 7. 实施顺序建议
 
