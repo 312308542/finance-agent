@@ -1,0 +1,111 @@
+# 项目进度跟踪表
+
+更新时间：2026-05-15
+
+本文档用于跟踪 `finance-agent` 的真实建设进度。后续每次完成数据链路、数据库、因子、推荐或前端能力时，都优先更新这里，避免进度散落在多个设计文档里。
+
+## 1. 总体状态
+
+| 模块 | 状态 | 当前结论 | 下一步 |
+| --- | --- | --- | --- |
+| 项目方向 | 已确定 | 同时覆盖 A 股和数字货币，聚焦标的推荐、解释和风险反驳，不做自动交易主链路 | 持续约束后续需求，不回到泛金融工具集 |
+| 推荐主链路 | 设计完成，代码未闭环 | 链路确定为“股票池/币池 -> 数据采集 -> 因子计算 -> 初筛 -> 多维评分 -> Agent 分析 -> 风险反驳 -> 推荐排序 -> 中文报告” | 先补数据采集和因子服务，再闭合推荐运行 |
+| 数据库 | M0/M1 基础完成 | PostgreSQL + TimescaleDB 已作为全环境统一方案，M0 主链路表和 A 股 M1 表已迁移 | 补 P2 财务/估值数据写入和后续因子表使用 |
+| A 股数据 | P0/P1 部分完成 | AKShare 能力注册表、行情 fallback、P1 Provider、raw_records 归档已完成；部分东财接口当前网络断连 | 接 P2 财务/估值 Provider；为行业/资金流补 curl_cffi fallback |
+| 数字货币数据 | M0 部分完成 | 已接入 Binance 原生衍生品快照，已有 ccxt/Binance Provider 基础 | 补统一采集任务和币种候选池刷新 |
+| 因子与指标 | 仅有表设计 | 已设计 `indicator_frames`、`factor_frames`、`signal_snapshots`，尚未实现计算服务 | 引入开源 Python 指标库，先计算技术指标和资金流因子 |
+| 初筛与评分 | 仅有表设计 | 初筛、评分、排序表已设计，尚未实现规则引擎 | 建立第一版规则集和多维评分服务 |
+| Agent 分析 | 架构定义完成 | Agent 职责已收敛为 6 类金融分析角色，只消费结构化数据和证据 | 等因子/评分输出稳定后接 Agent 输入协议 |
+| 风险反驳 | 表设计完成 | `risk_findings` 和 Agent 分析明细已设计，未实现风险生成服务 | 先接停复牌、退市、质押、两融、龙虎榜等风险数据 |
+| 推荐报告 | 未开始 | 数据表已有推荐运行和推荐结果结构，暂无生成服务 | 在评分和 Agent 输出后生成中文解释报告 |
+| 前端办公室 | 原型阶段 | Phaser/React 原型和设计文档已有，尚未接真实后端 | 后端推荐链路闭合后再接实时状态 |
+
+## 2. 推荐链路进度
+
+| 链路节点 | 状态 | 已有资产 | 缺口 |
+| --- | --- | --- | --- |
+| 股票池/币池 | 部分完成 | `assets`、`asset_universes`、`asset_universe_members` 表；A 股行业种子 Provider；数字货币 markets Provider | 全 A、指数成分、热度池、资金流池、币种候选池刷新任务 |
+| 数据采集 | 进行中 | AKShare P0 行情 fallback；AKShare P1 行业/资金流/新闻 Provider；Binance 衍生品快照；`raw_records` 归档 | P2 财务/估值/风险/情绪 Provider；统一调度任务 |
+| 原始响应审计 | 已完成基础版 | `RawRecordRepository`、`AshareP1Collector` 已把成功和失败写入 `raw_records` | 后续所有 Provider 都要接入同一归档模式 |
+| 标准行情 | 部分完成 | `market_bars` hypertable；A 股 OHLCV Provider；数字货币 OHLCV Provider | 批量刷新任务、缺口补采、交易日历对齐 |
+| 因子计算 | 未开始 | 表结构已就绪 | 技术指标、资金流、估值、基本面、事件和衍生品因子计算 |
+| 初筛规则 | 未开始 | 表结构已就绪 | 流动性、停牌退市、数据完整性、极端风险剔除规则 |
+| 多维评分 | 未开始 | 表结构已就绪 | 分组权重、缺失惩罚、市场环境调整、排序策略 |
+| Agent 分析 | 未开始 | Agent 职责与输入边界已定义 | LangGraph 工作流、Agent 输入快照、输出落库 |
+| 风险反驳 | 未开始 | `risk_findings` 表结构 | 风险数据 Provider、风险扣分、反方观点生成 |
+| 推荐排序 | 未开始 | `recommendation_runs`、`asset_recommendations` 表结构 | 推荐服务、榜单生成、观察池/回避池输出 |
+| 中文解释报告 | 未开始 | 证据表和报告字段已有 | 报告模板、引用证据、风险提示、数据状态说明 |
+
+## 3. A 股数据进度
+
+| 优先级 | 能力 | 状态 | 说明 |
+| --- | --- | --- | --- |
+| P0 | AKShare 能力注册表 | 已完成 | 已登记 34 个 AKShare 股票接口，按推荐链路映射 |
+| P0 | A 股资产和行情 | 部分完成 | 东财失败后可走腾讯和 curl_cffi fallback |
+| P0 | 原始响应归档 | 已完成基础版 | P1 调用成功和失败均已进入 `raw_records` |
+| P1 | 行业/概念种子 | Provider 已完成，当前网络失败 | `stock_board_industry_cons_em` 当前出现 `RemoteDisconnected` |
+| P1 | 个股资金流 | Provider 已完成，当前网络失败 | `stock_individual_fund_flow_rank` 当前出现 `RemoteDisconnected` |
+| P1 | 个股新闻 | 已完成并可用 | `stock_news_em` 已写入 `event_records` 和 `evidence` |
+| P1 | 公告披露 | Provider 已完成，未纳入冒烟主流程 | 可继续接入定时采集 |
+| P2 | 财报/业绩 | 未开始 | 待接 `stock_yjbb_em`、`stock_yjkb_em`、`stock_yjyg_em` |
+| P2 | 财务指标 | 未开始 | 待接 `stock_financial_analysis_indicator_em` |
+| P2 | 估值/股息率 | 未开始 | 待接 `stock_value_em`、`stock_a_gxl_lg` 等 |
+| P2 | 风险与情绪 | 未开始 | 待接停复牌、质押、两融、龙虎榜、大宗交易、热度、涨停池 |
+
+## 4. 数字货币数据进度
+
+| 能力 | 状态 | 说明 | 下一步 |
+| --- | --- | --- | --- |
+| Binance/ccxt 基础 Provider | 已有基础版 | 已区分 Binance 原生和 ccxt 能力边界 | 统一落库与 raw_records 归档 |
+| 现货/合约资产池 | 部分完成 | markets 归一化已有 | 建立币种候选池刷新任务 |
+| OHLCV 行情 | 部分完成 | ccxt OHLCV 归一化已有 | 接批量刷新和缺口补采 |
+| 合约衍生品快照 | 已完成基础版 | 资金费率、未平仓量、多空比已落表 | 与因子服务对接，生成拥挤度和风险因子 |
+| 链上/宏观事件 | 未开始 | 暂未接入 | 后续作为事件和风险增强，不影响第一版推荐闭环 |
+
+## 5. 数据库进度
+
+| 迁移 | 状态 | 内容 |
+| --- | --- | --- |
+| `20260514_0001_create_m0_schema.py` | 已应用 | M0 推荐主链路表、TimescaleDB hypertable、候选池、行情、因子、推荐、Agent 审计 |
+| `20260514_0002_create_crypto_derivative_snapshots.py` | 已应用 | 数字货币衍生品快照表 |
+| `20260515_0003_create_ashare_m1_tables.py` | 已应用 | A 股财务估值、资金流、事件记录表 |
+
+当前实测状态：
+
+| 表 | 当前验证结果 | 说明 |
+| --- | --- | --- |
+| `raw_records` | AKShare 已有 6 条 | 成功和失败响应均已归档 |
+| `event_records` | AKShare 新闻 3 条 | 来自 `stock_news_em` |
+| `evidence` | AKShare 新闻证据 3 条 | 推荐解释可引用 |
+| `capital_flow_snapshots` | 0 条 | 资金流接口当前网络断连 |
+| `fundamental_snapshots` | 0 条 | P2 财务/估值尚未接入 |
+
+## 6. 最近提交
+
+| 提交 | 说明 |
+| --- | --- |
+| `57b74d8 增强 AKShare P1 采集归档链路` | 新增 `AshareP1Collector`，P1 调用成功/失败写入 `raw_records` |
+| `0878579 feat: add ashare m1 data pipeline` | 新增 A 股 M1 表、P1 Provider 和冒烟脚本 |
+| `023ba76 feat: register AKShare capabilities and fallback` | 新增 AKShare 能力注册表和行情 fallback |
+| `6bdf423 docs: clarify universe sources versus recommendations` | 澄清候选池来源和推荐结果边界 |
+| `f78ad40 docs: map AKShare capabilities to recommendation pipeline` | 映射 AKShare 能力到推荐链路 |
+
+## 7. 当前阻塞和风险
+
+| 问题 | 影响 | 当前处理 |
+| --- | --- | --- |
+| 部分东方财富接口被上游断连 | 行业成分和资金流暂时拿不到真实数据 | 已记录错误到 `raw_records`，下一步补 curl_cffi fallback |
+| P2 财务/估值未接入 | 基本面和估值评分暂不可用 | 下一阶段优先实现 |
+| 因子计算服务未开始 | 推荐链路无法从数据进入评分 | 数据采集稳定后立即实现 |
+| 统一采集任务未建立 | 只能通过脚本手动刷新 | 后续补定时/命令式采集入口 |
+| GitNexus 尚未索引 finance-agent | 当前无法对本仓库做图谱影响分析 | 后续建议对本仓库执行 GitNexus analyze |
+
+## 8. 下一步执行顺序
+
+1. 接入 A 股 P2 财务/估值 Provider，写入 `fundamental_snapshots`。
+2. 为行业成分和资金流补 repo-side `curl_cffi` fallback。
+3. 把 Binance/ccxt Provider 接入 `raw_records` 归档模式。
+4. 建立统一采集命令，按 P0/P1/P2 分批刷新数据。
+5. 实现第一版指标和因子计算服务。
+6. 实现初筛规则和多维评分。
+7. 接入 Agent 分析、风险反驳和中文推荐报告。
