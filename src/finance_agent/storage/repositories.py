@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from finance_agent.storage.orm import (
     AssetORM,
+    AssetRecommendationORM,
     AssetScoreORM,
     AssetUniverseMemberORM,
     AssetUniverseORM,
@@ -32,6 +33,8 @@ from finance_agent.storage.orm import (
     IndicatorFrameORM,
     MarketBarORM,
     RawRecordORM,
+    RecommendationRunORM,
+    RecommendationRunUniverseORM,
     RiskFindingORM,
     ScreeningResultItemORM,
     ScreeningResultORM,
@@ -139,6 +142,11 @@ class AssetRepository:
         """根据资产 ID 查询资产，不存在则抛错。"""
 
         return self.session.get_one(AssetORM, asset_id)
+
+    def get_asset_or_none(self, asset_id: str) -> AssetORM | None:
+        """根据资产 ID 查询资产，不存在时返回空。"""
+
+        return self.session.get(AssetORM, asset_id)
 
     def find_by_market(self, market: str, *, only_tradable: bool = True) -> list[AssetORM]:
         """按市场查询资产列表。"""
@@ -965,6 +973,184 @@ class SignalSnapshotRepository:
         return self.session.scalars(
             statement.order_by(SignalSnapshotORM.as_of.desc()).limit(1)
         ).one_or_none()
+
+
+class RecommendationRepository:
+    """推荐运行和单标的推荐结果仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_run(
+        self,
+        *,
+        run_id: str,
+        strategy: str,
+        market: str,
+        horizon: str,
+        limit: int,
+        status: str,
+        started_at: datetime,
+        universe_id: str | None = None,
+        screening_id: str | None = None,
+        finished_at: datetime | None = None,
+        summary: str | None = None,
+        payload: JsonDict | None = None,
+    ) -> RecommendationRunORM:
+        """按 `run_id` 幂等写入推荐运行。"""
+
+        values = {
+            "run_id": run_id,
+            "universe_id": universe_id,
+            "screening_id": screening_id,
+            "strategy": strategy,
+            "market": market,
+            "horizon": horizon,
+            "limit": limit,
+            "status": status,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "summary": summary,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(RecommendationRunORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "run_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[RecommendationRunORM.run_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(RecommendationRunORM, run_id)
+
+    def upsert_run_universe(
+        self,
+        *,
+        record_id: str,
+        run_id: str,
+        universe_id: str,
+        market: str,
+        role: str,
+        weight: Decimal | None = None,
+        asset_count: int | None = None,
+        payload: JsonDict | None = None,
+    ) -> RecommendationRunUniverseORM:
+        """按 `run_id + universe_id` 幂等写入推荐运行候选池关联。"""
+
+        values = {
+            "id": record_id,
+            "run_id": run_id,
+            "universe_id": universe_id,
+            "market": market,
+            "role": role,
+            "weight": weight,
+            "asset_count": asset_count,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(RecommendationRunUniverseORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"id", "run_id", "universe_id"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="uq_run_universes_run_universe",
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.get_run_universe(run_id=run_id, universe_id=universe_id)
+
+    def upsert_asset_recommendation(
+        self,
+        *,
+        recommendation_id: str,
+        run_id: str,
+        asset_id: str,
+        symbol: str,
+        name: str,
+        market: str,
+        horizon: str,
+        action: str,
+        rank: int,
+        total_score: Decimal,
+        confidence: Decimal,
+        conviction: str,
+        score_id: str | None = None,
+        factor_frame_id: str | None = None,
+        signal_ids: list[str] | None = None,
+        risk_ids: list[str] | None = None,
+        agent_analysis_item_ids: list[str] | None = None,
+        evidence_ids: list[str] | None = None,
+        watch_conditions: JsonDict | None = None,
+        invalid_if: JsonDict | None = None,
+        summary: str | None = None,
+        payload: JsonDict | None = None,
+    ) -> AssetRecommendationORM:
+        """按 `recommendation_id` 幂等写入单标的推荐结果。"""
+
+        values = {
+            "recommendation_id": recommendation_id,
+            "run_id": run_id,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "name": name,
+            "market": market,
+            "horizon": horizon,
+            "action": action,
+            "rank": rank,
+            "total_score": total_score,
+            "confidence": confidence,
+            "conviction": conviction,
+            "score_id": score_id,
+            "factor_frame_id": factor_frame_id,
+            "signal_ids": signal_ids or [],
+            "risk_ids": risk_ids or [],
+            "agent_analysis_item_ids": agent_analysis_item_ids or [],
+            "evidence_ids": evidence_ids or [],
+            "watch_conditions": _json_safe(watch_conditions or {}),
+            "invalid_if": _json_safe(invalid_if or {}),
+            "summary": summary,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(AssetRecommendationORM).values(**values)
+        update_values = {
+            key: statement.excluded[key] for key in values if key != "recommendation_id"
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[AssetRecommendationORM.recommendation_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(AssetRecommendationORM, recommendation_id)
+
+    def get_run_universe(
+        self,
+        *,
+        run_id: str,
+        universe_id: str,
+    ) -> RecommendationRunUniverseORM:
+        """查询推荐运行候选池关联。"""
+
+        statement = select(RecommendationRunUniverseORM).where(
+            RecommendationRunUniverseORM.run_id == run_id,
+            RecommendationRunUniverseORM.universe_id == universe_id,
+        )
+        return self.session.scalars(statement).one()
+
+    def list_recommendations(self, run_id: str) -> list[AssetRecommendationORM]:
+        """查询一次推荐运行的推荐结果。"""
+
+        statement = (
+            select(AssetRecommendationORM)
+            .where(AssetRecommendationORM.run_id == run_id)
+            .order_by(AssetRecommendationORM.rank)
+        )
+        return list(self.session.scalars(statement))
 
 
 class FundamentalDataRepository:

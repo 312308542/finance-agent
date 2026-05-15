@@ -17,6 +17,7 @@ from run_indicator_smoke import seed_sample_bars
 
 from finance_agent.factors import FactorService
 from finance_agent.indicators import IndicatorService
+from finance_agent.recommendations import RecommendationService
 from finance_agent.scoring import ScoringService
 from finance_agent.screening import ScreeningService
 from finance_agent.signals import SignalService
@@ -103,6 +104,12 @@ def run_recommendation_base_smoke(args: argparse.Namespace) -> JsonDict:
             asset_id=args.asset_id,
             horizon=args.horizon,
         )
+        recommendation = RecommendationService(session).rank_from_screening(
+            screening_id=screening.screening_id,
+            strategy=args.strategy,
+            horizon=args.horizon,
+            limit=20,
+        )
 
     return {
         "indicator": indicator.__dict__,
@@ -110,6 +117,7 @@ def run_recommendation_base_smoke(args: argparse.Namespace) -> JsonDict:
         "screening": screening.__dict__,
         "scoring": scoring.__dict__,
         "signal": signal.__dict__,
+        "recommendation": recommendation.__dict__,
     }
 
 
