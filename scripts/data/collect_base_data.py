@@ -28,11 +28,66 @@ from finance_agent.storage.db import create_session_factory, session_scope
 
 JsonDict = dict[str, Any]
 
+ALL_GROUPS = ("ashare-p0", "ashare-p1", "ashare-p2", "ashare-risk", "crypto")
+COLLECTION_ARG_DEFAULTS: JsonDict = {
+    "group": ["ashare-p1"],
+    "limit": 5,
+    "ashare_symbol": "000001",
+    "ashare_name": "平安银行",
+    "ashare_start": "20260501",
+    "ashare_end": "20260514",
+    "ashare_timeframe": "1d",
+    "ashare_adjust": "qfq",
+    "industry": "银行",
+    "concept": "融资融券",
+    "flow_window": "5日",
+    "report_date": "20250331",
+    "risk_start": "20260501",
+    "risk_end": "20260514",
+    "risk_block_symbol": "A股",
+    "cache_backend": "auto",
+    "lock_ttl_seconds": 600,
+    "circuit_failure_threshold": 3,
+    "circuit_cooldown_seconds": 900,
+    "force_provider": False,
+    "crypto_symbol": "BTCUSDT",
+    "crypto_timeframe": "1h",
+    "crypto_market_type": "spot",
+}
+
 
 def main() -> None:
     """解析命令行参数并执行基础数据采集。"""
 
     args = parse_args()
+    summary = collect_base_data(args)
+    print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+
+
+def default_collection_args(**overrides: Any) -> argparse.Namespace:
+    """生成采集入口默认参数，供调度器和其他编排脚本复用。"""
+
+    unknown_keys = sorted(set(overrides) - set(COLLECTION_ARG_DEFAULTS))
+    if unknown_keys:
+        raise ValueError(f"不支持的基础数据采集参数: {', '.join(unknown_keys)}")
+
+    values = {
+        key: list(value) if isinstance(value, list) else value
+        for key, value in COLLECTION_ARG_DEFAULTS.items()
+    }
+    values.update(overrides)
+    if values["group"] is None:
+        values["group"] = list(COLLECTION_ARG_DEFAULTS["group"])
+    elif isinstance(values["group"], str):
+        values["group"] = [values["group"]]
+    else:
+        values["group"] = list(values["group"])
+    return argparse.Namespace(**values)
+
+
+def collect_base_data(args: argparse.Namespace) -> JsonDict:
+    """按传入参数执行基础数据采集，并返回结构化摘要。"""
+
     session_factory = create_session_factory()
     started_at = datetime.now(tz=UTC)
     cache, locks, cache_status = create_cache_client(backend=args.cache_backend)
@@ -50,7 +105,7 @@ def main() -> None:
         results: list[CollectionTaskResult] = []
         selected_groups = set(args.group)
         if "all" in selected_groups:
-            selected_groups = {"ashare-p0", "ashare-p1", "ashare-p2", "ashare-risk", "crypto"}
+            selected_groups = set(ALL_GROUPS)
 
         if "ashare-p0" in selected_groups:
             results.extend(run_ashare_p0(session, args, runtime))
@@ -76,7 +131,7 @@ def main() -> None:
         "locked": sum(1 for item in results if item.status == "locked"),
         "results": [item.__dict__ for item in results],
     }
-    print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+    return summary
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,37 +145,99 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="采集分组；可重复传入。默认只跑 ashare-p1",
     )
-    parser.add_argument("--limit", type=int, default=5, help="每类列表型任务采集条数")
-    parser.add_argument("--ashare-symbol", default="000001", help="A 股样例代码")
-    parser.add_argument("--ashare-name", default="平安银行", help="A 股样例名称")
-    parser.add_argument("--ashare-start", default="20260501", help="A 股 K 线开始日期")
-    parser.add_argument("--ashare-end", default="20260514", help="A 股 K 线结束日期")
-    parser.add_argument("--ashare-timeframe", default="1d", help="A 股 K 线周期")
-    parser.add_argument("--ashare-adjust", default="qfq", help="A 股复权类型")
-    parser.add_argument("--industry", default="银行", help="A 股行业种子名称")
-    parser.add_argument("--concept", default="融资融券", help="A 股概念种子名称")
-    parser.add_argument("--flow-window", default="5日", help="A 股资金流周期")
-    parser.add_argument("--report-date", default="20250331", help="业绩报表日期")
-    parser.add_argument("--risk-start", default="20260501", help="A 股风险数据开始日期")
-    parser.add_argument("--risk-end", default="20260514", help="A 股风险数据结束日期")
-    parser.add_argument("--risk-block-symbol", default="A股", help="大宗交易市场范围")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=COLLECTION_ARG_DEFAULTS["limit"],
+        help="每类列表型任务采集条数",
+    )
+    parser.add_argument(
+        "--ashare-symbol",
+        default=COLLECTION_ARG_DEFAULTS["ashare_symbol"],
+        help="A 股样例代码",
+    )
+    parser.add_argument(
+        "--ashare-name",
+        default=COLLECTION_ARG_DEFAULTS["ashare_name"],
+        help="A 股样例名称",
+    )
+    parser.add_argument(
+        "--ashare-start",
+        default=COLLECTION_ARG_DEFAULTS["ashare_start"],
+        help="A 股 K 线开始日期",
+    )
+    parser.add_argument(
+        "--ashare-end",
+        default=COLLECTION_ARG_DEFAULTS["ashare_end"],
+        help="A 股 K 线结束日期",
+    )
+    parser.add_argument(
+        "--ashare-timeframe",
+        default=COLLECTION_ARG_DEFAULTS["ashare_timeframe"],
+        help="A 股 K 线周期",
+    )
+    parser.add_argument(
+        "--ashare-adjust",
+        default=COLLECTION_ARG_DEFAULTS["ashare_adjust"],
+        help="A 股复权类型",
+    )
+    parser.add_argument(
+        "--industry",
+        default=COLLECTION_ARG_DEFAULTS["industry"],
+        help="A 股行业种子名称",
+    )
+    parser.add_argument(
+        "--concept",
+        default=COLLECTION_ARG_DEFAULTS["concept"],
+        help="A 股概念种子名称",
+    )
+    parser.add_argument(
+        "--flow-window",
+        default=COLLECTION_ARG_DEFAULTS["flow_window"],
+        help="A 股资金流周期",
+    )
+    parser.add_argument(
+        "--report-date",
+        default=COLLECTION_ARG_DEFAULTS["report_date"],
+        help="业绩报表日期",
+    )
+    parser.add_argument(
+        "--risk-start",
+        default=COLLECTION_ARG_DEFAULTS["risk_start"],
+        help="A 股风险数据开始日期",
+    )
+    parser.add_argument(
+        "--risk-end",
+        default=COLLECTION_ARG_DEFAULTS["risk_end"],
+        help="A 股风险数据结束日期",
+    )
+    parser.add_argument(
+        "--risk-block-symbol",
+        default=COLLECTION_ARG_DEFAULTS["risk_block_symbol"],
+        help="大宗交易市场范围",
+    )
     parser.add_argument(
         "--cache-backend",
         choices=["auto", "redis", "null"],
-        default="auto",
+        default=COLLECTION_ARG_DEFAULTS["cache_backend"],
         help="缓存和任务锁后端；生产调度建议使用 redis",
     )
-    parser.add_argument("--lock-ttl-seconds", type=int, default=600, help="采集任务锁 TTL")
+    parser.add_argument(
+        "--lock-ttl-seconds",
+        type=int,
+        default=COLLECTION_ARG_DEFAULTS["lock_ttl_seconds"],
+        help="采集任务锁 TTL",
+    )
     parser.add_argument(
         "--circuit-failure-threshold",
         type=int,
-        default=3,
+        default=COLLECTION_ARG_DEFAULTS["circuit_failure_threshold"],
         help="Provider 连续失败多少次后熔断",
     )
     parser.add_argument(
         "--circuit-cooldown-seconds",
         type=int,
-        default=900,
+        default=COLLECTION_ARG_DEFAULTS["circuit_cooldown_seconds"],
         help="Provider 熔断冷却时间",
     )
     parser.add_argument(
@@ -128,17 +245,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="忽略 Provider 熔断状态，强制执行采集",
     )
-    parser.add_argument("--crypto-symbol", default="BTCUSDT", help="数字货币交易对")
-    parser.add_argument("--crypto-timeframe", default="1h", help="数字货币 K 线周期")
+    parser.add_argument(
+        "--crypto-symbol",
+        default=COLLECTION_ARG_DEFAULTS["crypto_symbol"],
+        help="数字货币交易对",
+    )
+    parser.add_argument(
+        "--crypto-timeframe",
+        default=COLLECTION_ARG_DEFAULTS["crypto_timeframe"],
+        help="数字货币 K 线周期",
+    )
     parser.add_argument(
         "--crypto-market-type",
-        default="spot",
+        default=COLLECTION_ARG_DEFAULTS["crypto_market_type"],
         choices=["spot", "future", "swap"],
         help="ccxt Binance 市场类型",
     )
     args = parser.parse_args()
     if args.group is None:
-        args.group = ["ashare-p1"]
+        args.group = list(COLLECTION_ARG_DEFAULTS["group"])
     return args
 
 
