@@ -21,7 +21,7 @@ from finance_agent.data.normalizers import (
     normalize_ashare_notice_reports,
     normalize_ashare_stock_news,
 )
-from finance_agent.data.providers import eastmoney_curl
+from finance_agent.data.providers import eastmoney_curl, ths_curl
 
 
 class AshareSectorProvider:
@@ -60,18 +60,33 @@ class AshareSectorProvider:
                         "error_message": str(fallback_exc),
                     }
                 )
-                return UniverseSeedsResult(
-                    provider_name=self.provider_name,
-                    status="error",
-                    collected_at=collected_at,
-                    error_message=str(fallback_exc),
-                    payload={
-                        "endpoint": "stock_board_industry_cons_em",
-                        "symbol": industry_name,
-                        "primary_source": primary_source,
-                        "fallback_trace": fallback_trace,
-                    },
-                )
+                try:
+                    df = ths_curl.fetch_industry_members(industry_name, limit=limit)
+                    actual_source = str(
+                        df.attrs.get(
+                            "actual_source",
+                            "ths:curl_cffi:stock_board_industry_detail_first_page",
+                        )
+                    )
+                except Exception as ths_exc:
+                    fallback_trace.append(
+                        {
+                            "source": "ths:curl_cffi:stock_board_industry_detail_first_page",
+                            "error_message": str(ths_exc),
+                        }
+                    )
+                    return UniverseSeedsResult(
+                        provider_name=self.provider_name,
+                        status="error",
+                        collected_at=collected_at,
+                        error_message=str(ths_exc),
+                        payload={
+                            "endpoint": "stock_board_industry_cons_em",
+                            "symbol": industry_name,
+                            "primary_source": primary_source,
+                            "fallback_trace": fallback_trace,
+                        },
+                    )
         seeds = normalize_ashare_board_members(
             df,
             source_name=industry_name,
@@ -92,6 +107,8 @@ class AshareSectorProvider:
                 "actual_source": actual_source,
                 "fallback_used": actual_source != primary_source,
                 "fallback_trace": fallback_trace,
+                "source_coverage": df.attrs.get("source_coverage"),
+                "source_board_code": df.attrs.get("board_code"),
             },
         )
 
@@ -126,18 +143,33 @@ class AshareSectorProvider:
                         "error_message": str(fallback_exc),
                     }
                 )
-                return UniverseSeedsResult(
-                    provider_name=self.provider_name,
-                    status="error",
-                    collected_at=collected_at,
-                    error_message=str(fallback_exc),
-                    payload={
-                        "endpoint": "stock_board_concept_cons_em",
-                        "symbol": concept_name,
-                        "primary_source": primary_source,
-                        "fallback_trace": fallback_trace,
-                    },
-                )
+                try:
+                    df = ths_curl.fetch_concept_members(concept_name, limit=limit)
+                    actual_source = str(
+                        df.attrs.get(
+                            "actual_source",
+                            "ths:curl_cffi:stock_board_concept_detail_first_page",
+                        )
+                    )
+                except Exception as ths_exc:
+                    fallback_trace.append(
+                        {
+                            "source": "ths:curl_cffi:stock_board_concept_detail_first_page",
+                            "error_message": str(ths_exc),
+                        }
+                    )
+                    return UniverseSeedsResult(
+                        provider_name=self.provider_name,
+                        status="error",
+                        collected_at=collected_at,
+                        error_message=str(ths_exc),
+                        payload={
+                            "endpoint": "stock_board_concept_cons_em",
+                            "symbol": concept_name,
+                            "primary_source": primary_source,
+                            "fallback_trace": fallback_trace,
+                        },
+                    )
         seeds = normalize_ashare_board_members(
             df,
             source_name=concept_name,
@@ -158,6 +190,8 @@ class AshareSectorProvider:
                 "actual_source": actual_source,
                 "fallback_used": actual_source != primary_source,
                 "fallback_trace": fallback_trace,
+                "source_coverage": df.attrs.get("source_coverage"),
+                "source_board_code": df.attrs.get("board_code"),
             },
         )
 

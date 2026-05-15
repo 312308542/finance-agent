@@ -39,6 +39,7 @@ AKShare 在本系统里应视为 **A 股数据 Provider 族**，不是单一 K �
 - 东方财富接口优先使用 AKShare；若本机触发断连，可用 `curl_cffi` 或腾讯接口兜底。
 - 腾讯接口可作为 A 股行情 fallback，尤其是实时行情和日线行情。
 - 腾讯实时行情 fallback 受分页和网络稳定性影响，第一版用于降级保底；完整全 A 主源仍优先使用东方财富或后续专门的股票列表接口。
+- 行业/概念成分优先使用东方财富全量接口；若 AKShare 和东财 `curl_cffi` 都断连，可用同花顺详情页首屏成分做轻量 fallback，并在 `raw_records.response_payload.source_coverage` 标记为 `first_page`。
 
 工程上采用“注册表尽量全、执行分批接”的方式：
 
@@ -224,7 +225,9 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 - `AshareValuationProvider.fetch_valuation`
 - `AshareValuationProvider.fetch_dividend_yield`
 - `AshareP1Collector`
+- `AshareP1Collector.collect_concept_members`
 - `AshareP2Collector`
+- `finance_agent/data/providers/ths_curl.py`
 - `finance_agent/data/akshare_capabilities.py`
 - `scripts/data/check_akshare_capabilities.py`
 - `scripts/data/smoke_akshare_p1.py`
@@ -243,14 +246,14 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 当前真实运行态：
 
 - `alembic current` 已到 `20260515_0003`。
-- `smoke_akshare_p1.py` 已能把 `stock_news_em` 写入 `event_records` 和 `evidence`，并能通过同花顺轻量 fallback 把 5 日个股资金流写入 `capital_flow_snapshots`。
+- `smoke_akshare_p1.py` 已能把行业种子池、概念种子池、个股资金流和个股新闻写入标准表；当前网络下板块成分走同花顺详情页首屏轻量 fallback，5 日个股资金流走同花顺资金流 fallback。
 - `smoke_akshare_p2.py` 已能把 `stock_financial_analysis_indicator_em` 和 `stock_value_em` 写入 `fundamental_snapshots`。
-- 当前网络下 `stock_board_industry_cons_em` 仍可能被东方财富上游断开，Provider 会返回结构化 `error`，不会让推荐链路崩溃。
+- 当前网络下 `stock_board_industry_cons_em` 和 `stock_board_concept_cons_em` 仍可能被东方财富上游断开；Provider 会先记录东财失败链路，再降级到同花顺首屏成分，并把 `actual_source`、`fallback_trace`、`source_coverage` 写入 `raw_records`。
 - 当前网络下 `stock_yjbb_em` 如果请求东财 datacenter 超时，可以走 `eastmoney:curl_cffi` fallback；成功和失败响应都会写入 `raw_records`。
 
 下一步应补：
 
-1. 给行业/概念成分接口补非东财备用源，降低东方财富板块成分接口断连影响。
-2. 将 P2 风险、情绪接口逐批转成 Provider、快照和证据。
-3. 建立采集任务，把 P0/P1/P2 数据按日刷新到标准化表。
+1. 把 Binance/ccxt Provider 接入统一 `raw_records` 归档模式。
+2. 建立采集任务，把 P0/P1/P2 数据按日刷新到标准化表。
+3. 将 P2 风险、情绪接口逐批转成 Provider、快照和证据。
 4. 定期运行数据健康检查脚本，输出哪些 AKShare 接口可用、哪些降级。

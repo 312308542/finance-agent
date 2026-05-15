@@ -172,6 +172,73 @@ class AshareP1Collector:
         )
         return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
+    def collect_concept_members(
+        self,
+        *,
+        concept_name: str,
+        universe_id: str,
+        universe_name: str,
+        strategy_context: str,
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集概念成分种子，并写入候选池定义和成员。"""
+
+        result = self.sector_provider.fetch_concept_members(
+            concept_name=concept_name,
+            limit=limit,
+        )
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_board_concept_cons_em",
+            request_params={"symbol": concept_name, "limit": limit},
+        )
+
+        self.universes.upsert_universe(
+            universe_id=universe_id,
+            name=universe_name,
+            source="akshare:stock_board_concept_cons_em",
+            market="ashare",
+            strategy_context=strategy_context,
+            as_of=result.collected_at,
+            total_before_filter=len(result.seeds),
+            total_after_filter=len(result.seeds),
+            status=result.status,
+            payload={
+                "provider_payload": result.payload,
+                "raw_record_id": raw_record_id,
+                "error": result.error_message,
+            },
+        )
+        if result.status != "available":
+            return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+        for seed in result.seeds:
+            self.assets.upsert_asset(
+                asset_id=seed.asset_id,
+                symbol=seed.symbol,
+                name=seed.name,
+                market=seed.market,
+                asset_type="stock",
+                payload=seed.payload,
+            )
+        self.universes.replace_members(
+            universe_id=universe_id,
+            members=[
+                {
+                    "member_id": f"universe_member:{universe_id}:{seed.symbol}",
+                    "asset_id": seed.asset_id,
+                    "symbol": seed.symbol,
+                    "market": seed.market,
+                    "as_of": seed.as_of or result.collected_at,
+                    "rank_hint": seed.rank_hint,
+                    "payload": seed.payload | {"raw_record_id": raw_record_id},
+                }
+                for seed in result.seeds
+            ],
+        )
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
     def collect_flow_rank(
         self,
         *,

@@ -32,14 +32,23 @@ def main() -> None:
             strategy_context="p1_smoke",
             limit=5,
         )
+        concept_archive = collector.collect_concept_members(
+            concept_name="融资融券",
+            universe_id="universe:akshare_p1_smoke:concept_margin",
+            universe_name="AKShare P1 冒烟概念种子池",
+            strategy_context="p1_smoke",
+            limit=5,
+        )
         flow_archive = collector.collect_flow_rank(indicator="5日", limit=5)
         news_archive = collector.collect_stock_news(symbol="000001", asset_name="平安银行", limit=3)
 
     industry = industry_archive.result
+    concept = concept_archive.result
     flow_rank = flow_archive.result
     news = news_archive.result
     raw_record_ids = [
         industry_archive.raw_record_id,
+        concept_archive.raw_record_id,
         flow_archive.raw_record_id,
         news_archive.raw_record_id,
     ]
@@ -50,6 +59,13 @@ def main() -> None:
             "industry_status": industry.status,
             "industry_count": len(industry.seeds),
             "industry_error": industry.error_message,
+            "industry_source": industry.payload.get("actual_source"),
+            "industry_coverage": industry.payload.get("source_coverage"),
+            "concept_status": concept.status,
+            "concept_count": len(concept.seeds),
+            "concept_error": concept.error_message,
+            "concept_source": concept.payload.get("actual_source"),
+            "concept_coverage": concept.payload.get("source_coverage"),
             "flow_status": flow_rank.status,
             "flow_count": len(flow_rank.snapshots),
             "flow_error": flow_rank.error_message,
