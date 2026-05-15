@@ -246,7 +246,9 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 当前真实运行态：
 
 - `alembic current` 已到 `20260515_0003`。
-- `collect_base_data.py` 已支持按 `ashare-p0`、`ashare-p1`、`ashare-p2`、`crypto` 和 `all` 分组采集基础数据，并输出每个任务的 `raw_record_id`。
+- `collect_base_data.py` 已支持按 `ashare-p0`、`ashare-p1`、`ashare-p2`、`ashare-risk`、`crypto` 和 `all` 分组采集基础数据，并输出每个任务的 `raw_record_id`。
+- `collect_base_data.py` 已接入 Redis 任务锁和 Provider 熔断状态；同参数任务会生成 `base_data_collect:*` 锁，连续失败的 Provider 会写入 `provider_state:*` 并在冷却期返回 `skipped`。
+- `scripts/data/check_base_data_health.py` 已能只读 PostgreSQL + Redis，汇总关键表数据量、最近 Provider 状态、Provider 熔断状态和当前数据缺口。
 - `smoke_akshare_p1.py` 已能把行业种子池、概念种子池、个股资金流和个股新闻写入标准表；当前网络下板块成分走同花顺详情页首屏轻量 fallback，5 日个股资金流走同花顺资金流 fallback。
 - `smoke_akshare_p2.py` 已能把 `stock_financial_analysis_indicator_em` 和 `stock_value_em` 写入 `fundamental_snapshots`。
 - 当前网络下 `stock_board_industry_cons_em` 和 `stock_board_concept_cons_em` 仍可能被东方财富上游断开；Provider 会先记录东财失败链路，再降级到同花顺首屏成分，并把 `actual_source`、`fallback_trace`、`source_coverage` 写入 `raw_records`。
@@ -258,6 +260,6 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 
 下一步应补：
 
-1. 将 P2 风险、情绪接口逐批转成 Provider、快照和证据。
-2. 把统一采集命令接入 Redis 任务锁、Provider 熔断状态和调度层。
-3. 定期运行数据健康检查脚本，输出哪些 AKShare 接口可用、哪些降级。
+1. 接入正式基础数据调度器，按 A 股交易日、盘中/盘后刷新窗口和 Provider 健康状态分组执行。
+2. 继续补停复牌、退市、限售解禁和质押等风险替代源，降低单一 Eastmoney 接口断连影响。
+3. 在因子计算服务中使用 AKShare 已落库的行情、资金流、财务估值、事件和风险数据。

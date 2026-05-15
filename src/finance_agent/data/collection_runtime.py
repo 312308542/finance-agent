@@ -1,0 +1,232 @@
+"""基础数据采集运行控制。
+
+这里封装任务锁、Provider 熔断状态和采集摘要，避免脚本、调度器和后续
+后台任务各自直接操作 Redis 键。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Any
+
+from finance_agent.data.collectors import ArchivedProviderResult
+from finance_agent.ports.cache import CacheClient, LockClient
+
+JsonDict = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class CollectionTaskResult:
+    """单个采集任务的摘要结果。"""
+
+    task: str
+    status: str
+    raw_record_id: str | None
+    item_count: int
+    error_message: str | None
+    payload: JsonDict
+
+
+@dataclass(frozen=True)
+class ProviderCircuitPolicy:
+    """Provider 熔断策略。"""
+
+    failure_threshold: int = 3
+    cooldown_seconds: int = 900
+    state_ttl_seconds: int = 86400
+
+
+@dataclass(frozen=True)
+class CollectionRuntime:
+    """采集任务运行控制器。"""
+
+    cache: CacheClient
+    locks: LockClient
+    lock_ttl_seconds: int = 600
+    circuit_policy: ProviderCircuitPolicy = field(default_factory=ProviderCircuitPolicy)
+
+    def run_task(
+        self,
+        *,
+        task: str,
+        provider_key: str,
+        parameters: JsonDict,
+        collect: Any,
+        force: bool = False,
+    ) -> CollectionTaskResult:
+        """带任务锁和 Provider 熔断保护地执行采集任务。"""
+
+        circuit_state = self.get_provider_state(provider_key)
+        if self.is_circuit_open(circuit_state) and not force:
+            return CollectionTaskResult(
+                task=task,
+                status="skipped",
+                raw_record_id=None,
+                item_count=0,
+                error_message="Provider 熔断中，跳过本次采集",
+                payload={
+                    "provider_key": provider_key,
+                    "circuit_state": circuit_state,
+                },
+            )
+
+        lock_key = collection_lock_key(task=task, parameters=parameters)
+        if not self.locks.acquire_lock(lock_key, ttl_seconds=self.lock_ttl_seconds):
+            return CollectionTaskResult(
+                task=task,
+                status="locked",
+                raw_record_id=None,
+                item_count=0,
+                error_message="同参数采集任务正在运行",
+                payload={"provider_key": provider_key, "lock_key": lock_key},
+            )
+
+        try:
+            archive: ArchivedProviderResult = collect()
+            result = summarize_archive(task, archive)
+            self.record_provider_result(provider_key=provider_key, result=result)
+            return result
+        finally:
+            self.locks.release_lock(lock_key)
+
+    def get_provider_state(self, provider_key: str) -> JsonDict:
+        """读取 Provider 熔断状态。"""
+
+        cached = self.cache.get_json(provider_state_key(provider_key))
+        return cached if isinstance(cached, dict) else {}
+
+    def is_circuit_open(self, state: JsonDict) -> bool:
+        """判断 Provider 是否处于熔断冷却期。"""
+
+        if state.get("status") != "open":
+            return False
+        opened_until = parse_datetime(state.get("opened_until"))
+        if opened_until is None:
+            return False
+        return opened_until > datetime.now(tz=UTC)
+
+    def record_provider_result(
+        self,
+        *,
+        provider_key: str,
+        result: CollectionTaskResult,
+    ) -> None:
+        """根据采集结果更新 Provider 熔断状态。"""
+
+        state = self.get_provider_state(provider_key)
+        now = datetime.now(tz=UTC)
+        if result.status == "available":
+            next_state = {
+                "status": "closed",
+                "failure_count": 0,
+                "last_status": result.status,
+                "last_raw_record_id": result.raw_record_id,
+                "last_error_message": None,
+                "updated_at": now.isoformat(),
+            }
+        elif result.status in {"error", "unavailable"}:
+            failure_count = int(state.get("failure_count") or 0) + 1
+            next_state = {
+                "status": "closed",
+                "failure_count": failure_count,
+                "last_status": result.status,
+                "last_raw_record_id": result.raw_record_id,
+                "last_error_message": result.error_message,
+                "updated_at": now.isoformat(),
+            }
+            if failure_count >= self.circuit_policy.failure_threshold:
+                opened_until = now.timestamp() + self.circuit_policy.cooldown_seconds
+                next_state["status"] = "open"
+                next_state["opened_until"] = datetime.fromtimestamp(
+                    opened_until,
+                    tz=UTC,
+                ).isoformat()
+        else:
+            next_state = state | {
+                "last_status": result.status,
+                "updated_at": now.isoformat(),
+            }
+
+        self.cache.set_json(
+            provider_state_key(provider_key),
+            next_state,
+            ttl_seconds=self.circuit_policy.state_ttl_seconds,
+        )
+
+    def list_provider_states(self, provider_keys: list[str]) -> list[JsonDict]:
+        """批量读取 Provider 熔断状态。"""
+
+        states: list[JsonDict] = []
+        for provider_key in provider_keys:
+            state = self.get_provider_state(provider_key)
+            states.append(
+                {
+                    "provider_key": provider_key,
+                    "status": state.get("status", "unknown"),
+                    "failure_count": state.get("failure_count", 0),
+                    "opened_until": state.get("opened_until"),
+                    "last_status": state.get("last_status"),
+                    "last_raw_record_id": state.get("last_raw_record_id"),
+                    "last_error_message": state.get("last_error_message"),
+                    "updated_at": state.get("updated_at"),
+                }
+            )
+        return states
+
+
+def summarize_archive(task: str, archive: ArchivedProviderResult) -> CollectionTaskResult:
+    """把带归档编号的 Provider 结果压缩成命令输出摘要。"""
+
+    result = archive.result
+    return CollectionTaskResult(
+        task=task,
+        status=result.status,
+        raw_record_id=archive.raw_record_id,
+        item_count=infer_item_count(result),
+        error_message=result.error_message,
+        payload={
+            "actual_source": result.payload.get("actual_source"),
+            "fallback_used": result.payload.get("fallback_used"),
+            "source_coverage": result.payload.get("source_coverage"),
+        },
+    )
+
+
+def infer_item_count(result: Any) -> int:
+    """根据 ProviderResult 子类型推断采集条数。"""
+
+    for attr_name in ("assets", "bars", "seeds", "snapshots", "risks", "events", "evidence"):
+        value = getattr(result, attr_name, None)
+        if value is not None:
+            return len(value)
+    if getattr(result, "snapshot", None) is not None:
+        return 1
+    return 0
+
+
+def provider_state_key(provider_key: str) -> str:
+    """生成 Provider 熔断状态缓存键。"""
+
+    return f"provider_state:{provider_key}"
+
+
+def collection_lock_key(*, task: str, parameters: JsonDict) -> str:
+    """生成采集任务锁键。"""
+
+    normalized = ":".join(f"{key}={parameters[key]}" for key in sorted(parameters))
+    return f"base_data_collect:{task}:{normalized}"
+
+
+def parse_datetime(value: Any) -> datetime | None:
+    """解析 ISO datetime 字符串。"""
+
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
