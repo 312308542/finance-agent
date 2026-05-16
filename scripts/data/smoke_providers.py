@@ -68,27 +68,45 @@ def main() -> None:
             payload={"source": "provider_smoke"},
         )
         universes.upsert_universe(
-            universe_id="universe:provider_smoke:mixed",
-            name="真实数据源冒烟候选池",
+            universe_id="universe:provider_smoke:ashare",
+            name="真实数据源 A 股冒烟候选池",
             source="provider_smoke",
-            market="mixed",
+            market="ashare",
             strategy_context="provider_smoke",
             as_of=as_of,
-            total_before_filter=2,
-            total_after_filter=2,
+            total_before_filter=1,
+            total_after_filter=1,
         )
         universes.replace_members(
-            universe_id="universe:provider_smoke:mixed",
+            universe_id="universe:provider_smoke:ashare",
             members=[
                 {
-                    "member_id": "universe_member:provider_smoke:ashare:000001",
+                    "member_id": "universe_member:universe:provider_smoke:ashare:ashare:000001",
                     "asset_id": "ashare:000001",
                     "symbol": "000001",
                     "market": "ashare",
                     "as_of": as_of,
                 },
+            ],
+        )
+        universes.upsert_universe(
+            universe_id="universe:provider_smoke:crypto_spot",
+            name="真实数据源数字货币冒烟候选池",
+            source="provider_smoke",
+            market="crypto_spot",
+            strategy_context="provider_smoke",
+            as_of=as_of,
+            total_before_filter=1,
+            total_after_filter=1,
+        )
+        universes.replace_members(
+            universe_id="universe:provider_smoke:crypto_spot",
+            members=[
                 {
-                    "member_id": "universe_member:provider_smoke:crypto_spot:BTCUSDT",
+                    "member_id": (
+                        "universe_member:universe:provider_smoke:crypto_spot:"
+                        "crypto_spot:BTCUSDT"
+                    ),
                     "asset_id": "crypto_spot:BTCUSDT",
                     "symbol": "BTCUSDT",
                     "market": "crypto_spot",

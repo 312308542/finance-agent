@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 from sqlalchemy.orm import Session
 
@@ -22,6 +22,13 @@ from finance_agent.storage.repositories import (
 JsonDict = dict[str, Any]
 
 RULE_VERSION = "screening_v1.0.0"
+
+
+class UniverseMemberLike(Protocol):
+    """候选池成员需要具备的最小市场边界字段。"""
+
+    asset_id: str
+    market: str
 
 
 @dataclass(frozen=True)
@@ -58,6 +65,7 @@ class ScreeningService:
 
         universe = self.universes.get_universe(universe_id)
         members = self.universes.list_members(universe_id)
+        ensure_single_market_universe(universe.market, members)
         as_of = datetime.now(tz=UTC)
         screening_id = build_screening_id(
             universe_id=universe_id,
@@ -199,6 +207,18 @@ def evaluate_member(
         "data_status": factor.status,
         "liquidity_status": liquidity_status(factor),
     }
+
+
+def ensure_single_market_universe(market: str, members: list[UniverseMemberLike]) -> None:
+    """确保一次初筛只处理单一市场候选池。"""
+
+    if market == "mixed":
+        raise ValueError("A 股和数字货币必须使用两条独立推荐链路，不能使用 mixed 候选池。")
+    mismatched_members = [member.asset_id for member in members if member.market != market]
+    if mismatched_members:
+        raise ValueError(
+            f"候选池市场为 {market}，但包含其他市场成员：{', '.join(mismatched_members)}"
+        )
 
 
 def has_critical_risk(factor: FactorFrameORM) -> bool:

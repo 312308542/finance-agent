@@ -68,6 +68,7 @@ class RecommendationService:
         """读取一次初筛的评分结果并生成推荐榜单。"""
 
         screening = self.screenings.get_screening_result(screening_id)
+        ensure_recommendation_market(screening.market)
         started_at = datetime.now(tz=UTC)
         run_id = build_run_id(
             screening_id=screening_id,
@@ -76,6 +77,7 @@ class RecommendationService:
             started_at=started_at,
         )
         scores = self.scores.list_scores_for_screening(screening_id)[:limit]
+        ensure_scores_match_market(scores=scores, market=screening.market)
         recommendation_ids: list[str] = []
 
         self.recommendations.upsert_run_universe(
@@ -242,6 +244,23 @@ def build_recommendation_payload(
         "invalid_if": invalid_if,
         "missing_data": missing_data,
     }
+
+
+def ensure_recommendation_market(market: str) -> None:
+    """推荐运行只允许单一市场。"""
+
+    if market == "mixed":
+        raise ValueError("A 股和数字货币必须分别生成推荐榜单，不能使用 mixed 推荐运行。")
+
+
+def ensure_scores_match_market(*, scores: list[AssetScoreORM], market: str) -> None:
+    """确保同一次推荐运行的评分都属于同一市场。"""
+
+    mismatched = [score.asset_id for score in scores if score.market != market]
+    if mismatched:
+        raise ValueError(
+            f"推荐运行市场为 {market}，但评分结果包含其他市场标的：{', '.join(mismatched)}"
+        )
 
 
 def decide_action(

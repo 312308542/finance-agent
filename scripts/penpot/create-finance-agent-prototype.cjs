@@ -651,7 +651,7 @@ ui.row(holdings, "持仓表头", 60, [
   ], widths, { fill: index % 2 === 0 ? "#0F1828" : "transparent", height: 30 });
 });
 
-const watch = ui.panel(canvas, "面板 / 观察清单与信号", 1028, 460, 372, 276, "观察清单与信号", "信号层统一输出，Agent 只消费协议结果。");
+const watch = ui.panel(canvas, "面板 / 观察清单与信号", 1028, 460, 372, 276, "观察清单与信号", "信号层按市场输出，Agent 只消费对应市场协议结果。");
 [
   ["比亚迪", "量价共振", "候选", C.green],
   ["中芯国际", "波动扩大", "观望", C.gold],

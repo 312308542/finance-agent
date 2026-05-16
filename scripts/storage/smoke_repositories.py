@@ -2,7 +2,7 @@
 
 用途：
 - 写入 A 股和数字货币样例资产。
-- 写入一个混合候选池。
+- 分别写入 A 股候选池和数字货币候选池。
 - 写入 A 股日线和数字货币 1h K 线。
 - 查询候选池成员和最近 K 线，验证 Repository 层和 TimescaleDB 表可用。
 """
@@ -56,34 +56,55 @@ def main() -> None:
         )
 
         universes.upsert_universe(
-            universe_id="universe:smoke:mixed:20260514",
-            name="冒烟验证混合候选池",
+            universe_id="universe:smoke:ashare:20260514",
+            name="冒烟验证 A 股候选池",
             source="manual:smoke",
-            market="mixed",
+            market="ashare",
             strategy_context="smoke_test",
             as_of=as_of,
-            total_before_filter=2,
-            total_after_filter=2,
-            payload={"note": "用于验证仓储层写入和查询"},
+            total_before_filter=1,
+            total_after_filter=1,
+            payload={"note": "用于验证 A 股仓储层写入和查询"},
         )
         universes.replace_members(
-            universe_id="universe:smoke:mixed:20260514",
+            universe_id="universe:smoke:ashare:20260514",
             members=[
                 {
-                    "member_id": "universe_member:smoke:ashare:600519",
+                    "member_id": (
+                        "universe_member:universe:smoke:ashare:20260514:ashare:600519"
+                    ),
                     "asset_id": "ashare:600519",
                     "symbol": "600519",
                     "market": "ashare",
                     "as_of": as_of,
                     "rank_hint": 1,
                 },
+            ],
+        )
+        universes.upsert_universe(
+            universe_id="universe:smoke:crypto_spot:20260514",
+            name="冒烟验证数字货币候选池",
+            source="manual:smoke",
+            market="crypto_spot",
+            strategy_context="smoke_test",
+            as_of=as_of,
+            total_before_filter=1,
+            total_after_filter=1,
+            payload={"note": "用于验证数字货币仓储层写入和查询"},
+        )
+        universes.replace_members(
+            universe_id="universe:smoke:crypto_spot:20260514",
+            members=[
                 {
-                    "member_id": "universe_member:smoke:crypto_spot:BTCUSDT",
+                    "member_id": (
+                        "universe_member:universe:smoke:crypto_spot:20260514:"
+                        "crypto_spot:BTCUSDT"
+                    ),
                     "asset_id": "crypto_spot:BTCUSDT",
                     "symbol": "BTCUSDT",
                     "market": "crypto_spot",
                     "as_of": as_of,
-                    "rank_hint": 2,
+                    "rank_hint": 1,
                 },
             ],
         )
@@ -134,7 +155,8 @@ def main() -> None:
             source="smoke",
         )
 
-        members = universes.list_members("universe:smoke:mixed:20260514")
+        ashare_members = universes.list_members("universe:smoke:ashare:20260514")
+        crypto_members = universes.list_members("universe:smoke:crypto_spot:20260514")
         btc_bars = market_data.list_recent_bars(
             asset_id="crypto_spot:BTCUSDT",
             timeframe="1h",
@@ -142,7 +164,7 @@ def main() -> None:
             limit=2,
         )
         window_bars = market_data.list_window_bars(
-            asset_ids=[member.asset_id for member in members],
+            asset_ids=[member.asset_id for member in crypto_members],
             timeframe="1h",
             start_at=as_of - timedelta(days=1),
             end_at=as_of + timedelta(days=1),
@@ -151,7 +173,8 @@ def main() -> None:
 
     print(
         {
-            "members": [member.asset_id for member in members],
+            "ashare_members": [member.asset_id for member in ashare_members],
+            "crypto_members": [member.asset_id for member in crypto_members],
             "btc_recent_closes": [str(bar.close) for bar in btc_bars],
             "window_bar_count": len(window_bars),
         }

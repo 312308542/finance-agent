@@ -44,6 +44,28 @@ from finance_agent.storage.orm import (
 JsonDict = dict[str, Any]
 
 
+def _ensure_not_mixed_market(market: str, *, context: str) -> None:
+    """推荐链路中的候选池和推荐结果必须属于单一市场。"""
+
+    if market == "mixed":
+        raise ValueError(f"{context} 不能使用 mixed，A 股和数字货币必须走两条独立链路。")
+
+
+def _ensure_same_market(
+    *,
+    expected: str,
+    actual: str,
+    context: str,
+    subject: str,
+) -> None:
+    """校验同一次候选池或推荐运行中的市场一致性。"""
+
+    if expected != actual:
+        raise ValueError(
+            f"{context} 市场为 {expected}，但 {subject} 属于 {actual}，不能跨市场混合。"
+        )
+
+
 def _json_safe(value: Any) -> Any:
     """把第三方响应转换成 PostgreSQL JSONB 可接受的结构。"""
 
@@ -254,6 +276,7 @@ class UniverseRepository:
     ) -> AssetUniverseORM:
         """按 `universe_id` 幂等写入候选池定义。"""
 
+        _ensure_not_mixed_market(market, context="候选池")
         values = {
             "universe_id": universe_id,
             "name": name,
@@ -301,6 +324,14 @@ class UniverseRepository:
     ) -> AssetUniverseMemberORM:
         """按 `universe_id + asset_id` 幂等写入候选池成员。"""
 
+        _ensure_not_mixed_market(market, context="候选池成员")
+        universe = self.get_universe(universe_id)
+        _ensure_same_market(
+            expected=universe.market,
+            actual=market,
+            context=f"候选池 {universe_id}",
+            subject=f"成员 {asset_id}",
+        )
         values = {
             "id": member_id,
             "universe_id": universe_id,
@@ -999,6 +1030,7 @@ class RecommendationRepository:
     ) -> RecommendationRunORM:
         """按 `run_id` 幂等写入推荐运行。"""
 
+        _ensure_not_mixed_market(market, context="推荐运行")
         values = {
             "run_id": run_id,
             "universe_id": universe_id,
@@ -1038,6 +1070,15 @@ class RecommendationRepository:
     ) -> RecommendationRunUniverseORM:
         """按 `run_id + universe_id` 幂等写入推荐运行候选池关联。"""
 
+        _ensure_not_mixed_market(market, context="推荐运行候选池关联")
+        run = self.session.get(RecommendationRunORM, run_id)
+        if run is not None:
+            _ensure_same_market(
+                expected=run.market,
+                actual=market,
+                context=f"推荐运行 {run_id}",
+                subject=f"候选池 {universe_id}",
+            )
         values = {
             "id": record_id,
             "run_id": run_id,
@@ -1091,6 +1132,15 @@ class RecommendationRepository:
     ) -> AssetRecommendationORM:
         """按 `recommendation_id` 幂等写入单标的推荐结果。"""
 
+        _ensure_not_mixed_market(market, context="推荐结果")
+        run = self.session.get(RecommendationRunORM, run_id)
+        if run is not None:
+            _ensure_same_market(
+                expected=run.market,
+                actual=market,
+                context=f"推荐运行 {run_id}",
+                subject=f"推荐标的 {asset_id}",
+            )
         values = {
             "recommendation_id": recommendation_id,
             "run_id": run_id,
