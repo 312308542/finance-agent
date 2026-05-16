@@ -220,6 +220,7 @@ def normalize_ashare_fund_flow_rank(
 
     snapshots: list[CapitalFlowSnapshotData] = []
     rows = df.head(limit) if limit else df
+    rank_total = len(rows.index)
     for index, row in enumerate(rows.to_dict("records"), start=1):
         symbol = strip_ashare_exchange_prefix(str(_first_present(row, ["代码", "股票代码"]) or ""))
         if not symbol:
@@ -249,7 +250,7 @@ def normalize_ashare_fund_flow_rank(
                 turnover_rate=turnover_rate,
                 amount=amount,
                 status="available",
-                payload={"raw": row, "rank_hint": index},
+                payload={"raw": row, "rank_hint": index, "rank_total": rank_total},
             )
         )
     return snapshots

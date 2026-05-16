@@ -1270,6 +1270,27 @@ class FundamentalDataRepository:
             statement.order_by(FundamentalSnapshotORM.as_of.desc()).limit(1)
         ).one_or_none()
 
+    def list_recent_snapshots(
+        self,
+        *,
+        asset_id: str,
+        limit: int,
+        source: str | None = None,
+    ) -> list[FundamentalSnapshotORM]:
+        """查询单标的最近 N 条财务估值快照，返回时间升序结果。"""
+
+        statement = select(FundamentalSnapshotORM).where(
+            FundamentalSnapshotORM.asset_id == asset_id
+        )
+        if source:
+            statement = statement.where(FundamentalSnapshotORM.source == source)
+        rows = list(
+            self.session.scalars(
+                statement.order_by(FundamentalSnapshotORM.as_of.desc()).limit(limit)
+            )
+        )
+        return list(reversed(rows))
+
 
 class CapitalFlowRepository:
     """A 股资金流快照仓储。"""
@@ -1338,6 +1359,30 @@ class CapitalFlowRepository:
         return self.session.scalars(
             statement.order_by(CapitalFlowSnapshotORM.as_of.desc()).limit(1)
         ).one_or_none()
+
+    def list_recent_snapshots(
+        self,
+        *,
+        asset_id: str,
+        limit: int,
+        window: str | None = None,
+        source: str | None = None,
+    ) -> list[CapitalFlowSnapshotORM]:
+        """查询单标的最近 N 条资金流快照，返回时间升序结果。"""
+
+        statement = select(CapitalFlowSnapshotORM).where(
+            CapitalFlowSnapshotORM.asset_id == asset_id
+        )
+        if window:
+            statement = statement.where(CapitalFlowSnapshotORM.window == window)
+        if source:
+            statement = statement.where(CapitalFlowSnapshotORM.source == source)
+        rows = list(
+            self.session.scalars(
+                statement.order_by(CapitalFlowSnapshotORM.as_of.desc()).limit(limit)
+            )
+        )
+        return list(reversed(rows))
 
 
 class EventRepository:

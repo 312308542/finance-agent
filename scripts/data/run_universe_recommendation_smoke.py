@@ -13,14 +13,20 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from run_indicator_smoke import seed_sample_bars
 
 from finance_agent.pipelines import UniverseRecommendationPipeline
 from finance_agent.storage.db import create_session_factory, session_scope
-from finance_agent.storage.repositories import UniverseRepository
+from finance_agent.storage.repositories import (
+    CapitalFlowRepository,
+    DerivativeDataRepository,
+    FundamentalDataRepository,
+    UniverseRepository,
+)
 
 JsonDict = dict[str, Any]
 
@@ -137,6 +143,139 @@ def seed_universe(
             timeframe=timeframe,
             source=source,
             bar_count=bar_count,
+        )
+        seed_factor_snapshots(
+            session=session,
+            market=market,
+            asset_id=str(member["asset_id"]),
+            symbol=str(member["symbol"]),
+            source=source,
+            as_of=as_of,
+        )
+
+
+def seed_factor_snapshots(
+    *,
+    session: Any,
+    market: str,
+    asset_id: str,
+    symbol: str,
+    source: str,
+    as_of: datetime,
+) -> None:
+    """写入因子服务需要的样例历史快照。"""
+
+    if market == "ashare":
+        seed_ashare_factor_snapshots(
+            session=session,
+            asset_id=asset_id,
+            symbol=symbol,
+            source=source,
+            as_of=as_of,
+        )
+        return
+    if market.startswith("crypto"):
+        seed_crypto_derivative_snapshots(
+            session=session,
+            asset_id=asset_id,
+            symbol=symbol,
+            market=market,
+            source=source,
+            as_of=as_of,
+        )
+
+
+def seed_ashare_factor_snapshots(
+    *,
+    session: Any,
+    asset_id: str,
+    symbol: str,
+    source: str,
+    as_of: datetime,
+) -> None:
+    """写入 A 股估值历史和资金流历史样例。"""
+
+    fundamentals = FundamentalDataRepository(session)
+    capital_flows = CapitalFlowRepository(session)
+    for index in range(8):
+        item_as_of = as_of - timedelta(days=7 - index)
+        pe_ttm = Decimal("18") + Decimal(index) * Decimal("1.6")
+        pb = Decimal("2.1") + Decimal(index) * Decimal("0.12")
+        fundamentals.upsert_fundamental_snapshot(
+            snapshot_id=f"fundamental:{asset_id}:{source}:{item_as_of:%Y%m%d}",
+            asset_id=asset_id,
+            symbol=symbol,
+            source=source,
+            status="available",
+            as_of=item_as_of,
+            report_period="2026Q1",
+            pe_ttm=pe_ttm,
+            pb=pb,
+            roe=Decimal("0.16") + Decimal(index) * Decimal("0.002"),
+            revenue_growth_yoy=Decimal("0.08") + Decimal(index) * Decimal("0.005"),
+            net_profit_growth_yoy=Decimal("0.10") + Decimal(index) * Decimal("0.004"),
+            debt_to_asset=Decimal("0.42"),
+            operating_cashflow=Decimal("1200000000") + Decimal(index) * Decimal("10000000"),
+            payload={
+                "source": "universe_recommendation_pipeline_smoke",
+                "dividend_yield": 0.025 + index * 0.001,
+            },
+        )
+
+        inflow_sign = Decimal("1") if index in {0, 2, 4, 5, 6, 7} else Decimal("-1")
+        flow_price_divergence = Decimal("0.01") if index >= 5 else Decimal("-0.005")
+        capital_flows.upsert_capital_flow_snapshot(
+            snapshot_id=f"capital_flow:{asset_id}:{source}:{item_as_of:%Y%m%d}",
+            asset_id=asset_id,
+            symbol=symbol,
+            market="ashare",
+            window="5d",
+            source=source,
+            status="available",
+            as_of=item_as_of,
+            main_net_inflow=inflow_sign * (Decimal("18000000") + Decimal(index * 1000000)),
+            turnover_rate=Decimal("0.018") + Decimal(index) * Decimal("0.001"),
+            amount=Decimal("700000000") + Decimal(index * 12000000),
+            payload={
+                "source": "universe_recommendation_pipeline_smoke",
+                "rank_hint": index + 1,
+                "rank_total": 20,
+                "flow_price_divergence": str(flow_price_divergence),
+            },
+        )
+
+
+def seed_crypto_derivative_snapshots(
+    *,
+    session: Any,
+    asset_id: str,
+    symbol: str,
+    market: str,
+    source: str,
+    as_of: datetime,
+) -> None:
+    """写入数字货币衍生品窗口样例。"""
+
+    derivatives = DerivativeDataRepository(session)
+    base_open_interest = Decimal("120000")
+    for index in range(30):
+        item_as_of = as_of - timedelta(hours=29 - index)
+        funding_rate = Decimal("-0.00005") + Decimal(index % 8) * Decimal("0.000015")
+        open_interest = base_open_interest + Decimal(index * 850)
+        derivatives.upsert_crypto_derivative_snapshot(
+            snapshot_id=f"crypto_derivative:{asset_id}:{source}:{item_as_of:%Y%m%dT%H%M%S}",
+            asset_id=asset_id,
+            symbol=symbol,
+            market=market,
+            source=source,
+            as_of=item_as_of,
+            funding_rate=funding_rate,
+            open_interest=open_interest,
+            open_interest_value=open_interest * Decimal("60000"),
+            long_short_ratio=Decimal("1.05") + Decimal(index % 5) * Decimal("0.015"),
+            basis_rate=Decimal("0.0008") + Decimal(index % 4) * Decimal("0.0001"),
+            status="available",
+            payload={"source": "universe_recommendation_pipeline_smoke"},
         )
 
 

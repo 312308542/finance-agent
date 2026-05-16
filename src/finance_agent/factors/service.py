@@ -8,6 +8,7 @@ LLM 参与打分。
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -15,6 +16,12 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from finance_agent.factors.specs import (
+    DEFAULT_FACTOR_SPEC,
+    AshareFactorSpec,
+    CryptoFactorSpec,
+    FactorSpec,
+)
 from finance_agent.storage.orm import (
     CapitalFlowSnapshotORM,
     CryptoDerivativeSnapshotORM,
@@ -54,7 +61,8 @@ class FactorComputationResult:
 class FactorService:
     """合并基础数据和指标结果，生成推荐因子快照。"""
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, *, spec: FactorSpec = DEFAULT_FACTOR_SPEC) -> None:
+        self.spec = spec
         self.indicators = IndicatorFrameRepository(session)
         self.factors = FactorFrameRepository(session)
         self.fundamentals = FundamentalDataRepository(session)
@@ -81,9 +89,21 @@ class FactorService:
             horizon=horizon,
             library=indicator_library,
         )
-        fundamental = self.fundamentals.get_latest_snapshot(asset_id=asset_id)
-        capital_flow = self.capital_flows.get_latest_snapshot(asset_id=asset_id)
-        derivative = self.derivatives.get_latest_snapshot(asset_id=asset_id)
+        fundamental_history = self.fundamentals.list_recent_snapshots(
+            asset_id=asset_id,
+            limit=self.spec.ashare.valuation_history_limit,
+        )
+        capital_flow_history = self.capital_flows.list_recent_snapshots(
+            asset_id=asset_id,
+            limit=self.spec.ashare.capital_flow_history_limit,
+        )
+        derivative_history = self.derivatives.list_recent_snapshots(
+            asset_id=asset_id,
+            limit=self.spec.crypto.derivative_history_limit,
+        )
+        fundamental = fundamental_history[-1] if fundamental_history else None
+        capital_flow = capital_flow_history[-1] if capital_flow_history else None
+        derivative = derivative_history[-1] if derivative_history else None
         events = self.events.list_recent_events(asset_id=asset_id, limit=20)
         risks = self.risks.list_recent_risks(asset_id=asset_id, limit=20)
 
@@ -99,9 +119,21 @@ class FactorService:
         groups = [
             build_technical_group(indicator),
             build_fundamental_group(fundamental),
-            build_valuation_group(fundamental),
-            build_capital_flow_group(capital_flow),
-            build_derivatives_group(derivative),
+            build_valuation_group(
+                fundamental,
+                history=fundamental_history,
+                spec=self.spec.ashare,
+            ),
+            build_capital_flow_group(
+                capital_flow,
+                history=capital_flow_history,
+                spec=self.spec.ashare,
+            ),
+            build_derivatives_group(
+                derivative,
+                history=derivative_history,
+                spec=self.spec.crypto,
+            ),
             build_event_group(events),
             build_risk_group(risks),
         ]
@@ -112,6 +144,9 @@ class FactorService:
             fundamental=fundamental,
             capital_flow=capital_flow,
             derivative=derivative,
+            fundamental_history=fundamental_history,
+            capital_flow_history=capital_flow_history,
+            derivative_history=derivative_history,
             events=events,
             risks=risks,
         )
@@ -209,79 +244,173 @@ def build_fundamental_group(snapshot: FundamentalSnapshotORM | None) -> JsonDict
     }
 
 
-def build_valuation_group(snapshot: FundamentalSnapshotORM | None) -> JsonDict:
+def build_valuation_group(
+    snapshot: FundamentalSnapshotORM | None,
+    *,
+    history: list[FundamentalSnapshotORM] | None = None,
+    spec: AshareFactorSpec = DEFAULT_FACTOR_SPEC.ashare,
+) -> JsonDict:
     """构建估值因子组。"""
 
     if snapshot is None:
         return unavailable_group("valuation", ["fundamental_snapshot"])
 
+    history = history or [snapshot]
+    pe_percentile = history_percentile(
+        snapshot.pe_ttm,
+        [item.pe_ttm for item in history],
+        min_observations=spec.valuation_percentile_min_observations,
+    )
+    pb_percentile = history_percentile(
+        snapshot.pb,
+        [item.pb for item in history],
+        min_observations=spec.valuation_percentile_min_observations,
+    )
+    dividend_yield = payload_float(snapshot.payload, "dividend_yield", "dividend_yield_ttm")
+    dividend_score = positive_float_score(dividend_yield, scale=spec.dividend_full_score_yield)
     factors = {
         "pe_ttm": decimal_to_float(snapshot.pe_ttm),
         "pb": decimal_to_float(snapshot.pb),
-        "pe_percentile": None,
-        "pb_percentile": None,
-        "dividend_score": None,
-        "valuation_overheat": valuation_overheat(snapshot),
+        "pe_percentile": pe_percentile,
+        "pb_percentile": pb_percentile,
+        "dividend_yield": dividend_yield,
+        "dividend_score": dividend_score,
+        "valuation_overheat": valuation_overheat(snapshot, pe_percentile=pe_percentile),
     }
     missing = [key for key, value in factors.items() if value is None]
+    score_inputs = {
+        "pe_score": inverse_score(snapshot.pe_ttm, scale=Decimal("60")),
+        "pe_percentile_score": inverse_float_score(pe_percentile, scale=1),
+        "pb_percentile_score": inverse_float_score(pb_percentile, scale=1),
+        "dividend_score": dividend_score,
+    }
     return {
         "group": "valuation",
         "status": "available" if not missing else "partial",
-        "score": inverse_score(snapshot.pe_ttm, scale=Decimal("60")),
+        "score": average_score(score_inputs),
         "factors": factors,
         "missing_factors": missing,
-        "source_ids": [snapshot.snapshot_id],
+        "source_ids": unique_source_ids(item.snapshot_id for item in history),
     }
 
 
-def build_capital_flow_group(snapshot: CapitalFlowSnapshotORM | None) -> JsonDict:
+def build_capital_flow_group(
+    snapshot: CapitalFlowSnapshotORM | None,
+    *,
+    history: list[CapitalFlowSnapshotORM] | None = None,
+    spec: AshareFactorSpec = DEFAULT_FACTOR_SPEC.ashare,
+) -> JsonDict:
     """构建资金流因子组。"""
 
     if snapshot is None:
         return unavailable_group("capital_flow", ["capital_flow_snapshot"])
 
+    history = history or [snapshot]
     strength = safe_decimal_ratio(snapshot.main_net_inflow, snapshot.amount)
+    flow_rank_percentile = payload_float(
+        snapshot.payload,
+        "flow_rank_percentile",
+        "rank_percentile",
+        "percentile",
+    )
+    if flow_rank_percentile is None:
+        flow_rank_percentile = rank_hint_percentile(snapshot.payload)
+    flow_continuity = capital_flow_continuity(
+        history,
+        window=spec.capital_flow_continuity_window,
+    )
+    flow_price_divergence = payload_float(
+        snapshot.payload,
+        "flow_price_divergence",
+        "price_divergence",
+    )
     factors = {
         "main_net_inflow_strength": strength,
-        "flow_rank_percentile": None,
-        "flow_continuity": None,
-        "flow_price_divergence": None,
+        "flow_rank_percentile": flow_rank_percentile,
+        "flow_continuity": flow_continuity,
+        "flow_price_divergence": flow_price_divergence,
         "window": snapshot.window,
     }
     missing = [key for key, value in factors.items() if value is None]
+    score_inputs = {
+        "main_net_inflow_strength": signed_float_score(
+            strength,
+            scale=spec.main_flow_strength_scale,
+        ),
+        "flow_rank_percentile": percentile_score(flow_rank_percentile),
+        "flow_continuity": positive_float_score(flow_continuity, scale=1),
+        "flow_price_divergence": signed_float_score(flow_price_divergence, scale=0.05),
+    }
     return {
         "group": "capital_flow",
         "status": "available" if not missing else "partial",
-        "score": signed_float_score(strength, scale=0.10),
+        "score": average_score(score_inputs),
         "factors": factors,
         "missing_factors": missing,
-        "source_ids": [snapshot.snapshot_id],
+        "source_ids": unique_source_ids(item.snapshot_id for item in history),
     }
 
 
-def build_derivatives_group(snapshot: CryptoDerivativeSnapshotORM | None) -> JsonDict:
+def build_derivatives_group(
+    snapshot: CryptoDerivativeSnapshotORM | None,
+    *,
+    history: list[CryptoDerivativeSnapshotORM] | None = None,
+    spec: CryptoFactorSpec = DEFAULT_FACTOR_SPEC.crypto,
+) -> JsonDict:
     """构建数字货币衍生品因子组。"""
 
     if snapshot is None:
         return unavailable_group("derivatives", ["crypto_derivative_snapshot"])
 
+    history = history or [snapshot]
+    funding_rate_zscore = decimal_zscore(
+        snapshot.funding_rate,
+        [item.funding_rate for item in history],
+        min_observations=spec.funding_zscore_min_observations,
+    )
+    open_interest_change = trailing_decimal_change(
+        snapshot.open_interest,
+        [item.open_interest for item in history],
+        lag=spec.open_interest_change_lag,
+    )
+    open_interest_value_change = trailing_decimal_change(
+        snapshot.open_interest_value,
+        [item.open_interest_value for item in history],
+        lag=spec.open_interest_change_lag,
+    )
     factors = {
         "funding_rate": decimal_to_float(snapshot.funding_rate),
-        "funding_rate_zscore": None,
+        "funding_rate_zscore": funding_rate_zscore,
         "open_interest": decimal_to_float(snapshot.open_interest),
-        "open_interest_change": None,
+        "open_interest_change": open_interest_change,
+        "open_interest_value_change": open_interest_value_change,
         "long_short_ratio": decimal_to_float(snapshot.long_short_ratio),
         "long_short_crowding": long_short_crowding(snapshot.long_short_ratio),
         "basis_rate": decimal_to_float(snapshot.basis_rate),
     }
     missing = [key for key, value in factors.items() if value is None]
+    score_inputs = {
+        "funding_abs_score": inverse_score_abs(snapshot.funding_rate, scale=Decimal("0.001")),
+        "funding_zscore_score": inverse_float_score(
+            abs(funding_rate_zscore) if funding_rate_zscore is not None else None,
+            scale=3,
+        ),
+        "open_interest_change_score": signed_float_score(
+            open_interest_change,
+            scale=spec.open_interest_positive_scale,
+        ),
+        "long_short_crowding_score": inverse_float_score(
+            long_short_crowding(snapshot.long_short_ratio),
+            scale=1,
+        ),
+    }
     return {
         "group": "derivatives",
         "status": "available" if not missing else "partial",
-        "score": derivatives_score(snapshot),
+        "score": average_score(score_inputs),
         "factors": factors,
         "missing_factors": missing,
-        "source_ids": [snapshot.snapshot_id],
+        "source_ids": unique_source_ids(item.snapshot_id for item in history),
     }
 
 
@@ -369,6 +498,9 @@ def collect_source_ids(
     derivative: CryptoDerivativeSnapshotORM | None,
     events: list[EventRecordORM],
     risks: list[RiskFindingORM],
+    fundamental_history: list[FundamentalSnapshotORM] | None = None,
+    capital_flow_history: list[CapitalFlowSnapshotORM] | None = None,
+    derivative_history: list[CryptoDerivativeSnapshotORM] | None = None,
 ) -> list[str]:
     """收集因子来源 ID。"""
 
@@ -381,9 +513,12 @@ def collect_source_ids(
         source_ids.append(capital_flow.snapshot_id)
     if derivative:
         source_ids.append(derivative.snapshot_id)
+    source_ids.extend(item.snapshot_id for item in fundamental_history or [])
+    source_ids.extend(item.snapshot_id for item in capital_flow_history or [])
+    source_ids.extend(item.snapshot_id for item in derivative_history or [])
     source_ids.extend(item.event_id for item in events)
     source_ids.extend(item.risk_id for item in risks)
-    return source_ids
+    return unique_source_ids(source_ids)
 
 
 def build_factor_frame_id(*, asset_id: str, horizon: str, as_of: datetime) -> str:
@@ -443,9 +578,15 @@ def derivatives_score(snapshot: CryptoDerivativeSnapshotORM) -> float | None:
     return sum(valid) / len(valid)
 
 
-def valuation_overheat(snapshot: FundamentalSnapshotORM) -> float | None:
+def valuation_overheat(
+    snapshot: FundamentalSnapshotORM,
+    *,
+    pe_percentile: float | None = None,
+) -> float | None:
     """粗略估值过热标记，后续会被历史分位替代。"""
 
+    if pe_percentile is not None:
+        return clamp(pe_percentile, 0, 1)
     if snapshot.pe_ttm is None:
         return None
     return clamp(decimal_to_float(snapshot.pe_ttm / Decimal("80")) or 0, 0, 1)
@@ -457,6 +598,173 @@ def long_short_crowding(value: Decimal | None) -> float | None:
     if value is None:
         return None
     return clamp(decimal_to_float(abs(value - Decimal("1"))) or 0, 0, 1)
+
+
+def history_percentile(
+    value: Decimal | None,
+    history: list[Decimal | None],
+    *,
+    min_observations: int,
+) -> float | None:
+    """计算当前值在历史窗口中的百分位。"""
+
+    current = decimal_to_float(value)
+    values = [decimal_to_float(item) for item in history]
+    clean_values = sorted(item for item in values if item is not None and math.isfinite(item))
+    if current is None or len(clean_values) < min_observations:
+        return None
+    lower_or_equal = sum(1 for item in clean_values if item <= current)
+    return clamp(lower_or_equal / len(clean_values), 0, 1)
+
+
+def capital_flow_continuity(
+    history: list[CapitalFlowSnapshotORM],
+    *,
+    window: int,
+) -> float | None:
+    """计算最近窗口内主力资金净流入为正的占比。"""
+
+    recent = [
+        item.main_net_inflow
+        for item in history[-window:]
+        if item.main_net_inflow is not None
+    ]
+    if not recent:
+        return None
+    positive_count = sum(1 for item in recent if item > 0)
+    return clamp(positive_count / len(recent), 0, 1)
+
+
+def decimal_zscore(
+    value: Decimal | None,
+    history: list[Decimal | None],
+    *,
+    min_observations: int,
+) -> float | None:
+    """计算 Decimal 序列的标准分。"""
+
+    current = decimal_to_float(value)
+    values = [decimal_to_float(item) for item in history]
+    clean_values = [item for item in values if item is not None and math.isfinite(item)]
+    if current is None or len(clean_values) < min_observations:
+        return None
+    mean = sum(clean_values) / len(clean_values)
+    variance = sum((item - mean) ** 2 for item in clean_values) / len(clean_values)
+    stddev = math.sqrt(variance)
+    if stddev == 0:
+        return 0.0
+    return (current - mean) / stddev
+
+
+def trailing_decimal_change(
+    value: Decimal | None,
+    history: list[Decimal | None],
+    *,
+    lag: int,
+) -> float | None:
+    """计算相对 lag 窗口前的变化率。"""
+
+    current = decimal_to_float(value)
+    clean_values = [decimal_to_float(item) for item in history]
+    clean_values = [item for item in clean_values if item is not None and math.isfinite(item)]
+    if current is None or len(clean_values) < 2:
+        return None
+    base_index = max(0, len(clean_values) - lag - 1)
+    base = clean_values[base_index]
+    if base == 0:
+        return None
+    return (current - base) / abs(base)
+
+
+def payload_float(payload: JsonDict | None, *keys: str) -> float | None:
+    """从 payload 的顶层或 raw 字段中读取浮点数。"""
+
+    if not payload:
+        return None
+    for key in keys:
+        parsed = coerce_float(payload.get(key))
+        if parsed is not None:
+            return parsed
+    raw = payload.get("raw")
+    if isinstance(raw, dict):
+        for key in keys:
+            parsed = coerce_float(raw.get(key))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def rank_hint_percentile(payload: JsonDict | None) -> float | None:
+    """把 AKShare 排名提示转换成 0-1 分位，越靠前越接近 1。"""
+
+    if not payload:
+        return None
+    rank = coerce_float(payload.get("rank_hint"))
+    total = coerce_float(payload.get("rank_total"))
+    raw = payload.get("raw")
+    if rank is None and isinstance(raw, dict):
+        rank = coerce_float(raw.get("rank_hint"))
+    if total is None and isinstance(raw, dict):
+        total = coerce_float(raw.get("rank_total") or raw.get("总数"))
+    if rank is None or rank <= 0:
+        return None
+    if total is None or total < rank:
+        return None
+    if total <= 1:
+        return 1.0
+    return clamp(1 - ((rank - 1) / (total - 1)), 0, 1)
+
+
+def percentile_score(value: float | None) -> float | None:
+    """把 0-1 分位转换为 0-100 得分。"""
+
+    return positive_float_score(value, scale=1)
+
+
+def positive_float_score(value: float | None, *, scale: float) -> float | None:
+    """浮点正向指标得分。"""
+
+    if value is None or scale == 0:
+        return None
+    return clamp_score(value / scale * 100)
+
+
+def coerce_float(value: Any) -> float | None:
+    """把常见数值表达转换为 float。"""
+
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return decimal_to_float(value)
+    if isinstance(value, int | float):
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        if not text:
+            return None
+        multiplier = 1.0
+        if text.endswith("%"):
+            multiplier = 0.01
+            text = text[:-1]
+        try:
+            parsed = float(text) * multiplier
+        except ValueError:
+            return None
+        return parsed if math.isfinite(parsed) else None
+    return None
+
+
+def unique_source_ids(values: Iterable[str]) -> list[str]:
+    """保持顺序去重来源 ID。"""
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
 
 
 def positive_score(value: Decimal | None, *, scale: Decimal) -> float | None:
