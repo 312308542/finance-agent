@@ -70,6 +70,8 @@ class FactorService:
         timeframe: str = "1d",
         horizon: str = "swing",
         indicator_library: str = "talib",
+        fallback_symbol: str | None = None,
+        fallback_market: str | None = None,
     ) -> FactorComputationResult:
         """计算单标的第一版因子快照。"""
 
@@ -90,6 +92,8 @@ class FactorService:
             fundamental=fundamental,
             capital_flow=capital_flow,
             derivative=derivative,
+            fallback_symbol=fallback_symbol,
+            fallback_market=fallback_market,
         )
         as_of = indicator.input_end_at if indicator else datetime.now(tz=UTC)
         groups = [
@@ -346,13 +350,15 @@ def infer_symbol_market(
     fundamental: FundamentalSnapshotORM | None,
     capital_flow: CapitalFlowSnapshotORM | None,
     derivative: CryptoDerivativeSnapshotORM | None,
+    fallback_symbol: str | None = None,
+    fallback_market: str | None = None,
 ) -> tuple[str, str]:
     """从可用输入中推断 symbol 和 market。"""
 
     for item in (indicator, fundamental, capital_flow, derivative):
         if item is not None:
             return item.symbol, item.market
-    return "unknown", "unknown"
+    return fallback_symbol or "unknown", fallback_market or "unknown"
 
 
 def collect_source_ids(

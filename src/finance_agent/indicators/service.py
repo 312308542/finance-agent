@@ -57,6 +57,8 @@ class IndicatorService:
         source: str | None = None,
         window: int = 120,
         min_bars: int = 2,
+        fallback_symbol: str | None = None,
+        fallback_market: str | None = None,
     ) -> IndicatorComputationResult:
         """读取单标的最近 K 线，计算指标并落库。
 
@@ -74,8 +76,8 @@ class IndicatorService:
                 status="unavailable",
                 indicator_frame_id=None,
                 asset_id=asset_id,
-                symbol=bars[-1].symbol if bars else None,
-                market=bars[-1].market if bars else None,
+                symbol=bars[-1].symbol if bars else fallback_symbol,
+                market=bars[-1].market if bars else fallback_market,
                 timeframe=timeframe,
                 horizon=horizon,
                 bar_count=len(bars),
