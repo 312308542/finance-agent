@@ -60,36 +60,159 @@ def _load_langgraph() -> tuple[Any, Any, Any]:
 def build_portfolio_monitoring_graph() -> Any:
     """构建持仓监控 LangGraph 工作流。"""
 
-    StateGraph, START, END = _load_langgraph()
-    workflow = PortfolioMonitoringWorkflow()
-    graph = StateGraph(dict)
-
-    def decision_synthesis(state: WorkflowGraphState) -> WorkflowGraphState:
-        workflow_input = state["workflow_input"]
-        result = workflow.run(workflow_input)
-        return {**state, "result": result, "decision_count": len(result.decisions)}
-
-    graph.add_node("decision_synthesis", decision_synthesis)
-    graph.add_edge(START, "decision_synthesis")
-    graph.add_edge("decision_synthesis", END)
-    return graph.compile()
+    return build_operational_roundtable_graph(
+        workflow_type="portfolio_monitoring",
+        title="持仓监控圆桌报告",
+        summary="金融团队已基于持仓、TA 指标、因子评分、风险和记忆完成持仓监控圆桌裁决。",
+        workflow=PortfolioMonitoringWorkflow(),
+    )
 
 
 def build_watchlist_management_graph() -> Any:
     """构建观察池管理 LangGraph 工作流。"""
 
+    return build_operational_roundtable_graph(
+        workflow_type="watchlist_management",
+        title="观察池管理圆桌报告",
+        summary="金融团队已基于观察池、TA 指标、因子评分、风险、投资假设和记忆完成观察池圆桌裁决。",
+        workflow=WatchlistManagementWorkflow(),
+    )
+
+
+def build_operational_roundtable_graph(
+    *,
+    workflow_type: str,
+    title: str,
+    summary: str,
+    workflow: Any,
+) -> Any:
+    """构建持仓和观察池这类运营型 Workflow 的圆桌图。"""
+
     StateGraph, START, END = _load_langgraph()
-    workflow = WatchlistManagementWorkflow()
+    review_policy = HighRiskReviewPolicy()
+    model_policy = ModelRoutingPolicy()
     graph = StateGraph(dict)
+
+    def load_context(state: WorkflowGraphState) -> WorkflowGraphState:
+        tool_runtime = build_tool_runtime(state)
+        return {
+            **state,
+            "workflow_type": workflow_type,
+            "tool_runtime": tool_runtime,
+            "node_trace": [*state.get("node_trace", []), "load_context"],
+        }
+
+    def data_gathering(state: WorkflowGraphState) -> WorkflowGraphState:
+        context = collect_operational_workflow_context(state, workflow_type=workflow_type)
+        return {
+            **state,
+            **context,
+            "node_trace": [*state.get("node_trace", []), "data_gathering"],
+        }
+
+    def roundtable_discussion(state: WorkflowGraphState) -> WorkflowGraphState:
+        model_routes = [
+            model_policy.route_primary(
+                workflow_type=workflow_type,
+                task="roundtable_discussion",
+                asset_id=asset_id,
+                reason="持仓和观察池圆桌基于已入库事实进行常规分析，默认使用 DeepSeek V4 Pro。",
+            ).to_dict()
+            for asset_id in state.get("asset_ids", [])
+        ]
+        opinions = build_report_roundtable_opinions(
+            workflow_type=workflow_type,
+            asset_contexts=state.get("asset_contexts", {}),
+            portfolio_context=state.get("portfolio_context"),
+            watchlist_context=state.get("watchlist_context"),
+            recommendation_context=None,
+            source_asset_id=None,
+            candidate_asset_id=None,
+        )
+        return {
+            **state,
+            "model_routes": [*state.get("model_routes", []), *model_routes],
+            "roundtable_opinions": opinions,
+            "node_trace": [*state.get("node_trace", []), "roundtable_discussion"],
+        }
 
     def decision_synthesis(state: WorkflowGraphState) -> WorkflowGraphState:
         workflow_input = state["workflow_input"]
         result = workflow.run(workflow_input)
-        return {**state, "result": result, "decision_count": len(result.decisions)}
+        decisions = serialize_operational_decisions(
+            workflow_type=workflow_type,
+            decisions=result.decisions,
+            asset_contexts=state.get("asset_contexts", {}),
+        )
+        return {
+            **state,
+            "result": result,
+            "workflow_decisions": decisions,
+            "decision_count": len(result.decisions),
+            "node_trace": [*state.get("node_trace", []), "decision_synthesis"],
+        }
 
+    def high_risk_review(state: WorkflowGraphState) -> WorkflowGraphState:
+        review_items = build_high_risk_review_items(
+            workflow_type=workflow_type,
+            decisions=state.get("workflow_decisions", []),
+            asset_contexts=state.get("asset_contexts", {}),
+            review_policy=review_policy,
+            model_policy=model_policy,
+        )
+        review_routes = [
+            item["model_review"]["route"]
+            for item in review_items
+            if item.get("model_review", {}).get("route")
+        ]
+        return {
+            **state,
+            "high_risk_reviews": review_items,
+            "review_model_routes": review_routes,
+            "node_trace": [*state.get("node_trace", []), "high_risk_review"],
+        }
+
+    def report_draft(state: WorkflowGraphState) -> WorkflowGraphState:
+        asset_symbols = [
+            state.get("asset_contexts", {}).get(asset_id, {}).get("profile", {}).get("symbol")
+            or asset_id
+            for asset_id in state.get("asset_ids", [])
+        ]
+        report = build_chinese_decision_report(
+            title=build_report_title(
+                title=title,
+                workflow_type=workflow_type,
+                asset_symbols=asset_symbols,
+            ),
+            summary=summary,
+            workflow_type=workflow_type,
+            asset_symbols=asset_symbols,
+            decisions=state.get("workflow_decisions", []),
+            roundtable_opinions=state.get("roundtable_opinions", []),
+            high_risk_reviews=state.get("high_risk_reviews", []),
+            asset_contexts=state.get("asset_contexts", {}),
+            model_routes=state.get("model_routes", []),
+            review_model_routes=state.get("review_model_routes", []),
+        )
+        return {
+            **state,
+            "report": report,
+            "node_trace": [*state.get("node_trace", []), "report_draft"],
+        }
+
+    graph.add_node("load_context", load_context)
+    graph.add_node("data_gathering", data_gathering)
+    graph.add_node("roundtable_discussion", roundtable_discussion)
     graph.add_node("decision_synthesis", decision_synthesis)
-    graph.add_edge(START, "decision_synthesis")
-    graph.add_edge("decision_synthesis", END)
+    graph.add_node("high_risk_review", high_risk_review)
+    graph.add_node("report_draft", report_draft)
+    graph.add_edge(START, "load_context")
+    graph.add_edge("load_context", "data_gathering")
+    graph.add_edge("data_gathering", "roundtable_discussion")
+    graph.add_edge("roundtable_discussion", "decision_synthesis")
+    graph.add_edge("decision_synthesis", "high_risk_review")
+    graph.add_edge("high_risk_review", "report_draft")
+    graph.add_edge("report_draft", END)
     return graph.compile()
 
 
@@ -549,6 +672,265 @@ def serialize_recommendation_decision(decision: Any) -> dict[str, Any]:
     }
 
 
+def serialize_operational_decisions(
+    *,
+    workflow_type: str,
+    decisions: Any,
+    asset_contexts: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """序列化持仓监控或观察池管理决策。"""
+
+    if workflow_type == "portfolio_monitoring":
+        return [
+            serialize_portfolio_monitoring_decision(
+                decision=decision,
+                asset_context=asset_contexts.get(decision.asset_id, {}),
+            )
+            for decision in decisions
+        ]
+    if workflow_type == "watchlist_management":
+        return [
+            serialize_watchlist_management_decision(
+                decision=decision,
+                asset_context=asset_contexts.get(decision.asset_id, {}),
+            )
+            for decision in decisions
+        ]
+    raise ValueError(f"不支持的运营类 Workflow：{workflow_type}")
+
+
+def serialize_portfolio_monitoring_decision(
+    *,
+    decision: Any,
+    asset_context: dict[str, Any],
+) -> dict[str, Any]:
+    """把持仓监控决策转换为中文报告模板结构。"""
+
+    return {
+        "asset_id": decision.asset_id,
+        "symbol": decision.symbol,
+        "market": decision.market,
+        "action": decision.suggested_action,
+        "decision_type": f"portfolio_{decision.decision_type}",
+        "severity": decision.severity,
+        "confidence": derive_report_confidence(asset_context),
+        "data_quality_status": classify_report_context_quality(asset_context),
+        "summary": decision.summary,
+        "risk_rebuttal": decision.risk_rebuttal,
+        "trigger_condition": decision.trigger_condition,
+        "thesis": decision.thesis,
+        "signal_ids": list(decision.signal_ids),
+        "risk_ids": list(decision.risk_ids),
+        "evidence_ids": list(decision.evidence_ids),
+        "review_questions": list(decision.review_questions),
+    }
+
+
+def serialize_watchlist_management_decision(
+    *,
+    decision: Any,
+    asset_context: dict[str, Any],
+) -> dict[str, Any]:
+    """把观察池管理决策转换为中文报告模板结构。"""
+
+    return {
+        "asset_id": decision.asset_id,
+        "symbol": decision.symbol,
+        "market": decision.market,
+        "watchlist_item_id": decision.watchlist_item_id,
+        "action": decision.suggested_action,
+        "decision_type": decision.decision_type,
+        "next_status": decision.next_status,
+        "severity": decision.severity,
+        "confidence": derive_report_confidence(asset_context),
+        "data_quality_status": classify_report_context_quality(asset_context),
+        "summary": decision.summary,
+        "daily_watch_reason": decision.daily_watch_reason,
+        "risk_rebuttal": decision.risk_rebuttal,
+        "trigger_condition": decision.trigger_condition,
+        "next_review_at": decision.next_review_at.isoformat()
+        if decision.next_review_at
+        else None,
+        "removed_reason": decision.removed_reason,
+        "signal_ids": list(decision.signal_ids),
+        "risk_ids": list(decision.risk_ids),
+        "evidence_ids": list(decision.evidence_ids),
+        "thesis_ids": list(decision.thesis_ids),
+        "review_questions": list(decision.review_questions),
+    }
+
+
+def build_high_risk_review_items(
+    *,
+    workflow_type: str,
+    decisions: list[dict[str, Any]],
+    asset_contexts: dict[str, dict[str, Any]],
+    review_policy: HighRiskReviewPolicy,
+    model_policy: ModelRoutingPolicy,
+) -> list[dict[str, Any]]:
+    """构建统一高风险复核摘要。"""
+
+    review_items: list[dict[str, Any]] = []
+    for decision in decisions:
+        asset_id = str(decision.get("asset_id") or "")
+        asset_context = asset_contexts.get(asset_id, {})
+        signal = get_nested(asset_context, "signal_risk", "signal") or {}
+        risks = get_nested(asset_context, "signal_risk", "risks") or []
+        context = ReviewDecisionContext(
+            decision_type=str(decision.get("decision_type") or ""),
+            suggested_action=str(decision.get("action") or ""),
+            severity=str(decision.get("severity") or "unknown"),
+            confidence=float(decision.get("confidence") or 0),
+            data_quality_status=str(decision.get("data_quality_status") or "missing"),
+            risk_severities=tuple(risk.get("severity", "unknown") for risk in risks),
+            has_conflicting_signal=has_report_conflicting_signal(
+                suggested_action=str(decision.get("action") or ""),
+                signal_direction=signal.get("direction"),
+            ),
+        )
+        review_item = {
+            "asset_id": asset_id,
+            "decision_type": decision.get("decision_type"),
+            "trade_action": decision.get("action"),
+            "requires_review": review_policy.requires_review(context),
+            "reason": context.__dict__,
+        }
+        review_item["model_review"] = model_policy.build_review_result(
+            workflow_type=workflow_type,
+            review_item=review_item,
+            decision_summary=decision.get("summary"),
+        )
+        review_items.append(review_item)
+    return review_items
+
+
+def collect_operational_workflow_context(
+    state: WorkflowGraphState,
+    *,
+    workflow_type: str,
+) -> dict[str, Any]:
+    """为持仓监控和观察池管理收集已入库金融事实上下文。"""
+
+    workflow_input = state["workflow_input"]
+    tool_runtime = build_tool_runtime(state)
+    owner_id = workflow_input.owner_id
+    tool_calls: list[dict[str, Any]] = []
+
+    portfolio_context = None
+    watchlist_context = None
+    asset_ids: list[str] = []
+    if workflow_type == "portfolio_monitoring":
+        portfolio_id = workflow_input.portfolio.portfolio_id
+        portfolio_context = tool_runtime.call("portfolio.get_snapshot", portfolio_id=portfolio_id)
+        tool_calls.append({"tool": "portfolio.get_snapshot", "portfolio_id": portfolio_id})
+        asset_ids = unique_ids(position.asset_id for position in workflow_input.positions)
+    elif workflow_type == "watchlist_management":
+        watchlist_id = workflow_input.watchlist.watchlist_id
+        watchlist_context = tool_runtime.call(
+            "watchlist.get_active_items",
+            owner_id=owner_id,
+            watchlist_id=watchlist_id,
+        )
+        tool_calls.append(
+            {
+                "tool": "watchlist.get_active_items",
+                "owner_id": owner_id,
+                "watchlist_id": watchlist_id,
+            }
+        )
+        asset_ids = unique_ids(item.asset_id for item in workflow_input.items)
+    else:
+        raise ValueError(f"不支持的运营类 Workflow：{workflow_type}")
+
+    asset_contexts = collect_asset_contexts(
+        tool_runtime=tool_runtime,
+        owner_id=owner_id,
+        asset_ids=asset_ids,
+        horizon=state.get("horizon", "swing"),
+        timeframe=state.get("timeframe", "1d"),
+        evidence_limit=state.get("evidence_limit", 5),
+        risk_limit=state.get("risk_limit", 5),
+        quality_limit=state.get("quality_limit", 5),
+        memory_limit=state.get("memory_limit", 5),
+        tool_calls=tool_calls,
+    )
+
+    return {
+        "asset_ids": asset_ids,
+        "asset_contexts": asset_contexts,
+        "portfolio_context": portfolio_context,
+        "watchlist_context": watchlist_context,
+        "tool_calls": tool_calls,
+    }
+
+
+def collect_asset_contexts(
+    *,
+    tool_runtime: FinanceToolRuntime,
+    owner_id: str,
+    asset_ids: list[str],
+    horizon: str,
+    timeframe: str,
+    evidence_limit: int,
+    risk_limit: int,
+    quality_limit: int,
+    memory_limit: int,
+    tool_calls: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """通过工具运行时收集单标的事实包，并记录工具调用。"""
+
+    asset_contexts: dict[str, dict[str, Any]] = {}
+    for asset_id in asset_ids:
+        factor_context = tool_runtime.call(
+            "factor.get_asset_factor_context",
+            asset_id=asset_id,
+            horizon=horizon,
+            timeframe=timeframe,
+            evidence_limit=evidence_limit,
+        )
+        tool_calls.append(
+            {
+                "tool": "factor.get_asset_factor_context",
+                "asset_id": asset_id,
+                "horizon": horizon,
+            }
+        )
+        signal_risk_context = tool_runtime.call(
+            "signal_risk.get_asset_context",
+            asset_id=asset_id,
+            horizon=horizon,
+            risk_limit=risk_limit,
+            quality_limit=quality_limit,
+        )
+        tool_calls.append(
+            {
+                "tool": "signal_risk.get_asset_context",
+                "asset_id": asset_id,
+                "horizon": horizon,
+            }
+        )
+        memory_context = tool_runtime.call(
+            "memory.recall_asset_memories",
+            owner_id=owner_id,
+            asset_id=asset_id,
+            limit=memory_limit,
+        )
+        tool_calls.append(
+            {
+                "tool": "memory.recall_asset_memories",
+                "asset_id": asset_id,
+                "owner_id": owner_id,
+            }
+        )
+        asset_contexts[asset_id] = {
+            "profile": build_asset_profile(asset_id=asset_id, factor_context=factor_context),
+            "factor": factor_context,
+            "signal_risk": signal_risk_context,
+            "memory": memory_context,
+        }
+    return asset_contexts
+
+
 def collect_roundtable_report_context(state: WorkflowGraphState) -> dict[str, Any]:
     """为报告类 Workflow 收集已入库金融事实上下文。"""
 
@@ -691,6 +1073,16 @@ def resolve_report_asset_ids(
     if not asset_ids:
         raise ValueError("报告类圆桌 Workflow 需要 asset_id 或 asset_ids。")
     return asset_ids
+
+
+def unique_ids(values: Any) -> list[str]:
+    """按出现顺序去重 ID。"""
+
+    result: list[str] = []
+    for value in values:
+        if value and value not in result:
+            result.append(value)
+    return result
 
 
 def build_asset_profile(*, asset_id: str, factor_context: dict[str, Any]) -> dict[str, Any]:
