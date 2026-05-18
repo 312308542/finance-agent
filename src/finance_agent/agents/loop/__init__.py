@@ -8,6 +8,7 @@ from finance_agent.agents.loop.planner import InternalFinanceAgentPlanner
 from finance_agent.agents.loop.runner import InternalFinanceAgentLoopRunner
 from finance_agent.agents.loop.state import (
     AgentLoopContext,
+    AgentLoopDaemonResult,
     AgentLoopLimits,
     AgentLoopPlan,
     AgentLoopRunResult,
@@ -16,6 +17,7 @@ from finance_agent.agents.loop.state import (
 
 __all__ = [
     "AgentLoopContext",
+    "AgentLoopDaemonResult",
     "AgentLoopLimits",
     "AgentLoopPlan",
     "AgentLoopRunResult",

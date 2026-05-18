@@ -104,6 +104,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     agent_run_task.add_argument("agent_task_id", help="触发层派发出的 Agent 任务 ID。")
     agent_run_task.add_argument("--as-of", default=None, help="ISO 时间，默认当前时间。")
+    agent_run_loop = agent_commands.add_parser(
+        "run-loop",
+        help="持续轮询内部 Agent 唤醒队列；可用 max-iterations 限制本地测试轮数。",
+    )
+    agent_run_loop.add_argument("--owner-id", default=None, help="只处理指定用户的 Agent 任务。")
+    agent_run_loop.add_argument("--limit", type=int, default=20, help="每轮最多处理任务数。")
+    agent_run_loop.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=5.0,
+        help="空闲轮询间隔秒数。",
+    )
+    agent_run_loop.add_argument(
+        "--max-iterations",
+        type=int,
+        default=None,
+        help="最多轮询次数；本地测试建议传 1，常驻运行可不传。",
+    )
+    agent_run_loop.add_argument("--as-of", default=None, help="ISO 时间，默认每轮当前时间。")
     return parser
 
 
@@ -263,6 +282,15 @@ def dispatch_agent(session: Any, args: argparse.Namespace) -> JsonDict:
     if args.command == "run-task":
         result = runner.run_task(
             agent_task_id=args.agent_task_id,
+            as_of=parse_datetime(args.as_of),
+        )
+        return {"status": "ok", "data": result.to_dict()}
+    if args.command == "run-loop":
+        result = runner.run_loop(
+            owner_id=args.owner_id,
+            limit=args.limit,
+            interval_seconds=args.interval_seconds,
+            max_iterations=args.max_iterations,
             as_of=parse_datetime(args.as_of),
         )
         return {"status": "ok", "data": result.to_dict()}

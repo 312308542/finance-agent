@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from time import sleep
 
 from sqlalchemy.orm import Session
 
 from finance_agent.agents.interfaces import FinanceAgentInterface
+from finance_agent.agents.loop.graph import build_internal_agent_loop_graph
 from finance_agent.agents.loop.planner import InternalFinanceAgentPlanner
 from finance_agent.agents.loop.state import (
     AgentLoopContext,
+    AgentLoopDaemonResult,
     AgentLoopLimits,
     AgentLoopRunResult,
     AgentLoopTaskResult,
@@ -45,6 +48,7 @@ class InternalFinanceAgentLoopRunner:
         owner_id: str | None = None,
         limit: int = 20,
         as_of: datetime | None = None,
+        use_graph: bool = True,
     ) -> AgentLoopRunResult:
         """处理一批已派发的 Agent 唤醒事件。"""
 
@@ -54,7 +58,7 @@ class InternalFinanceAgentLoopRunner:
         failed: list[AgentLoopTaskResult] = []
         events = self.triggers.list_agent_wakeup_events(owner_id=owner_id, limit=limit)
         for event in events:
-            result = self._handle_event(event=event, as_of=run_at)
+            result = self._handle_event(event=event, as_of=run_at, use_graph=use_graph)
             if result.status == "workflow_completed":
                 processed.append(result)
             elif result.status == "failed":
@@ -72,6 +76,7 @@ class InternalFinanceAgentLoopRunner:
         *,
         agent_task_id: str,
         as_of: datetime | None = None,
+        use_graph: bool = True,
     ) -> AgentLoopRunResult:
         """按 Agent 任务 ID 处理单个唤醒事件。"""
 
@@ -89,21 +94,78 @@ class InternalFinanceAgentLoopRunner:
                     ),
                 )
             )
-        result = self._handle_event(event=event, as_of=run_at)
+        result = self._handle_event(event=event, as_of=run_at, use_graph=use_graph)
         if result.status == "workflow_completed":
             return AgentLoopRunResult(processed=(result,))
         if result.status == "failed":
             return AgentLoopRunResult(failed=(result,))
         return AgentLoopRunResult(skipped=(result,))
 
+    def run_loop(
+        self,
+        *,
+        owner_id: str | None = None,
+        limit: int = 20,
+        interval_seconds: float = 5.0,
+        max_iterations: int | None = None,
+        as_of: datetime | None = None,
+        use_graph: bool = True,
+    ) -> AgentLoopDaemonResult:
+        """持续轮询已派发的 Agent 唤醒事件。
+
+        `max_iterations` 用于 smoke、调试和本地 CLI 测试；生产常驻时可以传空。
+        """
+
+        iterations = 0
+        processed: list[AgentLoopTaskResult] = []
+        skipped: list[AgentLoopTaskResult] = []
+        failed: list[AgentLoopTaskResult] = []
+        while max_iterations is None or iterations < max_iterations:
+            iterations += 1
+            result = self.run_once(
+                owner_id=owner_id,
+                limit=limit,
+                as_of=as_of,
+                use_graph=use_graph,
+            )
+            processed.extend(result.processed)
+            skipped.extend(result.skipped)
+            failed.extend(result.failed)
+            if max_iterations is None and not result.processed and not result.failed:
+                sleep(max(interval_seconds, 0))
+            elif max_iterations is not None and iterations < max_iterations:
+                sleep(max(interval_seconds, 0))
+        return AgentLoopDaemonResult(
+            iterations=iterations,
+            processed=tuple(processed),
+            skipped=tuple(skipped),
+            failed=tuple(failed),
+        )
+
     def _handle_event(
         self,
         *,
         event: AssistantTriggerEventORM,
         as_of: datetime,
+        use_graph: bool,
     ) -> AgentLoopTaskResult:
         agent_task_id = event.agent_task_id or event.trigger_event_id
         try:
+            if use_graph:
+                graph = build_internal_agent_loop_graph()
+                final_state = graph.invoke(
+                    {
+                        "event": event,
+                        "session": self.session,
+                        "as_of": as_of,
+                        "limits": self.limits,
+                        "planner": self.planner,
+                        "interface": self.interface,
+                        "triggers": self.triggers,
+                    }
+                )
+                return final_state["task_result"]
+
             context = AgentLoopContext(event=event, as_of=as_of, limits=self.limits)
             plan = self.planner.build_plan(context)
             if plan.action != "run_workflow":

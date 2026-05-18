@@ -88,6 +88,29 @@ class AgentLoopRunResult:
 
 
 @dataclass(frozen=True)
+class AgentLoopDaemonResult:
+    """内部 Agent Loop 常驻轮询的一次汇总结果。"""
+
+    iterations: int
+    processed: tuple[AgentLoopTaskResult, ...] = ()
+    skipped: tuple[AgentLoopTaskResult, ...] = ()
+    failed: tuple[AgentLoopTaskResult, ...] = ()
+
+    def to_dict(self) -> JsonDict:
+        """转换为 JSON 友好的字典。"""
+
+        return {
+            "iterations": self.iterations,
+            "processed_count": len(self.processed),
+            "skipped_count": len(self.skipped),
+            "failed_count": len(self.failed),
+            "runs": [item.to_dict() for item in self.processed],
+            "skipped": [item.to_dict() for item in self.skipped],
+            "failed": [item.to_dict() for item in self.failed],
+        }
+
+
+@dataclass(frozen=True)
 class AgentLoopContext:
     """内部 Agent Loop 当前任务上下文。"""
 
