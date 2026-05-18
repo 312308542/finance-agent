@@ -10,7 +10,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from finance_agent.agents.runtime import HighRiskReviewPolicy, ReviewDecisionContext
+from finance_agent.agents.reports import build_chinese_decision_report
+from finance_agent.agents.runtime import (
+    HighRiskReviewPolicy,
+    ModelRoutingPolicy,
+    ReviewDecisionContext,
+)
 from finance_agent.agents.tools import FinanceToolRuntime
 from finance_agent.agents.workflows.portfolio_monitoring import (
     PortfolioMonitoringWorkflow,
@@ -168,6 +173,7 @@ def build_roundtable_report_graph(
 
     StateGraph, START, END = _load_langgraph()
     review_policy = HighRiskReviewPolicy()
+    model_policy = ModelRoutingPolicy()
     graph = StateGraph(dict)
 
     def load_context(state: WorkflowGraphState) -> WorkflowGraphState:
@@ -188,6 +194,15 @@ def build_roundtable_report_graph(
         }
 
     def roundtable_discussion(state: WorkflowGraphState) -> WorkflowGraphState:
+        model_routes = [
+            model_policy.route_primary(
+                workflow_type=workflow_type,
+                task="roundtable_discussion",
+                asset_id=asset_id,
+                reason="圆桌角色基于已入库事实进行常规分析，默认使用 DeepSeek V4 Pro。",
+            ).to_dict()
+            for asset_id in state.get("asset_ids", [])
+        ]
         opinions = build_report_roundtable_opinions(
             workflow_type=workflow_type,
             asset_contexts=state.get("asset_contexts", {}),
@@ -199,6 +214,7 @@ def build_roundtable_report_graph(
         )
         return {
             **state,
+            "model_routes": [*state.get("model_routes", []), *model_routes],
             "roundtable_opinions": opinions,
             "node_trace": [*state.get("node_trace", []), "roundtable_discussion"],
         }
@@ -236,18 +252,28 @@ def build_roundtable_report_graph(
                     signal_direction=signal.get("direction"),
                 ),
             )
-            review_items.append(
-                {
-                    "asset_id": decision["asset_id"],
-                    "decision_type": decision["decision_type"],
-                    "trade_action": decision["action"],
-                    "requires_review": review_policy.requires_review(context),
-                    "reason": context.__dict__,
-                }
+            review_item = {
+                "asset_id": decision["asset_id"],
+                "decision_type": decision["decision_type"],
+                "trade_action": decision["action"],
+                "requires_review": review_policy.requires_review(context),
+                "reason": context.__dict__,
+            }
+            review_item["model_review"] = model_policy.build_review_result(
+                workflow_type=workflow_type,
+                review_item=review_item,
+                decision_summary=decision.get("summary"),
             )
+            review_items.append(review_item)
+        review_routes = [
+            item["model_review"]["route"]
+            for item in review_items
+            if item.get("model_review", {}).get("route")
+        ]
         return {
             **state,
             "high_risk_reviews": review_items,
+            "review_model_routes": review_routes,
             "node_trace": [*state.get("node_trace", []), "high_risk_review"],
         }
 
@@ -257,26 +283,22 @@ def build_roundtable_report_graph(
             or asset_id
             for asset_id in state.get("asset_ids", [])
         ]
-        report = {
-            "title": build_report_title(
+        report = build_chinese_decision_report(
+            title=build_report_title(
                 title=title,
                 workflow_type=workflow_type,
                 asset_symbols=asset_symbols,
             ),
-            "summary": summary,
-            "workflow_type": workflow_type,
-            "asset_symbols": asset_symbols,
-            "decision_actions": [
-                decision["action"] for decision in state.get("workflow_decisions", [])
-            ],
-            "roundtable_roles": sorted(
-                {opinion["role"] for opinion in state.get("roundtable_opinions", [])}
-            ),
-            "requires_review_count": sum(
-                1 for item in state.get("high_risk_reviews", [])
-                if item["requires_review"]
-            ),
-        }
+            summary=summary,
+            workflow_type=workflow_type,
+            asset_symbols=asset_symbols,
+            decisions=state.get("workflow_decisions", []),
+            roundtable_opinions=state.get("roundtable_opinions", []),
+            high_risk_reviews=state.get("high_risk_reviews", []),
+            asset_contexts=state.get("asset_contexts", {}),
+            model_routes=state.get("model_routes", []),
+            review_model_routes=state.get("review_model_routes", []),
+        )
         return {
             **state,
             "report": report,
@@ -310,6 +332,7 @@ def build_recommendation_decision_graph() -> Any:
     StateGraph, START, END = _load_langgraph()
     workflow = RecommendationDecisionWorkflow()
     review_policy = HighRiskReviewPolicy()
+    model_policy = ModelRoutingPolicy()
     graph = StateGraph(dict)
 
     def load_context(state: WorkflowGraphState) -> WorkflowGraphState:
@@ -350,6 +373,15 @@ def build_recommendation_decision_graph() -> Any:
     def roundtable_discussion(state: WorkflowGraphState) -> WorkflowGraphState:
         workflow_input: RecommendationDecisionInput = state["workflow_input"]
         opinions: list[dict[str, Any]] = []
+        model_routes = [
+            model_policy.route_primary(
+                workflow_type="recommendation_decision",
+                task="roundtable_discussion",
+                asset_id=recommendation.asset_id,
+                reason="推荐决策圆桌的常规分析默认使用 DeepSeek V4 Pro。",
+            ).to_dict()
+            for recommendation in workflow_input.recommendations
+        ]
         for recommendation in workflow_input.recommendations:
             factor_context = state.get("factor_contexts", {}).get(recommendation.asset_id, {})
             signal = workflow_input.signals_by_asset.get(recommendation.asset_id)
@@ -367,6 +399,7 @@ def build_recommendation_decision_graph() -> Any:
             )
         return {
             **state,
+            "model_routes": [*state.get("model_routes", []), *model_routes],
             "roundtable_opinions": opinions,
             "node_trace": [*state.get("node_trace", []), "roundtable_discussion"],
         }
@@ -403,18 +436,28 @@ def build_recommendation_decision_graph() -> Any:
                     workflow_input=workflow_input,
                 ),
             )
-            review_items.append(
-                {
-                    "asset_id": decision.asset_id,
-                    "decision_type": decision.decision_type,
-                    "trade_action": decision.trade_action,
-                    "requires_review": review_policy.requires_review(context),
-                    "reason": context.__dict__,
-                }
+            review_item = {
+                "asset_id": decision.asset_id,
+                "decision_type": decision.decision_type,
+                "trade_action": decision.trade_action,
+                "requires_review": review_policy.requires_review(context),
+                "reason": context.__dict__,
+            }
+            review_item["model_review"] = model_policy.build_review_result(
+                workflow_type="recommendation_decision",
+                review_item=review_item,
+                decision_summary=decision.summary,
             )
+            review_items.append(review_item)
+        review_routes = [
+            item["model_review"]["route"]
+            for item in review_items
+            if item.get("model_review", {}).get("route")
+        ]
         return {
             **state,
             "high_risk_reviews": review_items,
+            "review_model_routes": review_routes,
             "node_trace": [*state.get("node_trace", []), "high_risk_review"],
         }
 
@@ -422,18 +465,31 @@ def build_recommendation_decision_graph() -> Any:
         result = state["result"]
         recommendations = state["workflow_input"].recommendations
         primary_symbol = recommendations[0].symbol if recommendations else "空推荐"
-        decision_actions = [decision.agent_action for decision in result.decisions]
-        report = {
-            "title": f"{primary_symbol} 圆桌决策报告",
-            "summary": "金融团队已基于推荐、TA 指标、AKShare 因子、评分、风险和记忆完成圆桌裁决。",
-            "decision_actions": decision_actions,
-            "roundtable_roles": sorted(
-                {opinion["role"] for opinion in state.get("roundtable_opinions", [])}
-            ),
-            "requires_review_count": sum(
-                1 for item in state.get("high_risk_reviews", []) if item["requires_review"]
-            ),
-        }
+        report = build_chinese_decision_report(
+            title=f"{primary_symbol} 圆桌决策报告",
+            summary="金融团队已基于推荐、TA 指标、AKShare 因子、评分、风险和记忆完成圆桌裁决。",
+            workflow_type="recommendation_decision",
+            asset_symbols=[recommendation.symbol for recommendation in recommendations],
+            decisions=[
+                serialize_recommendation_decision(decision)
+                for decision in result.decisions
+            ],
+            roundtable_opinions=state.get("roundtable_opinions", []),
+            high_risk_reviews=state.get("high_risk_reviews", []),
+            asset_contexts={
+                recommendation.asset_id: {
+                    "profile": {
+                        "asset_id": recommendation.asset_id,
+                        "symbol": recommendation.symbol,
+                        "market": recommendation.market,
+                    },
+                    "factor": state.get("factor_contexts", {}).get(recommendation.asset_id, {}),
+                }
+                for recommendation in recommendations
+            },
+            model_routes=state.get("model_routes", []),
+            review_model_routes=state.get("review_model_routes", []),
+        )
         return {
             **state,
             "report": report,
@@ -466,6 +522,31 @@ def build_tool_runtime(state: WorkflowGraphState) -> FinanceToolRuntime:
     if session is None:
         raise ValueError("推荐决策圆桌 Workflow 需要 session 或 tool_runtime。")
     return FinanceToolRuntime(session)
+
+
+def serialize_recommendation_decision(decision: Any) -> dict[str, Any]:
+    """把推荐决策对象转换为中文报告模板可消费的结构。"""
+
+    return {
+        "asset_id": decision.asset_id,
+        "symbol": decision.symbol,
+        "name": decision.name,
+        "market": decision.market,
+        "recommendation_id": decision.recommendation_id,
+        "agent_action": decision.agent_action,
+        "action": decision.trade_action,
+        "decision_type": decision.decision_type,
+        "severity": decision.severity,
+        "confidence": None,
+        "data_quality_status": None,
+        "summary": decision.summary,
+        "rationale": decision.rationale,
+        "risk_rebuttal": decision.risk_rebuttal,
+        "reason_ids": list(decision.reason_ids),
+        "signal_ids": list(decision.signal_ids),
+        "risk_ids": list(decision.risk_ids),
+        "evidence_ids": list(decision.evidence_ids),
+    }
 
 
 def collect_roundtable_report_context(state: WorkflowGraphState) -> dict[str, Any]:

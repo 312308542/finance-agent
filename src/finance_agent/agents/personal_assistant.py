@@ -1360,10 +1360,32 @@ def build_workflow_node_events(final_state: dict[str, Any]) -> tuple[WorkflowNod
                 message=f"圆桌观点：{opinion['role']} - {opinion.get('summary', '')}",
             )
         )
-    for review in final_state.get("high_risk_reviews", []):
+    for index, route in enumerate(final_state.get("model_routes", []), start=1):
         events.append(
             WorkflowNodeEvent(
-                name=f"high_risk_review:{review.get('asset_id')}",
+                name=f"model_route:primary:{index}",
+                output=route,
+                message=(
+                    f"模型路由：{route.get('task')} -> "
+                    f"{route.get('model_name') or route.get('model_key')}"
+                ),
+            )
+        )
+    for index, route in enumerate(final_state.get("review_model_routes", []), start=1):
+        events.append(
+            WorkflowNodeEvent(
+                name=f"model_route:review:{index}",
+                output=route,
+                message=(
+                    f"高风险模型路由：{route.get('decision_type')} -> "
+                    f"{route.get('model_name') or route.get('model_key')}"
+                ),
+            )
+        )
+    for index, review in enumerate(final_state.get("high_risk_reviews", []), start=1):
+        events.append(
+            WorkflowNodeEvent(
+                name=f"high_risk_review:{index}",
                 output=review,
                 message=(
                     f"高风险复核：{review.get('asset_id')} "
@@ -1371,6 +1393,18 @@ def build_workflow_node_events(final_state: dict[str, Any]) -> tuple[WorkflowNod
                 ),
             )
         )
+        model_review = review.get("model_review")
+        if model_review:
+            events.append(
+                WorkflowNodeEvent(
+                    name=f"model_review:{index}",
+                    output=model_review,
+                    message=(
+                        f"模型复核状态：{review.get('asset_id')} "
+                        f"{model_review.get('review_status')}"
+                    ),
+                )
+            )
     report = final_state.get("report")
     if report:
         events.append(
@@ -1405,6 +1439,7 @@ def build_node_event_output(*, node_name: str, final_state: dict[str, Any]) -> d
                 1 for item in final_state.get("high_risk_reviews", [])
                 if item.get("requires_review")
             ),
+            "review_model_route_count": len(final_state.get("review_model_routes", [])),
         }
     if node_name == "report_draft":
         return {"report": final_state.get("report")}

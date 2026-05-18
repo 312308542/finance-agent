@@ -66,3 +66,5 @@ scripts/**/__pycache__/
 reports/
 exports/
 coverage/
+!src/finance_agent/agents/reports/
+!src/finance_agent/agents/reports/*.py
