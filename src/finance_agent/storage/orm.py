@@ -10,7 +10,17 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Date, DateTime, Index, Numeric, String, Text, UniqueConstraint, text
+from sqlalchemy import (
+    Date,
+    DateTime,
+    Index,
+    Numeric,
+    PrimaryKeyConstraint,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -764,6 +774,537 @@ class AgentAnalysisItemORM(Base):
     )
     summary: Mapped[str | None] = mapped_column(Text)
     as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class PortfolioORM(Base):
+    """用户组合定义表，支撑私人金融助手长期监控。"""
+
+    __tablename__ = "portfolios"
+    __table_args__ = (
+        Index("idx_portfolios_owner", "owner_id"),
+        Index("idx_portfolios_status", "status"),
+    )
+
+    portfolio_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    portfolio_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    base_currency: Mapped[str] = mapped_column(String(16), nullable=False)
+    risk_profile: Mapped[str] = mapped_column(String(64), nullable=False)
+    total_equity: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    cash: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    market_value: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    max_position_weight: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    max_drawdown_alert: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class PositionORM(Base):
+    """组合当前持仓表。"""
+
+    __tablename__ = "positions"
+    __table_args__ = (
+        UniqueConstraint(
+            "portfolio_id",
+            "asset_id",
+            "side",
+            name="uq_positions_portfolio_asset_side",
+        ),
+        Index("idx_positions_portfolio", "portfolio_id"),
+        Index("idx_positions_asset", "asset_id"),
+        Index("idx_positions_market", "market"),
+    )
+
+    position_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    portfolio_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    side: Mapped[str] = mapped_column(String(32), nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(Numeric(36, 10), nullable=False)
+    avg_cost: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    last_price: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    market_value: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    unrealized_pnl: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    unrealized_pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    portfolio_weight: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    leverage: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    liquidation_price: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class PortfolioSnapshotORM(Base):
+    """组合历史快照表，用于长期追踪资产变化。"""
+
+    __tablename__ = "portfolio_snapshots"
+    __table_args__ = (
+        PrimaryKeyConstraint("snapshot_id", "captured_at"),
+        Index("idx_portfolio_snapshots_portfolio_time", "portfolio_id", "captured_at"),
+        Index("idx_portfolio_snapshots_owner_time", "owner_id", "captured_at"),
+    )
+
+    snapshot_id: Mapped[str] = mapped_column(String(192), nullable=False)
+    portfolio_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    total_equity: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    cash: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    market_value: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    position_count: Mapped[int | None]
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class PositionSnapshotORM(Base):
+    """持仓历史快照表，用于追踪盈亏、仓位和风险暴露变化。"""
+
+    __tablename__ = "position_snapshots"
+    __table_args__ = (
+        PrimaryKeyConstraint("snapshot_id", "captured_at"),
+        Index("idx_position_snapshots_position_time", "position_id", "captured_at"),
+        Index("idx_position_snapshots_portfolio_time", "portfolio_id", "captured_at"),
+        Index("idx_position_snapshots_asset_time", "asset_id", "captured_at"),
+    )
+
+    snapshot_id: Mapped[str] = mapped_column(String(192), nullable=False)
+    position_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    portfolio_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    side: Mapped[str] = mapped_column(String(32), nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(Numeric(36, 10), nullable=False)
+    avg_cost: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    last_price: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    market_value: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    unrealized_pnl: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    unrealized_pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    portfolio_weight: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    leverage: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    liquidation_price: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class WatchlistORM(Base):
+    """私人观察池定义表。"""
+
+    __tablename__ = "watchlists"
+    __table_args__ = (
+        Index("idx_watchlists_owner_status", "owner_id", "status"),
+        Index("idx_watchlists_market", "market"),
+    )
+
+    watchlist_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    market: Mapped[str | None] = mapped_column(String(32))
+    purpose: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class WatchlistItemORM(Base):
+    """私人观察池成员表。"""
+
+    __tablename__ = "watchlist_items"
+    __table_args__ = (
+        UniqueConstraint("watchlist_id", "asset_id", name="uq_watchlist_items_watchlist_asset"),
+        Index("idx_watchlist_items_watchlist_status", "watchlist_id", "status"),
+        Index("idx_watchlist_items_asset", "asset_id"),
+        Index("idx_watchlist_items_next_review", "next_review_at"),
+    )
+
+    watchlist_item_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    watchlist_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_id: Mapped[str | None] = mapped_column(String(192))
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    watch_conditions: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    trigger_conditions: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    invalid_conditions: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    risk_level: Mapped[str | None] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    next_review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    removed_reason: Mapped[str | None] = mapped_column(Text)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class AssetThesisORM(Base):
+    """投资假设表。"""
+
+    __tablename__ = "asset_theses"
+    __table_args__ = (
+        Index("idx_asset_theses_asset_status", "asset_id", "status"),
+        Index("idx_asset_theses_source", "source_type", "source_id"),
+    )
+
+    thesis_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_id: Mapped[str | None] = mapped_column(String(192))
+    thesis: Mapped[str] = mapped_column(Text, nullable=False)
+    supporting_points: Mapped[list[JsonDict]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    risk_points: Mapped[list[JsonDict]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    invalid_if: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class WatchlistItemEventORM(Base):
+    """观察池成员事件表，记录入池、升级、剔除和人工确认等轨迹。"""
+
+    __tablename__ = "watchlist_item_events"
+    __table_args__ = (
+        Index("idx_watchlist_events_watchlist_created", "watchlist_id", "created_at"),
+        Index("idx_watchlist_events_item_created", "watchlist_item_id", "created_at"),
+        Index("idx_watchlist_events_asset_created", "asset_id", "created_at"),
+        Index("idx_watchlist_events_owner_created", "owner_id", "created_at"),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    watchlist_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    watchlist_item_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    from_status: Mapped[str | None] = mapped_column(String(32))
+    to_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    source_decision_id: Mapped[str | None] = mapped_column(String(160))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class MonitoringAlertORM(Base):
+    """监控提醒表，只记录触发事件，不直接代表最终买卖建议。"""
+
+    __tablename__ = "monitoring_alerts"
+    __table_args__ = (
+        Index("idx_alerts_owner_status", "owner_id", "status"),
+        Index("idx_alerts_asset_asof", "asset_id", "as_of"),
+        Index("idx_alerts_severity", "severity"),
+    )
+
+    alert_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    portfolio_id: Mapped[str | None] = mapped_column(String(128))
+    asset_id: Mapped[str | None] = mapped_column(String(128))
+    alert_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    severity: Mapped[str] = mapped_column(String(32), nullable=False)
+    triggered_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    trigger_condition: Mapped[str] = mapped_column(Text, nullable=False)
+    current_value: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    threshold_value: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class DecisionLogORM(Base):
+    """决策日志表，记录系统建议、用户动作、反馈和证据引用。"""
+
+    __tablename__ = "decision_logs"
+    __table_args__ = (
+        Index("idx_decision_logs_owner_created", "owner_id", "created_at"),
+        Index("idx_decision_logs_asset_created", "asset_id", "created_at"),
+        Index("idx_decision_logs_type", "decision_type"),
+    )
+
+    decision_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    portfolio_id: Mapped[str | None] = mapped_column(String(128))
+    asset_id: Mapped[str | None] = mapped_column(String(128))
+    decision_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_recommendation_id: Mapped[str | None] = mapped_column(String(192))
+    source_alert_id: Mapped[str | None] = mapped_column(String(160))
+    workflow_run_id: Mapped[str | None] = mapped_column(String(160))
+    suggested_action: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_action: Mapped[str] = mapped_column(String(64), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    reason_ids: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    risk_ids: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    evidence_ids: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class AssistantMemoryORM(Base):
+    """Finance Memory 长期记忆表，不保存 Hermes 通用对话记忆。"""
+
+    __tablename__ = "assistant_memories"
+    __table_args__ = (
+        Index("idx_memories_owner_type", "owner_id", "memory_type"),
+        Index("idx_memories_scope_asset", "scope", "asset_id"),
+        Index("idx_memories_status", "status"),
+    )
+
+    memory_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    memory_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    scope: Mapped[str] = mapped_column(String(64), nullable=False)
+    asset_id: Mapped[str | None] = mapped_column(String(128))
+    source_decision_id: Mapped[str | None] = mapped_column(String(160))
+    source_review_task_id: Mapped[str | None] = mapped_column(String(160))
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding_ref: Mapped[str | None] = mapped_column(String(160))
+    confidence: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class MemoryEmbeddingORM(Base):
+    """Finance Memory 语义召回索引表，第一阶段用 JSONB 预留向量。"""
+
+    __tablename__ = "memory_embeddings"
+    __table_args__ = (
+        Index("idx_memory_embeddings_owner_source", "owner_id", "source_type", "source_id"),
+        Index("idx_memory_embeddings_memory", "memory_id"),
+        Index("idx_memory_embeddings_hash", "content_hash"),
+    )
+
+    embedding_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    memory_id: Mapped[str | None] = mapped_column(String(160))
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(192), nullable=False)
+    chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[list[float] | None] = mapped_column(JSONB)
+    embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class FinancialMemoryEdgeORM(Base):
+    """Finance Memory 轻量图谱边表。"""
+
+    __tablename__ = "financial_memory_edges"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id",
+            "source_type",
+            "source_id",
+            "relation_type",
+            "target_type",
+            "target_id",
+            name="uq_memory_edges_owner_source_relation_target",
+        ),
+        Index("idx_memory_edges_source", "owner_id", "source_type", "source_id"),
+        Index("idx_memory_edges_target", "owner_id", "target_type", "target_id"),
+        Index("idx_memory_edges_relation", "relation_type"),
+    )
+
+    edge_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(192), nullable=False)
+    relation_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(192), nullable=False)
+    confidence: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class ReviewTaskORM(Base):
+    """复盘任务表。"""
+
+    __tablename__ = "review_tasks"
+    __table_args__ = (
+        Index("idx_review_tasks_owner_due", "owner_id", "due_at"),
+        Index("idx_review_tasks_status", "status"),
+        Index("idx_review_tasks_source_decision", "source_decision_id"),
+    )
+
+    review_task_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    asset_id: Mapped[str | None] = mapped_column(String(128))
+    source_decision_id: Mapped[str | None] = mapped_column(String(160))
+    review_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    review_questions: Mapped[list[JsonDict]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    result_summary: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class DataQualitySnapshotORM(Base):
+    """资产级数据质量快照表，用于推荐报告说明数据新鲜度和缺口。"""
+
+    __tablename__ = "data_quality_snapshots"
+    __table_args__ = (
+        PrimaryKeyConstraint("quality_id", "checked_at"),
+        Index("idx_quality_asset_domain_checked", "asset_id", "data_domain", "checked_at"),
+        Index("idx_quality_market_domain", "market", "data_domain"),
+        Index("idx_quality_status", "status", "freshness_status"),
+    )
+
+    quality_id: Mapped[str] = mapped_column(String(192), nullable=False)
+    asset_id: Mapped[str | None] = mapped_column(String(128))
+    symbol: Mapped[str | None] = mapped_column(String(64))
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    data_domain: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    freshness_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    latest_data_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    missing_items: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    issue_count: Mapped[int] = mapped_column(nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class AgentWorkflowRunORM(Base):
+    """上层主 Agent 调用底层 Workflow 的运行审计表。"""
+
+    __tablename__ = "agent_workflow_runs"
+    __table_args__ = (
+        Index("idx_workflow_runs_owner_started", "owner_id", "started_at"),
+        Index("idx_workflow_runs_type_status", "workflow_type", "status"),
+    )
+
+    workflow_run_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    workflow_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    trigger_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    trigger_ref: Mapped[str | None] = mapped_column(String(192))
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    input_ref: Mapped[str | None] = mapped_column(String(255))
+    output_ref: Mapped[str | None] = mapped_column(String(255))
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class AgentWorkflowEventORM(Base):
+    """Workflow 可审计事件表，供排障和前端办公室展示。"""
+
+    __tablename__ = "agent_workflow_events"
+    __table_args__ = (
+        Index("idx_workflow_events_run_created", "workflow_run_id", "created_at"),
+        Index("idx_workflow_events_agent", "agent_name"),
+    )
+
+    workflow_event_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    workflow_run_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    agent_name: Mapped[str | None] = mapped_column(String(64))
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_ids: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
     payload: Mapped[JsonDict] = mapped_column(
         JSONB, server_default=text("'{}'::jsonb"), nullable=False
     )

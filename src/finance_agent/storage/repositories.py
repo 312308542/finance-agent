@@ -19,26 +19,43 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from finance_agent.storage.orm import (
+    AgentWorkflowEventORM,
+    AgentWorkflowRunORM,
     AssetORM,
     AssetRecommendationORM,
     AssetScoreORM,
+    AssetThesisORM,
     AssetUniverseMemberORM,
     AssetUniverseORM,
+    AssistantMemoryORM,
     CapitalFlowSnapshotORM,
     CryptoDerivativeSnapshotORM,
+    DataQualitySnapshotORM,
+    DecisionLogORM,
     EventRecordORM,
     EvidenceORM,
     FactorFrameORM,
+    FinancialMemoryEdgeORM,
     FundamentalSnapshotORM,
     IndicatorFrameORM,
     MarketBarORM,
+    MemoryEmbeddingORM,
+    MonitoringAlertORM,
+    PortfolioORM,
+    PortfolioSnapshotORM,
+    PositionORM,
+    PositionSnapshotORM,
     RawRecordORM,
     RecommendationRunORM,
     RecommendationRunUniverseORM,
+    ReviewTaskORM,
     RiskFindingORM,
     ScreeningResultItemORM,
     ScreeningResultORM,
     SignalSnapshotORM,
+    WatchlistItemEventORM,
+    WatchlistItemORM,
+    WatchlistORM,
 )
 
 JsonDict = dict[str, Any]
@@ -1202,6 +1219,27 @@ class RecommendationRepository:
         )
         return list(self.session.scalars(statement))
 
+    def get_recommendation(self, recommendation_id: str) -> AssetRecommendationORM:
+        """根据推荐 ID 查询单条推荐结果。"""
+
+        return self.session.get_one(AssetRecommendationORM, recommendation_id)
+
+    def list_top_recommendations(
+        self,
+        *,
+        run_id: str,
+        limit: int = 20,
+    ) -> list[AssetRecommendationORM]:
+        """查询一次推荐运行的前 N 条推荐结果。"""
+
+        statement = (
+            select(AssetRecommendationORM)
+            .where(AssetRecommendationORM.run_id == run_id)
+            .order_by(AssetRecommendationORM.rank)
+            .limit(limit)
+        )
+        return list(self.session.scalars(statement))
+
 
 class FundamentalDataRepository:
     """A 股财务估值快照仓储。"""
@@ -1290,6 +1328,1106 @@ class FundamentalDataRepository:
             )
         )
         return list(reversed(rows))
+
+
+class PortfolioRepository:
+    """私人金融助手组合和持仓仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_portfolio(
+        self,
+        *,
+        portfolio_id: str,
+        owner_id: str,
+        name: str,
+        portfolio_type: str,
+        base_currency: str,
+        risk_profile: str,
+        as_of: datetime,
+        total_equity: Decimal | None = None,
+        cash: Decimal | None = None,
+        market_value: Decimal | None = None,
+        max_position_weight: Decimal | None = None,
+        max_drawdown_alert: Decimal | None = None,
+        status: str = "active",
+        payload: JsonDict | None = None,
+    ) -> PortfolioORM:
+        """按 `portfolio_id` 幂等写入组合定义。"""
+
+        values = {
+            "portfolio_id": portfolio_id,
+            "owner_id": owner_id,
+            "name": name,
+            "portfolio_type": portfolio_type,
+            "base_currency": base_currency,
+            "risk_profile": risk_profile,
+            "total_equity": total_equity,
+            "cash": cash,
+            "market_value": market_value,
+            "max_position_weight": max_position_weight,
+            "max_drawdown_alert": max_drawdown_alert,
+            "status": status,
+            "as_of": as_of,
+            "payload": _json_safe(payload or {}),
+            "updated_at": datetime.now().astimezone(),
+        }
+        statement = insert(PortfolioORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "portfolio_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[PortfolioORM.portfolio_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(PortfolioORM, portfolio_id)
+
+    def insert_portfolio_snapshot(
+        self,
+        *,
+        snapshot_id: str,
+        portfolio_id: str,
+        owner_id: str,
+        captured_at: datetime,
+        source: str,
+        total_equity: Decimal | None = None,
+        cash: Decimal | None = None,
+        market_value: Decimal | None = None,
+        position_count: int | None = None,
+        payload: JsonDict | None = None,
+    ) -> PortfolioSnapshotORM:
+        """写入组合历史快照。"""
+
+        values = {
+            "snapshot_id": snapshot_id,
+            "portfolio_id": portfolio_id,
+            "owner_id": owner_id,
+            "total_equity": total_equity,
+            "cash": cash,
+            "market_value": market_value,
+            "position_count": position_count,
+            "source": source,
+            "captured_at": captured_at,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(PortfolioSnapshotORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"snapshot_id", "captured_at"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[
+                    PortfolioSnapshotORM.snapshot_id,
+                    PortfolioSnapshotORM.captured_at,
+                ],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(
+            PortfolioSnapshotORM,
+            {"snapshot_id": snapshot_id, "captured_at": captured_at},
+        )
+
+    def upsert_position(
+        self,
+        *,
+        position_id: str,
+        portfolio_id: str,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        side: str,
+        quantity: Decimal,
+        as_of: datetime,
+        avg_cost: Decimal | None = None,
+        last_price: Decimal | None = None,
+        market_value: Decimal | None = None,
+        unrealized_pnl: Decimal | None = None,
+        unrealized_pnl_pct: Decimal | None = None,
+        portfolio_weight: Decimal | None = None,
+        leverage: Decimal | None = None,
+        liquidation_price: Decimal | None = None,
+        status: str = "active",
+        payload: JsonDict | None = None,
+    ) -> PositionORM:
+        """按 `portfolio_id + asset_id + side` 幂等写入当前持仓。"""
+
+        values = {
+            "position_id": position_id,
+            "portfolio_id": portfolio_id,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "side": side,
+            "quantity": quantity,
+            "avg_cost": avg_cost,
+            "last_price": last_price,
+            "market_value": market_value,
+            "unrealized_pnl": unrealized_pnl,
+            "unrealized_pnl_pct": unrealized_pnl_pct,
+            "portfolio_weight": portfolio_weight,
+            "leverage": leverage,
+            "liquidation_price": liquidation_price,
+            "status": status,
+            "as_of": as_of,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(PositionORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"position_id", "portfolio_id", "asset_id", "side"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="uq_positions_portfolio_asset_side",
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.get_position(portfolio_id=portfolio_id, asset_id=asset_id, side=side)
+
+    def insert_position_snapshot(
+        self,
+        *,
+        snapshot_id: str,
+        position_id: str,
+        portfolio_id: str,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        side: str,
+        quantity: Decimal,
+        captured_at: datetime,
+        source: str,
+        avg_cost: Decimal | None = None,
+        last_price: Decimal | None = None,
+        market_value: Decimal | None = None,
+        unrealized_pnl: Decimal | None = None,
+        unrealized_pnl_pct: Decimal | None = None,
+        portfolio_weight: Decimal | None = None,
+        leverage: Decimal | None = None,
+        liquidation_price: Decimal | None = None,
+        payload: JsonDict | None = None,
+    ) -> PositionSnapshotORM:
+        """写入持仓历史快照。"""
+
+        values = {
+            "snapshot_id": snapshot_id,
+            "position_id": position_id,
+            "portfolio_id": portfolio_id,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "side": side,
+            "quantity": quantity,
+            "avg_cost": avg_cost,
+            "last_price": last_price,
+            "market_value": market_value,
+            "unrealized_pnl": unrealized_pnl,
+            "unrealized_pnl_pct": unrealized_pnl_pct,
+            "portfolio_weight": portfolio_weight,
+            "leverage": leverage,
+            "liquidation_price": liquidation_price,
+            "source": source,
+            "captured_at": captured_at,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(PositionSnapshotORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"snapshot_id", "captured_at"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[
+                    PositionSnapshotORM.snapshot_id,
+                    PositionSnapshotORM.captured_at,
+                ],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(
+            PositionSnapshotORM,
+            {"snapshot_id": snapshot_id, "captured_at": captured_at},
+        )
+
+    def get_portfolio(self, portfolio_id: str) -> PortfolioORM:
+        """根据组合 ID 查询组合。"""
+
+        return self.session.get_one(PortfolioORM, portfolio_id)
+
+    def list_portfolios(self, *, owner_id: str, status: str | None = None) -> list[PortfolioORM]:
+        """查询用户组合。"""
+
+        statement = select(PortfolioORM).where(PortfolioORM.owner_id == owner_id)
+        if status:
+            statement = statement.where(PortfolioORM.status == status)
+        return list(self.session.scalars(statement.order_by(PortfolioORM.updated_at.desc())))
+
+    def get_position(self, *, portfolio_id: str, asset_id: str, side: str) -> PositionORM:
+        """根据组合、资产和方向查询持仓。"""
+
+        statement = select(PositionORM).where(
+            PositionORM.portfolio_id == portfolio_id,
+            PositionORM.asset_id == asset_id,
+            PositionORM.side == side,
+        )
+        return self.session.scalars(statement).one()
+
+    def list_positions(
+        self,
+        portfolio_id: str,
+        *,
+        status: str | None = "active",
+    ) -> list[PositionORM]:
+        """查询组合当前持仓。"""
+
+        statement = select(PositionORM).where(PositionORM.portfolio_id == portfolio_id)
+        if status:
+            statement = statement.where(PositionORM.status == status)
+        return list(
+            self.session.scalars(statement.order_by(PositionORM.market, PositionORM.symbol))
+        )
+
+    def list_portfolio_snapshots(
+        self,
+        *,
+        portfolio_id: str,
+        limit: int = 20,
+    ) -> list[PortfolioSnapshotORM]:
+        """查询组合历史快照，返回时间倒序结果。"""
+
+        statement = (
+            select(PortfolioSnapshotORM)
+            .where(PortfolioSnapshotORM.portfolio_id == portfolio_id)
+            .order_by(PortfolioSnapshotORM.captured_at.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(statement))
+
+    def list_position_snapshots(
+        self,
+        *,
+        portfolio_id: str,
+        asset_id: str | None = None,
+        limit: int = 20,
+    ) -> list[PositionSnapshotORM]:
+        """查询持仓历史快照，返回时间倒序结果。"""
+
+        statement = select(PositionSnapshotORM).where(
+            PositionSnapshotORM.portfolio_id == portfolio_id
+        )
+        if asset_id:
+            statement = statement.where(PositionSnapshotORM.asset_id == asset_id)
+        return list(
+            self.session.scalars(
+                statement.order_by(PositionSnapshotORM.captured_at.desc()).limit(limit)
+            )
+        )
+
+
+class WatchlistRepository:
+    """私人观察池和投资假设仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_watchlist(
+        self,
+        *,
+        watchlist_id: str,
+        owner_id: str,
+        name: str,
+        purpose: str,
+        market: str | None = None,
+        status: str = "active",
+        payload: JsonDict | None = None,
+    ) -> WatchlistORM:
+        """按 `watchlist_id` 幂等写入观察池。"""
+
+        values = {
+            "watchlist_id": watchlist_id,
+            "owner_id": owner_id,
+            "name": name,
+            "market": market,
+            "purpose": purpose,
+            "status": status,
+            "payload": _json_safe(payload or {}),
+            "updated_at": datetime.now().astimezone(),
+        }
+        statement = insert(WatchlistORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "watchlist_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[WatchlistORM.watchlist_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(WatchlistORM, watchlist_id)
+
+    def upsert_watchlist_item(
+        self,
+        *,
+        watchlist_item_id: str,
+        watchlist_id: str,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        source_type: str,
+        reason: str,
+        source_id: str | None = None,
+        watch_conditions: JsonDict | None = None,
+        trigger_conditions: JsonDict | None = None,
+        invalid_conditions: JsonDict | None = None,
+        risk_level: str | None = None,
+        status: str = "active",
+        next_review_at: datetime | None = None,
+        removed_at: datetime | None = None,
+        removed_reason: str | None = None,
+        payload: JsonDict | None = None,
+    ) -> WatchlistItemORM:
+        """按 `watchlist_id + asset_id` 幂等写入观察项。"""
+
+        values = {
+            "watchlist_item_id": watchlist_item_id,
+            "watchlist_id": watchlist_id,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "source_type": source_type,
+            "source_id": source_id,
+            "reason": reason,
+            "watch_conditions": _json_safe(watch_conditions or {}),
+            "trigger_conditions": _json_safe(trigger_conditions or {}),
+            "invalid_conditions": _json_safe(invalid_conditions or {}),
+            "risk_level": risk_level,
+            "status": status,
+            "next_review_at": next_review_at,
+            "removed_at": removed_at,
+            "removed_reason": removed_reason,
+            "payload": _json_safe(payload or {}),
+            "updated_at": datetime.now().astimezone(),
+        }
+        statement = insert(WatchlistItemORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"watchlist_item_id", "watchlist_id", "asset_id"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="uq_watchlist_items_watchlist_asset",
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.get_watchlist_item(watchlist_id=watchlist_id, asset_id=asset_id)
+
+    def upsert_asset_thesis(
+        self,
+        *,
+        thesis_id: str,
+        asset_id: str,
+        owner_id: str,
+        source_type: str,
+        thesis: str,
+        source_id: str | None = None,
+        supporting_points: list[JsonDict] | None = None,
+        risk_points: list[JsonDict] | None = None,
+        invalid_if: JsonDict | None = None,
+        status: str = "active",
+        payload: JsonDict | None = None,
+    ) -> AssetThesisORM:
+        """按 `thesis_id` 幂等写入投资假设。"""
+
+        values = {
+            "thesis_id": thesis_id,
+            "asset_id": asset_id,
+            "owner_id": owner_id,
+            "source_type": source_type,
+            "source_id": source_id,
+            "thesis": thesis,
+            "supporting_points": _json_safe(supporting_points or []),
+            "risk_points": _json_safe(risk_points or []),
+            "invalid_if": _json_safe(invalid_if or {}),
+            "status": status,
+            "payload": _json_safe(payload or {}),
+            "updated_at": datetime.now().astimezone(),
+        }
+        statement = insert(AssetThesisORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "thesis_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[AssetThesisORM.thesis_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(AssetThesisORM, thesis_id)
+
+    def insert_watchlist_event(
+        self,
+        *,
+        event_id: str,
+        owner_id: str,
+        watchlist_id: str,
+        watchlist_item_id: str,
+        asset_id: str,
+        event_type: str,
+        to_status: str,
+        created_at: datetime,
+        from_status: str | None = None,
+        reason: str | None = None,
+        source_decision_id: str | None = None,
+        payload: JsonDict | None = None,
+    ) -> WatchlistItemEventORM:
+        """写入观察池成员事件。"""
+
+        values = {
+            "event_id": event_id,
+            "owner_id": owner_id,
+            "watchlist_id": watchlist_id,
+            "watchlist_item_id": watchlist_item_id,
+            "asset_id": asset_id,
+            "event_type": event_type,
+            "from_status": from_status,
+            "to_status": to_status,
+            "reason": reason,
+            "source_decision_id": source_decision_id,
+            "created_at": created_at,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(WatchlistItemEventORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "event_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[WatchlistItemEventORM.event_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(WatchlistItemEventORM, event_id)
+
+    def get_watchlist(self, watchlist_id: str) -> WatchlistORM:
+        """根据观察池 ID 查询观察池。"""
+
+        return self.session.get_one(WatchlistORM, watchlist_id)
+
+    def get_watchlist_item(self, *, watchlist_id: str, asset_id: str) -> WatchlistItemORM:
+        """根据观察池和资产查询观察项。"""
+
+        statement = select(WatchlistItemORM).where(
+            WatchlistItemORM.watchlist_id == watchlist_id,
+            WatchlistItemORM.asset_id == asset_id,
+        )
+        return self.session.scalars(statement).one()
+
+    def list_active_items(
+        self,
+        *,
+        owner_id: str,
+        watchlist_id: str | None = None,
+    ) -> list[WatchlistItemORM]:
+        """查询用户所有活跃观察项。"""
+
+        statement = (
+            select(WatchlistItemORM)
+            .join(WatchlistORM, WatchlistORM.watchlist_id == WatchlistItemORM.watchlist_id)
+            .where(WatchlistORM.owner_id == owner_id, WatchlistItemORM.status == "active")
+        )
+        if watchlist_id:
+            statement = statement.where(WatchlistItemORM.watchlist_id == watchlist_id)
+        return list(
+            self.session.scalars(
+                statement.order_by(
+                    WatchlistItemORM.next_review_at.asc().nullslast(),
+                    WatchlistItemORM.updated_at.desc(),
+                )
+            )
+        )
+
+    def list_asset_theses(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str,
+        status: str | None = "active",
+    ) -> list[AssetThesisORM]:
+        """查询单资产投资假设。"""
+
+        statement = select(AssetThesisORM).where(
+            AssetThesisORM.owner_id == owner_id,
+            AssetThesisORM.asset_id == asset_id,
+        )
+        if status:
+            statement = statement.where(AssetThesisORM.status == status)
+        return list(self.session.scalars(statement.order_by(AssetThesisORM.updated_at.desc())))
+
+    def list_watchlist_events(
+        self,
+        *,
+        watchlist_id: str,
+        limit: int = 50,
+    ) -> list[WatchlistItemEventORM]:
+        """查询观察池事件，返回时间倒序结果。"""
+
+        statement = (
+            select(WatchlistItemEventORM)
+            .where(WatchlistItemEventORM.watchlist_id == watchlist_id)
+            .order_by(WatchlistItemEventORM.created_at.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(statement))
+
+
+class DecisionLogRepository:
+    """提醒和决策日志仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def insert_monitoring_alert(
+        self,
+        *,
+        alert_id: str,
+        owner_id: str,
+        alert_type: str,
+        severity: str,
+        triggered_by: str,
+        trigger_condition: str,
+        status: str,
+        as_of: datetime,
+        portfolio_id: str | None = None,
+        asset_id: str | None = None,
+        current_value: Decimal | None = None,
+        threshold_value: Decimal | None = None,
+        payload: JsonDict | None = None,
+    ) -> MonitoringAlertORM:
+        """写入或覆盖一条监控提醒。"""
+
+        values = {
+            "alert_id": alert_id,
+            "owner_id": owner_id,
+            "portfolio_id": portfolio_id,
+            "asset_id": asset_id,
+            "alert_type": alert_type,
+            "severity": severity,
+            "triggered_by": triggered_by,
+            "trigger_condition": trigger_condition,
+            "current_value": current_value,
+            "threshold_value": threshold_value,
+            "status": status,
+            "as_of": as_of,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(MonitoringAlertORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "alert_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[MonitoringAlertORM.alert_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(MonitoringAlertORM, alert_id)
+
+    def insert_decision_log(
+        self,
+        *,
+        decision_id: str,
+        owner_id: str,
+        decision_type: str,
+        suggested_action: str,
+        user_action: str,
+        summary: str,
+        portfolio_id: str | None = None,
+        asset_id: str | None = None,
+        source_recommendation_id: str | None = None,
+        source_alert_id: str | None = None,
+        workflow_run_id: str | None = None,
+        reason_ids: list[str] | None = None,
+        risk_ids: list[str] | None = None,
+        evidence_ids: list[str] | None = None,
+        created_at: datetime | None = None,
+        payload: JsonDict | None = None,
+    ) -> DecisionLogORM:
+        """写入或覆盖一条决策日志。"""
+
+        values = {
+            "decision_id": decision_id,
+            "owner_id": owner_id,
+            "portfolio_id": portfolio_id,
+            "asset_id": asset_id,
+            "decision_type": decision_type,
+            "source_recommendation_id": source_recommendation_id,
+            "source_alert_id": source_alert_id,
+            "workflow_run_id": workflow_run_id,
+            "suggested_action": suggested_action,
+            "user_action": user_action,
+            "summary": summary,
+            "reason_ids": reason_ids or [],
+            "risk_ids": risk_ids or [],
+            "evidence_ids": evidence_ids or [],
+            "created_at": created_at or datetime.now().astimezone(),
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(DecisionLogORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "decision_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[DecisionLogORM.decision_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(DecisionLogORM, decision_id)
+
+    def list_recent_decisions(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str | None = None,
+        limit: int = 20,
+    ) -> list[DecisionLogORM]:
+        """查询最近决策日志。"""
+
+        statement = select(DecisionLogORM).where(DecisionLogORM.owner_id == owner_id)
+        if asset_id:
+            statement = statement.where(DecisionLogORM.asset_id == asset_id)
+        return list(
+            self.session.scalars(
+                statement.order_by(DecisionLogORM.created_at.desc()).limit(limit)
+            )
+        )
+
+
+class MemoryRepository:
+    """Finance Memory、向量索引、轻量图谱和复盘任务仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_memory(
+        self,
+        *,
+        memory_id: str,
+        owner_id: str,
+        memory_type: str,
+        scope: str,
+        content: str,
+        confidence: Decimal,
+        asset_id: str | None = None,
+        source_decision_id: str | None = None,
+        source_review_task_id: str | None = None,
+        embedding_ref: str | None = None,
+        status: str = "active",
+        payload: JsonDict | None = None,
+    ) -> AssistantMemoryORM:
+        """按 `memory_id` 幂等写入 Finance Memory。"""
+
+        values = {
+            "memory_id": memory_id,
+            "owner_id": owner_id,
+            "memory_type": memory_type,
+            "scope": scope,
+            "asset_id": asset_id,
+            "source_decision_id": source_decision_id,
+            "source_review_task_id": source_review_task_id,
+            "content": content,
+            "embedding_ref": embedding_ref,
+            "confidence": confidence,
+            "status": status,
+            "payload": _json_safe(payload or {}),
+            "updated_at": datetime.now().astimezone(),
+        }
+        statement = insert(AssistantMemoryORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "memory_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[AssistantMemoryORM.memory_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(AssistantMemoryORM, memory_id)
+
+    def upsert_embedding(
+        self,
+        *,
+        embedding_id: str,
+        owner_id: str,
+        source_type: str,
+        source_id: str,
+        chunk_text: str,
+        embedding_model: str,
+        memory_id: str | None = None,
+        embedding: list[float] | None = None,
+        content_hash: str | None = None,
+        payload: JsonDict | None = None,
+    ) -> MemoryEmbeddingORM:
+        """按 `embedding_id` 幂等写入 Finance Memory 语义索引。"""
+
+        values = {
+            "embedding_id": embedding_id,
+            "owner_id": owner_id,
+            "memory_id": memory_id,
+            "source_type": source_type,
+            "source_id": source_id,
+            "chunk_text": chunk_text,
+            "embedding": _json_safe(embedding) if embedding is not None else None,
+            "embedding_model": embedding_model,
+            "content_hash": content_hash or _stable_json_hash({"text": chunk_text}),
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(MemoryEmbeddingORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "embedding_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[MemoryEmbeddingORM.embedding_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(MemoryEmbeddingORM, embedding_id)
+
+    def upsert_edge(
+        self,
+        *,
+        edge_id: str,
+        owner_id: str,
+        source_type: str,
+        source_id: str,
+        relation_type: str,
+        target_type: str,
+        target_id: str,
+        confidence: Decimal,
+        reason: str | None = None,
+        payload: JsonDict | None = None,
+    ) -> FinancialMemoryEdgeORM:
+        """按语义边唯一约束幂等写入轻量图谱关系。"""
+
+        values = {
+            "edge_id": edge_id,
+            "owner_id": owner_id,
+            "source_type": source_type,
+            "source_id": source_id,
+            "relation_type": relation_type,
+            "target_type": target_type,
+            "target_id": target_id,
+            "confidence": confidence,
+            "reason": reason,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(FinancialMemoryEdgeORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key
+            not in {
+                "edge_id",
+                "owner_id",
+                "source_type",
+                "source_id",
+                "relation_type",
+                "target_type",
+                "target_id",
+            }
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="uq_memory_edges_owner_source_relation_target",
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.get_edge(
+            owner_id=owner_id,
+            source_type=source_type,
+            source_id=source_id,
+            relation_type=relation_type,
+            target_type=target_type,
+            target_id=target_id,
+        )
+
+    def upsert_review_task(
+        self,
+        *,
+        review_task_id: str,
+        owner_id: str,
+        review_type: str,
+        due_at: datetime,
+        status: str,
+        asset_id: str | None = None,
+        source_decision_id: str | None = None,
+        review_questions: list[JsonDict] | None = None,
+        result_summary: str | None = None,
+        finished_at: datetime | None = None,
+        payload: JsonDict | None = None,
+    ) -> ReviewTaskORM:
+        """按 `review_task_id` 幂等写入复盘任务。"""
+
+        values = {
+            "review_task_id": review_task_id,
+            "owner_id": owner_id,
+            "asset_id": asset_id,
+            "source_decision_id": source_decision_id,
+            "review_type": review_type,
+            "due_at": due_at,
+            "status": status,
+            "review_questions": _json_safe(review_questions or []),
+            "result_summary": result_summary,
+            "finished_at": finished_at,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(ReviewTaskORM).values(**values)
+        update_values = {
+            key: statement.excluded[key] for key in values if key != "review_task_id"
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[ReviewTaskORM.review_task_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(ReviewTaskORM, review_task_id)
+
+    def get_edge(
+        self,
+        *,
+        owner_id: str,
+        source_type: str,
+        source_id: str,
+        relation_type: str,
+        target_type: str,
+        target_id: str,
+    ) -> FinancialMemoryEdgeORM:
+        """根据语义边唯一键查询关系。"""
+
+        statement = select(FinancialMemoryEdgeORM).where(
+            FinancialMemoryEdgeORM.owner_id == owner_id,
+            FinancialMemoryEdgeORM.source_type == source_type,
+            FinancialMemoryEdgeORM.source_id == source_id,
+            FinancialMemoryEdgeORM.relation_type == relation_type,
+            FinancialMemoryEdgeORM.target_type == target_type,
+            FinancialMemoryEdgeORM.target_id == target_id,
+        )
+        return self.session.scalars(statement).one()
+
+    def list_active_memories(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str | None = None,
+        memory_type: str | None = None,
+        limit: int = 20,
+    ) -> list[AssistantMemoryORM]:
+        """查询可用 Finance Memory。"""
+
+        statement = select(AssistantMemoryORM).where(
+            AssistantMemoryORM.owner_id == owner_id,
+            AssistantMemoryORM.status == "active",
+        )
+        if asset_id:
+            statement = statement.where(AssistantMemoryORM.asset_id == asset_id)
+        if memory_type:
+            statement = statement.where(AssistantMemoryORM.memory_type == memory_type)
+        return list(
+            self.session.scalars(
+                statement.order_by(AssistantMemoryORM.updated_at.desc()).limit(limit)
+            )
+        )
+
+
+class DataQualityRepository:
+    """数据质量快照仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_quality_snapshot(
+        self,
+        *,
+        quality_id: str,
+        market: str,
+        data_domain: str,
+        provider: str,
+        status: str,
+        freshness_status: str,
+        checked_at: datetime,
+        issue_count: int,
+        asset_id: str | None = None,
+        symbol: str | None = None,
+        latest_data_at: datetime | None = None,
+        missing_items: list[str] | None = None,
+        payload: JsonDict | None = None,
+    ) -> DataQualitySnapshotORM:
+        """按 `quality_id` 幂等写入数据质量快照。"""
+
+        values = {
+            "quality_id": quality_id,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "data_domain": data_domain,
+            "provider": provider,
+            "status": status,
+            "freshness_status": freshness_status,
+            "latest_data_at": latest_data_at,
+            "checked_at": checked_at,
+            "missing_items": missing_items or [],
+            "issue_count": issue_count,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(DataQualitySnapshotORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"quality_id", "checked_at"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[
+                    DataQualitySnapshotORM.quality_id,
+                    DataQualitySnapshotORM.checked_at,
+                ],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(
+            DataQualitySnapshotORM,
+            {"quality_id": quality_id, "checked_at": checked_at},
+        )
+
+    def list_latest_quality(
+        self,
+        *,
+        asset_id: str | None = None,
+        market: str | None = None,
+        data_domain: str | None = None,
+        limit: int = 20,
+    ) -> list[DataQualitySnapshotORM]:
+        """查询最近数据质量快照。"""
+
+        statement = select(DataQualitySnapshotORM)
+        if asset_id:
+            statement = statement.where(DataQualitySnapshotORM.asset_id == asset_id)
+        if market:
+            statement = statement.where(DataQualitySnapshotORM.market == market)
+        if data_domain:
+            statement = statement.where(DataQualitySnapshotORM.data_domain == data_domain)
+        return list(
+            self.session.scalars(
+                statement.order_by(DataQualitySnapshotORM.checked_at.desc()).limit(limit)
+            )
+        )
+
+
+class WorkflowAuditRepository:
+    """上层主 Agent 调用底层金融团队 Workflow 的审计仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_run(
+        self,
+        *,
+        workflow_run_id: str,
+        owner_id: str,
+        workflow_type: str,
+        trigger_type: str,
+        status: str,
+        started_at: datetime,
+        trigger_ref: str | None = None,
+        finished_at: datetime | None = None,
+        input_ref: str | None = None,
+        output_ref: str | None = None,
+        payload: JsonDict | None = None,
+    ) -> AgentWorkflowRunORM:
+        """按 `workflow_run_id` 幂等写入 Workflow 运行审计。"""
+
+        values = {
+            "workflow_run_id": workflow_run_id,
+            "owner_id": owner_id,
+            "workflow_type": workflow_type,
+            "trigger_type": trigger_type,
+            "trigger_ref": trigger_ref,
+            "status": status,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "input_ref": input_ref,
+            "output_ref": output_ref,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(AgentWorkflowRunORM).values(**values)
+        update_values = {
+            key: statement.excluded[key] for key in values if key != "workflow_run_id"
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[AgentWorkflowRunORM.workflow_run_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(AgentWorkflowRunORM, workflow_run_id)
+
+    def insert_event(
+        self,
+        *,
+        workflow_event_id: str,
+        workflow_run_id: str,
+        event_type: str,
+        message: str,
+        agent_name: str | None = None,
+        evidence_ids: list[str] | None = None,
+        created_at: datetime | None = None,
+        payload: JsonDict | None = None,
+    ) -> AgentWorkflowEventORM:
+        """写入或覆盖一条 Workflow 可审计事件。"""
+
+        values = {
+            "workflow_event_id": workflow_event_id,
+            "workflow_run_id": workflow_run_id,
+            "event_type": event_type,
+            "agent_name": agent_name,
+            "message": message,
+            "evidence_ids": evidence_ids or [],
+            "created_at": created_at or datetime.now().astimezone(),
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(AgentWorkflowEventORM).values(**values)
+        update_values = {
+            key: statement.excluded[key] for key in values if key != "workflow_event_id"
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[AgentWorkflowEventORM.workflow_event_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(AgentWorkflowEventORM, workflow_event_id)
+
+    def list_events(self, workflow_run_id: str) -> list[AgentWorkflowEventORM]:
+        """查询一次 Workflow 的事件。"""
+
+        statement = (
+            select(AgentWorkflowEventORM)
+            .where(AgentWorkflowEventORM.workflow_run_id == workflow_run_id)
+            .order_by(AgentWorkflowEventORM.created_at)
+        )
+        return list(self.session.scalars(statement))
 
 
 class CapitalFlowRepository:
