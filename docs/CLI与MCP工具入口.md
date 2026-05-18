@@ -1,6 +1,6 @@
 # CLI 与 MCP 工具入口
 
-本文记录当前阶段给 Hermes-Agent、Codex、Scheduler 和后续前端 API 使用的工具入口。结论是：CLI 和 MCP 共用同一层 `FinanceAgentInterface`，只做参数解析、事务边界、JSON 序列化和调用转发，不承载金融决策逻辑。
+本文记录当前阶段给 Hermes-Agent、Codex、Scheduler 和后续前端 API 使用的工具入口。结论是：CLI 和 MCP 都保持薄入口；Workflow 与事实工具共用 `FinanceAgentInterface`，V1.2 触发事件入口调用 `TriggerService`，入口层只做参数解析、事务边界、JSON 序列化和调用转发，不承载金融决策逻辑。
 
 ## 1. 分层
 
@@ -8,10 +8,14 @@
 flowchart TD
     H["Hermes / Codex / Scheduler"] --> CLI["CLI\nfinance-agent"]
     H --> MCP["MCP Server\nfinance-agent-mcp"]
-    CLI --> IF["FinanceAgentInterface\n统一工具门面"]
+    CLI --> IF["FinanceAgentInterface\nWorkflow / 工具门面"]
     MCP --> IF
+    CLI --> TS["TriggerService\n触发事件评估与派发"]
+    MCP --> TS
     IF --> FAS["FinanceAssistantService\n金融业务编排内核"]
     IF --> TR["FinanceToolRuntime\n只读事实工具"]
+    TS --> FAS
+    TS --> EVT["assistant_trigger_events"]
     FAS --> WF["LangGraph Workflow"]
     TR --> DB["PostgreSQL + TimescaleDB\n已清洗入库数据"]
     WF --> LOG["agent_workflow_runs / agent_workflow_events"]
@@ -89,6 +93,9 @@ finance-agent-mcp
 | `get_report` | 查询中文解释报告，可返回 Markdown |
 | `list_tools` | 列出只读金融事实工具 |
 | `call_tool` | 调用 `FinanceToolRuntime` 中的只读事实工具 |
+| `evaluate_triggers` | 评估已入库事实并生成触发事件 |
+| `dispatch_triggers` | 派发待处理触发事件到金融团队 Workflow |
+| `run_triggers_once` | 执行一次触发评估并立即派发 |
 
 MCP 依赖写入 `pyproject.toml`：`mcp>=1.16,<2.0`。当前本地已验证 `mcp 1.27.1` 可以创建 server。
 
@@ -98,6 +105,7 @@ MCP 依赖写入 `pyproject.toml`：`mcp>=1.16,<2.0`。当前本地已验证 `mc
 - CLI 和 MCP 不直接计算指标、因子、评分或信号。
 - CLI 和 MCP 不直接调用外部 LLM。
 - CLI 和 MCP 不绕过 `FinanceAssistantService` 写决策、记忆或审计。
+- 触发入口不直接给买卖结论，只写 `assistant_trigger_events` 并派发 Workflow。
 - 真实交易下单仍不在本项目第一阶段范围内，后续必须增加人工确认和交易权限开关。
 
 ## 5. 验证
@@ -107,6 +115,7 @@ MCP 依赖写入 `pyproject.toml`：`mcp>=1.16,<2.0`。当前本地已验证 `mc
 ```bash
 python scripts/storage/smoke_agent_cli_interface.py
 python scripts/storage/smoke_agent_mcp_server.py
+python scripts/storage/smoke_v12_trigger_events.py
 ```
 
 已验证：
@@ -115,3 +124,4 @@ python scripts/storage/smoke_agent_mcp_server.py
 - CLI 可以输出结构化 JSON。
 - CLI 可以运行 `asset_deep_analysis` 圆桌报告 Workflow。
 - MCP SDK 安装后可以创建 MCP Server。
+- V1.2 触发层能生成 6 类触发事件、冷却去重，并通过 CLI 重复评估返回结构化 JSON。

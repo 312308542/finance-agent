@@ -164,13 +164,13 @@ flowchart LR
 
 ## 6.2 CLI 与 MCP 入口
 
-CLI 和 MCP 已经同时落地，二者都是薄入口，共用 `FinanceAgentInterface`：
+CLI 和 MCP 已经同时落地，二者都是薄入口。Workflow 和事实工具入口共用 `FinanceAgentInterface`；V1.2 触发事件入口调用 `TriggerService`，再派发到 `FinanceAssistantService.run_workflow()`：
 
 ```text
-Hermes / Codex / Scheduler
+Hermes / Codex / Scheduler / Trigger Engine
   -> CLI 或 MCP
-  -> FinanceAgentInterface
-  -> FinanceAssistantService / FinanceToolRuntime
+  -> FinanceAgentInterface / TriggerService
+  -> FinanceAssistantService / FinanceToolRuntime / assistant_trigger_events
   -> LangGraph Workflow / PostgreSQL + TimescaleDB
 ```
 
@@ -185,6 +185,9 @@ finance-agent workflows show <workflow_run_id>
 finance-agent reports show <workflow_run_id> --markdown
 finance-agent tools list
 finance-agent tools call factor.get_asset_factor_context --arguments "{\"asset_id\":\"asset:demo\"}"
+finance-agent triggers evaluate --owner-id owner:demo --portfolio-id portfolio:demo
+finance-agent triggers dispatch --owner-id owner:demo
+finance-agent triggers run-once --owner-id owner:demo --portfolio-id portfolio:demo --watchlist-id watchlist:demo
 ```
 
 已提供的 MCP tools：
@@ -195,6 +198,9 @@ finance-agent tools call factor.get_asset_factor_context --arguments "{\"asset_i
 - `get_report`
 - `list_tools`
 - `call_tool`
+- `evaluate_triggers`
+- `dispatch_triggers`
+- `run_triggers_once`
 
 CLI / MCP 入口约束：
 
@@ -203,6 +209,33 @@ CLI / MCP 入口约束：
 - 不直接调用外部模型。
 - 不绕过 `FinanceAssistantService` 写入决策、记忆和审计。
 - 输出统一为 JSON；报告可以额外返回 Markdown。
+
+## 6.3 V1.2 触发事件层
+
+V1.2 新增 `assistant_trigger_events` 和 `TriggerService`。触发层不常驻运行 Workflow，而是把已入库事实变化转成可审计事件，再由 dispatcher 派发到金融团队 Workflow。
+
+```mermaid
+flowchart LR
+    DB["已入库事实\n持仓 / 信号 / TA / 因子 / 评分 / 风险 / 数据质量"] --> TS["TriggerService.evaluate"]
+    TS --> EV["assistant_trigger_events\npending / dispatched / skipped"]
+    EV --> CD["dedup_key + cooldown\n去重和冷却"]
+    CD --> DP["TriggerService.dispatch_pending"]
+    DP --> FAS["FinanceAssistantService.run_workflow"]
+    FAS --> AUD["agent_workflow_runs / agent_workflow_events\n中文报告 / 记忆 / 审计"]
+```
+
+当前基础版支持：
+
+| 触发类型 | 数据来源 | Workflow |
+| --- | --- | --- |
+| `position_drawdown` | `positions` | `portfolio_monitoring` |
+| `signal_flip` | `signal_snapshots` | `portfolio_monitoring` |
+| `watchlist_condition_hit` | `signal_snapshots`、`indicator_frames`、`factor_frames`、`asset_scores` | `asset_deep_analysis` |
+| `recommendation_run_ready` | `recommendation_runs` | `recommendation_decision` |
+| `risk_event_detected` | `risk_findings` | `portfolio_monitoring` 或 `asset_deep_analysis` |
+| `data_quality_degraded` | `data_quality_snapshots` | `portfolio_monitoring` 或 `asset_deep_analysis` |
+
+这层读取的是数据层已经由 TA-Lib、pandas/numpy、AKShare、Binance/ccxt 输入产出的指标、因子、评分和信号，不在触发时重新计算。
 
 ## 7. 工具能力
 
