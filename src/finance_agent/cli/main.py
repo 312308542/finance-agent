@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from finance_agent.agents.interfaces import FinanceAgentInterface, parse_datetime
+from finance_agent.agents.loop import InternalFinanceAgentLoopRunner
 from finance_agent.storage.db import create_session_factory, session_scope
 from finance_agent.triggers import TriggerEvaluationRequest, TriggerService
 
@@ -87,6 +88,22 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_parser.add_argument("--as-of", default=None, help="ISO 时间，默认当前时间。")
     run_once = trigger_commands.add_parser("run-once", help="执行一次触发评估并立即唤醒 Agent。")
     add_trigger_request_arguments(run_once)
+
+    agent = subparsers.add_parser("agent", help="内部金融 Agent Loop。")
+    agent_commands = agent.add_subparsers(dest="command", required=True)
+    agent_run_once = agent_commands.add_parser(
+        "run-once",
+        help="消费已派发的 Agent 唤醒事件，并按需调用底层金融团队 Workflow。",
+    )
+    agent_run_once.add_argument("--owner-id", default=None, help="只处理指定用户的 Agent 任务。")
+    agent_run_once.add_argument("--limit", type=int, default=20, help="本次最多处理任务数。")
+    agent_run_once.add_argument("--as-of", default=None, help="ISO 时间，默认当前时间。")
+    agent_run_task = agent_commands.add_parser(
+        "run-task",
+        help="按 Agent 任务 ID 处理单个唤醒事件。",
+    )
+    agent_run_task.add_argument("agent_task_id", help="触发层派发出的 Agent 任务 ID。")
+    agent_run_task.add_argument("--as-of", default=None, help="ISO 时间，默认当前时间。")
     return parser
 
 
@@ -146,6 +163,8 @@ def dispatch(args: argparse.Namespace) -> JsonDict:
             return dispatch_reports(interface, args).to_dict()
         if args.group == "triggers":
             return dispatch_triggers(session, args)
+        if args.group == "agent":
+            return dispatch_agent(session, args)
     raise ValueError(f"未知命令组：{args.group}")
 
 
@@ -228,6 +247,26 @@ def dispatch_triggers(session: Any, args: argparse.Namespace) -> JsonDict:
             "data": service.run_once(build_trigger_request(args)),
         }
     raise ValueError(f"未知 triggers 命令：{args.command}")
+
+
+def dispatch_agent(session: Any, args: argparse.Namespace) -> JsonDict:
+    """处理内部金融 Agent Loop 命令。"""
+
+    runner = InternalFinanceAgentLoopRunner(session)
+    if args.command == "run-once":
+        result = runner.run_once(
+            owner_id=args.owner_id,
+            limit=args.limit,
+            as_of=parse_datetime(args.as_of),
+        )
+        return {"status": "ok", "data": result.to_dict()}
+    if args.command == "run-task":
+        result = runner.run_task(
+            agent_task_id=args.agent_task_id,
+            as_of=parse_datetime(args.as_of),
+        )
+        return {"status": "ok", "data": result.to_dict()}
+    raise ValueError(f"未知 agent 命令：{args.command}")
 
 
 def build_trigger_request(args: argparse.Namespace) -> TriggerEvaluationRequest:

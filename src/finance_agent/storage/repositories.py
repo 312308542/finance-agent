@@ -2053,6 +2053,50 @@ class AssistantTriggerRepository:
             )
         )
 
+    def list_agent_wakeup_events(
+        self,
+        *,
+        owner_id: str | None = None,
+        agent_runtime: str | None = None,
+        limit: int = 20,
+    ) -> list[AssistantTriggerEventORM]:
+        """查询已派发但尚未被内部 Agent Loop 完成处理的唤醒事件。"""
+
+        statement = select(AssistantTriggerEventORM).where(
+            AssistantTriggerEventORM.status == "dispatched",
+            AssistantTriggerEventORM.agent_task_id.is_not(None),
+        )
+        if owner_id:
+            statement = statement.where(AssistantTriggerEventORM.owner_id == owner_id)
+        if agent_runtime:
+            statement = statement.where(AssistantTriggerEventORM.agent_runtime == agent_runtime)
+
+        rows = list(
+            self.session.scalars(
+                statement.order_by(
+                    AssistantTriggerEventORM.triggered_at.asc(),
+                    AssistantTriggerEventORM.severity.desc(),
+                ).limit(max(limit * 5, limit))
+            )
+        )
+        return [
+            event
+            for event in rows
+            if (event.payload or {}).get("agent_loop_status")
+            not in {"workflow_completed", "skipped", "failed"}
+        ][:limit]
+
+    def get_trigger_event_by_agent_task_id(
+        self,
+        agent_task_id: str,
+    ) -> AssistantTriggerEventORM | None:
+        """按 Agent 任务 ID 查询触发事件。"""
+
+        statement = select(AssistantTriggerEventORM).where(
+            AssistantTriggerEventORM.agent_task_id == agent_task_id
+        )
+        return self.session.scalars(statement).one_or_none()
+
     def mark_dispatched(
         self,
         *,
@@ -2118,6 +2162,132 @@ class AssistantTriggerRepository:
             triggered_at=event.triggered_at,
             dispatched_at=skipped_at,
             payload=payload,
+        )
+
+    def mark_agent_loop_completed(
+        self,
+        *,
+        trigger_event_id: str,
+        workflow_run_id: str,
+        completed_at: datetime,
+        payload: JsonDict | None = None,
+    ) -> AssistantTriggerEventORM:
+        """标记触发事件已经被内部 Agent Loop 处理完成。"""
+
+        event = self.session.get_one(AssistantTriggerEventORM, trigger_event_id)
+        merged_payload = dict(event.payload or {})
+        merged_payload.update(
+            {
+                "agent_loop_status": "workflow_completed",
+                "handled_by": "InternalFinanceAgentLoop",
+                "handled_at": completed_at.isoformat(),
+                "workflow_run_id": workflow_run_id,
+            }
+        )
+        merged_payload.update(_json_safe(payload or {}))
+        return self.upsert_trigger_event(
+            trigger_event_id=event.trigger_event_id,
+            owner_id=event.owner_id,
+            trigger_type=event.trigger_type,
+            trigger_ref=event.trigger_ref,
+            dedup_key=event.dedup_key,
+            severity=event.severity,
+            status=event.status,
+            agent_runtime=event.agent_runtime,
+            agent_task_id=event.agent_task_id,
+            requested_workflow_type=event.requested_workflow_type,
+            portfolio_id=event.portfolio_id,
+            watchlist_id=event.watchlist_id,
+            recommendation_run_id=event.recommendation_run_id,
+            asset_id=event.asset_id,
+            cooldown_until=event.cooldown_until,
+            triggered_at=event.triggered_at,
+            dispatched_at=event.dispatched_at,
+            payload=merged_payload,
+        )
+
+    def mark_agent_loop_skipped(
+        self,
+        *,
+        trigger_event_id: str,
+        skipped_at: datetime,
+        reason: str,
+        payload: JsonDict | None = None,
+    ) -> AssistantTriggerEventORM:
+        """标记触发事件被内部 Agent Loop 跳过。"""
+
+        event = self.session.get_one(AssistantTriggerEventORM, trigger_event_id)
+        merged_payload = dict(event.payload or {})
+        merged_payload.update(
+            {
+                "agent_loop_status": "skipped",
+                "handled_by": "InternalFinanceAgentLoop",
+                "handled_at": skipped_at.isoformat(),
+                "skip_reason": reason,
+            }
+        )
+        merged_payload.update(_json_safe(payload or {}))
+        return self.upsert_trigger_event(
+            trigger_event_id=event.trigger_event_id,
+            owner_id=event.owner_id,
+            trigger_type=event.trigger_type,
+            trigger_ref=event.trigger_ref,
+            dedup_key=event.dedup_key,
+            severity=event.severity,
+            status=event.status,
+            agent_runtime=event.agent_runtime,
+            agent_task_id=event.agent_task_id,
+            requested_workflow_type=event.requested_workflow_type,
+            portfolio_id=event.portfolio_id,
+            watchlist_id=event.watchlist_id,
+            recommendation_run_id=event.recommendation_run_id,
+            asset_id=event.asset_id,
+            cooldown_until=event.cooldown_until,
+            triggered_at=event.triggered_at,
+            dispatched_at=event.dispatched_at,
+            payload=merged_payload,
+        )
+
+    def mark_agent_loop_failed(
+        self,
+        *,
+        trigger_event_id: str,
+        failed_at: datetime,
+        error_message: str,
+        payload: JsonDict | None = None,
+    ) -> AssistantTriggerEventORM:
+        """标记触发事件被内部 Agent Loop 处理失败。"""
+
+        event = self.session.get_one(AssistantTriggerEventORM, trigger_event_id)
+        merged_payload = dict(event.payload or {})
+        merged_payload.update(
+            {
+                "agent_loop_status": "failed",
+                "handled_by": "InternalFinanceAgentLoop",
+                "handled_at": failed_at.isoformat(),
+                "error_message": error_message,
+            }
+        )
+        merged_payload.update(_json_safe(payload or {}))
+        return self.upsert_trigger_event(
+            trigger_event_id=event.trigger_event_id,
+            owner_id=event.owner_id,
+            trigger_type=event.trigger_type,
+            trigger_ref=event.trigger_ref,
+            dedup_key=event.dedup_key,
+            severity=event.severity,
+            status=event.status,
+            agent_runtime=event.agent_runtime,
+            agent_task_id=event.agent_task_id,
+            requested_workflow_type=event.requested_workflow_type,
+            portfolio_id=event.portfolio_id,
+            watchlist_id=event.watchlist_id,
+            recommendation_run_id=event.recommendation_run_id,
+            asset_id=event.asset_id,
+            cooldown_until=event.cooldown_until,
+            triggered_at=event.triggered_at,
+            dispatched_at=event.dispatched_at,
+            payload=merged_payload,
         )
 
 
