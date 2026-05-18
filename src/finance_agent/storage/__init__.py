@@ -9,6 +9,7 @@ from finance_agent.storage.orm import Base
 from finance_agent.storage.repositories import (
     AssetRepository,
     AssetScoreRepository,
+    AssistantTriggerRepository,
     DataQualityRepository,
     DecisionLogRepository,
     DerivativeDataRepository,
@@ -28,6 +29,7 @@ from finance_agent.storage.repositories import (
 __all__ = [
     "AssetScoreRepository",
     "AssetRepository",
+    "AssistantTriggerRepository",
     "Base",
     "DataQualityRepository",
     "DecisionLogRepository",

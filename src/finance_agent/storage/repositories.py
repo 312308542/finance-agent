@@ -28,6 +28,7 @@ from finance_agent.storage.orm import (
     AssetUniverseMemberORM,
     AssetUniverseORM,
     AssistantMemoryORM,
+    AssistantTriggerEventORM,
     CapitalFlowSnapshotORM,
     CryptoDerivativeSnapshotORM,
     DataQualitySnapshotORM,
@@ -956,6 +957,25 @@ class AssetScoreRepository:
         )
         return list(self.session.scalars(statement))
 
+    def get_latest_score(
+        self,
+        *,
+        asset_id: str,
+        horizon: str,
+    ) -> AssetScoreORM | None:
+        """查询单标的最新多维评分。"""
+
+        statement = (
+            select(AssetScoreORM)
+            .where(
+                AssetScoreORM.asset_id == asset_id,
+                AssetScoreORM.horizon == horizon,
+            )
+            .order_by(AssetScoreORM.as_of.desc())
+            .limit(1)
+        )
+        return self.session.scalars(statement).one_or_none()
+
 
 class SignalSnapshotRepository:
     """信号快照仓储。"""
@@ -1021,6 +1041,26 @@ class SignalSnapshotRepository:
         return self.session.scalars(
             statement.order_by(SignalSnapshotORM.as_of.desc()).limit(1)
         ).one_or_none()
+
+    def list_recent_signals(
+        self,
+        *,
+        asset_id: str,
+        horizon: str,
+        limit: int = 5,
+    ) -> list[SignalSnapshotORM]:
+        """查询单标的最近信号快照，返回时间倒序结果。"""
+
+        statement = (
+            select(SignalSnapshotORM)
+            .where(
+                SignalSnapshotORM.asset_id == asset_id,
+                SignalSnapshotORM.horizon == horizon,
+            )
+            .order_by(SignalSnapshotORM.as_of.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(statement))
 
 
 class RecommendationRepository:
@@ -1239,6 +1279,27 @@ class RecommendationRepository:
             .limit(limit)
         )
         return list(self.session.scalars(statement))
+
+    def list_available_runs_since(
+        self,
+        *,
+        since: datetime,
+        market: str | None = None,
+        limit: int = 20,
+    ) -> list[RecommendationRunORM]:
+        """查询最近完成或可用的推荐运行。"""
+
+        statement = select(RecommendationRunORM).where(
+            RecommendationRunORM.status == "available",
+            RecommendationRunORM.started_at >= since,
+        )
+        if market:
+            statement = statement.where(RecommendationRunORM.market == market)
+        return list(
+            self.session.scalars(
+                statement.order_by(RecommendationRunORM.started_at.desc()).limit(limit)
+            )
+        )
 
 
 class FundamentalDataRepository:
@@ -1889,6 +1950,171 @@ class WatchlistRepository:
         return list(self.session.scalars(statement))
 
 
+class AssistantTriggerRepository:
+    """私人金融助手触发事件仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_trigger_event(
+        self,
+        *,
+        trigger_event_id: str,
+        owner_id: str,
+        trigger_type: str,
+        dedup_key: str,
+        severity: str,
+        status: str,
+        workflow_type: str,
+        triggered_at: datetime,
+        trigger_ref: str | None = None,
+        workflow_run_id: str | None = None,
+        portfolio_id: str | None = None,
+        watchlist_id: str | None = None,
+        recommendation_run_id: str | None = None,
+        asset_id: str | None = None,
+        cooldown_until: datetime | None = None,
+        dispatched_at: datetime | None = None,
+        payload: JsonDict | None = None,
+    ) -> AssistantTriggerEventORM:
+        """按触发事件 ID 幂等写入触发事件。"""
+
+        values = {
+            "trigger_event_id": trigger_event_id,
+            "owner_id": owner_id,
+            "trigger_type": trigger_type,
+            "trigger_ref": trigger_ref,
+            "dedup_key": dedup_key,
+            "severity": severity,
+            "status": status,
+            "workflow_type": workflow_type,
+            "workflow_run_id": workflow_run_id,
+            "portfolio_id": portfolio_id,
+            "watchlist_id": watchlist_id,
+            "recommendation_run_id": recommendation_run_id,
+            "asset_id": asset_id,
+            "cooldown_until": cooldown_until,
+            "triggered_at": triggered_at,
+            "dispatched_at": dispatched_at,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(AssistantTriggerEventORM).values(**values)
+        update_values = {
+            key: statement.excluded[key] for key in values if key != "trigger_event_id"
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[AssistantTriggerEventORM.trigger_event_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(AssistantTriggerEventORM, trigger_event_id)
+
+    def has_recent_event(
+        self,
+        *,
+        dedup_key: str,
+        since: datetime,
+        statuses: Sequence[str] = ("pending", "dispatched", "skipped"),
+    ) -> bool:
+        """判断冷却窗口内是否已有同类触发。"""
+
+        statement = select(func.count()).select_from(AssistantTriggerEventORM).where(
+            AssistantTriggerEventORM.dedup_key == dedup_key,
+            AssistantTriggerEventORM.triggered_at >= since,
+            AssistantTriggerEventORM.status.in_(statuses),
+        )
+        return int(self.session.scalar(statement) or 0) > 0
+
+    def list_pending_events(
+        self,
+        *,
+        owner_id: str | None = None,
+        limit: int = 50,
+    ) -> list[AssistantTriggerEventORM]:
+        """查询待派发触发事件。"""
+
+        statement = select(AssistantTriggerEventORM).where(
+            AssistantTriggerEventORM.status == "pending"
+        )
+        if owner_id:
+            statement = statement.where(AssistantTriggerEventORM.owner_id == owner_id)
+        return list(
+            self.session.scalars(
+                statement.order_by(
+                    AssistantTriggerEventORM.triggered_at.asc(),
+                    AssistantTriggerEventORM.severity.desc(),
+                ).limit(limit)
+            )
+        )
+
+    def mark_dispatched(
+        self,
+        *,
+        trigger_event_id: str,
+        workflow_run_id: str,
+        dispatched_at: datetime,
+        payload: JsonDict | None = None,
+    ) -> AssistantTriggerEventORM:
+        """标记触发事件已经派发到 Workflow。"""
+
+        event = self.session.get_one(AssistantTriggerEventORM, trigger_event_id)
+        merged_payload = dict(event.payload or {})
+        merged_payload.update(_json_safe(payload or {}))
+        return self.upsert_trigger_event(
+            trigger_event_id=event.trigger_event_id,
+            owner_id=event.owner_id,
+            trigger_type=event.trigger_type,
+            trigger_ref=event.trigger_ref,
+            dedup_key=event.dedup_key,
+            severity=event.severity,
+            status="dispatched",
+            workflow_type=event.workflow_type,
+            workflow_run_id=workflow_run_id,
+            portfolio_id=event.portfolio_id,
+            watchlist_id=event.watchlist_id,
+            recommendation_run_id=event.recommendation_run_id,
+            asset_id=event.asset_id,
+            cooldown_until=event.cooldown_until,
+            triggered_at=event.triggered_at,
+            dispatched_at=dispatched_at,
+            payload=merged_payload,
+        )
+
+    def mark_skipped(
+        self,
+        *,
+        trigger_event_id: str,
+        skipped_at: datetime,
+        reason: str,
+    ) -> AssistantTriggerEventORM:
+        """标记触发事件被跳过。"""
+
+        event = self.session.get_one(AssistantTriggerEventORM, trigger_event_id)
+        payload = dict(event.payload or {})
+        payload["skip_reason"] = reason
+        return self.upsert_trigger_event(
+            trigger_event_id=event.trigger_event_id,
+            owner_id=event.owner_id,
+            trigger_type=event.trigger_type,
+            trigger_ref=event.trigger_ref,
+            dedup_key=event.dedup_key,
+            severity=event.severity,
+            status="skipped",
+            workflow_type=event.workflow_type,
+            workflow_run_id=event.workflow_run_id,
+            portfolio_id=event.portfolio_id,
+            watchlist_id=event.watchlist_id,
+            recommendation_run_id=event.recommendation_run_id,
+            asset_id=event.asset_id,
+            cooldown_until=event.cooldown_until,
+            triggered_at=event.triggered_at,
+            dispatched_at=skipped_at,
+            payload=payload,
+        )
+
+
 class DecisionLogRepository:
     """提醒和决策日志仓储。"""
 
@@ -2332,6 +2558,28 @@ class DataQualityRepository:
             )
         )
 
+    def list_recent_quality_since(
+        self,
+        *,
+        asset_ids: Sequence[str],
+        since: datetime,
+        limit: int = 50,
+    ) -> list[DataQualitySnapshotORM]:
+        """查询一组资产在时间窗口内新增的数据质量快照。"""
+
+        if not asset_ids:
+            return []
+        statement = (
+            select(DataQualitySnapshotORM)
+            .where(
+                DataQualitySnapshotORM.asset_id.in_(asset_ids),
+                DataQualitySnapshotORM.checked_at >= since,
+            )
+            .order_by(DataQualitySnapshotORM.checked_at.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(statement))
+
 
 class WorkflowAuditRepository:
     """上层主 Agent 调用底层金融团队 Workflow 的审计仓储。"""
@@ -2687,6 +2935,30 @@ class RiskRepository:
         statement = (
             select(RiskFindingORM)
             .where(RiskFindingORM.asset_id == asset_id)
+            .order_by(RiskFindingORM.as_of.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(statement))
+
+    def list_recent_risks_since(
+        self,
+        *,
+        asset_ids: Sequence[str],
+        since: datetime,
+        severities: Sequence[str] = ("high", "critical"),
+        limit: int = 50,
+    ) -> list[RiskFindingORM]:
+        """查询一组资产在时间窗口内新增的高优先级风险。"""
+
+        if not asset_ids:
+            return []
+        statement = (
+            select(RiskFindingORM)
+            .where(
+                RiskFindingORM.asset_id.in_(asset_ids),
+                RiskFindingORM.as_of >= since,
+                RiskFindingORM.severity.in_(severities),
+            )
             .order_by(RiskFindingORM.as_of.desc())
             .limit(limit)
         )

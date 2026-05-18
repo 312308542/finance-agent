@@ -1041,6 +1041,40 @@ class WatchlistItemEventORM(Base):
     )
 
 
+class AssistantTriggerEventORM(Base):
+    """私人金融助手触发事件表，记录 Workflow 被唤起前的输入事件。"""
+
+    __tablename__ = "assistant_trigger_events"
+    __table_args__ = (
+        UniqueConstraint("dedup_key", "triggered_at", name="uq_trigger_events_dedup_time"),
+        Index("idx_trigger_events_owner_status", "owner_id", "status"),
+        Index("idx_trigger_events_type_status", "trigger_type", "status"),
+        Index("idx_trigger_events_asset_time", "asset_id", "triggered_at"),
+        Index("idx_trigger_events_dedup_time", "dedup_key", "triggered_at"),
+        Index("idx_trigger_events_workflow", "workflow_type", "status"),
+    )
+
+    trigger_event_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    trigger_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    trigger_ref: Mapped[str | None] = mapped_column(String(192))
+    dedup_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    severity: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    workflow_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    workflow_run_id: Mapped[str | None] = mapped_column(String(160))
+    portfolio_id: Mapped[str | None] = mapped_column(String(128))
+    watchlist_id: Mapped[str | None] = mapped_column(String(128))
+    recommendation_run_id: Mapped[str | None] = mapped_column(String(160))
+    asset_id: Mapped[str | None] = mapped_column(String(128))
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    triggered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
 class MonitoringAlertORM(Base):
     """监控提醒表，只记录触发事件，不直接代表最终买卖建议。"""
 
