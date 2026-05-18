@@ -10,9 +10,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 from finance_agent.agents.interfaces import FinanceAgentInterface
 from finance_agent.agents.runtime import ModelRegistry, preview_model_routes
+from finance_agent.storage.repositories import ChatMemoryRepository
 
 JsonDict = dict[str, Any]
 
@@ -58,14 +60,18 @@ class ChatSessionResult:
     """一次聊天会话结果。"""
 
     owner_id: str
+    chat_session_id: str
     turns: tuple[ChatTurn, ...]
+    restored_message_count: int = 0
 
     def to_dict(self) -> JsonDict:
         """转换为 JSON 友好的字典。"""
 
         return {
             "owner_id": self.owner_id,
+            "chat_session_id": self.chat_session_id,
             "turn_count": len(self.turns),
+            "restored_message_count": self.restored_message_count,
             "turns": [turn.to_dict() for turn in self.turns],
         }
 
@@ -79,11 +85,20 @@ class FinanceAgentChatSession:
         owner_id: str,
         interface: FinanceAgentInterface,
         model_registry: ModelRegistry,
+        chat_memory: ChatMemoryRepository | None = None,
+        chat_session_id: str | None = None,
+        history_limit: int = 20,
     ) -> None:
         self.owner_id = owner_id
         self.interface = interface
         self.model_registry = model_registry
+        self.chat_memory = chat_memory
+        self.chat_session_id = chat_session_id or build_chat_session_id(owner_id=owner_id)
+        self.history_limit = history_limit
         self.turns: list[ChatTurn] = []
+        self.restored_messages: list[ChatMessage] = []
+        self._ensure_chat_session()
+        self._restore_recent_messages()
 
     def handle_message(self, content: str) -> ChatTurn:
         """处理一条用户输入。"""
@@ -104,11 +119,14 @@ class FinanceAgentChatSession:
             assistant = self._answer_model_config(intent)
         elif intent == "route_preview":
             assistant = self._answer_route_preview(intent)
+        elif intent == "history":
+            assistant = self._answer_history(intent)
         else:
             assistant = self._answer_help(intent)
 
         turn = ChatTurn(user_message=user_message, assistant_message=assistant)
         self.turns.append(turn)
+        self._persist_turn(turn)
         return turn
 
     def run_scripted(self, messages: list[str]) -> ChatSessionResult:
@@ -118,7 +136,12 @@ class FinanceAgentChatSession:
             turn = self.handle_message(message)
             if turn.assistant_message.intent == "exit":
                 break
-        return ChatSessionResult(owner_id=self.owner_id, turns=tuple(self.turns))
+        return ChatSessionResult(
+            owner_id=self.owner_id,
+            chat_session_id=self.chat_session_id,
+            restored_message_count=len(self.restored_messages),
+            turns=tuple(self.turns),
+        )
 
     def _answer_workflows(self, intent: str) -> ChatMessage:
         result = self.interface.list_workflows().to_dict()["data"]
@@ -186,7 +209,7 @@ class FinanceAgentChatSession:
             role="assistant",
             content=(
                 "我现在可以在 CLI 聊天窗口里帮你查询：可用 Workflow、只读金融工具、"
-                "模型配置、模型路由预览。你也可以输入 /exit 退出。"
+                "模型配置、模型路由预览、最近聊天历史。你也可以输入 /exit 退出。"
             ),
             intent=intent,
             data={
@@ -195,9 +218,86 @@ class FinanceAgentChatSession:
                     "list_tools",
                     "model_config",
                     "route_preview",
+                    "history",
                     "exit",
                 ]
             },
+        )
+
+    def _answer_history(self, intent: str) -> ChatMessage:
+        messages = self._load_recent_messages()
+        if not messages:
+            return ChatMessage(
+                role="assistant",
+                content="当前聊天会话还没有可恢复的历史消息。",
+                intent=intent,
+                data={"messages": []},
+            )
+
+        lines = [f"最近 {len(messages)} 条聊天历史："]
+        for message in messages:
+            role = "你" if message.role == "user" else "Agent"
+            lines.append(f"- {role}：{message.content}")
+        return ChatMessage(
+            role="assistant",
+            content="\n".join(lines),
+            intent=intent,
+            data={"messages": [message.to_dict() for message in messages]},
+        )
+
+    def _ensure_chat_session(self) -> None:
+        if self.chat_memory is None:
+            return
+        existing = self.chat_memory.get_session(
+            owner_id=self.owner_id,
+            chat_session_id=self.chat_session_id,
+        )
+        if existing is None:
+            self.chat_memory.upsert_session(
+                chat_session_id=self.chat_session_id,
+                owner_id=self.owner_id,
+                payload={"runtime": "finance_agent_cli"},
+            )
+
+    def _restore_recent_messages(self) -> None:
+        self.restored_messages = self._load_recent_messages()
+
+    def _load_recent_messages(self) -> list[ChatMessage]:
+        if self.chat_memory is None:
+            return []
+        records = self.chat_memory.list_recent_messages(
+            owner_id=self.owner_id,
+            chat_session_id=self.chat_session_id,
+            limit=self.history_limit,
+        )
+        return [
+            ChatMessage(
+                role=record.role,
+                content=record.content,
+                intent=record.intent,
+                data=record.data or None,
+            )
+            for record in records
+        ]
+
+    def _persist_turn(self, turn: ChatTurn) -> None:
+        if self.chat_memory is None:
+            return
+        self.chat_memory.append_message(
+            chat_session_id=self.chat_session_id,
+            owner_id=self.owner_id,
+            role=turn.user_message.role,
+            content=turn.user_message.content,
+            intent=turn.user_message.intent,
+            data=turn.user_message.data,
+        )
+        self.chat_memory.append_message(
+            chat_session_id=self.chat_session_id,
+            owner_id=self.owner_id,
+            role=turn.assistant_message.role,
+            content=turn.assistant_message.content,
+            intent=turn.assistant_message.intent,
+            data=turn.assistant_message.data,
         )
 
 
@@ -215,4 +315,13 @@ def detect_chat_intent(content: str) -> str:
         return "model_config"
     if any(keyword in normalized for keyword in ("路由", "route", "高风险复核")):
         return "route_preview"
+    if any(keyword in normalized for keyword in ("/history", "history", "历史", "聊天记录")):
+        return "history"
     return "help"
+
+
+def build_chat_session_id(*, owner_id: str) -> str:
+    """生成聊天会话 ID。"""
+
+    safe_owner = "".join(char if char.isalnum() else "-" for char in owner_id.lower())
+    return f"chat:{safe_owner}:{uuid4().hex[:12]}"

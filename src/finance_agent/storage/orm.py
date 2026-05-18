@@ -1178,6 +1178,66 @@ class AssistantMemoryORM(Base):
     )
 
 
+class AssistantChatSessionORM(Base):
+    """CLI 聊天会话表，只保存对话流水，不等同于 Finance Memory。"""
+
+    __tablename__ = "assistant_chat_sessions"
+    __table_args__ = (
+        Index("idx_chat_sessions_owner_status", "owner_id", "status"),
+        Index("idx_chat_sessions_owner_updated", "owner_id", "updated_at"),
+        Index("idx_chat_sessions_last_message", "owner_id", "last_message_at"),
+    )
+
+    chat_session_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    title: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    message_count: Mapped[int] = mapped_column(server_default=text("0"), nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class AssistantChatMessageORM(Base):
+    """CLI 聊天消息表，按会话顺序保存用户和 Agent 消息。"""
+
+    __tablename__ = "assistant_chat_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "chat_session_id",
+            "sequence_no",
+            name="uq_chat_messages_session_seq",
+        ),
+        Index("idx_chat_messages_session_seq", "chat_session_id", "sequence_no"),
+        Index("idx_chat_messages_owner_created", "owner_id", "created_at"),
+        Index("idx_chat_messages_intent", "intent"),
+    )
+
+    chat_message_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    chat_session_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    sequence_no: Mapped[int] = mapped_column(nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    intent: Mapped[str | None] = mapped_column(String(64))
+    data: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
 class MemoryEmbeddingORM(Base):
     """Finance Memory 语义召回索引表，第一阶段用 JSONB 预留向量。"""
 

@@ -27,6 +27,8 @@ from finance_agent.storage.orm import (
     AssetThesisORM,
     AssetUniverseMemberORM,
     AssetUniverseORM,
+    AssistantChatMessageORM,
+    AssistantChatSessionORM,
     AssistantMemoryORM,
     AssistantTriggerEventORM,
     CapitalFlowSnapshotORM,
@@ -2648,6 +2650,188 @@ class MemoryRepository:
                 statement.order_by(AssistantMemoryORM.updated_at.desc()).limit(limit)
             )
         )
+
+
+class ChatMemoryRepository:
+    """CLI 聊天会话和消息仓储。
+
+    这里保存普通聊天流水，用于恢复上下文；可审计的金融长期记忆仍由
+    `MemoryRepository` 写入 `assistant_memories`。
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_session(
+        self,
+        *,
+        chat_session_id: str,
+        owner_id: str,
+        title: str | None = None,
+        status: str = "active",
+        started_at: datetime | None = None,
+        last_message_at: datetime | None = None,
+        message_count: int = 0,
+        summary: str | None = None,
+        payload: JsonDict | None = None,
+    ) -> AssistantChatSessionORM:
+        """按 `chat_session_id` 幂等写入聊天会话。"""
+
+        now = datetime.now().astimezone()
+        values = {
+            "chat_session_id": chat_session_id,
+            "owner_id": owner_id,
+            "title": title,
+            "status": status,
+            "started_at": started_at or now,
+            "last_message_at": last_message_at,
+            "message_count": message_count,
+            "summary": summary,
+            "payload": _json_safe(payload or {}),
+            "updated_at": now,
+        }
+        statement = insert(AssistantChatSessionORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"chat_session_id", "owner_id", "started_at", "created_at"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[AssistantChatSessionORM.chat_session_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(AssistantChatSessionORM, chat_session_id)
+
+    def get_session(
+        self,
+        *,
+        owner_id: str,
+        chat_session_id: str,
+    ) -> AssistantChatSessionORM | None:
+        """按用户和会话 ID 查询聊天会话。"""
+
+        statement = select(AssistantChatSessionORM).where(
+            AssistantChatSessionORM.owner_id == owner_id,
+            AssistantChatSessionORM.chat_session_id == chat_session_id,
+        )
+        return self.session.scalars(statement).one_or_none()
+
+    def get_latest_session(self, *, owner_id: str) -> AssistantChatSessionORM | None:
+        """查询用户最近活跃的聊天会话。"""
+
+        statement = (
+            select(AssistantChatSessionORM)
+            .where(
+                AssistantChatSessionORM.owner_id == owner_id,
+                AssistantChatSessionORM.status == "active",
+            )
+            .order_by(
+                AssistantChatSessionORM.last_message_at.desc().nullslast(),
+                AssistantChatSessionORM.updated_at.desc(),
+            )
+            .limit(1)
+        )
+        return self.session.scalars(statement).first()
+
+    def append_message(
+        self,
+        *,
+        chat_session_id: str,
+        owner_id: str,
+        role: str,
+        content: str,
+        intent: str | None = None,
+        data: JsonDict | None = None,
+        payload: JsonDict | None = None,
+        created_at: datetime | None = None,
+    ) -> AssistantChatMessageORM:
+        """追加一条聊天消息，并同步会话计数。"""
+
+        created = created_at or datetime.now().astimezone()
+        sequence_no = self.next_sequence_no(chat_session_id=chat_session_id)
+        chat_message_id = f"{chat_session_id}:msg:{sequence_no:06d}"
+        values = {
+            "chat_message_id": chat_message_id,
+            "chat_session_id": chat_session_id,
+            "owner_id": owner_id,
+            "sequence_no": sequence_no,
+            "role": role,
+            "content": content,
+            "intent": intent,
+            "data": _json_safe(data or {}),
+            "created_at": created,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(AssistantChatMessageORM).values(**values)
+        self.session.execute(
+            statement.on_conflict_do_nothing(
+                constraint="uq_chat_messages_session_seq",
+            )
+        )
+        count_statement = select(func.count()).select_from(AssistantChatMessageORM).where(
+            AssistantChatMessageORM.chat_session_id == chat_session_id
+        )
+        message_count = int(self.session.scalar(count_statement) or 0)
+        session = self.session.get(AssistantChatSessionORM, chat_session_id)
+        if session is not None:
+            session.last_message_at = created
+            session.message_count = message_count
+            session.updated_at = datetime.now().astimezone()
+            if not session.title and role == "user":
+                session.title = content.strip()[:80]
+        self.session.flush()
+        return self.session.get_one(AssistantChatMessageORM, chat_message_id)
+
+    def next_sequence_no(self, *, chat_session_id: str) -> int:
+        """查询下一条消息序号。"""
+
+        statement = select(func.max(AssistantChatMessageORM.sequence_no)).where(
+            AssistantChatMessageORM.chat_session_id == chat_session_id
+        )
+        return int(self.session.scalar(statement) or 0) + 1
+
+    def list_messages(
+        self,
+        *,
+        owner_id: str,
+        chat_session_id: str,
+        limit: int = 50,
+    ) -> list[AssistantChatMessageORM]:
+        """按时间顺序查询聊天消息。"""
+
+        statement = (
+            select(AssistantChatMessageORM)
+            .where(
+                AssistantChatMessageORM.owner_id == owner_id,
+                AssistantChatMessageORM.chat_session_id == chat_session_id,
+            )
+            .order_by(AssistantChatMessageORM.sequence_no.asc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(statement))
+
+    def list_recent_messages(
+        self,
+        *,
+        owner_id: str,
+        chat_session_id: str,
+        limit: int = 20,
+    ) -> list[AssistantChatMessageORM]:
+        """查询最近消息，并按对话顺序返回。"""
+
+        statement = (
+            select(AssistantChatMessageORM)
+            .where(
+                AssistantChatMessageORM.owner_id == owner_id,
+                AssistantChatMessageORM.chat_session_id == chat_session_id,
+            )
+            .order_by(AssistantChatMessageORM.sequence_no.desc())
+            .limit(limit)
+        )
+        return list(reversed(list(self.session.scalars(statement))))
 
 
 class DataQualityRepository:

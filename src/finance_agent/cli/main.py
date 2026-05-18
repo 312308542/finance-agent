@@ -22,6 +22,7 @@ from finance_agent.agents.runtime import (
 )
 from finance_agent.agents.runtime.model_tui import render_model_tui
 from finance_agent.storage.db import create_session_factory, session_scope
+from finance_agent.storage.repositories import ChatMemoryRepository
 from finance_agent.triggers import TriggerEvaluationRequest, TriggerService
 
 JsonDict = dict[str, Any]
@@ -60,6 +61,18 @@ def build_parser() -> argparse.ArgumentParser:
     chat = subparsers.add_parser("chat", help="打开类似 Hermes-Agent 的 CLI 聊天窗口。")
     chat.add_argument("--owner-id", required=True, help="用户/账户 ID。")
     chat.add_argument("--config-file", default=None, help="模型配置 JSON 文件路径。")
+    chat.add_argument("--session-id", default=None, help="恢复指定聊天会话。")
+    chat.add_argument(
+        "--new-session",
+        action="store_true",
+        help="忽略最近会话，强制创建新的聊天会话。",
+    )
+    chat.add_argument(
+        "--history-limit",
+        type=int,
+        default=20,
+        help="恢复聊天历史时最多读取的消息条数。",
+    )
     chat.add_argument(
         "--message",
         action="append",
@@ -252,15 +265,20 @@ def dispatch(args: argparse.Namespace) -> JsonDict:
 def dispatch_chat(interface: FinanceAgentInterface, args: argparse.Namespace) -> JsonDict:
     """处理 CLI 聊天窗口命令。"""
 
+    chat_memory = ChatMemoryRepository(interface.session)
+    chat_session_id = resolve_chat_session_id(chat_memory, args)
     session = FinanceAgentChatSession(
         owner_id=args.owner_id,
         interface=interface,
         model_registry=load_model_registry(args.config_file),
+        chat_memory=chat_memory,
+        chat_session_id=chat_session_id,
+        history_limit=args.history_limit,
     )
     if args.message:
         return {"status": "ok", "data": session.run_scripted(args.message).to_dict()}
 
-    print("finance-agent 聊天窗口已启动，输入 /exit 退出。")
+    print(f"finance-agent 聊天窗口已启动，会话：{session.chat_session_id}，输入 /exit 退出。")
     while True:
         try:
             content = input("你> ")
@@ -271,6 +289,28 @@ def dispatch_chat(interface: FinanceAgentInterface, args: argparse.Namespace) ->
         if turn.assistant_message.intent == "exit":
             break
     return {"status": "ok", "data": session.run_scripted([]).to_dict()}
+
+
+def resolve_chat_session_id(
+    chat_memory: ChatMemoryRepository,
+    args: argparse.Namespace,
+) -> str | None:
+    """解析聊天会话 ID；未指定时默认恢复最近会话。"""
+
+    if args.session_id:
+        existing = chat_memory.get_session(
+            owner_id=args.owner_id,
+            chat_session_id=args.session_id,
+        )
+        if existing is None:
+            raise ValueError(f"找不到聊天会话：{args.session_id}")
+        return args.session_id
+    if args.new_session:
+        return None
+    latest = chat_memory.get_latest_session(owner_id=args.owner_id)
+    if latest is not None:
+        return latest.chat_session_id
+    return None
 
 
 def dispatch_workflows(
