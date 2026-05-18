@@ -4,7 +4,7 @@
 - 触发层只读取已入库数据，不直接抓行情或计算因子。
 - 持仓回撤、信号转弱、观察池条件、推荐运行、风险和数据质量均能生成触发事件。
 - 观察池触发条件能使用 TA 指标、因子快照和多维评分。
-- 触发事件具备冷却去重，并能派发到 Workflow。
+- 触发事件具备冷却去重，并能派发到 Agent 唤醒队列。
 """
 
 from __future__ import annotations
@@ -15,8 +15,11 @@ import sys
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from sqlalchemy import func, select
+
 from finance_agent.application import PortfolioService, WatchlistService
 from finance_agent.storage.db import create_session_factory, session_scope
+from finance_agent.storage.orm import AgentWorkflowRunORM
 from finance_agent.storage.repositories import (
     AssetRepository,
     AssetScoreRepository,
@@ -339,7 +342,23 @@ def main() -> None:
         dispatch = service.dispatch_pending(owner_id=owner_id, limit=20, as_of=as_of)
         if len(dispatch.dispatched_events) < len(required_types):
             skipped = [event.payload for event in dispatch.skipped_events]
-            raise AssertionError(f"触发事件必须能派发到 Workflow，skipped={skipped}")
+            raise AssertionError(f"触发事件必须能派发到 Agent 唤醒队列，skipped={skipped}")
+        for event in dispatch.dispatched_events:
+            if not event.agent_task_id:
+                raise AssertionError("触发事件派发后必须生成 Agent 任务 ID。")
+            if event.payload.get("dispatch_status") != "agent_wakeup_queued":
+                raise AssertionError("触发事件派发后必须标记为 Agent 唤醒任务。")
+            if not event.requested_workflow_type:
+                raise AssertionError(
+                    "触发事件必须保留建议的内部 Workflow 类型，供 Agent 按需调用。"
+                )
+        workflow_run_count = session.scalar(
+            select(func.count())
+            .select_from(AgentWorkflowRunORM)
+            .where(AgentWorkflowRunORM.owner_id == owner_id)
+        )
+        if workflow_run_count:
+            raise AssertionError("触发派发不应直接创建 Workflow run，应只唤醒 Agent。")
 
     process = subprocess.run(
         [

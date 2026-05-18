@@ -158,7 +158,7 @@ def create_mcp_server() -> Any:
         limit: int = 20,
         as_of: str | None = None,
     ) -> JsonDict:
-        """派发待处理触发事件到金融团队 Workflow。"""
+        """派发待处理触发事件到 Agent 唤醒队列。"""
 
         return run_with_trigger_service(
             lambda service: service.dispatch_pending(
@@ -182,7 +182,7 @@ def create_mcp_server() -> Any:
         recommendation_limit: int = 20,
         drawdown_threshold: str = "0.050000",
     ) -> JsonDict:
-        """执行一次触发评估并立即派发。"""
+        """执行一次触发评估并立即唤醒 Agent。"""
 
         return run_with_trigger_service(
             lambda service: service.run_once(

@@ -1965,10 +1965,11 @@ class AssistantTriggerRepository:
         dedup_key: str,
         severity: str,
         status: str,
-        workflow_type: str,
+        requested_workflow_type: str,
         triggered_at: datetime,
         trigger_ref: str | None = None,
-        workflow_run_id: str | None = None,
+        agent_runtime: str = "hermes_agent",
+        agent_task_id: str | None = None,
         portfolio_id: str | None = None,
         watchlist_id: str | None = None,
         recommendation_run_id: str | None = None,
@@ -1987,8 +1988,9 @@ class AssistantTriggerRepository:
             "dedup_key": dedup_key,
             "severity": severity,
             "status": status,
-            "workflow_type": workflow_type,
-            "workflow_run_id": workflow_run_id,
+            "agent_runtime": agent_runtime,
+            "agent_task_id": agent_task_id,
+            "requested_workflow_type": requested_workflow_type,
             "portfolio_id": portfolio_id,
             "watchlist_id": watchlist_id,
             "recommendation_run_id": recommendation_run_id,
@@ -2009,7 +2011,9 @@ class AssistantTriggerRepository:
             )
         )
         self.session.flush()
-        return self.session.get_one(AssistantTriggerEventORM, trigger_event_id)
+        event = self.session.get_one(AssistantTriggerEventORM, trigger_event_id)
+        self.session.refresh(event)
+        return event
 
     def has_recent_event(
         self,
@@ -2053,11 +2057,11 @@ class AssistantTriggerRepository:
         self,
         *,
         trigger_event_id: str,
-        workflow_run_id: str,
+        agent_task_id: str,
         dispatched_at: datetime,
         payload: JsonDict | None = None,
     ) -> AssistantTriggerEventORM:
-        """标记触发事件已经派发到 Workflow。"""
+        """标记触发事件已经派发到 Agent 唤醒队列。"""
 
         event = self.session.get_one(AssistantTriggerEventORM, trigger_event_id)
         merged_payload = dict(event.payload or {})
@@ -2070,8 +2074,9 @@ class AssistantTriggerRepository:
             dedup_key=event.dedup_key,
             severity=event.severity,
             status="dispatched",
-            workflow_type=event.workflow_type,
-            workflow_run_id=workflow_run_id,
+            agent_runtime=event.agent_runtime,
+            agent_task_id=agent_task_id,
+            requested_workflow_type=event.requested_workflow_type,
             portfolio_id=event.portfolio_id,
             watchlist_id=event.watchlist_id,
             recommendation_run_id=event.recommendation_run_id,
@@ -2102,8 +2107,9 @@ class AssistantTriggerRepository:
             dedup_key=event.dedup_key,
             severity=event.severity,
             status="skipped",
-            workflow_type=event.workflow_type,
-            workflow_run_id=event.workflow_run_id,
+            agent_runtime=event.agent_runtime,
+            agent_task_id=event.agent_task_id,
+            requested_workflow_type=event.requested_workflow_type,
             portfolio_id=event.portfolio_id,
             watchlist_id=event.watchlist_id,
             recommendation_run_id=event.recommendation_run_id,

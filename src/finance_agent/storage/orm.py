@@ -1042,7 +1042,7 @@ class WatchlistItemEventORM(Base):
 
 
 class AssistantTriggerEventORM(Base):
-    """私人金融助手触发事件表，记录 Workflow 被唤起前的输入事件。"""
+    """私人金融助手触发事件表，记录 Agent 被唤醒前的输入事件。"""
 
     __tablename__ = "assistant_trigger_events"
     __table_args__ = (
@@ -1051,7 +1051,8 @@ class AssistantTriggerEventORM(Base):
         Index("idx_trigger_events_type_status", "trigger_type", "status"),
         Index("idx_trigger_events_asset_time", "asset_id", "triggered_at"),
         Index("idx_trigger_events_dedup_time", "dedup_key", "triggered_at"),
-        Index("idx_trigger_events_workflow", "workflow_type", "status"),
+        Index("idx_trigger_events_agent_runtime", "agent_runtime", "status"),
+        Index("idx_trigger_events_requested_workflow", "requested_workflow_type", "status"),
     )
 
     trigger_event_id: Mapped[str] = mapped_column(String(192), primary_key=True)
@@ -1061,8 +1062,13 @@ class AssistantTriggerEventORM(Base):
     dedup_key: Mapped[str] = mapped_column(String(255), nullable=False)
     severity: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
-    workflow_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    workflow_run_id: Mapped[str | None] = mapped_column(String(160))
+    agent_runtime: Mapped[str] = mapped_column(
+        String(64),
+        server_default=text("'hermes_agent'"),
+        nullable=False,
+    )
+    agent_task_id: Mapped[str | None] = mapped_column(String(160))
+    requested_workflow_type: Mapped[str] = mapped_column(String(64), nullable=False)
     portfolio_id: Mapped[str | None] = mapped_column(String(128))
     watchlist_id: Mapped[str | None] = mapped_column(String(128))
     recommendation_run_id: Mapped[str | None] = mapped_column(String(160))

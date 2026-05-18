@@ -1,8 +1,8 @@
-"""V1.2 触发事件评估与 Workflow 派发服务。
+"""V1.2 触发事件评估与 Agent 唤醒服务。
 
 触发层只读取已入库的持仓、观察池、推荐、信号和风险事实，不临时抓取行情，
 也不临时计算 TA 或因子。TA、因子、评分和信号应先由数据层入库，触发层只判断
-哪些变化值得唤起金融团队 Workflow。
+哪些变化值得唤醒 Hermes 或内部金融 Agent。
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from finance_agent.agents.interfaces import FinanceAgentInterface
 from finance_agent.agents.tools.runtime import json_value
 from finance_agent.application import PortfolioService, WatchlistService
 from finance_agent.storage.orm import (
@@ -63,7 +62,7 @@ class TriggerEventDraft:
     """待写入的触发事件草稿。"""
 
     trigger_type: str
-    workflow_type: str
+    requested_workflow_type: str
     severity: str
     dedup_key: str
     trigger_ref: str | None = None
@@ -95,8 +94,8 @@ class TriggerEvaluationResult:
 
 
 @dataclass(frozen=True)
-class WorkflowDispatchResult:
-    """触发事件派发结果。"""
+class AgentWakeupDispatchResult:
+    """触发事件派发到 Agent 唤醒队列的结果。"""
 
     dispatched_events: tuple[AssistantTriggerEventORM, ...]
     skipped_events: tuple[AssistantTriggerEventORM, ...]
@@ -177,11 +176,14 @@ class TriggerService:
         owner_id: str | None = None,
         limit: int = 20,
         as_of: datetime | None = None,
-    ) -> WorkflowDispatchResult:
-        """派发待处理触发事件到金融团队 Workflow。"""
+    ) -> AgentWakeupDispatchResult:
+        """派发待处理触发事件到 Agent 唤醒队列。
+
+        触发层只负责把事件交给上层 Hermes 或内部金融 Agent。Agent 被唤醒后，
+        可以根据 `requested_workflow_type` 和 payload 决定是否调用内部 Workflow。
+        """
 
         dispatch_time = as_of or datetime.now(UTC)
-        interface = FinanceAgentInterface(self.session)
         dispatched: list[AssistantTriggerEventORM] = []
         skipped: list[AssistantTriggerEventORM] = []
         for event in self.triggers.list_pending_events(owner_id=owner_id, limit=limit):
@@ -196,43 +198,21 @@ class TriggerService:
                 )
                 continue
 
-            workflow_run_id = build_trigger_workflow_run_id(event=event)
-            try:
-                interface.run_workflow(
-                    workflow_type=event.workflow_type,
-                    owner_id=event.owner_id,
-                    workflow_run_id=workflow_run_id,
-                    trigger_type=event.trigger_type,
-                    trigger_ref=event.trigger_event_id,
-                    started_at=dispatch_time,
-                    initial_state={
-                        "trigger_event_id": event.trigger_event_id,
-                        "trigger_payload": event.payload or {},
-                    },
-                    portfolio_id=event.portfolio_id,
-                    watchlist_id=event.watchlist_id,
-                    recommendation_run_id=event.recommendation_run_id,
-                    asset_id=event.asset_id,
-                )
-            except Exception as exc:
-                skipped.append(
-                    self.triggers.mark_skipped(
-                        trigger_event_id=event.trigger_event_id,
-                        skipped_at=dispatch_time,
-                        reason=f"dispatch_failed: {exc}",
-                    )
-                )
-                continue
-
+            agent_task_id = build_trigger_agent_task_id(event=event)
             dispatched.append(
                 self.triggers.mark_dispatched(
                     trigger_event_id=event.trigger_event_id,
-                    workflow_run_id=workflow_run_id,
+                    agent_task_id=agent_task_id,
                     dispatched_at=dispatch_time,
-                    payload={"dispatch_status": "succeeded"},
+                    payload={
+                        "dispatch_status": "agent_wakeup_queued",
+                        "agent_runtime": event.agent_runtime,
+                        "agent_task_id": agent_task_id,
+                        "requested_workflow_type": event.requested_workflow_type,
+                    },
                 )
             )
-        return WorkflowDispatchResult(
+        return AgentWakeupDispatchResult(
             dispatched_events=tuple(dispatched),
             skipped_events=tuple(skipped),
         )
@@ -352,13 +332,13 @@ class TriggerService:
             drafts.append(
                 TriggerEventDraft(
                     trigger_type="watchlist_condition_hit",
-                    workflow_type="asset_deep_analysis",
+                    requested_workflow_type="asset_deep_analysis",
                     severity="medium",
                     trigger_ref=item.watchlist_item_id,
                     dedup_key=build_dedup_key(
                         owner_id=request.owner_id,
                         trigger_type="watchlist_condition_hit",
-                        workflow_type="asset_deep_analysis",
+                        requested_workflow_type="asset_deep_analysis",
                         asset_id=item.asset_id,
                         scope_id=item.watchlist_id,
                     ),
@@ -407,13 +387,13 @@ class TriggerService:
         return [
             TriggerEventDraft(
                 trigger_type="recommendation_run_ready",
-                workflow_type="recommendation_decision",
+                requested_workflow_type="recommendation_decision",
                 severity="medium",
                 trigger_ref=run.run_id,
                 dedup_key=build_dedup_key(
                     owner_id=request.owner_id,
                     trigger_type="recommendation_run_ready",
-                    workflow_type="recommendation_decision",
+                    requested_workflow_type="recommendation_decision",
                     scope_id=run.run_id,
                 ),
                 portfolio_id=portfolio_id,
@@ -454,17 +434,19 @@ class TriggerService:
             if risk.asset_id is None:
                 continue
             portfolio_id = held_assets.get(risk.asset_id)
-            workflow_type = "portfolio_monitoring" if portfolio_id else "asset_deep_analysis"
+            requested_workflow_type = (
+                "portfolio_monitoring" if portfolio_id else "asset_deep_analysis"
+            )
             drafts.append(
                 TriggerEventDraft(
                     trigger_type="risk_event_detected",
-                    workflow_type=workflow_type,
+                    requested_workflow_type=requested_workflow_type,
                     severity="high" if risk.severity == "critical" else "medium",
                     trigger_ref=risk.risk_id,
                     dedup_key=build_dedup_key(
                         owner_id=request.owner_id,
                         trigger_type="risk_event_detected",
-                        workflow_type=workflow_type,
+                        requested_workflow_type=requested_workflow_type,
                         asset_id=risk.asset_id,
                         scope_id=risk.risk_id,
                     ),
@@ -508,18 +490,20 @@ class TriggerService:
             if quality.asset_id is None:
                 continue
             portfolio_id = held_assets.get(quality.asset_id)
-            workflow_type = "portfolio_monitoring" if portfolio_id else "asset_deep_analysis"
+            requested_workflow_type = (
+                "portfolio_monitoring" if portfolio_id else "asset_deep_analysis"
+            )
             severity = "high" if quality.status == "missing" else "medium"
             drafts.append(
                 TriggerEventDraft(
                     trigger_type="data_quality_degraded",
-                    workflow_type=workflow_type,
+                    requested_workflow_type=requested_workflow_type,
                     severity=severity,
                     trigger_ref=quality.quality_id,
                     dedup_key=build_dedup_key(
                         owner_id=request.owner_id,
                         trigger_type="data_quality_degraded",
-                        workflow_type=workflow_type,
+                        requested_workflow_type=requested_workflow_type,
                         asset_id=quality.asset_id,
                         scope_id=quality.quality_id,
                     ),
@@ -570,7 +554,7 @@ class TriggerService:
                     dedup_key=draft.dedup_key,
                     severity=draft.severity,
                     status="pending",
-                    workflow_type=draft.workflow_type,
+                    requested_workflow_type=draft.requested_workflow_type,
                     portfolio_id=draft.portfolio_id,
                     watchlist_id=draft.watchlist_id,
                     recommendation_run_id=draft.recommendation_run_id,
@@ -601,13 +585,13 @@ def build_position_trigger(
 
     return TriggerEventDraft(
         trigger_type=trigger_type,
-        workflow_type="portfolio_monitoring",
+        requested_workflow_type="portfolio_monitoring",
         severity=severity,
         trigger_ref=position.position_id,
         dedup_key=build_dedup_key(
             owner_id=request.owner_id,
             trigger_type=trigger_type,
-            workflow_type="portfolio_monitoring",
+            requested_workflow_type="portfolio_monitoring",
             asset_id=position.asset_id,
             scope_id=portfolio_id,
         ),
@@ -692,17 +676,20 @@ def is_signal_flip_to_bearish(signals: list[SignalSnapshotORM]) -> bool:
 
 
 def validate_dispatch_requirements(event: AssistantTriggerEventORM) -> str | None:
-    """检查派发 Workflow 所需参数。"""
+    """检查唤醒 Agent 时建议分析流程所需的上下文引用。"""
 
-    if event.workflow_type in {"portfolio_monitoring", "recommendation_decision"}:
+    if event.requested_workflow_type in {"portfolio_monitoring", "recommendation_decision"}:
         if not event.portfolio_id:
-            return f"{event.workflow_type} 缺少 portfolio_id"
-    if event.workflow_type in {"watchlist_management", "recommendation_decision"}:
+            return f"{event.requested_workflow_type} 缺少 portfolio_id"
+    if event.requested_workflow_type in {"watchlist_management", "recommendation_decision"}:
         if not event.watchlist_id:
-            return f"{event.workflow_type} 缺少 watchlist_id"
-    if event.workflow_type == "recommendation_decision" and not event.recommendation_run_id:
+            return f"{event.requested_workflow_type} 缺少 watchlist_id"
+    if (
+        event.requested_workflow_type == "recommendation_decision"
+        and not event.recommendation_run_id
+    ):
         return "recommendation_decision 缺少 recommendation_run_id"
-    if event.workflow_type == "asset_deep_analysis" and not event.asset_id:
+    if event.requested_workflow_type == "asset_deep_analysis" and not event.asset_id:
         return "asset_deep_analysis 缺少 asset_id"
     return None
 
@@ -718,8 +705,9 @@ def serialize_trigger_event(event: AssistantTriggerEventORM) -> JsonDict:
         "dedup_key": event.dedup_key,
         "severity": event.severity,
         "status": event.status,
-        "workflow_type": event.workflow_type,
-        "workflow_run_id": event.workflow_run_id,
+        "agent_runtime": event.agent_runtime,
+        "agent_task_id": event.agent_task_id,
+        "requested_workflow_type": event.requested_workflow_type,
         "portfolio_id": event.portfolio_id,
         "watchlist_id": event.watchlist_id,
         "recommendation_run_id": event.recommendation_run_id,
@@ -735,7 +723,7 @@ def build_dedup_key(
     *,
     owner_id: str,
     trigger_type: str,
-    workflow_type: str,
+    requested_workflow_type: str,
     asset_id: str | None = None,
     scope_id: str | None = None,
 ) -> str:
@@ -743,7 +731,7 @@ def build_dedup_key(
 
     return ":".join(
         value
-        for value in (owner_id, trigger_type, workflow_type, scope_id, asset_id)
+        for value in (owner_id, trigger_type, requested_workflow_type, scope_id, asset_id)
         if value
     )
 
@@ -757,12 +745,12 @@ def build_trigger_event_id(*, draft: TriggerEventDraft, as_of: datetime) -> str:
     return f"trigger:{draft.trigger_type}:{digest}"
 
 
-def build_trigger_workflow_run_id(*, event: AssistantTriggerEventORM) -> str:
-    """生成由触发事件派发的 Workflow Run ID。"""
+def build_trigger_agent_task_id(*, event: AssistantTriggerEventORM) -> str:
+    """生成由触发事件派发的 Agent 唤醒任务 ID。"""
 
     owner = event.owner_id.replace(":", "_")
     digest = sha1(event.trigger_event_id.encode()).hexdigest()[:12]
-    return f"workflow:{owner}:{event.workflow_type}:trigger:{digest}"
+    return f"agent_task:{owner}:{event.trigger_type}:trigger:{digest}"
 
 
 def first_portfolio_id(portfolio_snapshots: tuple[Any, ...]) -> str | None:

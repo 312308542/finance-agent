@@ -74,15 +74,18 @@ def build_parser() -> argparse.ArgumentParser:
     report_show.add_argument("workflow_run_id", help="Workflow Run ID。")
     report_show.add_argument("--markdown", action="store_true", help="仅输出 Markdown 正文。")
 
-    triggers = subparsers.add_parser("triggers", help="V1.2 触发事件评估与派发。")
+    triggers = subparsers.add_parser("triggers", help="V1.2 触发事件评估与 Agent 唤醒。")
     trigger_commands = triggers.add_subparsers(dest="command", required=True)
     evaluate = trigger_commands.add_parser("evaluate", help="评估已入库事实并生成触发事件。")
     add_trigger_request_arguments(evaluate)
-    dispatch_parser = trigger_commands.add_parser("dispatch", help="派发待处理触发事件。")
+    dispatch_parser = trigger_commands.add_parser(
+        "dispatch",
+        help="把待处理触发事件派发到 Agent 唤醒队列。",
+    )
     dispatch_parser.add_argument("--owner-id", default=None, help="只派发指定用户的触发事件。")
     dispatch_parser.add_argument("--limit", type=int, default=20, help="本次最多派发事件数。")
     dispatch_parser.add_argument("--as-of", default=None, help="ISO 时间，默认当前时间。")
-    run_once = trigger_commands.add_parser("run-once", help="执行一次触发评估并立即派发。")
+    run_once = trigger_commands.add_parser("run-once", help="执行一次触发评估并立即唤醒 Agent。")
     add_trigger_request_arguments(run_once)
     return parser
 
