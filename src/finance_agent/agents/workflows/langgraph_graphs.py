@@ -1,0 +1,1239 @@
+"""LangGraph 金融团队 Workflow 构建器。
+
+本模块只负责把现有确定性 Workflow 包装成 LangGraph 图节点。LangGraph
+缺失时会给出明确错误；现有规则版 Workflow 仍可作为 fallback 独立运行。
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+from finance_agent.agents.runtime import HighRiskReviewPolicy, ReviewDecisionContext
+from finance_agent.agents.tools import FinanceToolRuntime
+from finance_agent.agents.workflows.portfolio_monitoring import (
+    PortfolioMonitoringWorkflow,
+)
+from finance_agent.agents.workflows.recommendation_decision import (
+    RecommendationDecisionInput,
+    RecommendationDecisionWorkflow,
+)
+from finance_agent.agents.workflows.watchlist_management import (
+    WatchlistManagementWorkflow,
+)
+
+WorkflowGraphState = dict[str, Any]
+
+
+class LangGraphWorkflowUnavailable(RuntimeError):
+    """LangGraph 依赖不可用。"""
+
+
+@dataclass(frozen=True)
+class LangGraphWorkflowBuilder:
+    """LangGraph Workflow 构建器元数据。"""
+
+    workflow_type: str
+    description: str
+    build: Callable[[], Any]
+
+
+def _load_langgraph() -> tuple[Any, Any, Any]:
+    """延迟加载 LangGraph，便于本地缺依赖时保留规则 fallback。"""
+
+    try:
+        from langgraph.graph import END, START, StateGraph
+    except ImportError as exc:
+        raise LangGraphWorkflowUnavailable(
+            "缺少 langgraph 依赖。请先安装项目依赖："
+            ".venv\\Scripts\\python.exe -m pip install langgraph"
+        ) from exc
+    return StateGraph, START, END
+
+
+def build_portfolio_monitoring_graph() -> Any:
+    """构建持仓监控 LangGraph 工作流。"""
+
+    StateGraph, START, END = _load_langgraph()
+    workflow = PortfolioMonitoringWorkflow()
+    graph = StateGraph(dict)
+
+    def decision_synthesis(state: WorkflowGraphState) -> WorkflowGraphState:
+        workflow_input = state["workflow_input"]
+        result = workflow.run(workflow_input)
+        return {**state, "result": result, "decision_count": len(result.decisions)}
+
+    graph.add_node("decision_synthesis", decision_synthesis)
+    graph.add_edge(START, "decision_synthesis")
+    graph.add_edge("decision_synthesis", END)
+    return graph.compile()
+
+
+def build_watchlist_management_graph() -> Any:
+    """构建观察池管理 LangGraph 工作流。"""
+
+    StateGraph, START, END = _load_langgraph()
+    workflow = WatchlistManagementWorkflow()
+    graph = StateGraph(dict)
+
+    def decision_synthesis(state: WorkflowGraphState) -> WorkflowGraphState:
+        workflow_input = state["workflow_input"]
+        result = workflow.run(workflow_input)
+        return {**state, "result": result, "decision_count": len(result.decisions)}
+
+    graph.add_node("decision_synthesis", decision_synthesis)
+    graph.add_edge(START, "decision_synthesis")
+    graph.add_edge("decision_synthesis", END)
+    return graph.compile()
+
+
+def build_asset_deep_analysis_graph() -> Any:
+    """构建单标的深度分析 LangGraph 骨架。
+
+    第一阶段使用确定性圆桌摘要，后续可在同一结构上替换为 LLM 节点。
+    """
+
+    return build_roundtable_report_graph(
+        workflow_type="asset_deep_analysis",
+        title="单标的深度分析报告",
+        summary="已创建单标的深度分析 Workflow 骨架，后续接入指标、因子、风险和记忆圆桌。",
+    )
+
+
+def build_swap_decision_graph() -> Any:
+    """构建换股或换币比较 LangGraph 骨架。"""
+
+    return build_roundtable_report_graph(
+        workflow_type="swap_decision",
+        title="换股/换币比较报告",
+        summary="已创建弱持仓与强候选比较 Workflow 骨架，高风险动作后续进入复核。",
+    )
+
+
+def build_daily_review_graph() -> Any:
+    """构建每日复盘 LangGraph 骨架。"""
+
+    return build_roundtable_report_graph(
+        workflow_type="daily_review",
+        title="每日金融助手复盘报告",
+        summary="已创建每日持仓、观察池、推荐和风险复盘 Workflow 骨架。",
+    )
+
+
+def build_static_report_graph(
+    *,
+    workflow_type: str,
+    title: str,
+    summary: str,
+) -> Any:
+    """构建只产出报告骨架的 LangGraph。"""
+
+    StateGraph, START, END = _load_langgraph()
+    graph = StateGraph(dict)
+
+    def load_context(state: WorkflowGraphState) -> WorkflowGraphState:
+        return {
+            **state,
+            "workflow_type": workflow_type,
+            "node_trace": [*state.get("node_trace", []), "load_context"],
+        }
+
+    def report_draft(state: WorkflowGraphState) -> WorkflowGraphState:
+        return {
+            **state,
+            "report": {
+                "title": title,
+                "summary": summary,
+                "workflow_type": workflow_type,
+            },
+            "node_trace": [*state.get("node_trace", []), "report_draft"],
+        }
+
+    graph.add_node("load_context", load_context)
+    graph.add_node("report_draft", report_draft)
+    graph.add_edge(START, "load_context")
+    graph.add_edge("load_context", "report_draft")
+    graph.add_edge("report_draft", END)
+    return graph.compile()
+
+
+def build_roundtable_report_graph(
+    *,
+    workflow_type: str,
+    title: str,
+    summary: str,
+) -> Any:
+    """构建带工具调用、圆桌、复核和报告的通用 LangGraph。"""
+
+    StateGraph, START, END = _load_langgraph()
+    review_policy = HighRiskReviewPolicy()
+    graph = StateGraph(dict)
+
+    def load_context(state: WorkflowGraphState) -> WorkflowGraphState:
+        tool_runtime = build_tool_runtime(state)
+        return {
+            **state,
+            "workflow_type": workflow_type,
+            "tool_runtime": tool_runtime,
+            "node_trace": [*state.get("node_trace", []), "load_context"],
+        }
+
+    def data_gathering(state: WorkflowGraphState) -> WorkflowGraphState:
+        context = collect_roundtable_report_context(state)
+        return {
+            **state,
+            **context,
+            "node_trace": [*state.get("node_trace", []), "data_gathering"],
+        }
+
+    def roundtable_discussion(state: WorkflowGraphState) -> WorkflowGraphState:
+        opinions = build_report_roundtable_opinions(
+            workflow_type=workflow_type,
+            asset_contexts=state.get("asset_contexts", {}),
+            portfolio_context=state.get("portfolio_context"),
+            watchlist_context=state.get("watchlist_context"),
+            recommendation_context=state.get("recommendation_context"),
+            source_asset_id=state.get("source_asset_id"),
+            candidate_asset_id=state.get("candidate_asset_id"),
+        )
+        return {
+            **state,
+            "roundtable_opinions": opinions,
+            "node_trace": [*state.get("node_trace", []), "roundtable_discussion"],
+        }
+
+    def decision_synthesis(state: WorkflowGraphState) -> WorkflowGraphState:
+        decisions = build_report_workflow_decisions(
+            workflow_type=workflow_type,
+            asset_ids=state.get("asset_ids", []),
+            asset_contexts=state.get("asset_contexts", {}),
+            source_asset_id=state.get("source_asset_id"),
+            candidate_asset_id=state.get("candidate_asset_id"),
+        )
+        return {
+            **state,
+            "workflow_decisions": decisions,
+            "decision_count": len(decisions),
+            "node_trace": [*state.get("node_trace", []), "decision_synthesis"],
+        }
+
+    def high_risk_review(state: WorkflowGraphState) -> WorkflowGraphState:
+        review_items = []
+        for decision in state.get("workflow_decisions", []):
+            asset_context = state.get("asset_contexts", {}).get(decision["asset_id"], {})
+            signal = get_nested(asset_context, "signal_risk", "signal") or {}
+            risks = get_nested(asset_context, "signal_risk", "risks") or []
+            context = ReviewDecisionContext(
+                decision_type=decision["decision_type"],
+                suggested_action=decision["action"],
+                severity=decision["severity"],
+                confidence=decision["confidence"],
+                data_quality_status=decision["data_quality_status"],
+                risk_severities=tuple(risk.get("severity", "unknown") for risk in risks),
+                has_conflicting_signal=has_report_conflicting_signal(
+                    suggested_action=decision["action"],
+                    signal_direction=signal.get("direction"),
+                ),
+            )
+            review_items.append(
+                {
+                    "asset_id": decision["asset_id"],
+                    "decision_type": decision["decision_type"],
+                    "trade_action": decision["action"],
+                    "requires_review": review_policy.requires_review(context),
+                    "reason": context.__dict__,
+                }
+            )
+        return {
+            **state,
+            "high_risk_reviews": review_items,
+            "node_trace": [*state.get("node_trace", []), "high_risk_review"],
+        }
+
+    def report_draft(state: WorkflowGraphState) -> WorkflowGraphState:
+        asset_symbols = [
+            state.get("asset_contexts", {}).get(asset_id, {}).get("profile", {}).get("symbol")
+            or asset_id
+            for asset_id in state.get("asset_ids", [])
+        ]
+        report = {
+            "title": build_report_title(
+                title=title,
+                workflow_type=workflow_type,
+                asset_symbols=asset_symbols,
+            ),
+            "summary": summary,
+            "workflow_type": workflow_type,
+            "asset_symbols": asset_symbols,
+            "decision_actions": [
+                decision["action"] for decision in state.get("workflow_decisions", [])
+            ],
+            "roundtable_roles": sorted(
+                {opinion["role"] for opinion in state.get("roundtable_opinions", [])}
+            ),
+            "requires_review_count": sum(
+                1 for item in state.get("high_risk_reviews", [])
+                if item["requires_review"]
+            ),
+        }
+        return {
+            **state,
+            "report": report,
+            "node_trace": [*state.get("node_trace", []), "report_draft"],
+        }
+
+    graph.add_node("load_context", load_context)
+    graph.add_node("data_gathering", data_gathering)
+    graph.add_node("roundtable_discussion", roundtable_discussion)
+    graph.add_node("decision_synthesis", decision_synthesis)
+    graph.add_node("high_risk_review", high_risk_review)
+    graph.add_node("report_draft", report_draft)
+    graph.add_edge(START, "load_context")
+    graph.add_edge("load_context", "data_gathering")
+    graph.add_edge("data_gathering", "roundtable_discussion")
+    graph.add_edge("roundtable_discussion", "decision_synthesis")
+    graph.add_edge("decision_synthesis", "high_risk_review")
+    graph.add_edge("high_risk_review", "report_draft")
+    graph.add_edge("report_draft", END)
+    return graph.compile()
+
+
+def build_recommendation_decision_graph() -> Any:
+    """构建推荐决策 LangGraph 工作流。
+
+    推荐决策使用受控圆桌形式：前置节点准备事实，上下文只能来自工具层；
+    圆桌角色分别查看技术指标、因子评分、风险、组合和记忆；主席节点再调用
+    确定性 fallback 生成结构化动作，后续进入高风险复核和报告摘要。
+    """
+
+    StateGraph, START, END = _load_langgraph()
+    workflow = RecommendationDecisionWorkflow()
+    review_policy = HighRiskReviewPolicy()
+    graph = StateGraph(dict)
+
+    def load_context(state: WorkflowGraphState) -> WorkflowGraphState:
+        workflow_input: RecommendationDecisionInput = state["workflow_input"]
+        tool_runtime = build_tool_runtime(state)
+        contexts = {
+            recommendation.asset_id: tool_runtime.call(
+                "factor.get_asset_factor_context",
+                asset_id=recommendation.asset_id,
+                horizon=recommendation.horizon,
+                timeframe=state.get("timeframe", "1d"),
+                evidence_limit=state.get("evidence_limit", 5),
+            )
+            for recommendation in workflow_input.recommendations
+        }
+        return {
+            **state,
+            "tool_runtime": tool_runtime,
+            "factor_contexts": contexts,
+            "node_trace": [*state.get("node_trace", []), "load_context"],
+        }
+
+    def data_quality_check(state: WorkflowGraphState) -> WorkflowGraphState:
+        workflow_input: RecommendationDecisionInput = state["workflow_input"]
+        factor_contexts = state.get("factor_contexts", {})
+        data_quality = {
+            recommendation.asset_id: classify_factor_context_quality(
+                factor_contexts.get(recommendation.asset_id, {})
+            )
+            for recommendation in workflow_input.recommendations
+        }
+        return {
+            **state,
+            "data_quality": data_quality,
+            "node_trace": [*state.get("node_trace", []), "data_quality_check"],
+        }
+
+    def roundtable_discussion(state: WorkflowGraphState) -> WorkflowGraphState:
+        workflow_input: RecommendationDecisionInput = state["workflow_input"]
+        opinions: list[dict[str, Any]] = []
+        for recommendation in workflow_input.recommendations:
+            factor_context = state.get("factor_contexts", {}).get(recommendation.asset_id, {})
+            signal = workflow_input.signals_by_asset.get(recommendation.asset_id)
+            risks = workflow_input.risks_by_asset.get(recommendation.asset_id, ())
+            memories = workflow_input.memories_by_asset.get(recommendation.asset_id, ())
+            opinions.extend(
+                build_roundtable_opinions(
+                    recommendation=recommendation,
+                    factor_context=factor_context,
+                    signal=signal,
+                    risks=risks,
+                    memories=memories,
+                    positions=workflow_input.positions,
+                )
+            )
+        return {
+            **state,
+            "roundtable_opinions": opinions,
+            "node_trace": [*state.get("node_trace", []), "roundtable_discussion"],
+        }
+
+    def decision_synthesis(state: WorkflowGraphState) -> WorkflowGraphState:
+        workflow_input = state["workflow_input"]
+        result = workflow.run(workflow_input)
+        return {
+            **state,
+            "result": result,
+            "decision_count": len(result.decisions),
+            "node_trace": [*state.get("node_trace", []), "decision_synthesis"],
+        }
+
+    def high_risk_review(state: WorkflowGraphState) -> WorkflowGraphState:
+        result = state["result"]
+        workflow_input: RecommendationDecisionInput = state["workflow_input"]
+        data_quality = state.get("data_quality", {})
+        review_items = []
+        for decision in result.decisions:
+            risks = workflow_input.risks_by_asset.get(decision.asset_id, ())
+            context = ReviewDecisionContext(
+                decision_type=decision.decision_type,
+                suggested_action=decision.trade_action,
+                severity=decision.severity,
+                confidence=derive_decision_confidence(
+                    decision=decision,
+                    workflow_input=workflow_input,
+                ),
+                data_quality_status=data_quality.get(decision.asset_id, "missing"),
+                risk_severities=tuple(risk.severity for risk in risks),
+                has_conflicting_signal=has_conflicting_signal(
+                    decision=decision,
+                    workflow_input=workflow_input,
+                ),
+            )
+            review_items.append(
+                {
+                    "asset_id": decision.asset_id,
+                    "decision_type": decision.decision_type,
+                    "trade_action": decision.trade_action,
+                    "requires_review": review_policy.requires_review(context),
+                    "reason": context.__dict__,
+                }
+            )
+        return {
+            **state,
+            "high_risk_reviews": review_items,
+            "node_trace": [*state.get("node_trace", []), "high_risk_review"],
+        }
+
+    def report_draft(state: WorkflowGraphState) -> WorkflowGraphState:
+        result = state["result"]
+        recommendations = state["workflow_input"].recommendations
+        primary_symbol = recommendations[0].symbol if recommendations else "空推荐"
+        decision_actions = [decision.agent_action for decision in result.decisions]
+        report = {
+            "title": f"{primary_symbol} 圆桌决策报告",
+            "summary": "金融团队已基于推荐、TA 指标、AKShare 因子、评分、风险和记忆完成圆桌裁决。",
+            "decision_actions": decision_actions,
+            "roundtable_roles": sorted(
+                {opinion["role"] for opinion in state.get("roundtable_opinions", [])}
+            ),
+            "requires_review_count": sum(
+                1 for item in state.get("high_risk_reviews", []) if item["requires_review"]
+            ),
+        }
+        return {
+            **state,
+            "report": report,
+            "node_trace": [*state.get("node_trace", []), "report_draft"],
+        }
+
+    graph.add_node("load_context", load_context)
+    graph.add_node("data_quality_check", data_quality_check)
+    graph.add_node("roundtable_discussion", roundtable_discussion)
+    graph.add_node("decision_synthesis", decision_synthesis)
+    graph.add_node("high_risk_review", high_risk_review)
+    graph.add_node("report_draft", report_draft)
+    graph.add_edge(START, "load_context")
+    graph.add_edge("load_context", "data_quality_check")
+    graph.add_edge("data_quality_check", "roundtable_discussion")
+    graph.add_edge("roundtable_discussion", "decision_synthesis")
+    graph.add_edge("decision_synthesis", "high_risk_review")
+    graph.add_edge("high_risk_review", "report_draft")
+    graph.add_edge("report_draft", END)
+    return graph.compile()
+
+
+def build_tool_runtime(state: WorkflowGraphState) -> FinanceToolRuntime:
+    """从状态中读取或创建工具运行时。"""
+
+    existing = state.get("tool_runtime")
+    if isinstance(existing, FinanceToolRuntime):
+        return existing
+    session = state.get("session")
+    if session is None:
+        raise ValueError("推荐决策圆桌 Workflow 需要 session 或 tool_runtime。")
+    return FinanceToolRuntime(session)
+
+
+def collect_roundtable_report_context(state: WorkflowGraphState) -> dict[str, Any]:
+    """为报告类 Workflow 收集已入库金融事实上下文。"""
+
+    tool_runtime = build_tool_runtime(state)
+    owner_id = state["owner_id"]
+    tool_calls: list[dict[str, Any]] = []
+
+    portfolio_context = None
+    portfolio_id = state.get("portfolio_id")
+    if portfolio_id:
+        portfolio_context = tool_runtime.call("portfolio.get_snapshot", portfolio_id=portfolio_id)
+        tool_calls.append({"tool": "portfolio.get_snapshot", "portfolio_id": portfolio_id})
+
+    watchlist_context = None
+    watchlist_id = state.get("watchlist_id")
+    if watchlist_id:
+        watchlist_context = tool_runtime.call(
+            "watchlist.get_active_items",
+            owner_id=owner_id,
+            watchlist_id=watchlist_id,
+        )
+        tool_calls.append(
+            {
+                "tool": "watchlist.get_active_items",
+                "owner_id": owner_id,
+                "watchlist_id": watchlist_id,
+            }
+        )
+
+    recommendation_context = None
+    recommendation_run_id = state.get("recommendation_run_id")
+    if recommendation_run_id:
+        recommendation_context = tool_runtime.call(
+            "recommendation.get_run",
+            run_id=recommendation_run_id,
+            limit=state.get("recommendation_limit", 20),
+        )
+        tool_calls.append(
+            {"tool": "recommendation.get_run", "run_id": recommendation_run_id}
+        )
+
+    asset_ids = resolve_report_asset_ids(
+        state,
+        portfolio_context=portfolio_context,
+        watchlist_context=watchlist_context,
+        recommendation_context=recommendation_context,
+    )
+    asset_contexts: dict[str, dict[str, Any]] = {}
+    for asset_id in asset_ids:
+        factor_context = tool_runtime.call(
+            "factor.get_asset_factor_context",
+            asset_id=asset_id,
+            horizon=state.get("horizon", "swing"),
+            timeframe=state.get("timeframe", "1d"),
+            evidence_limit=state.get("evidence_limit", 5),
+        )
+        tool_calls.append(
+            {
+                "tool": "factor.get_asset_factor_context",
+                "asset_id": asset_id,
+                "horizon": state.get("horizon", "swing"),
+            }
+        )
+        signal_risk_context = tool_runtime.call(
+            "signal_risk.get_asset_context",
+            asset_id=asset_id,
+            horizon=state.get("horizon", "swing"),
+            risk_limit=state.get("risk_limit", 5),
+            quality_limit=state.get("quality_limit", 5),
+        )
+        tool_calls.append(
+            {
+                "tool": "signal_risk.get_asset_context",
+                "asset_id": asset_id,
+                "horizon": state.get("horizon", "swing"),
+            }
+        )
+        memory_context = tool_runtime.call(
+            "memory.recall_asset_memories",
+            owner_id=owner_id,
+            asset_id=asset_id,
+            limit=state.get("memory_limit", 5),
+        )
+        tool_calls.append(
+            {
+                "tool": "memory.recall_asset_memories",
+                "asset_id": asset_id,
+                "owner_id": owner_id,
+            }
+        )
+        asset_contexts[asset_id] = {
+            "profile": build_asset_profile(asset_id=asset_id, factor_context=factor_context),
+            "factor": factor_context,
+            "signal_risk": signal_risk_context,
+            "memory": memory_context,
+        }
+
+    return {
+        "asset_ids": asset_ids,
+        "asset_contexts": asset_contexts,
+        "portfolio_context": portfolio_context,
+        "watchlist_context": watchlist_context,
+        "recommendation_context": recommendation_context,
+        "tool_calls": tool_calls,
+    }
+
+
+def resolve_report_asset_ids(
+    state: WorkflowGraphState,
+    *,
+    portfolio_context: dict[str, Any] | None = None,
+    watchlist_context: dict[str, Any] | None = None,
+    recommendation_context: dict[str, Any] | None = None,
+) -> list[str]:
+    """从 Workflow 输入中解析需要讨论的标的。"""
+
+    asset_ids: list[str] = []
+    for key in ("asset_id", "source_asset_id", "candidate_asset_id"):
+        value = state.get(key)
+        if value and value not in asset_ids:
+            asset_ids.append(value)
+    for value in state.get("asset_ids", []):
+        if value and value not in asset_ids:
+            asset_ids.append(value)
+    if not asset_ids and recommendation_context:
+        for item in recommendation_context.get("recommendations", []):
+            value = item.get("asset_id")
+            if value and value not in asset_ids:
+                asset_ids.append(value)
+    if not asset_ids and watchlist_context:
+        for item in watchlist_context.get("items", []):
+            value = item.get("asset_id")
+            if value and value not in asset_ids:
+                asset_ids.append(value)
+    if not asset_ids and portfolio_context:
+        for item in portfolio_context.get("positions", []):
+            value = item.get("asset_id")
+            if value and value not in asset_ids:
+                asset_ids.append(value)
+    if not asset_ids:
+        raise ValueError("报告类圆桌 Workflow 需要 asset_id 或 asset_ids。")
+    return asset_ids
+
+
+def build_asset_profile(*, asset_id: str, factor_context: dict[str, Any]) -> dict[str, Any]:
+    """从因子工具上下文提取标的基础展示信息。"""
+
+    for key in ("score", "factor_frame", "indicator_frame"):
+        item = factor_context.get(key) or {}
+        if item:
+            return {
+                "asset_id": asset_id,
+                "symbol": item.get("symbol") or asset_id,
+                "market": item.get("market"),
+            }
+    return {"asset_id": asset_id, "symbol": asset_id, "market": None}
+
+
+def build_report_roundtable_opinions(
+    *,
+    workflow_type: str,
+    asset_contexts: dict[str, dict[str, Any]],
+    portfolio_context: dict[str, Any] | None,
+    watchlist_context: dict[str, Any] | None,
+    recommendation_context: dict[str, Any] | None,
+    source_asset_id: str | None,
+    candidate_asset_id: str | None,
+) -> list[dict[str, Any]]:
+    """构建报告类 Workflow 的受控圆桌观点。"""
+
+    opinions: list[dict[str, Any]] = []
+    for asset_id, context in asset_contexts.items():
+        profile = context.get("profile", {})
+        factor_context = context.get("factor", {})
+        signal_risk_context = context.get("signal_risk", {})
+        memory_context = context.get("memory", {})
+        indicator = factor_context.get("indicator_frame") or {}
+        factor = factor_context.get("factor_frame") or {}
+        score = factor_context.get("score") or {}
+        evidence = factor_context.get("evidence") or []
+        risks = signal_risk_context.get("risks") or []
+        memories = memory_context.get("memories") or []
+        signal = signal_risk_context.get("signal")
+        symbol = profile.get("symbol") or asset_id
+        factor_tool_call = {
+            "tool": "factor.get_asset_factor_context",
+            "asset_id": asset_id,
+        }
+        risk_tool_call = {
+            "tool": "signal_risk.get_asset_context",
+            "asset_id": asset_id,
+        }
+        memory_tool_call = {
+            "tool": "memory.recall_asset_memories",
+            "asset_id": asset_id,
+        }
+
+        opinions.extend(
+            [
+                {
+                    "role": "technical_analyst",
+                    "asset_id": asset_id,
+                    "stance": "support" if indicator else "insufficient",
+                    "summary": build_technical_summary_from_dict(
+                        symbol=symbol,
+                        indicator=indicator,
+                        signal=signal,
+                    ),
+                    "tool_calls": [factor_tool_call, risk_tool_call],
+                    "evidence_ids": [item["evidence_id"] for item in evidence],
+                    "source_ids": compact_ids(indicator.get("indicator_frame_id")),
+                },
+                {
+                    "role": "factor_analyst",
+                    "asset_id": asset_id,
+                    "stance": "support" if score and factor else "insufficient",
+                    "summary": build_factor_summary(score=score, factor=factor),
+                    "tool_calls": [factor_tool_call],
+                    "evidence_ids": [item["evidence_id"] for item in evidence],
+                    "source_ids": compact_ids(
+                        factor.get("factor_frame_id"),
+                        score.get("score_id"),
+                        factor.get("indicator_frame_id"),
+                    ),
+                },
+                {
+                    "role": "risk_rebuttal",
+                    "asset_id": asset_id,
+                    "stance": "oppose" if has_high_dict_risk(risks) else "caution",
+                    "summary": build_risk_summary_from_dicts(risks=risks),
+                    "tool_calls": [risk_tool_call],
+                    "evidence_ids": sorted(
+                        {
+                            evidence_id
+                            for risk in risks
+                            for evidence_id in risk.get("evidence_ids", [])
+                        }
+                    ),
+                    "source_ids": [risk["risk_id"] for risk in risks],
+                },
+                {
+                    "role": "memory_manager",
+                    "asset_id": asset_id,
+                    "stance": "recall" if memories else "no_memory",
+                    "summary": build_memory_summary_from_dicts(memories=memories),
+                    "tool_calls": [memory_tool_call],
+                    "evidence_ids": [],
+                    "source_ids": [memory["memory_id"] for memory in memories],
+                },
+            ]
+        )
+
+    opinions.append(
+        {
+            "role": "portfolio_manager",
+            "asset_id": candidate_asset_id or source_asset_id or "",
+            "stance": "compare" if workflow_type == "swap_decision" else "coordinate",
+            "summary": build_portfolio_roundtable_summary(
+                workflow_type=workflow_type,
+                portfolio_context=portfolio_context,
+                watchlist_context=watchlist_context,
+                recommendation_context=recommendation_context,
+                source_asset_id=source_asset_id,
+                candidate_asset_id=candidate_asset_id,
+            ),
+            "tool_calls": build_portfolio_roundtable_tool_calls(
+                portfolio_context=portfolio_context,
+                watchlist_context=watchlist_context,
+                recommendation_context=recommendation_context,
+            ),
+            "evidence_ids": [],
+            "source_ids": build_portfolio_roundtable_source_ids(
+                portfolio_context=portfolio_context,
+                watchlist_context=watchlist_context,
+                recommendation_context=recommendation_context,
+            ),
+        }
+    )
+    return opinions
+
+
+def build_report_workflow_decisions(
+    *,
+    workflow_type: str,
+    asset_ids: list[str],
+    asset_contexts: dict[str, dict[str, Any]],
+    source_asset_id: str | None,
+    candidate_asset_id: str | None,
+) -> list[dict[str, Any]]:
+    """合成报告类 Workflow 的主席裁决摘要。"""
+
+    if workflow_type == "swap_decision":
+        candidate_id = candidate_asset_id or (asset_ids[-1] if asset_ids else "")
+        source_id = source_asset_id or (asset_ids[0] if asset_ids else "")
+        candidate_context = asset_contexts.get(candidate_id, {})
+        source_context = asset_contexts.get(source_id, {})
+        candidate_score = score_to_float(candidate_context)
+        source_signal = signal_direction(source_context)
+        action = "swap" if candidate_score >= 80 and source_signal == "bearish" else "watch"
+        severity = "high" if action == "swap" else "medium"
+        return [
+            build_report_decision(
+                workflow_type=workflow_type,
+                asset_id=candidate_id,
+                action=action,
+                severity=severity,
+                context=candidate_context,
+                summary=(
+                    f"候选标的评分 {candidate_score:.1f}，弱持仓信号 {source_signal}，"
+                    f"主席裁决为 {action}。"
+                ),
+            )
+        ]
+
+    decisions: list[dict[str, Any]] = []
+    for asset_id in asset_ids:
+        context = asset_contexts.get(asset_id, {})
+        score = score_to_float(context)
+        direction = signal_direction(context)
+        has_high_risk = has_high_dict_risk(get_nested(context, "signal_risk", "risks") or [])
+        if workflow_type == "daily_review":
+            action = "review_next_day"
+            severity = "medium" if has_high_risk else "low"
+        elif score >= 80 and direction == "bullish" and not has_high_risk:
+            action = "deep_analysis_support"
+            severity = "medium"
+        elif has_high_risk:
+            action = "risk_watch"
+            severity = "high"
+        else:
+            action = "keep_watching"
+            severity = "low"
+        decisions.append(
+            build_report_decision(
+                workflow_type=workflow_type,
+                asset_id=asset_id,
+                action=action,
+                severity=severity,
+                context=context,
+                summary=(
+                    f"评分 {score:.1f}，信号 {direction}，高风险={has_high_risk}，"
+                    f"主席裁决为 {action}。"
+                ),
+            )
+        )
+    return decisions
+
+
+def build_report_decision(
+    *,
+    workflow_type: str,
+    asset_id: str,
+    action: str,
+    severity: str,
+    context: dict[str, Any],
+    summary: str,
+) -> dict[str, Any]:
+    """构建报告类 Workflow 的结构化裁决。"""
+
+    return {
+        "asset_id": asset_id,
+        "decision_type": f"{workflow_type}_{action}",
+        "action": action,
+        "severity": severity,
+        "confidence": derive_report_confidence(context),
+        "data_quality_status": classify_report_context_quality(context),
+        "summary": summary,
+    }
+
+
+def classify_report_context_quality(context: dict[str, Any]) -> str:
+    """判断报告类 Workflow 的数据质量。"""
+
+    factor_context = context.get("factor") or {}
+    signal_risk_context = context.get("signal_risk") or {}
+    quality_items = signal_risk_context.get("data_quality") or []
+    if not factor_context:
+        return "missing"
+    if factor_context.get("factor_frame") is None or factor_context.get("indicator_frame") is None:
+        return "partial"
+    if any(item.get("freshness_status") == "stale" for item in quality_items):
+        return "stale"
+    return "available"
+
+
+def derive_report_confidence(context: dict[str, Any]) -> float:
+    """从评分或信号上下文推导复核置信度。"""
+
+    score = get_nested(context, "factor", "score") or {}
+    if score.get("confidence") is not None:
+        return float(score["confidence"])
+    signal = get_nested(context, "signal_risk", "signal") or {}
+    if signal.get("confidence") is not None:
+        return float(signal["confidence"])
+    return 0.5
+
+
+def score_to_float(context: dict[str, Any]) -> float:
+    """读取总评分。"""
+
+    score = get_nested(context, "factor", "score") or {}
+    return float(score.get("total_score") or 0)
+
+
+def signal_direction(context: dict[str, Any]) -> str:
+    """读取信号方向。"""
+
+    signal = get_nested(context, "signal_risk", "signal") or {}
+    return signal.get("direction") or "unknown"
+
+
+def has_report_conflicting_signal(
+    *,
+    suggested_action: str,
+    signal_direction: str | None,
+) -> bool:
+    """判断报告类 Workflow 裁决是否和信号冲突。"""
+
+    if signal_direction is None:
+        return True
+    if suggested_action in {"swap", "deep_analysis_support"} and signal_direction == "bearish":
+        return True
+    return suggested_action == "risk_watch" and signal_direction == "bullish"
+
+
+def build_technical_summary_from_dict(
+    *,
+    symbol: str,
+    indicator: dict[str, Any],
+    signal: dict[str, Any] | None,
+) -> str:
+    """基于序列化工具结果生成技术面摘要。"""
+
+    if not indicator:
+        return f"{symbol} 缺少 TA 指标快照，技术面只能保持中性。"
+    direction = signal.get("direction") if signal else "unknown"
+    return (
+        f"{symbol} TA 指标显示 RSI14={indicator.get('rsi_14')}、"
+        f"MACD={indicator.get('macd')}、布林位置={indicator.get('bb_percent_b')}；"
+        f"最新信号方向为 {direction}。"
+    )
+
+
+def build_risk_summary_from_dicts(*, risks: list[dict[str, Any]]) -> str:
+    """基于序列化风险结果生成风险反驳摘要。"""
+
+    if not risks:
+        return "未发现高优先级风险，但仍需监控事件、资金流和数据质量。"
+    return "；".join(f"{risk['severity']}:{risk['title']}" for risk in risks[:3])
+
+
+def build_memory_summary_from_dicts(*, memories: list[dict[str, Any]]) -> str:
+    """基于序列化记忆结果生成记忆摘要。"""
+
+    if not memories:
+        return "暂无该标的历史金融记忆。"
+    return "；".join(memory["content"] for memory in memories[:2])
+
+
+def build_portfolio_roundtable_summary(
+    *,
+    workflow_type: str,
+    portfolio_context: dict[str, Any] | None,
+    watchlist_context: dict[str, Any] | None,
+    recommendation_context: dict[str, Any] | None,
+    source_asset_id: str | None,
+    candidate_asset_id: str | None,
+) -> str:
+    """生成组合经理圆桌摘要。"""
+
+    position_count = len((portfolio_context or {}).get("positions", []))
+    watch_count = len((watchlist_context or {}).get("items", []))
+    recommendation_count = len((recommendation_context or {}).get("recommendations", []))
+    if workflow_type == "swap_decision":
+        return (
+            f"换股/换币比较需要在弱持仓 {source_asset_id} 与强候选 "
+            f"{candidate_asset_id} 之间权衡；当前持仓 {position_count} 个，"
+            f"观察项 {watch_count} 个，推荐结果 {recommendation_count} 条。"
+        )
+    return (
+        f"当前持仓 {position_count} 个，观察项 {watch_count} 个，"
+        f"推荐结果 {recommendation_count} 条；需要把单标的结论放回组合风险预算。"
+    )
+
+
+def build_portfolio_roundtable_tool_calls(
+    *,
+    portfolio_context: dict[str, Any] | None,
+    watchlist_context: dict[str, Any] | None,
+    recommendation_context: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """记录组合经理实际消费过的工具类型。"""
+
+    calls: list[dict[str, Any]] = []
+    if portfolio_context is not None:
+        calls.append({"tool": "portfolio.get_snapshot"})
+    if watchlist_context is not None:
+        calls.append({"tool": "watchlist.get_active_items"})
+    if recommendation_context is not None:
+        calls.append({"tool": "recommendation.get_run"})
+    return calls
+
+
+def build_portfolio_roundtable_source_ids(
+    *,
+    portfolio_context: dict[str, Any] | None,
+    watchlist_context: dict[str, Any] | None,
+    recommendation_context: dict[str, Any] | None,
+) -> list[str]:
+    """提取组合经理观点引用的来源 ID。"""
+
+    source_ids: list[str] = []
+    if portfolio_context:
+        portfolio = portfolio_context.get("portfolio") or {}
+        source_ids.extend(compact_ids(portfolio.get("portfolio_id")))
+        source_ids.extend(
+            position["position_id"] for position in portfolio_context.get("positions", [])
+        )
+    if watchlist_context:
+        source_ids.extend(
+            item["watchlist_item_id"] for item in watchlist_context.get("items", [])
+        )
+    if recommendation_context:
+        run = recommendation_context.get("run") or {}
+        source_ids.extend(compact_ids(run.get("run_id")))
+        source_ids.extend(
+            item["recommendation_id"]
+            for item in recommendation_context.get("recommendations", [])
+        )
+    return source_ids
+
+
+def build_report_title(
+    *,
+    title: str,
+    workflow_type: str,
+    asset_symbols: list[str],
+) -> str:
+    """生成报告标题。"""
+
+    if workflow_type == "daily_review":
+        return title
+    if asset_symbols:
+        return f"{' / '.join(asset_symbols)} {title}"
+    return title
+
+
+def has_high_dict_risk(risks: list[dict[str, Any]]) -> bool:
+    """判断序列化风险列表中是否存在高风险。"""
+
+    return any(risk.get("severity") in {"high", "critical"} for risk in risks)
+
+
+def get_nested(mapping: dict[str, Any], *keys: str) -> Any:
+    """安全读取嵌套字典。"""
+
+    current: Any = mapping
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def classify_factor_context_quality(context: dict[str, Any]) -> str:
+    """根据工具上下文粗略判断数据质量。"""
+
+    if not context:
+        return "missing"
+    if context.get("factor_frame") is None or context.get("indicator_frame") is None:
+        return "partial"
+    factor = context.get("factor_frame") or {}
+    if factor.get("status") != "available":
+        return "stale"
+    return "available"
+
+
+def build_roundtable_opinions(
+    *,
+    recommendation: Any,
+    factor_context: dict[str, Any],
+    signal: Any,
+    risks: tuple[Any, ...],
+    memories: tuple[Any, ...],
+    positions: tuple[Any, ...],
+) -> list[dict[str, Any]]:
+    """构建受控圆桌观点。
+
+    这里先用确定性摘要模拟各角色观点；后续接入 LLM 时仍复用同一结构，
+    并保留 `tool_calls`、证据 ID 和观点摘要。
+    """
+
+    indicator = factor_context.get("indicator_frame") or {}
+    factor = factor_context.get("factor_frame") or {}
+    score = factor_context.get("score") or {}
+    evidence = factor_context.get("evidence") or []
+    position_symbols = [position.symbol for position in positions]
+    high_risks = [risk for risk in risks if risk.severity in {"high", "critical"}]
+    tool_call = {
+        "tool": "factor.get_asset_factor_context",
+        "asset_id": recommendation.asset_id,
+        "horizon": recommendation.horizon,
+    }
+
+    return [
+        {
+            "role": "technical_analyst",
+            "stance": "support" if indicator else "insufficient",
+            "summary": build_technical_summary(indicator=indicator, signal=signal),
+            "tool_calls": [tool_call],
+            "evidence_ids": [item["evidence_id"] for item in evidence],
+            "source_ids": [indicator.get("indicator_frame_id")] if indicator else [],
+        },
+        {
+            "role": "factor_analyst",
+            "stance": "support" if score and factor else "insufficient",
+            "summary": build_factor_summary(score=score, factor=factor),
+            "tool_calls": [tool_call],
+            "evidence_ids": [item["evidence_id"] for item in evidence],
+            "source_ids": compact_ids(
+                factor.get("factor_frame_id"),
+                score.get("score_id"),
+                factor.get("indicator_frame_id"),
+            ),
+        },
+        {
+            "role": "risk_rebuttal",
+            "stance": "oppose" if high_risks else "caution",
+            "summary": build_risk_summary(risks=risks),
+            "tool_calls": [tool_call],
+            "evidence_ids": sorted(
+                {evidence_id for risk in risks for evidence_id in (risk.evidence_ids or [])}
+            ),
+            "source_ids": [risk.risk_id for risk in risks],
+        },
+        {
+            "role": "portfolio_manager",
+            "stance": "compare",
+            "summary": (
+                f"当前组合持仓包含 {', '.join(position_symbols) or '无活跃持仓'}，"
+                f"推荐标的 {recommendation.symbol} 需要结合弱持仓和仓位上限比较。"
+            ),
+            "tool_calls": [{"tool": "portfolio.get_snapshot"}],
+            "evidence_ids": [],
+            "source_ids": [position.position_id for position in positions],
+        },
+        {
+            "role": "memory_manager",
+            "stance": "recall" if memories else "no_memory",
+            "summary": build_memory_summary(memories=memories),
+            "tool_calls": [
+                {
+                    "tool": "memory.recall_asset_memories",
+                    "asset_id": recommendation.asset_id,
+                }
+            ],
+            "evidence_ids": [],
+            "source_ids": [memory.memory_id for memory in memories],
+        },
+    ]
+
+
+def build_technical_summary(*, indicator: dict[str, Any], signal: Any) -> str:
+    """生成技术分析角色摘要。"""
+
+    if not indicator:
+        return "缺少 TA 指标快照，技术面只能保持中性。"
+    direction = signal.direction if signal else "unknown"
+    return (
+        f"TA 指标显示 RSI14={indicator.get('rsi_14')}、MACD={indicator.get('macd')}、"
+        f"布林位置={indicator.get('bb_percent_b')}；最新信号方向为 {direction}。"
+    )
+
+
+def build_factor_summary(*, score: dict[str, Any], factor: dict[str, Any]) -> str:
+    """生成因子分析角色摘要。"""
+
+    if not factor:
+        return "缺少因子快照，不能解释 AKShare、TA 或衍生品数据对推荐的贡献。"
+    return (
+        f"综合评分={score.get('total_score')}，技术={score.get('technical_score')}，"
+        f"基本面={score.get('fundamental_score')}，资金流={score.get('flow_score')}，"
+        f"缺失因子组={factor.get('missing_groups', [])}。"
+    )
+
+
+def build_risk_summary(*, risks: tuple[Any, ...]) -> str:
+    """生成风险反驳角色摘要。"""
+
+    if not risks:
+        return "未发现高优先级风险，但仍需监控事件、资金流和数据质量。"
+    return "；".join(f"{risk.severity}:{risk.title}" for risk in risks[:3])
+
+
+def build_memory_summary(*, memories: tuple[Any, ...]) -> str:
+    """生成记忆管理员摘要。"""
+
+    if not memories:
+        return "暂无该标的历史金融记忆。"
+    return "；".join(memory.content for memory in memories[:2])
+
+
+def compact_ids(*values: Any) -> list[str]:
+    """压缩非空 ID。"""
+
+    return [value for value in values if value]
+
+
+def derive_decision_confidence(
+    *,
+    decision: Any,
+    workflow_input: RecommendationDecisionInput,
+) -> float:
+    """从推荐或信号中提取用于复核策略的置信度。"""
+
+    recommendation = next(
+        item for item in workflow_input.recommendations if item.asset_id == decision.asset_id
+    )
+    return float(recommendation.confidence)
+
+
+def has_conflicting_signal(*, decision: Any, workflow_input: RecommendationDecisionInput) -> bool:
+    """判断决策动作和信号方向是否冲突。"""
+
+    signal = workflow_input.signals_by_asset.get(decision.asset_id)
+    if signal is None:
+        return True
+    if decision.trade_action in {"buy", "swap", "watch"} and signal.direction == "bearish":
+        return True
+    if decision.trade_action in {"sell", "reduce"} and signal.direction == "bullish":
+        return True
+    return False
+
+
+def list_langgraph_workflow_builders() -> tuple[LangGraphWorkflowBuilder, ...]:
+    """列出已具备 LangGraph 包装入口的 Workflow。"""
+
+    return (
+        LangGraphWorkflowBuilder(
+            workflow_type="portfolio_monitoring",
+            description="持仓监控 LangGraph 包装入口。",
+            build=build_portfolio_monitoring_graph,
+        ),
+        LangGraphWorkflowBuilder(
+            workflow_type="watchlist_management",
+            description="观察池管理 LangGraph 包装入口。",
+            build=build_watchlist_management_graph,
+        ),
+        LangGraphWorkflowBuilder(
+            workflow_type="recommendation_decision",
+            description="推荐入池、买卖和换股决策 LangGraph 包装入口。",
+            build=build_recommendation_decision_graph,
+        ),
+        LangGraphWorkflowBuilder(
+            workflow_type="asset_deep_analysis",
+            description="单标的深度分析 LangGraph 骨架。",
+            build=build_asset_deep_analysis_graph,
+        ),
+        LangGraphWorkflowBuilder(
+            workflow_type="swap_decision",
+            description="弱持仓与强候选之间的换股或换币比较 LangGraph 骨架。",
+            build=build_swap_decision_graph,
+        ),
+        LangGraphWorkflowBuilder(
+            workflow_type="daily_review",
+            description="每日持仓、观察池、推荐和风险复盘 LangGraph 骨架。",
+            build=build_daily_review_graph,
+        ),
+    )
