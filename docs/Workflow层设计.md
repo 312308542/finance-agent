@@ -10,7 +10,8 @@
 
 | 层级 | 组件 | 职责 |
 | --- | --- | --- |
-| 上层运行时 | Hermes Agent | 长期运行、自由 loop、通用记忆、任务调度、工具调用和用户对话 |
+| 上层外部运行时 | Hermes Agent | 长期运行、自由 loop、通用记忆、任务调度、工具调用和用户对话 |
+| 上层内部运行时 | InternalFinanceAgentLoop | 不使用 Hermes 时的项目内受控 Agent Loop，基于 LangGraph 消费 `assistant_trigger_events` |
 | 金融业务内核 | `FinanceAssistantService` | 聚合持仓、观察池、推荐、信号、风险、Finance Memory，并调用 Workflow |
 | 工具接口 | CLI / MCP / API | 把金融事实查询、Workflow 调用和记忆写入能力暴露给 Hermes、Dashboard 和 Scheduler |
 | Workflow 编排引擎 | LangGraph | 编排固定金融团队流程、节点状态流转、条件分支和可恢复执行 |
@@ -35,7 +36,7 @@ flowchart TD
     OUT --> REP["完整中文解释报告\n结构化 JSON / Markdown"]
 ```
 
-Hermes Agent 负责“什么时候关心什么”和“下一步调用哪个工具”。`FinanceAssistantService` 负责“金融事实怎么查、哪些动作能写库、决策怎么审计、Workflow 怎么落库”。
+Hermes Agent 或内部 `InternalFinanceAgentLoop` 负责“什么时候关心什么”和“下一步调用哪个工具”。`FinanceAssistantService` 负责“金融事实怎么查、哪些动作能写库、决策怎么审计、Workflow 怎么落库”。内部 Agent Loop 的详细设计见 [内部金融AgentLoop设计.md](内部金融AgentLoop设计.md)。
 
 ## 3. 为什么不让 Hermes 直接承担全部金融逻辑
 
@@ -86,7 +87,8 @@ Hermes 适合做上层运行时，但不适合直接替代本项目的金融业�
 | 审计落库 | 本项目 | 写入 `agent_workflow_runs`、`agent_workflow_events`、`decision_logs` |
 | fallback 规则 | 本项目 | LLM 不可用或数据不足时回到确定性规则 |
 | 高风险复核策略 | 本项目 | 决定是否升级到 GPT-5.5 Pro |
-| 上层自由 loop | Hermes Agent | 不放进 LangGraph，也不放进本项目 Workflow |
+| 上层外部自由 loop | Hermes Agent | 不放进本项目 Workflow |
+| 上层内部受控 loop | InternalFinanceAgentLoop | 可使用 LangGraph，但必须有轮次、工具调用和 Workflow 调用预算 |
 
 标准步骤：
 
