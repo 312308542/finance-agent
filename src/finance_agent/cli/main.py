@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from finance_agent.agents.chat import FinanceAgentChatSession
 from finance_agent.agents.interfaces import FinanceAgentInterface, parse_datetime
 from finance_agent.agents.loop import InternalFinanceAgentLoopRunner
 from finance_agent.agents.runtime import (
@@ -55,6 +56,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--database-url", default=None, help="覆盖 FINANCE_AGENT_DATABASE_URL。")
     subparsers = parser.add_subparsers(dest="group", required=True)
+
+    chat = subparsers.add_parser("chat", help="打开类似 Hermes-Agent 的 CLI 聊天窗口。")
+    chat.add_argument("--owner-id", required=True, help="用户/账户 ID。")
+    chat.add_argument("--config-file", default=None, help="模型配置 JSON 文件路径。")
+    chat.add_argument(
+        "--message",
+        action="append",
+        default=[],
+        help="脚本化输入消息；传多次可模拟多轮对话。",
+    )
 
     workflows = subparsers.add_parser("workflows", help="Workflow 调度与查询。")
     workflow_commands = workflows.add_subparsers(dest="command", required=True)
@@ -223,6 +234,8 @@ def dispatch(args: argparse.Namespace) -> JsonDict:
     session_factory = create_session_factory(args.database_url)
     with session_scope(session_factory) as session:
         interface = FinanceAgentInterface(session)
+        if args.group == "chat":
+            return dispatch_chat(interface, args)
         if args.group == "workflows":
             return dispatch_workflows(interface, args).to_dict()
         if args.group == "tools":
@@ -234,6 +247,30 @@ def dispatch(args: argparse.Namespace) -> JsonDict:
         if args.group == "agent":
             return dispatch_agent(session, args)
     raise ValueError(f"未知命令组：{args.group}")
+
+
+def dispatch_chat(interface: FinanceAgentInterface, args: argparse.Namespace) -> JsonDict:
+    """处理 CLI 聊天窗口命令。"""
+
+    session = FinanceAgentChatSession(
+        owner_id=args.owner_id,
+        interface=interface,
+        model_registry=load_model_registry(args.config_file),
+    )
+    if args.message:
+        return {"status": "ok", "data": session.run_scripted(args.message).to_dict()}
+
+    print("finance-agent 聊天窗口已启动，输入 /exit 退出。")
+    while True:
+        try:
+            content = input("你> ")
+        except EOFError:
+            content = "/exit"
+        turn = session.handle_message(content)
+        print(f"Agent> {turn.assistant_message.content}")
+        if turn.assistant_message.intent == "exit":
+            break
+    return {"status": "ok", "data": session.run_scripted([]).to_dict()}
 
 
 def dispatch_workflows(
