@@ -75,6 +75,16 @@ finance-agent tools call factor.get_asset_factor_context \
 
 CLI 默认输出结构化 JSON；`reports show --markdown` 可只输出中文 Markdown 正文。
 
+CLI 聊天窗口示例：
+
+```bash
+finance-agent chat --owner-id owner:demo
+finance-agent chat --owner-id owner:demo --new-session
+finance-agent chat --owner-id owner:demo --session-id chat:owner-demo:xxxx --message "查看历史"
+```
+
+聊天窗口会把会话写入 `assistant_chat_sessions`，把用户消息和 Agent 回复写入 `assistant_chat_messages`，用于跨进程恢复和 `/history` 历史查看。它只保存普通聊天上下文；可审计的金融长期记忆仍由 Workflow、决策日志、复盘和用户反馈写入 `assistant_memories`。
+
 ## 3. MCP 入口
 
 MCP Server 入口：
@@ -124,5 +134,6 @@ python scripts/storage/smoke_v12_trigger_events.py
 - `FinanceAgentInterface` 和 CLI 暴露一致的 Workflow 清单。
 - CLI 可以输出结构化 JSON。
 - CLI 可以运行 `asset_deep_analysis` 圆桌报告 Workflow。
+- CLI 聊天窗口可以持久化 `chat_session_id`，并通过 `--session-id` 恢复最近聊天流水。
 - MCP SDK 安装后可以创建 MCP Server。
 - V1.2 触发层能生成 6 类触发事件、冷却去重，并通过 CLI 重复评估返回结构化 JSON。
