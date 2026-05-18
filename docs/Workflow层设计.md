@@ -126,10 +126,11 @@ flowchart LR
 
 ## 6.1 统一调度与审计事件
 
-当前内部调度基础版已经落地，范围不包含 Hermes Agent 调用：
+当前内部调度基础版已经落地；CLI 和 MCP 工具入口已经接入，Hermes Agent 后续可通过这两个入口调用，不需要直接依赖 Python 内部类：
 
 - `FinanceAssistantService.list_workflows()`：列出 6 个可调度 Workflow。
 - `FinanceAssistantService.run_workflow()`：按 `workflow_type` 找到 LangGraph 构建器，执行图，并统一写入 `agent_workflow_runs` / `agent_workflow_events`。
+- `FinanceAgentInterface`：CLI / MCP 共用门面，负责参数归一化、DTO 组装、事务边界和 JSON 序列化。
 - `FinanceToolRuntime.workflow.list_workflows`：给 Hermes、MCP、CLI 或前端查询可用 Workflow 使用。
 - `list_langgraph_workflow_builders()`：作为本项目内部 Workflow 注册表，当前包含 `portfolio_monitoring`、`watchlist_management`、`recommendation_decision`、`asset_deep_analysis`、`swap_decision`、`daily_review`。
 
@@ -160,6 +161,48 @@ flowchart LR
 - `markdown`：可直接展示或归档的中文 Markdown。
 
 当前阶段只落地模型路由与复核协议，不真实调用外部 LLM。Hermes-Agent 或后续模型客户端应消费 `model_route` / `model_review` 审计事件里的 `model_key`、`review_input` 和证据引用，再把真实复核结果回写到同一条 Workflow 审计链路。
+
+## 6.2 CLI 与 MCP 入口
+
+CLI 和 MCP 已经同时落地，二者都是薄入口，共用 `FinanceAgentInterface`：
+
+```text
+Hermes / Codex / Scheduler
+  -> CLI 或 MCP
+  -> FinanceAgentInterface
+  -> FinanceAssistantService / FinanceToolRuntime
+  -> LangGraph Workflow / PostgreSQL + TimescaleDB
+```
+
+CLI 更适合本地开发、批处理、冒烟验证和大模型直接调命令；MCP 更适合作为长期 Agent 的正式工具入口，具备工具发现、结构化参数和权限边界。
+
+已提供的 CLI 命令：
+
+```bash
+finance-agent workflows list
+finance-agent workflows run asset_deep_analysis --owner-id owner:demo --asset-id asset:demo
+finance-agent workflows show <workflow_run_id>
+finance-agent reports show <workflow_run_id> --markdown
+finance-agent tools list
+finance-agent tools call factor.get_asset_factor_context --arguments "{\"asset_id\":\"asset:demo\"}"
+```
+
+已提供的 MCP tools：
+
+- `list_workflows`
+- `run_workflow`
+- `get_workflow_run`
+- `get_report`
+- `list_tools`
+- `call_tool`
+
+CLI / MCP 入口约束：
+
+- 不直接访问外部数据源。
+- 不直接计算因子、指标、评分或信号。
+- 不直接调用外部模型。
+- 不绕过 `FinanceAssistantService` 写入决策、记忆和审计。
+- 输出统一为 JSON；报告可以额外返回 Markdown。
 
 ## 7. 工具能力
 
