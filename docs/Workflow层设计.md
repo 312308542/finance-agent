@@ -32,7 +32,7 @@ flowchart TD
     TR --> MEM["Finance Memory\n决策 / 入池原因 / 每日关注 / 复盘"]
     WF --> OUT["结构化决策结果\n买 / 卖 / 换 / 入池 / 继续观察 / 回避"]
     OUT --> LOG["decision_logs / assistant_memories\nreview_tasks / agent_workflow_events"]
-    OUT --> REP["中文解释报告"]
+    OUT --> REP["完整中文解释报告\n结构化 JSON / Markdown"]
 ```
 
 Hermes Agent 负责“什么时候关心什么”和“下一步调用哪个工具”。`FinanceAssistantService` 负责“金融事实怎么查、哪些动作能写库、决策怎么审计、Workflow 怎么落库”。
@@ -62,7 +62,7 @@ Hermes 适合做上层运行时，但不适合直接替代本项目的金融业�
 - 调用底层 Domain Workflow。
 - 写入提醒、决策日志、Workflow 审计、复盘任务和观察池事件。
 - 通过 `list_workflows()` 暴露本项目内部可调度的金融团队 Workflow。
-- 通过 `run_workflow()` 统一调度 LangGraph Workflow，并把节点、圆桌、高风险复核和报告摘要写入审计表。
+- 通过 `run_workflow()` 统一调度 LangGraph Workflow，并把节点、圆桌、模型路由、高风险复核和完整中文报告写入审计表。
 
 它不允许做：
 
@@ -140,7 +140,26 @@ flowchart LR
 | `workflow_node_completed` | 普通 LangGraph 节点 | 记录上下文加载、数据工具调用、主席裁决等节点摘要 |
 | `roundtable_opinion` | `roundtable:*` 角色观点 | 记录技术分析、因子分析、风险反驳、组合经理、记忆管理员等结构化观点 |
 | `high_risk_review` | `high_risk_review:*` 复核项 | 记录卖出、换股、强风险、数据缺口等是否需要升级复核 |
-| `report_draft` | 报告摘要节点 | 记录中文解释报告摘要，后续完整报告模板继续复用该事件 |
+| `model_route` | `model_route:*` 路由项 | 记录 DeepSeek V4 Pro 常规分析路由和 GPT-5.5 Pro 高风险复核路由 |
+| `model_review` | `model_review:*` 复核协议 | 记录高风险复核状态、复核模型、复核输入摘要和等待真实模型执行的状态 |
+| `report_draft` | 报告节点 | 记录完整中文解释报告结构，包含 JSON 字段和 Markdown 文本 |
+
+当前已接入完整中文报告模板，报告结构包含：
+
+- `executive_summary`：执行摘要。
+- `decision`：主席裁决和动作。
+- `action_plan`：后续行动计划。
+- `key_evidence`：证据、评分和指标引用。
+- `roundtable_opinions`：圆桌角色观点。
+- `risk_rebuttal`：风险反驳。
+- `data_quality`：数据质量状态。
+- `memory_references`：Finance Memory 引用。
+- `review_status`：高风险复核状态。
+- `model_routing`：模型路由和复核模型。
+- `disclaimer`：非投资建议声明。
+- `markdown`：可直接展示或归档的中文 Markdown。
+
+当前阶段只落地模型路由与复核协议，不真实调用外部 LLM。Hermes-Agent 或后续模型客户端应消费 `model_route` / `model_review` 审计事件里的 `model_key`、`review_input` 和证据引用，再把真实复核结果回写到同一条 Workflow 审计链路。
 
 ## 7. 工具能力
 
@@ -208,6 +227,13 @@ report_sections      # 中文报告结构
 
 高风险复核不是另起一套系统，而是复查 DeepSeek V4 Pro 或规则 Workflow 的初步建议。复核输出仍必须回写同一套 `decision_logs`、`assistant_memories`、`review_tasks` 和 Workflow 审计链路。
 
+当前代码已实现 `ModelRoutingPolicy`：
+
+- 常规圆桌分析路由为 `deepseek-v4-pro`。
+- 触发高风险复核时生成 `gpt-5.5-pro` 路由。
+- `high_risk_review` 会把 `requires_review`、复核原因、复核输入和模型路由写入 `model_review`。
+- 当前不直接请求模型 API，避免在 Hermes 接入前把模型调用散落到 Workflow 内部。
+
 ## 10. 迁移策略
 
 第一阶段不做大重命名：
@@ -231,4 +257,4 @@ report_sections      # 中文报告结构
 - 卖出、换股和大仓位调整必须进入 GPT-5.5 Pro 复核策略。
 - 不接外部实时网页查询，不让 Hermes 或 Workflow 直接调用 AKShare、Binance、ccxt。
 - Workflow 运行过程写入 `agent_workflow_runs` 和 `agent_workflow_events`。
-- `asset_deep_analysis`、`swap_decision`、`daily_review` 至少具备可运行圆桌报告基础版，能调用已入库数据工具并落库圆桌观点、复核和报告摘要。
+- `asset_deep_analysis`、`swap_decision`、`daily_review` 至少具备可运行圆桌报告基础版，能调用已入库数据工具并落库圆桌观点、复核和完整中文报告。
