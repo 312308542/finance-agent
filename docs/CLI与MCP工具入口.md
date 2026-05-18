@@ -1,6 +1,6 @@
 # CLI 与 MCP 工具入口
 
-本文记录当前阶段给 Hermes-Agent、Codex、Scheduler 和后续前端 API 使用的工具入口。结论是：CLI 和 MCP 都保持薄入口；Workflow 与事实工具共用 `FinanceAgentInterface`，V1.2 触发事件入口调用 `TriggerService`，入口层只做参数解析、事务边界、JSON 序列化和调用转发，不承载金融决策逻辑。
+本文记录当前阶段给 Hermes-Agent、Codex、Scheduler 和后续前端 API 使用的工具入口。结论是：CLI 和 MCP 都保持薄入口；Workflow 与事实工具共用 `FinanceAgentInterface`，V1.2 触发事件入口调用 `TriggerService` 并唤醒 Hermes-Agent 或内部金融 Agent，入口层只做参数解析、事务边界、JSON 序列化和调用转发，不承载金融决策逻辑。
 
 ## 1. 分层
 
@@ -14,7 +14,8 @@ flowchart TD
     MCP --> TS
     IF --> FAS["FinanceAssistantService\n金融业务编排内核"]
     IF --> TR["FinanceToolRuntime\n只读事实工具"]
-    TS --> FAS
+    TS --> AG["Hermes-Agent / 内部金融 Agent\n触发唤醒目标"]
+    AG --> FAS
     TS --> EVT["assistant_trigger_events"]
     FAS --> WF["LangGraph Workflow"]
     TR --> DB["PostgreSQL + TimescaleDB\n已清洗入库数据"]
@@ -94,8 +95,8 @@ finance-agent-mcp
 | `list_tools` | 列出只读金融事实工具 |
 | `call_tool` | 调用 `FinanceToolRuntime` 中的只读事实工具 |
 | `evaluate_triggers` | 评估已入库事实并生成触发事件 |
-| `dispatch_triggers` | 派发待处理触发事件到金融团队 Workflow |
-| `run_triggers_once` | 执行一次触发评估并立即派发 |
+| `dispatch_triggers` | 派发待处理触发事件到 Agent 唤醒队列 |
+| `run_triggers_once` | 执行一次触发评估并立即唤醒 Agent |
 
 MCP 依赖写入 `pyproject.toml`：`mcp>=1.16,<2.0`。当前本地已验证 `mcp 1.27.1` 可以创建 server。
 
@@ -105,7 +106,7 @@ MCP 依赖写入 `pyproject.toml`：`mcp>=1.16,<2.0`。当前本地已验证 `mc
 - CLI 和 MCP 不直接计算指标、因子、评分或信号。
 - CLI 和 MCP 不直接调用外部 LLM。
 - CLI 和 MCP 不绕过 `FinanceAssistantService` 写决策、记忆或审计。
-- 触发入口不直接给买卖结论，只写 `assistant_trigger_events` 并派发 Workflow。
+- 触发入口不直接给买卖结论，也不直接运行 Workflow；只写 `assistant_trigger_events` 并唤醒 Hermes-Agent 或内部金融 Agent。
 - 真实交易下单仍不在本项目第一阶段范围内，后续必须增加人工确认和交易权限开关。
 
 ## 5. 验证

@@ -164,14 +164,16 @@ flowchart LR
 
 ## 6.2 CLI 与 MCP 入口
 
-CLI 和 MCP 已经同时落地，二者都是薄入口。Workflow 和事实工具入口共用 `FinanceAgentInterface`；V1.2 触发事件入口调用 `TriggerService`，再派发到 `FinanceAssistantService.run_workflow()`：
+CLI 和 MCP 已经同时落地，二者都是薄入口。Workflow 和事实工具入口共用 `FinanceAgentInterface`；V1.2 触发事件入口调用 `TriggerService`，只把事件写入 `assistant_trigger_events` 并唤醒 Hermes-Agent 或内部金融 Agent。Agent 在自己的 loop 中读取触发事件、已入库事实和金融记忆，再按需调用 `FinanceAssistantService.run_workflow()`：
 
 ```text
 Hermes / Codex / Scheduler / Trigger Engine
   -> CLI 或 MCP
   -> FinanceAgentInterface / TriggerService
-  -> FinanceAssistantService / FinanceToolRuntime / assistant_trigger_events
-  -> LangGraph Workflow / PostgreSQL + TimescaleDB
+  -> assistant_trigger_events
+  -> Hermes-Agent 或内部金融 Agent
+  -> FinanceAssistantService / FinanceToolRuntime
+  -> 按需调用 LangGraph Workflow / PostgreSQL + TimescaleDB
 ```
 
 CLI 更适合本地开发、批处理、冒烟验证和大模型直接调命令；MCP 更适合作为长期 Agent 的正式工具入口，具备工具发现、结构化参数和权限边界。
@@ -212,7 +214,7 @@ CLI / MCP 入口约束：
 
 ## 6.3 V1.2 触发事件层
 
-V1.2 新增 `assistant_trigger_events` 和 `TriggerService`。触发层不常驻运行 Workflow，而是把已入库事实变化转成可审计事件，再由 dispatcher 派发到金融团队 Workflow。
+V1.2 新增 `assistant_trigger_events` 和 `TriggerService`。触发层不常驻运行 Workflow，也不直接运行 Workflow，而是把已入库事实变化转成可审计事件，再由 dispatcher 唤醒 Hermes-Agent 或内部金融 Agent。Workflow 只是 Agent 后续可按需调用的内部分析工具。
 
 ```mermaid
 flowchart LR
@@ -220,13 +222,14 @@ flowchart LR
     TS --> EV["assistant_trigger_events\npending / dispatched / skipped"]
     EV --> CD["dedup_key + cooldown\n去重和冷却"]
     CD --> DP["TriggerService.dispatch_pending"]
-    DP --> FAS["FinanceAssistantService.run_workflow"]
+    DP --> AG["Hermes-Agent / 内部金融 Agent\n自由 loop / 工具调用"]
+    AG --> FAS["FinanceAssistantService.run_workflow\n按需调用金融团队 Workflow"]
     FAS --> AUD["agent_workflow_runs / agent_workflow_events\n中文报告 / 记忆 / 审计"]
 ```
 
 当前基础版支持：
 
-| 触发类型 | 数据来源 | Workflow |
+| 触发类型 | 数据来源 | 建议内部 Workflow |
 | --- | --- | --- |
 | `position_drawdown` | `positions` | `portfolio_monitoring` |
 | `signal_flip` | `signal_snapshots` | `portfolio_monitoring` |
