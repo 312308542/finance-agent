@@ -12,6 +12,7 @@ from typing import Any
 
 from finance_agent.agents.interfaces import FinanceAgentInterface, parse_datetime
 from finance_agent.storage.db import create_session_factory, session_scope
+from finance_agent.triggers import TriggerEvaluationRequest, TriggerService
 
 JsonDict = dict[str, Any]
 
@@ -117,6 +118,90 @@ def create_mcp_server() -> Any:
             ).to_dict()
         )
 
+    @mcp.tool()
+    def evaluate_triggers(
+        owner_id: str,
+        as_of: str | None = None,
+        portfolio_id: str | None = None,
+        watchlist_id: str | None = None,
+        recommendation_run_id: str | None = None,
+        horizon: str = "swing",
+        timeframe: str = "1d",
+        since_minutes: int = 60,
+        cooldown_minutes: int = 15,
+        recommendation_limit: int = 20,
+        drawdown_threshold: str = "0.050000",
+    ) -> JsonDict:
+        """评估已入库事实并生成触发事件。"""
+
+        return run_with_trigger_service(
+            lambda service: service.evaluate(
+                build_trigger_request(
+                    owner_id=owner_id,
+                    as_of=as_of,
+                    portfolio_id=portfolio_id,
+                    watchlist_id=watchlist_id,
+                    recommendation_run_id=recommendation_run_id,
+                    horizon=horizon,
+                    timeframe=timeframe,
+                    since_minutes=since_minutes,
+                    cooldown_minutes=cooldown_minutes,
+                    recommendation_limit=recommendation_limit,
+                    drawdown_threshold=drawdown_threshold,
+                )
+            ).to_dict()
+        )
+
+    @mcp.tool()
+    def dispatch_triggers(
+        owner_id: str | None = None,
+        limit: int = 20,
+        as_of: str | None = None,
+    ) -> JsonDict:
+        """派发待处理触发事件到金融团队 Workflow。"""
+
+        return run_with_trigger_service(
+            lambda service: service.dispatch_pending(
+                owner_id=owner_id,
+                limit=limit,
+                as_of=parse_datetime(as_of),
+            ).to_dict()
+        )
+
+    @mcp.tool()
+    def run_triggers_once(
+        owner_id: str,
+        as_of: str | None = None,
+        portfolio_id: str | None = None,
+        watchlist_id: str | None = None,
+        recommendation_run_id: str | None = None,
+        horizon: str = "swing",
+        timeframe: str = "1d",
+        since_minutes: int = 60,
+        cooldown_minutes: int = 15,
+        recommendation_limit: int = 20,
+        drawdown_threshold: str = "0.050000",
+    ) -> JsonDict:
+        """执行一次触发评估并立即派发。"""
+
+        return run_with_trigger_service(
+            lambda service: service.run_once(
+                build_trigger_request(
+                    owner_id=owner_id,
+                    as_of=as_of,
+                    portfolio_id=portfolio_id,
+                    watchlist_id=watchlist_id,
+                    recommendation_run_id=recommendation_run_id,
+                    horizon=horizon,
+                    timeframe=timeframe,
+                    since_minutes=since_minutes,
+                    cooldown_minutes=cooldown_minutes,
+                    recommendation_limit=recommendation_limit,
+                    drawdown_threshold=drawdown_threshold,
+                )
+            )
+        )
+
     return mcp
 
 
@@ -127,6 +212,48 @@ def run_with_interface(callback: Callable[[FinanceAgentInterface], JsonDict]) ->
     with session_scope(session_factory) as session:
         interface = FinanceAgentInterface(session)
         return callback(interface)
+
+
+def run_with_trigger_service(callback: Callable[[TriggerService], JsonDict]) -> JsonDict:
+    """创建事务边界并执行触发事件服务回调。"""
+
+    session_factory = create_session_factory()
+    with session_scope(session_factory) as session:
+        return callback(TriggerService(session))
+
+
+def build_trigger_request(
+    *,
+    owner_id: str,
+    as_of: str | None,
+    portfolio_id: str | None,
+    watchlist_id: str | None,
+    recommendation_run_id: str | None,
+    horizon: str,
+    timeframe: str,
+    since_minutes: int,
+    cooldown_minutes: int,
+    recommendation_limit: int,
+    drawdown_threshold: str,
+) -> TriggerEvaluationRequest:
+    """构建 MCP 触发评估请求。"""
+
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    return TriggerEvaluationRequest(
+        owner_id=owner_id,
+        as_of=parse_datetime(as_of) or datetime.now(UTC),
+        portfolio_id=portfolio_id,
+        watchlist_id=watchlist_id,
+        recommendation_run_id=recommendation_run_id,
+        horizon=horizon,
+        timeframe=timeframe,
+        since_minutes=since_minutes,
+        cooldown_minutes=cooldown_minutes,
+        recommendation_limit=recommendation_limit,
+        drawdown_threshold=Decimal(drawdown_threshold),
+    )
 
 
 def main() -> None:

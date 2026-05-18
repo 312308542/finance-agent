@@ -14,6 +14,7 @@ from typing import Any
 
 from finance_agent.agents.interfaces import FinanceAgentInterface, parse_datetime
 from finance_agent.storage.db import create_session_factory, session_scope
+from finance_agent.triggers import TriggerEvaluationRequest, TriggerService
 
 JsonDict = dict[str, Any]
 
@@ -72,6 +73,17 @@ def build_parser() -> argparse.ArgumentParser:
     report_show = report_commands.add_parser("show", help="读取 Workflow 中文报告。")
     report_show.add_argument("workflow_run_id", help="Workflow Run ID。")
     report_show.add_argument("--markdown", action="store_true", help="仅输出 Markdown 正文。")
+
+    triggers = subparsers.add_parser("triggers", help="V1.2 触发事件评估与派发。")
+    trigger_commands = triggers.add_subparsers(dest="command", required=True)
+    evaluate = trigger_commands.add_parser("evaluate", help="评估已入库事实并生成触发事件。")
+    add_trigger_request_arguments(evaluate)
+    dispatch_parser = trigger_commands.add_parser("dispatch", help="派发待处理触发事件。")
+    dispatch_parser.add_argument("--owner-id", default=None, help="只派发指定用户的触发事件。")
+    dispatch_parser.add_argument("--limit", type=int, default=20, help="本次最多派发事件数。")
+    dispatch_parser.add_argument("--as-of", default=None, help="ISO 时间，默认当前时间。")
+    run_once = trigger_commands.add_parser("run-once", help="执行一次触发评估并立即派发。")
+    add_trigger_request_arguments(run_once)
     return parser
 
 
@@ -97,6 +109,26 @@ def add_workflow_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--initial-state-file", default=None, help="从 JSON 文件读取额外 state。")
 
 
+def add_trigger_request_arguments(parser: argparse.ArgumentParser) -> None:
+    """注册触发评估请求参数。"""
+
+    parser.add_argument("--owner-id", required=True, help="用户/账户 ID。")
+    parser.add_argument("--as-of", default=None, help="ISO 时间，默认当前时间。")
+    parser.add_argument("--portfolio-id", default=None, help="只评估指定组合。")
+    parser.add_argument("--watchlist-id", default=None, help="只评估指定观察池。")
+    parser.add_argument("--recommendation-run-id", default=None, help="只评估指定推荐运行。")
+    parser.add_argument("--horizon", default="swing", help="信号和因子分析周期。")
+    parser.add_argument("--timeframe", default="1d", help="TA 指标周期。")
+    parser.add_argument("--since-minutes", type=int, default=60, help="触发回看窗口分钟数。")
+    parser.add_argument("--cooldown-minutes", type=int, default=15, help="同类触发冷却分钟数。")
+    parser.add_argument("--recommendation-limit", type=int, default=20, help="推荐运行读取数量。")
+    parser.add_argument(
+        "--drawdown-threshold",
+        default="0.050000",
+        help="持仓回撤触发阈值，Decimal 字符串。",
+    )
+
+
 def dispatch(args: argparse.Namespace) -> JsonDict:
     """执行具体命令。"""
 
@@ -109,6 +141,8 @@ def dispatch(args: argparse.Namespace) -> JsonDict:
             return dispatch_tools(interface, args).to_dict()
         if args.group == "reports":
             return dispatch_reports(interface, args).to_dict()
+        if args.group == "triggers":
+            return dispatch_triggers(session, args)
     raise ValueError(f"未知命令组：{args.group}")
 
 
@@ -167,6 +201,51 @@ def dispatch_reports(interface: FinanceAgentInterface, args: argparse.Namespace)
             markdown=args.markdown,
         )
     raise ValueError(f"未知 reports 命令：{args.command}")
+
+
+def dispatch_triggers(session: Any, args: argparse.Namespace) -> JsonDict:
+    """处理触发事件命令。"""
+
+    service = TriggerService(session)
+    if args.command == "evaluate":
+        return {
+            "status": "ok",
+            "data": service.evaluate(build_trigger_request(args)).to_dict(),
+        }
+    if args.command == "dispatch":
+        result = service.dispatch_pending(
+            owner_id=args.owner_id,
+            limit=args.limit,
+            as_of=parse_datetime(args.as_of),
+        )
+        return {"status": "ok", "data": result.to_dict()}
+    if args.command == "run-once":
+        return {
+            "status": "ok",
+            "data": service.run_once(build_trigger_request(args)),
+        }
+    raise ValueError(f"未知 triggers 命令：{args.command}")
+
+
+def build_trigger_request(args: argparse.Namespace) -> TriggerEvaluationRequest:
+    """从 CLI 参数构建触发评估请求。"""
+
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    return TriggerEvaluationRequest(
+        owner_id=args.owner_id,
+        as_of=parse_datetime(args.as_of) or datetime.now(UTC),
+        portfolio_id=args.portfolio_id,
+        watchlist_id=args.watchlist_id,
+        recommendation_run_id=args.recommendation_run_id,
+        horizon=args.horizon,
+        timeframe=args.timeframe,
+        since_minutes=args.since_minutes,
+        cooldown_minutes=args.cooldown_minutes,
+        recommendation_limit=args.recommendation_limit,
+        drawdown_threshold=Decimal(args.drawdown_threshold),
+    )
 
 
 def load_json_argument(value: str, file_path: str | None) -> JsonDict:
