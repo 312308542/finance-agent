@@ -14,6 +14,12 @@ from typing import Any
 
 from finance_agent.agents.interfaces import FinanceAgentInterface, parse_datetime
 from finance_agent.agents.loop import InternalFinanceAgentLoopRunner
+from finance_agent.agents.runtime import (
+    load_model_registry,
+    preview_model_routes,
+    test_model_endpoint,
+)
+from finance_agent.agents.runtime.model_tui import render_model_tui
 from finance_agent.storage.db import create_session_factory, session_scope
 from finance_agent.triggers import TriggerEvaluationRequest, TriggerService
 
@@ -123,6 +129,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="最多轮询次数；本地测试建议传 1，常驻运行可不传。",
     )
     agent_run_loop.add_argument("--as-of", default=None, help="ISO 时间，默认每轮当前时间。")
+
+    models = subparsers.add_parser("models", help="模型配置、路由预览和本地测试。")
+    model_commands = models.add_subparsers(dest="command", required=True)
+    model_config = model_commands.add_parser("config", help="查看模型配置脱敏摘要。")
+    add_model_common_arguments(model_config)
+    route_preview = model_commands.add_parser("route-preview", help="预览 Workflow 模型路由。")
+    add_model_common_arguments(route_preview)
+    route_preview.add_argument("--workflow-type", required=True, help="Workflow 类型。")
+    route_preview.add_argument("--task", default="roundtable_discussion", help="模型任务名。")
+    route_preview.add_argument("--asset-id", default=None, help="资产 ID。")
+    route_preview.add_argument("--decision-type", default=None, help="决策类型。")
+    route_preview.add_argument("--high-risk", action="store_true", help="同时预览高风险复核路由。")
+    model_test = model_commands.add_parser("test", help="测试模型配置，默认 dry-run。")
+    add_model_common_arguments(model_test)
+    model_test.add_argument("--model-key", required=True, help="模型 key。")
+    model_test.add_argument(
+        "--prompt",
+        default="用一句中文说明模型配置已就绪。",
+        help="测试提示词。",
+    )
+    model_test.add_argument("--dry-run", action="store_true", help="只生成请求预览，不发起 HTTP。")
+    model_test.add_argument(
+        "--real-request",
+        action="store_true",
+        help="发起真实 HTTP 连通测试；仅在确认 API 配置后使用。",
+    )
+    model_tui = model_commands.add_parser("tui", help="打开轻量文本模型配置 TUI。")
+    add_model_common_arguments(model_tui)
+    model_tui.add_argument(
+        "--scripted",
+        choices=["config", "route-preview", "test"],
+        default=None,
+        help="脚本化 TUI 动作，用于本地 smoke。",
+    )
     return parser
 
 
@@ -168,8 +208,17 @@ def add_trigger_request_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_model_common_arguments(parser: argparse.ArgumentParser) -> None:
+    """注册模型命令通用参数。"""
+
+    parser.add_argument("--config-file", default=None, help="模型配置 JSON 文件路径。")
+
+
 def dispatch(args: argparse.Namespace) -> JsonDict:
     """执行具体命令。"""
+
+    if args.group == "models":
+        return dispatch_models(args)
 
     session_factory = create_session_factory(args.database_url)
     with session_scope(session_factory) as session:
@@ -295,6 +344,50 @@ def dispatch_agent(session: Any, args: argparse.Namespace) -> JsonDict:
         )
         return {"status": "ok", "data": result.to_dict()}
     raise ValueError(f"未知 agent 命令：{args.command}")
+
+
+def dispatch_models(args: argparse.Namespace) -> JsonDict:
+    """处理模型配置和测试命令。"""
+
+    registry = load_model_registry(args.config_file)
+    if args.command == "config":
+        return {"status": "ok", "data": registry.to_safe_dict()}
+    if args.command == "route-preview":
+        return {
+            "status": "ok",
+            "data": {
+                "routes": preview_model_routes(
+                    registry=registry,
+                    workflow_type=args.workflow_type,
+                    task=args.task,
+                    asset_id=args.asset_id,
+                    decision_type=args.decision_type,
+                    high_risk=args.high_risk,
+                )
+            },
+        }
+    if args.command == "test":
+        dry_run = args.dry_run or not args.real_request
+        return {
+            "status": "ok",
+            "data": test_model_endpoint(
+                registry=registry,
+                model_key=args.model_key,
+                prompt=args.prompt,
+                dry_run=dry_run,
+            ),
+        }
+    if args.command == "tui":
+        return {
+            "status": "ok",
+            "data": {
+                "output": render_model_tui(
+                    registry=registry,
+                    scripted=args.scripted,
+                )
+            },
+        }
+    raise ValueError(f"未知 models 命令：{args.command}")
 
 
 def build_trigger_request(args: argparse.Namespace) -> TriggerEvaluationRequest:
