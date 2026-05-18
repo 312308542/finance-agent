@@ -139,7 +139,11 @@ def classify_workflow_event_type(name: str) -> str:
 
     if name.startswith("roundtable:"):
         return "roundtable_opinion"
-    if name.startswith("high_risk_review:"):
+    if name.startswith("model_route:"):
+        return "model_route"
+    if name.startswith("model_review:"):
+        return "model_review"
+    if name.startswith("high_risk_review:") or name == "high_risk_review":
         return "high_risk_review"
     if name == "report_draft":
         return "report_draft"
