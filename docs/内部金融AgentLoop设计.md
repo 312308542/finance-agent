@@ -158,12 +158,12 @@ Agent Loop 可以跳过 Workflow，但必须给出结构化原因，例如数据
 
 第一阶段只做最小可用内部运行时：
 
-1. 消费已派发的 `assistant_trigger_events`。
-2. 加载结构化上下文。
-3. 根据 `requested_workflow_type` 决定是否调用一个 Domain Workflow。
-4. 写入 Agent 任务处理摘要、决策日志、记忆或跳过原因。
-5. 提供 CLI：`finance-agent agent run-once`。
-6. 提供 smoke：验证触发事件可以被内部 Agent Loop 消费，并且不会重复处理。
+1. 消费已派发的 `assistant_trigger_events`。（已完成基础版）
+2. 加载结构化上下文。（已通过 Workflow 初始 state 和只读工具调用计划完成基础版）
+3. 根据 `requested_workflow_type` 决定是否调用一个 Domain Workflow。（已完成基础版）
+4. 写入 Agent 任务处理摘要、跳过原因或失败原因。（已完成基础版，决策日志和记忆继续由 Domain Workflow 负责）
+5. 提供 CLI：`finance-agent agent run-once` / `finance-agent agent run-task`。（已完成基础版）
+6. 提供 smoke：验证触发事件可以被内部 Agent Loop 消费，并且不会重复处理。（已完成）
 
 第一阶段不做：
 
@@ -186,6 +186,13 @@ src/finance_agent/agents/loop/
   persistence.py    # 任务状态和审计写入
 ```
 
+当前基础版已落地 `state.py`、`planner.py`、`runner.py`、`graph.py` 和 `__init__.py`。其中：
+
+- `runner.py` 负责从 `assistant_trigger_events` 领取已派发任务、调用 `FinanceAgentInterface.run_workflow()`、回写 `agent_loop_status` 和 `workflow_run_id`。
+- `planner.py` 当前是确定性策略，后续可接 DeepSeek V4 Pro 做 `PlanNextStep`。
+- `graph.py` 先作为 LangGraph loop 扩展入口保留，避免第一阶段过度抽象。
+- 暂未新增 `persistence.py`，因为当前持久化已由 `AssistantTriggerRepository` 承担；后续若增加 `agent_loop_runs` / `agent_loop_events` 再拆出。
+
 建议新增脚本：
 
 ```text
@@ -201,7 +208,7 @@ finance-agent agent run-task --agent-task-id agent_task:...
 
 实现优先级：
 
-1. 先实现确定性 planner，保证触发事件能闭环。
+1. 先实现确定性 planner，保证触发事件能闭环。（已完成）
 2. 再接 LangGraph 图节点和审计事件。
 3. 再接模型客户端，让 DeepSeek V4 Pro 参与 `PlanNextStep` 和 `DecideAction`。
 4. 最后接 Scheduler/Hermes 常驻唤醒。
