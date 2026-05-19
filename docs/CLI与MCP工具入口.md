@@ -19,6 +19,8 @@ flowchart TD
     TS --> EVT["assistant_trigger_events"]
     FAS --> WF["LangGraph Workflow"]
     TR --> DB["PostgreSQL + TimescaleDB\n已清洗入库数据"]
+    IF --> GS["GraphSyncService / MemoryGraphStore\nFinance Memory 知识图谱"]
+    GS --> GDB["Neo4j / DozerDB 或 Apache AGE\n配置二选一"]
     WF --> LOG["agent_workflow_runs / agent_workflow_events"]
 ```
 
@@ -75,6 +77,22 @@ finance-agent tools call factor.get_asset_factor_context \
 
 CLI 默认输出结构化 JSON；`reports show --markdown` 可只输出中文 Markdown 正文。
 
+知识图谱命令示例：
+
+```bash
+finance-agent graph health
+finance-agent graph init
+finance-agent graph sync-asset --owner-id owner:demo --asset-id asset:demo:600519
+finance-agent graph sync-owner --owner-id owner:demo
+finance-agent graph trace --owner-id owner:demo --asset-id asset:demo:600519
+finance-agent graph reason-chain --owner-id owner:demo --asset-id asset:demo:600519
+finance-agent graph similar-decisions --owner-id owner:demo --asset-id asset:demo:600519
+finance-agent graph risk-contagion --owner-id owner:demo --asset-id asset:demo:600519
+finance-agent graph conflicts --owner-id owner:demo --asset-id asset:demo:600519
+```
+
+图谱命令只访问当前配置选择的一个后端：默认 `neo4j` / DozerDB，也可以显式配置为 `apache_age`；不做双写、双读或自动 fallback。
+
 CLI 聊天窗口示例：
 
 ```bash
@@ -107,6 +125,15 @@ finance-agent-mcp
 | `evaluate_triggers` | 评估已入库事实并生成触发事件 |
 | `dispatch_triggers` | 派发待处理触发事件到 Agent 唤醒队列 |
 | `run_triggers_once` | 执行一次触发评估并立即唤醒 Agent |
+| `graph_health` | 检查当前图谱后端健康状态 |
+| `graph_initialize` | 初始化图谱约束、索引或 AGE 图空间 |
+| `graph_sync_asset` | 同步单标的图谱投影 |
+| `graph_sync_owner` | 同步某个用户的图谱投影 |
+| `graph_trace_asset` | 追踪单标的决策、记忆、观察池、风险和证据路径 |
+| `graph_explain_candidate_reason_chain` | 解释入池或持续关注原因链 |
+| `graph_find_similar_decision_paths` | 查找相似历史决策路径 |
+| `graph_detect_risk_contagion` | 检测风险传导路径 |
+| `graph_find_memory_conflicts` | 发现 Finance Memory 冲突 |
 
 MCP 依赖写入 `pyproject.toml`：`mcp>=1.16,<2.0`。当前本地已验证 `mcp 1.27.1` 可以创建 server。
 
@@ -116,6 +143,8 @@ MCP 依赖写入 `pyproject.toml`：`mcp>=1.16,<2.0`。当前本地已验证 `mc
 - CLI 和 MCP 不直接计算指标、因子、评分或信号。
 - CLI 和 MCP 不直接调用外部 LLM。
 - CLI 和 MCP 不绕过 `FinanceAssistantService` 写决策、记忆或审计。
+- CLI 和 MCP 图谱入口不直接写业务事实，只把 PostgreSQL 事实源同步为可重建图谱投影。
+- 图谱入口只使用配置选择的一个图数据库后端，不自动切换后端。
 - 触发入口不直接给买卖结论，也不直接运行 Workflow；只写 `assistant_trigger_events` 并唤醒 Hermes-Agent 或内部金融 Agent。
 - 真实交易下单仍不在本项目第一阶段范围内，后续必须增加人工确认和交易权限开关。
 
@@ -126,6 +155,7 @@ MCP 依赖写入 `pyproject.toml`：`mcp>=1.16,<2.0`。当前本地已验证 `mc
 ```bash
 python scripts/storage/smoke_agent_cli_interface.py
 python scripts/storage/smoke_agent_mcp_server.py
+python scripts/storage/smoke_graph_store.py
 python scripts/storage/smoke_v12_trigger_events.py
 ```
 
@@ -134,6 +164,7 @@ python scripts/storage/smoke_v12_trigger_events.py
 - `FinanceAgentInterface` 和 CLI 暴露一致的 Workflow 清单。
 - CLI 可以输出结构化 JSON。
 - CLI 可以运行 `asset_deep_analysis` 圆桌报告 Workflow。
+- CLI/MCP 可通过独立 graph 命令和 tool 调用覆盖图谱健康检查、初始化、同步、路径追踪、入池原因链、相似历史决策、风险传导和记忆冲突。
 - CLI 聊天窗口可以持久化 `chat_session_id`，并通过 `--session-id` 恢复最近聊天流水。
 - MCP SDK 安装后可以创建 MCP Server。
 - V1.2 触发层能生成 6 类触发事件、冷却去重，并通过 CLI 重复评估返回结构化 JSON。

@@ -280,7 +280,7 @@ AKShare 能力还可以继续补，但现在不应成为主线。后续新增数
 - `decision_logs`
 - `assistant_memories`
 - `memory_embeddings`
-- `financial_memory_edges`
+- GraphStore 知识图谱后端（默认 Neo4j / DozerDB，可选 Apache AGE；`financial_memory_edges` 仅作历史兼容）
 - `review_tasks`
 - `agent_workflow_runs`
 - `agent_workflow_events`

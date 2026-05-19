@@ -83,7 +83,7 @@ Hermes 适合做上层运行时，但不适合直接替代本项目的金融业�
 | --- | --- | --- |
 | 节点图、边、条件分支、状态传递 | LangGraph | 使用成熟编排能力，不自己造图执行框架 |
 | 金融状态对象和 DTO | 本项目 | 定义 `FinancialTeamState`、决策输出、证据引用和报告结构 |
-| 工具调用端口 | 本项目 | 只查询 PostgreSQL + TimescaleDB 和 Finance Memory |
+| 工具调用端口 | 本项目 | 只查询 PostgreSQL + TimescaleDB、Finance Memory 和配置选择的 GraphStore |
 | 审计落库 | 本项目 | 写入 `agent_workflow_runs`、`agent_workflow_events`、`decision_logs` |
 | fallback 规则 | 本项目 | LLM 不可用或数据不足时回到确定性规则 |
 | 高风险复核策略 | 本项目 | 决定是否升级到 GPT-5.5 Pro |
@@ -253,7 +253,7 @@ Workflow 和 Hermes 都只能通过本项目工具查询已经入库的数据：
 | `RecommendationTool` | 推荐运行、推荐项、评分、信号、证据 | 不直接改推荐分 |
 | `SignalRiskTool` | 信号快照、风险发现、证据引用 | 不直接改信号和风险 |
 | `FactorTool` | TA 指标、因子快照、多维评分、AKShare/Binance/ccxt 数据形成的证据 | 不直接计算或覆盖指标、因子、评分 |
-| `MemoryTool` | Finance Memory、相似历史、关系边 | 决策摘要、入池原因、复盘结论 |
+| `MemoryTool` | Finance Memory、相似历史、GraphStore 图谱路径 | 决策摘要、入池原因、复盘结论 |
 | `WorkflowTool` | 可调用 Workflow 列表和运行结果 | Workflow run、event、输出引用 |
 | `ReportTool` | 决策结构、证据、记忆 | 中文解释报告 |
 
@@ -334,6 +334,7 @@ report_sections      # 中文报告结构
 - 工具返回结构化 JSON，不只返回自然语言。
 - 所有决策都能追溯到信号、风险、推荐、证据和 Finance Memory。
 - 入池原因和每日继续关注原因继续写入 `watchlist_item_events` 与 `assistant_memories`。
+- 知识图谱查询通过 `GraphStore` 访问配置选择的唯一后端，默认 Neo4j / DozerDB，可选 Apache AGE，不自动 fallback。
 - 数据质量不足时只允许输出等待、继续观察或补数建议，不能强买卖。
 - 卖出、换股和大仓位调整必须进入 GPT-5.5 Pro 复核策略。
 - 不接外部实时网页查询，不让 Hermes 或 Workflow 直接调用 AKShare、Binance、ccxt。
