@@ -105,6 +105,46 @@ def build_parser() -> argparse.ArgumentParser:
     report_show.add_argument("workflow_run_id", help="Workflow Run ID。")
     report_show.add_argument("--markdown", action="store_true", help="仅输出 Markdown 正文。")
 
+    graph = subparsers.add_parser("graph", help="Finance Memory 知识图谱。")
+    graph_commands = graph.add_subparsers(dest="command", required=True)
+    graph_commands.add_parser("health", help="检查图谱后端健康状态。")
+    graph_commands.add_parser("init", help="初始化图谱后端约束、索引或图空间。")
+    sync_asset = graph_commands.add_parser("sync-asset", help="同步单标的图谱投影。")
+    sync_asset.add_argument("--owner-id", required=True, help="用户/账户 ID。")
+    sync_asset.add_argument("--asset-id", required=True, help="资产 ID。")
+    sync_asset.add_argument("--limit", type=int, default=20, help="单类事实读取数量。")
+    sync_owner = graph_commands.add_parser("sync-owner", help="同步某个用户的图谱投影。")
+    sync_owner.add_argument("--owner-id", required=True, help="用户/账户 ID。")
+    sync_owner.add_argument("--asset-ids", default=None, help="逗号分隔的资产 ID。")
+    sync_owner.add_argument("--limit-assets", type=int, default=100, help="最多同步资产数。")
+    sync_owner.add_argument("--limit-per-asset", type=int, default=20, help="每个资产读取数量。")
+    sync_all = graph_commands.add_parser("sync-all", help="同步全部或指定用户图谱投影。")
+    sync_all.add_argument("--owner-id", default=None, help="可选：只同步指定用户。")
+    sync_all.add_argument("--limit-assets", type=int, default=200, help="最多同步资产数。")
+    sync_all.add_argument("--limit-per-asset", type=int, default=20, help="每个资产读取数量。")
+    trace = graph_commands.add_parser("trace", help="追踪单标的图谱路径。")
+    trace.add_argument("--owner-id", required=True, help="用户/账户 ID。")
+    trace.add_argument("--asset-id", required=True, help="资产 ID。")
+    trace.add_argument("--max-depth", type=int, default=2, help="最大路径深度。")
+    trace.add_argument("--limit", type=int, default=20, help="返回上限。")
+    reason_chain = graph_commands.add_parser("reason-chain", help="解释入池和持续关注原因链。")
+    reason_chain.add_argument("--owner-id", required=True, help="用户/账户 ID。")
+    reason_chain.add_argument("--asset-id", required=True, help="资产 ID。")
+    reason_chain.add_argument("--limit", type=int, default=5, help="返回上限。")
+    similar = graph_commands.add_parser("similar-decisions", help="查找相似历史决策路径。")
+    similar.add_argument("--owner-id", required=True, help="用户/账户 ID。")
+    similar.add_argument("--asset-id", required=True, help="资产 ID。")
+    similar.add_argument("--limit", type=int, default=10, help="返回上限。")
+    risk_contagion = graph_commands.add_parser("risk-contagion", help="检测风险传导路径。")
+    risk_contagion.add_argument("--owner-id", required=True, help="用户/账户 ID。")
+    risk_contagion.add_argument("--asset-id", default=None, help="可选：限制到单资产。")
+    risk_contagion.add_argument("--max-depth", type=int, default=3, help="最大路径深度。")
+    risk_contagion.add_argument("--limit", type=int, default=20, help="返回上限。")
+    conflicts = graph_commands.add_parser("conflicts", help="发现 Finance Memory 冲突。")
+    conflicts.add_argument("--owner-id", required=True, help="用户/账户 ID。")
+    conflicts.add_argument("--asset-id", default=None, help="可选：限制到单资产。")
+    conflicts.add_argument("--limit", type=int, default=10, help="返回上限。")
+
     triggers = subparsers.add_parser("triggers", help="V1.2 触发事件评估与 Agent 唤醒。")
     trigger_commands = triggers.add_subparsers(dest="command", required=True)
     evaluate = trigger_commands.add_parser("evaluate", help="评估已入库事实并生成触发事件。")
@@ -255,6 +295,8 @@ def dispatch(args: argparse.Namespace) -> JsonDict:
             return dispatch_tools(interface, args).to_dict()
         if args.group == "reports":
             return dispatch_reports(interface, args).to_dict()
+        if args.group == "graph":
+            return dispatch_graph(interface, args).to_dict()
         if args.group == "triggers":
             return dispatch_triggers(session, args)
         if args.group == "agent":
@@ -368,6 +410,67 @@ def dispatch_reports(interface: FinanceAgentInterface, args: argparse.Namespace)
             markdown=args.markdown,
         )
     raise ValueError(f"未知 reports 命令：{args.command}")
+
+
+def dispatch_graph(interface: FinanceAgentInterface, args: argparse.Namespace):
+    """处理知识图谱命令。"""
+
+    if args.command == "health":
+        return interface.graph_health()
+    if args.command == "init":
+        return interface.graph_initialize()
+    if args.command == "sync-asset":
+        return interface.graph_sync_asset(
+            owner_id=args.owner_id,
+            asset_id=args.asset_id,
+            limit=args.limit,
+        )
+    if args.command == "sync-owner":
+        return interface.graph_sync_owner(
+            owner_id=args.owner_id,
+            asset_ids=parse_csv(args.asset_ids),
+            limit_assets=args.limit_assets,
+            limit_per_asset=args.limit_per_asset,
+        )
+    if args.command == "sync-all":
+        return interface.graph_sync_all(
+            owner_id=args.owner_id,
+            limit_assets=args.limit_assets,
+            limit_per_asset=args.limit_per_asset,
+        )
+    if args.command == "trace":
+        return interface.graph_trace_asset(
+            owner_id=args.owner_id,
+            asset_id=args.asset_id,
+            max_depth=args.max_depth,
+            limit=args.limit,
+        )
+    if args.command == "reason-chain":
+        return interface.graph_explain_candidate_reason_chain(
+            owner_id=args.owner_id,
+            asset_id=args.asset_id,
+            limit=args.limit,
+        )
+    if args.command == "similar-decisions":
+        return interface.graph_find_similar_decision_paths(
+            owner_id=args.owner_id,
+            asset_id=args.asset_id,
+            limit=args.limit,
+        )
+    if args.command == "risk-contagion":
+        return interface.graph_detect_risk_contagion(
+            owner_id=args.owner_id,
+            asset_id=args.asset_id,
+            max_depth=args.max_depth,
+            limit=args.limit,
+        )
+    if args.command == "conflicts":
+        return interface.graph_find_memory_conflicts(
+            owner_id=args.owner_id,
+            asset_id=args.asset_id,
+            limit=args.limit,
+        )
+    raise ValueError(f"未知 graph 命令：{args.command}")
 
 
 def dispatch_triggers(session: Any, args: argparse.Namespace) -> JsonDict:

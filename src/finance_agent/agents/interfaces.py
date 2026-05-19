@@ -19,6 +19,7 @@ from finance_agent.agents.workflows.portfolio_monitoring import PortfolioMonitor
 from finance_agent.agents.workflows.recommendation_decision import RecommendationDecisionInput
 from finance_agent.agents.workflows.watchlist_management import WatchlistManagementInput
 from finance_agent.application import PortfolioService, WatchlistService
+from finance_agent.graph import GraphSyncService
 from finance_agent.storage.orm import AgentWorkflowEventORM, AgentWorkflowRunORM
 from finance_agent.storage.repositories import (
     MemoryRepository,
@@ -77,6 +78,156 @@ class FinanceAgentInterface:
 
         data = self.tool_runtime.call(name, **(arguments or {}))
         return AgentInterfaceResult(status="ok", data={"tool": name, "result": data})
+
+    def graph_health(self) -> AgentInterfaceResult:
+        """检查当前配置选择的图谱后端。"""
+
+        return AgentInterfaceResult(status="ok", data=self.tool_runtime.graph_store.health_check())
+
+    def graph_initialize(self) -> AgentInterfaceResult:
+        """初始化当前配置选择的图谱后端。"""
+
+        return AgentInterfaceResult(
+            status="ok",
+            data=self.tool_runtime.graph_store.initialize_schema(),
+        )
+
+    def graph_sync_asset(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str,
+        limit: int = 20,
+    ) -> AgentInterfaceResult:
+        """同步单标的图谱投影。"""
+
+        data = GraphSyncService(
+            session=self.session,
+            graph_store=self.tool_runtime.graph_store,
+        ).sync_asset_graph(owner_id=owner_id, asset_id=asset_id, limit=limit)
+        return AgentInterfaceResult(status="ok", data=data.to_dict())
+
+    def graph_sync_owner(
+        self,
+        *,
+        owner_id: str,
+        asset_ids: list[str] | None = None,
+        limit_assets: int = 100,
+        limit_per_asset: int = 20,
+    ) -> AgentInterfaceResult:
+        """同步某个用户的图谱投影。"""
+
+        data = GraphSyncService(
+            session=self.session,
+            graph_store=self.tool_runtime.graph_store,
+        ).sync_owner_graph(
+            owner_id=owner_id,
+            asset_ids=asset_ids,
+            limit_assets=limit_assets,
+            limit_per_asset=limit_per_asset,
+        )
+        return AgentInterfaceResult(status="ok", data=data)
+
+    def graph_sync_all(
+        self,
+        *,
+        owner_id: str | None = None,
+        limit_assets: int = 200,
+        limit_per_asset: int = 20,
+    ) -> AgentInterfaceResult:
+        """同步全部或指定用户的图谱投影。"""
+
+        data = GraphSyncService(
+            session=self.session,
+            graph_store=self.tool_runtime.graph_store,
+        ).sync_all_graph(
+            owner_id=owner_id,
+            limit_assets=limit_assets,
+            limit_per_asset=limit_per_asset,
+        )
+        return AgentInterfaceResult(status="ok", data=data)
+
+    def graph_trace_asset(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str,
+        max_depth: int = 2,
+        limit: int = 20,
+    ) -> AgentInterfaceResult:
+        """同步并追踪单标的图谱路径。"""
+
+        return self.call_tool(
+            name="memory.trace_asset_graph",
+            arguments={
+                "owner_id": owner_id,
+                "asset_id": asset_id,
+                "max_depth": max_depth,
+                "limit": limit,
+            },
+        )
+
+    def graph_explain_candidate_reason_chain(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str,
+        limit: int = 5,
+    ) -> AgentInterfaceResult:
+        """同步并解释标的入池或持续关注原因链。"""
+
+        return self.call_tool(
+            name="memory.explain_candidate_reason_chain",
+            arguments={"owner_id": owner_id, "asset_id": asset_id, "limit": limit},
+        )
+
+    def graph_find_similar_decision_paths(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str,
+        limit: int = 10,
+    ) -> AgentInterfaceResult:
+        """同步并查找相似历史决策路径。"""
+
+        return self.call_tool(
+            name="memory.find_similar_decision_paths",
+            arguments={"owner_id": owner_id, "asset_id": asset_id, "limit": limit},
+        )
+
+    def graph_detect_risk_contagion(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str | None = None,
+        max_depth: int = 3,
+        limit: int = 20,
+    ) -> AgentInterfaceResult:
+        """同步并检测风险传导路径。"""
+
+        return self.call_tool(
+            name="memory.detect_risk_contagion",
+            arguments={
+                "owner_id": owner_id,
+                "asset_id": asset_id,
+                "max_depth": max_depth,
+                "limit": limit,
+            },
+        )
+
+    def graph_find_memory_conflicts(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str | None = None,
+        limit: int = 10,
+    ) -> AgentInterfaceResult:
+        """同步并查找记忆冲突。"""
+
+        return self.call_tool(
+            name="memory.find_memory_conflicts",
+            arguments={"owner_id": owner_id, "asset_id": asset_id, "limit": limit},
+        )
 
     def run_workflow(
         self,
@@ -486,4 +637,3 @@ def parse_datetime(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed
-

@@ -119,6 +119,132 @@ def create_mcp_server() -> Any:
         )
 
     @mcp.tool()
+    def graph_health() -> JsonDict:
+        """检查当前配置选择的图谱后端健康状态。"""
+
+        return run_with_interface(lambda interface: interface.graph_health().to_dict())
+
+    @mcp.tool()
+    def graph_initialize() -> JsonDict:
+        """初始化当前配置选择的图谱后端。"""
+
+        return run_with_interface(lambda interface: interface.graph_initialize().to_dict())
+
+    @mcp.tool()
+    def graph_sync_asset(owner_id: str, asset_id: str, limit: int = 20) -> JsonDict:
+        """同步单标的 Finance Memory 知识图谱投影。"""
+
+        return run_with_interface(
+            lambda interface: interface.graph_sync_asset(
+                owner_id=owner_id,
+                asset_id=asset_id,
+                limit=limit,
+            ).to_dict()
+        )
+
+    @mcp.tool()
+    def graph_sync_owner(
+        owner_id: str,
+        asset_ids: list[str] | None = None,
+        limit_assets: int = 100,
+        limit_per_asset: int = 20,
+    ) -> JsonDict:
+        """同步某个用户的 Finance Memory 知识图谱投影。"""
+
+        return run_with_interface(
+            lambda interface: interface.graph_sync_owner(
+                owner_id=owner_id,
+                asset_ids=asset_ids,
+                limit_assets=limit_assets,
+                limit_per_asset=limit_per_asset,
+            ).to_dict()
+        )
+
+    @mcp.tool()
+    def graph_trace_asset(
+        owner_id: str,
+        asset_id: str,
+        max_depth: int = 2,
+        limit: int = 20,
+    ) -> JsonDict:
+        """追踪单标的决策、记忆、观察池、风险和证据路径。"""
+
+        return run_with_interface(
+            lambda interface: interface.graph_trace_asset(
+                owner_id=owner_id,
+                asset_id=asset_id,
+                max_depth=max_depth,
+                limit=limit,
+            ).to_dict()
+        )
+
+    @mcp.tool()
+    def graph_explain_candidate_reason_chain(
+        owner_id: str,
+        asset_id: str,
+        limit: int = 5,
+    ) -> JsonDict:
+        """解释标的被纳入候选/观察池或持续关注的原因链。"""
+
+        return run_with_interface(
+            lambda interface: interface.graph_explain_candidate_reason_chain(
+                owner_id=owner_id,
+                asset_id=asset_id,
+                limit=limit,
+            ).to_dict()
+        )
+
+    @mcp.tool()
+    def graph_find_similar_decision_paths(
+        owner_id: str,
+        asset_id: str,
+        limit: int = 10,
+    ) -> JsonDict:
+        """查找与目标标的结构相似的历史决策路径。"""
+
+        return run_with_interface(
+            lambda interface: interface.graph_find_similar_decision_paths(
+                owner_id=owner_id,
+                asset_id=asset_id,
+                limit=limit,
+            ).to_dict()
+        )
+
+    @mcp.tool()
+    def graph_detect_risk_contagion(
+        owner_id: str,
+        asset_id: str | None = None,
+        max_depth: int = 3,
+        limit: int = 20,
+    ) -> JsonDict:
+        """检测风险、证据、决策、记忆和资产之间的传导路径。"""
+
+        return run_with_interface(
+            lambda interface: interface.graph_detect_risk_contagion(
+                owner_id=owner_id,
+                asset_id=asset_id,
+                max_depth=max_depth,
+                limit=limit,
+            ).to_dict()
+        )
+
+    @mcp.tool()
+    def graph_find_memory_conflicts(
+        owner_id: str,
+        asset_id: str | None = None,
+        limit: int = 10,
+    ) -> JsonDict:
+        """发现 Finance Memory 中看多、失效、卖出等冲突。"""
+
+        return run_with_interface(
+            lambda interface: interface.graph_find_memory_conflicts(
+                owner_id=owner_id,
+                asset_id=asset_id,
+                limit=limit,
+            ).to_dict()
+        )
+
+    @mcp.tool()
     def evaluate_triggers(
         owner_id: str,
         as_of: str | None = None,

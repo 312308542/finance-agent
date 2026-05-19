@@ -15,6 +15,8 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from finance_agent.application import PortfolioService, WatchlistService
+from finance_agent.graph import GraphSyncService, create_graph_store
+from finance_agent.graph.stores import MemoryGraphStore
 from finance_agent.storage.orm import (
     AssetScoreORM,
     AssistantMemoryORM,
@@ -57,8 +59,9 @@ class FinanceTool:
 class FinanceToolRuntime:
     """统一封装金融事实查询工具。"""
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, graph_store: MemoryGraphStore | None = None) -> None:
         self.session = session
+        self.graph_store = graph_store or create_graph_store()
         self.portfolios = PortfolioService(session)
         self.watchlists = WatchlistService(session)
         self.recommendations = RecommendationRepository(session)
@@ -136,6 +139,41 @@ class FinanceToolRuntime:
                 name="memory.recall_asset_memories",
                 description="召回标的相关 Finance Memory。",
                 handler=self.recall_asset_memories,
+            )
+        )
+        self.register(
+            FinanceTool(
+                name="memory.trace_asset_graph",
+                description="追踪单标的决策、观察池、记忆、风险和证据图谱路径。",
+                handler=self.trace_asset_graph,
+            )
+        )
+        self.register(
+            FinanceTool(
+                name="memory.explain_candidate_reason_chain",
+                description="解释标的被纳入观察池或持续关注的原因链。",
+                handler=self.explain_candidate_reason_chain,
+            )
+        )
+        self.register(
+            FinanceTool(
+                name="memory.find_memory_conflicts",
+                description="发现同一标的 Finance Memory 中的看多、失效、卖出等冲突。",
+                handler=self.find_memory_conflicts,
+            )
+        )
+        self.register(
+            FinanceTool(
+                name="memory.find_similar_decision_paths",
+                description="从知识图谱查找与当前标的结构相似的历史决策路径。",
+                handler=self.find_similar_decision_paths,
+            )
+        )
+        self.register(
+            FinanceTool(
+                name="memory.detect_risk_contagion",
+                description="从知识图谱追踪风险、证据、决策、记忆和资产之间的传导路径。",
+                handler=self.detect_risk_contagion,
             )
         )
         self.register(
@@ -261,6 +299,137 @@ class FinanceToolRuntime:
             limit=limit,
         )
         return {"memories": [serialize_memory(memory) for memory in memories]}
+
+    def trace_asset_graph(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str,
+        max_depth: int = 2,
+        limit: int = 20,
+    ) -> JsonDict:
+        """追踪单标的知识图谱路径。
+
+        工具调用前会先同步一次 PostgreSQL 事实库中的可重建投影，确保图谱查询
+        尽量接近当前事实库状态。
+        """
+
+        sync_result = GraphSyncService(
+            session=self.session,
+            graph_store=self.graph_store,
+        ).sync_asset_graph(owner_id=owner_id, asset_id=asset_id, limit=limit)
+        result = self.graph_store.trace_asset_graph(
+            owner_id=owner_id,
+            asset_id=asset_id,
+            max_depth=max_depth,
+            limit=limit,
+        ).to_dict()
+        result["sync_result"] = sync_result.to_dict()
+        return result
+
+    def explain_candidate_reason_chain(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str,
+        limit: int = 5,
+    ) -> JsonDict:
+        """解释标的入池和持续观察原因链。"""
+
+        sync_result = GraphSyncService(
+            session=self.session,
+            graph_store=self.graph_store,
+        ).sync_asset_graph(owner_id=owner_id, asset_id=asset_id, limit=max(limit, 5))
+        result = self.graph_store.explain_candidate_reason_chain(
+            owner_id=owner_id,
+            asset_id=asset_id,
+            limit=limit,
+        ).to_dict()
+        result["sync_result"] = sync_result.to_dict()
+        return result
+
+    def find_memory_conflicts(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str | None = None,
+        limit: int = 10,
+    ) -> JsonDict:
+        """发现 Finance Memory 中需要 Agent 复核的冲突。"""
+
+        sync_payload: JsonDict | None = None
+        if asset_id:
+            sync_result = GraphSyncService(
+                session=self.session,
+                graph_store=self.graph_store,
+            ).sync_asset_graph(owner_id=owner_id, asset_id=asset_id, limit=max(limit, 10))
+            sync_payload = sync_result.to_dict()
+        result = self.graph_store.find_memory_conflicts(
+            owner_id=owner_id,
+            asset_id=asset_id,
+            limit=limit,
+        ).to_dict()
+        result["sync_result"] = sync_payload
+        return result
+
+    def find_similar_decision_paths(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str,
+        limit: int = 10,
+    ) -> JsonDict:
+        """查找结构相似的历史决策路径。"""
+
+        sync_result = GraphSyncService(
+            session=self.session,
+            graph_store=self.graph_store,
+        ).sync_owner_graph(
+            owner_id=owner_id,
+            asset_ids=None,
+            limit_assets=max(limit + 1, 20),
+            limit_per_asset=max(limit, 10),
+        )
+        result = self.graph_store.find_similar_decision_paths(
+            owner_id=owner_id,
+            asset_id=asset_id,
+            limit=limit,
+        ).to_dict()
+        result["sync_result"] = sync_result
+        return result
+
+    def detect_risk_contagion(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str | None = None,
+        max_depth: int = 3,
+        limit: int = 20,
+    ) -> JsonDict:
+        """追踪风险传导路径。"""
+
+        sync_service = GraphSyncService(session=self.session, graph_store=self.graph_store)
+        sync_payload: JsonDict
+        if asset_id:
+            sync_payload = sync_service.sync_asset_graph(
+                owner_id=owner_id,
+                asset_id=asset_id,
+                limit=max(limit, 10),
+            ).to_dict()
+        else:
+            sync_payload = sync_service.sync_owner_graph(
+                owner_id=owner_id,
+                limit_assets=limit,
+                limit_per_asset=max(limit, 10),
+            )
+        result = self.graph_store.detect_risk_contagion(
+            owner_id=owner_id,
+            asset_id=asset_id,
+            max_depth=max_depth,
+            limit=limit,
+        ).to_dict()
+        result["sync_result"] = sync_payload
+        return result
 
     def list_workflows(self) -> JsonDict:
         """列出第一阶段可调用的金融团队 Workflow。"""

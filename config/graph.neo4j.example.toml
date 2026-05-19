@@ -1,0 +1,16 @@
+# GraphStore 知识图谱后端配置示例：Neo4j / DozerDB。
+#
+# 同一运行环境只能选择一个图数据库后端。本文件选择 neo4j，
+# 不会自动 fallback 到 Apache AGE，也不会双写。
+
+[graph]
+enabled = true
+backend = "neo4j"
+dry_run = false
+graph_version = "finance-memory-graph-v1"
+
+[graph.neo4j]
+uri = "bolt://localhost:7687"
+user = "neo4j"
+password = "password123"
+database = "neo4j"

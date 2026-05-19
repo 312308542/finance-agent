@@ -1,0 +1,15 @@
+# GraphStore 知识图谱后端配置示例：Apache AGE。
+#
+# Apache AGE 是资源较小环境的一种可选部署形态，不是 Neo4j 的 fallback。
+# 使用本文件时，同一运行环境不应再启用 Neo4j 后端。
+
+[graph]
+enabled = true
+backend = "apache_age"
+dry_run = false
+graph_version = "finance-memory-graph-v1"
+
+[graph.apache_age]
+database_url = "postgresql+psycopg://finance_agent:finance_agent@localhost:5432/finance_agent"
+graph_name = "finance_memory_graph"
+schema = "ag_catalog"
