@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy.orm import Session
+
 from finance_agent.storage.orm import AssistantTriggerEventORM
 
 JsonDict = dict[str, Any]
@@ -117,3 +119,4 @@ class AgentLoopContext:
     event: AssistantTriggerEventORM
     as_of: datetime
     limits: AgentLoopLimits
+    session: Session | None = None

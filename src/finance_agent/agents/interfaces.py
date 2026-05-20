@@ -20,6 +20,7 @@ from finance_agent.agents.workflows.recommendation_decision import Recommendatio
 from finance_agent.agents.workflows.watchlist_management import WatchlistManagementInput
 from finance_agent.application import PortfolioService, WatchlistService
 from finance_agent.graph import GraphSyncService
+from finance_agent.graph.stores import DryRunGraphStore
 from finance_agent.storage.orm import AgentWorkflowEventORM, AgentWorkflowRunORM
 from finance_agent.storage.repositories import (
     MemoryRepository,
@@ -54,7 +55,7 @@ class FinanceAgentInterface:
     def __init__(self, session: Session) -> None:
         self.session = session
         self.assistant = FinanceAssistantService(session)
-        self.tool_runtime = FinanceToolRuntime(session)
+        self.tool_runtime = FinanceToolRuntime(session, graph_store=DryRunGraphStore())
 
     def list_workflows(self) -> AgentInterfaceResult:
         """列出可由上层 Agent 调用的 Workflow。"""
@@ -264,6 +265,7 @@ class FinanceAgentInterface:
         )
         state = dict(initial_state or {})
         state["session"] = self.session
+        state.setdefault("tool_runtime", self.tool_runtime)
 
         if workflow_type == "portfolio_monitoring":
             if not portfolio_id:

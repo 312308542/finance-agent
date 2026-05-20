@@ -21,6 +21,7 @@ from finance_agent.agents.runtime import (
     test_model_endpoint,
 )
 from finance_agent.agents.runtime.model_tui import render_model_tui
+from finance_agent.scheduler import AssistantLoopScheduler, AssistantLoopSchedulerConfig
 from finance_agent.storage.db import create_session_factory, session_scope
 from finance_agent.storage.repositories import ChatMemoryRepository
 from finance_agent.triggers import TriggerEvaluationRequest, TriggerService
@@ -158,6 +159,25 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_parser.add_argument("--as-of", default=None, help="ISO 时间，默认当前时间。")
     run_once = trigger_commands.add_parser("run-once", help="执行一次触发评估并立即唤醒 Agent。")
     add_trigger_request_arguments(run_once)
+    assistant_loop = trigger_commands.add_parser(
+        "assistant-loop",
+        help="常驻轮询触发评估、派发和内部 Agent Loop；本地测试可限制 max-cycles。",
+    )
+    add_trigger_request_arguments(assistant_loop)
+    assistant_loop.add_argument("--trigger-limit", type=int, default=20, help="每轮最多派发事件数。")
+    assistant_loop.add_argument("--agent-limit", type=int, default=20, help="每轮最多处理 Agent 任务数。")
+    assistant_loop.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=5.0,
+        help="常驻轮询间隔秒数。",
+    )
+    assistant_loop.add_argument(
+        "--max-cycles",
+        type=int,
+        default=None,
+        help="最多轮询轮数；不传则持续常驻运行。",
+    )
 
     agent = subparsers.add_parser("agent", help="内部金融 Agent Loop。")
     agent_commands = agent.add_subparsers(dest="command", required=True)
@@ -493,6 +513,22 @@ def dispatch_triggers(session: Any, args: argparse.Namespace) -> JsonDict:
         return {
             "status": "ok",
             "data": service.run_once(build_trigger_request(args)),
+        }
+    if args.command == "assistant-loop":
+        scheduler = AssistantLoopScheduler(
+            session=session,
+            config=AssistantLoopSchedulerConfig(
+                owner_id=args.owner_id,
+                interval_seconds=args.interval_seconds,
+                trigger_limit=args.trigger_limit,
+                agent_limit=args.agent_limit,
+                max_cycles=args.max_cycles,
+                run_agent_once=True,
+            ),
+        )
+        return {
+            "status": "ok",
+            "data": scheduler.run_loop(request=build_trigger_request(args)).to_dict(),
         }
     raise ValueError(f"未知 triggers 命令：{args.command}")
 

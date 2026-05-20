@@ -4,7 +4,10 @@ from finance_agent.agents.loop.graph import (
     InternalAgentLoopGraphUnavailable,
     build_internal_agent_loop_graph,
 )
-from finance_agent.agents.loop.planner import InternalFinanceAgentPlanner
+from finance_agent.agents.loop.planner import (
+    InternalFinanceAgentPlanner,
+    ModelFinanceAgentPlanner,
+)
 from finance_agent.agents.loop.runner import InternalFinanceAgentLoopRunner
 from finance_agent.agents.loop.state import (
     AgentLoopContext,
@@ -25,5 +28,6 @@ __all__ = [
     "InternalAgentLoopGraphUnavailable",
     "InternalFinanceAgentLoopRunner",
     "InternalFinanceAgentPlanner",
+    "ModelFinanceAgentPlanner",
     "build_internal_agent_loop_graph",
 ]

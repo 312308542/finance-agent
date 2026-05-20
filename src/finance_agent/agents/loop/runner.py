@@ -166,7 +166,12 @@ class InternalFinanceAgentLoopRunner:
                 )
                 return final_state["task_result"]
 
-            context = AgentLoopContext(event=event, as_of=as_of, limits=self.limits)
+            context = AgentLoopContext(
+                event=event,
+                as_of=as_of,
+                limits=self.limits,
+                session=self.session,
+            )
             plan = self.planner.build_plan(context)
             if plan.action != "run_workflow":
                 self.triggers.mark_agent_loop_skipped(

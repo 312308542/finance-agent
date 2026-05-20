@@ -54,6 +54,7 @@ def build_internal_agent_loop_graph() -> Any:
             event=state["event"],
             as_of=state["as_of"],
             limits=state.get("limits") or AgentLoopLimits(),
+            session=state.get("session"),
         )
         agent_plan = planner.build_plan(context)
         return {
