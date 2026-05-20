@@ -1,5 +1,11 @@
 """基础数据调度器。"""
 
+from finance_agent.scheduler.assistant_loop_scheduler import (
+    AssistantLoopScheduler,
+    AssistantLoopSchedulerConfig,
+    AssistantLoopSchedulerCycleResult,
+    AssistantLoopSchedulerResult,
+)
 from finance_agent.scheduler.base_data_scheduler import (
     BaseDataScheduler,
     BaseDataSchedulerConfig,
@@ -10,6 +16,10 @@ from finance_agent.scheduler.base_data_scheduler import (
 )
 
 __all__ = [
+    "AssistantLoopScheduler",
+    "AssistantLoopSchedulerConfig",
+    "AssistantLoopSchedulerCycleResult",
+    "AssistantLoopSchedulerResult",
     "BaseDataScheduler",
     "BaseDataSchedulerConfig",
     "BaseDataSchedulerJob",

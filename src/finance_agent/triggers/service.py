@@ -176,6 +176,7 @@ class TriggerService:
         owner_id: str | None = None,
         limit: int = 20,
         as_of: datetime | None = None,
+        agent_runtime: str | None = None,
     ) -> AgentWakeupDispatchResult:
         """派发待处理触发事件到 Agent 唤醒队列。
 
@@ -204,9 +205,10 @@ class TriggerService:
                     trigger_event_id=event.trigger_event_id,
                     agent_task_id=agent_task_id,
                     dispatched_at=dispatch_time,
+                    agent_runtime=agent_runtime,
                     payload={
                         "dispatch_status": "agent_wakeup_queued",
-                        "agent_runtime": event.agent_runtime,
+                        "agent_runtime": agent_runtime or event.agent_runtime,
                         "agent_task_id": agent_task_id,
                         "requested_workflow_type": event.requested_workflow_type,
                     },
