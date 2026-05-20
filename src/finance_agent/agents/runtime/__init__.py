@@ -5,6 +5,7 @@ from finance_agent.agents.runtime.langgraph_adapter import (
     WorkflowNodeEvent,
     extract_context_envelope,
     summarize_context_envelope,
+    summarize_model_prompt_bundle,
 )
 from finance_agent.agents.runtime.context_envelope import (
     CONTEXT_ENVELOPE_VERSION,
@@ -59,5 +60,6 @@ __all__ = [
     "extract_context_envelope",
     "resolve_stable_prompt",
     "summarize_context_envelope",
+    "summarize_model_prompt_bundle",
     "test_model_endpoint",
 ]

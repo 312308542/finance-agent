@@ -215,10 +215,44 @@ def main() -> None:
         prompt_bundle = (agent_workflow.payload or {}).get("model_prompt_bundle") or {}
         if prompt_bundle.get("model_role") != "primary_financial_analyst":
             raise AssertionError(f"模型 Planner 必须写入 prompt bundle，实际={prompt_bundle}")
+        if prompt_bundle.get("template_id") != "primary_financial_analyst":
+            raise AssertionError(f"模型 Planner 必须写入结构化模板 ID，实际={prompt_bundle}")
+        if prompt_bundle.get("prompt_version") != "1.0.0":
+            raise AssertionError(f"模型 Planner 必须写入 Prompt 版本，实际={prompt_bundle}")
+        if prompt_bundle.get("market_type") != "ashare":
+            raise AssertionError(f"模型 Planner 必须写入市场类型，实际={prompt_bundle}")
+        if prompt_bundle.get("workflow_type") != task_result["workflow_type"]:
+            raise AssertionError(f"模型 Planner 必须写入 Workflow 类型，实际={prompt_bundle}")
+        if not prompt_bundle.get("prompt_hash"):
+            raise AssertionError("模型 Planner 必须写入 prompt_hash，便于后续审计。")
         if "DeepSeek" not in prompt_bundle.get("stable", ""):
             raise AssertionError("模型 Planner Prompt 必须包含主分析模型稳定提示词。")
         if task_result["workflow_type"] not in prompt_bundle.get("context", ""):
             raise AssertionError("模型 Planner Prompt 必须包含 Workflow 上下文。")
+        if "FinanceToolRuntime" not in prompt_bundle.get("tool_protocol", ""):
+            raise AssertionError("模型 Planner Prompt 必须包含工具调用协议。")
+        if "停复牌" not in prompt_bundle.get("market_rules", ""):
+            raise AssertionError("A 股 Prompt 必须包含市场差异化规则。")
+        output_schema = prompt_bundle.get("output_schema") or {}
+        if "action" not in (output_schema.get("properties") or {}):
+            raise AssertionError(f"模型 Planner Prompt 必须包含输出 JSON Schema，实际={output_schema}")
+        prompt_summary = (agent_workflow.payload or {}).get("model_prompt_summary") or {}
+        if prompt_summary.get("template_id") != "primary_financial_analyst":
+            raise AssertionError(f"模型 Prompt 审计摘要必须写入 template_id，实际={prompt_summary}")
+        if prompt_summary.get("prompt_version") != "1.0.0":
+            raise AssertionError(f"模型 Prompt 审计摘要必须写入 prompt_version，实际={prompt_summary}")
+        if prompt_summary.get("prompt_hash") != prompt_bundle.get("prompt_hash"):
+            raise AssertionError(f"模型 Prompt 审计摘要必须记录 prompt_hash，实际={prompt_summary}")
+        if prompt_summary.get("workflow_type") != task_result["workflow_type"]:
+            raise AssertionError(f"模型 Prompt 审计摘要必须记录 workflow_type，实际={prompt_summary}")
+        if not prompt_summary.get("prompt_char_count"):
+            raise AssertionError(f"模型 Prompt 审计摘要必须记录 prompt_char_count，实际={prompt_summary}")
+        if not prompt_summary.get("tool_count"):
+            raise AssertionError(f"模型 Prompt 审计摘要必须记录 tool_count，实际={prompt_summary}")
+        if not prompt_summary.get("prompt_hash_stable"):
+            raise AssertionError(f"模型 Prompt 审计摘要必须记录 prompt_hash_stable，实际={prompt_summary}")
+        if not prompt_summary.get("section_lengths"):
+            raise AssertionError(f"模型 Prompt 审计摘要必须记录 section_lengths，实际={prompt_summary}")
         if not (agent_workflow.payload or {}).get("model_prompt_envelope"):
             raise AssertionError("模型 Planner 必须保存 prompt envelope 供审计回放。")
 

@@ -17,7 +17,7 @@
 - 缺少模板元信息，无法区分模板 ID、角色、适用市场和适用 Workflow。
 - 缺少结构化输出协议，真实模型接入后不利于解析和回写。
 - 工具调用规则、风险反驳规则、A 股与数字货币规则还没有固化。
-- 还没有为后续 `prompt_hash`、模板版本和模型调用审计预留稳定接口。
+- 还没有为后续 `prompt_hash`、`prompt_version` 和模型调用审计预留稳定接口。
 
 ## 2. 设计目标
 
@@ -123,7 +123,7 @@ PromptTemplateSection(
 ```python
 PromptBundle(
     template_id: str,
-    template_version: str,
+    prompt_version: str,
     model_role: str,
     role_name: str | None,
     market_type: str,
@@ -356,14 +356,14 @@ context_envelope
 本阶段不建表，但 `PromptBundle` 需要预留以下字段：
 
 - `template_id`
-- `template_version`
-- `template_hash`
+- `prompt_version`
+- `prompt_hash`
 - `model_role`
 - `role_name`
 - `market_type`
 - `workflow_type`
 
-其中 `template_hash` 可先由模板内容计算，不需要数据库。
+其中 `prompt_hash` 可先由模板内容计算，不需要数据库。
 
 后续如果新增数据库审计，可以把这些字段写入：
 
@@ -390,7 +390,7 @@ context_envelope
 实现完成后必须满足：
 
 1. `build_prompt_bundle()` 返回模板元信息。
-2. Prompt Bundle 包含 `template_id`、`template_version`、`market_type`、`workflow_type`。
+2. Prompt Bundle 包含 `template_id`、`prompt_version`、`market_type`、`workflow_type`。
 3. A 股和数字货币能渲染不同 `market_rules`。
 4. 高风险复核模板包含反驳协议和复核 schema。
 5. 主分析模板包含工具协议和推荐输出 schema。
@@ -401,7 +401,7 @@ context_envelope
 
 结构化模板稳定后，再进入下一阶段：
 
-1. 增加 `template_hash` 审计。
+1. 增加 `prompt_hash` 审计。
 2. 把模板元信息写入 Workflow 审计。
 3. 接真实模型调用。
 4. 解析模型 JSON 输出并回写推荐、复核和报告。

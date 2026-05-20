@@ -223,6 +223,7 @@ def extract_model_prompt_payload(
     )
     if isinstance(prompt_bundle, dict):
         payload["model_prompt_bundle"] = prompt_bundle
+        payload["model_prompt_summary"] = summarize_model_prompt_bundle(prompt_bundle)
     prompt_envelope = final_state.get("model_prompt_envelope") or initial_state.get(
         "model_prompt_envelope"
     )
@@ -232,3 +233,34 @@ def extract_model_prompt_payload(
             prompt_envelope
         )
     return payload
+
+
+def summarize_model_prompt_bundle(prompt_bundle: dict[str, Any]) -> dict[str, Any]:
+    """提取适合检索和排障的 Prompt 模板审计摘要。"""
+
+    output_schema = prompt_bundle.get("output_schema") or {}
+    properties = output_schema.get("properties") or {}
+    sections = prompt_bundle.get("sections") or []
+    section_names = [
+        section.get("name")
+        for section in sections
+        if isinstance(section, dict) and section.get("name")
+    ]
+    return {
+        "template_id": prompt_bundle.get("template_id"),
+        "prompt_version": prompt_bundle.get("prompt_version"),
+        "prompt_hash": prompt_bundle.get("prompt_hash"),
+        "model_role": prompt_bundle.get("model_role"),
+        "role_name": prompt_bundle.get("role_name"),
+        "market_type": prompt_bundle.get("market_type"),
+        "workflow_type": prompt_bundle.get("workflow_type"),
+        "section_names": section_names,
+        "output_schema_keys": sorted(properties),
+        "has_tool_protocol": bool(prompt_bundle.get("tool_protocol")),
+        "has_risk_protocol": bool(prompt_bundle.get("risk_protocol")),
+        "has_market_rules": bool(prompt_bundle.get("market_rules")),
+        "prompt_char_count": (prompt_bundle.get("audit_summary") or {}).get("prompt_char_count"),
+        "tool_count": (prompt_bundle.get("audit_summary") or {}).get("tool_count"),
+        "prompt_hash_stable": (prompt_bundle.get("audit_summary") or {}).get("prompt_hash_stable"),
+        "section_lengths": (prompt_bundle.get("audit_summary") or {}).get("section_lengths") or {},
+    }

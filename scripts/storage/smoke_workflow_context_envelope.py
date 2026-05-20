@@ -81,6 +81,82 @@ def main() -> None:
     assert "market_type=ashare" in bundle["context"]
     assert "risk_count=1" in bundle["volatile"]
     assert "风险反驳" in bundle["role"]
+    assert bundle["template_id"] == "primary_financial_analyst"
+    assert bundle["prompt_version"] == "1.0.0"
+    assert bundle["market_type"] == "ashare"
+    assert bundle["workflow_type"] == "asset_deep_analysis"
+    assert bundle["prompt_hash"]
+    assert bundle["top_level_output_schema"]["properties"]["status"]["enum"] == ["ready", "need_more_data", "blocked"]
+    assert bundle["prompt_hash_stable"] is True
+    assert bundle["output_schema"]["properties"]["action"]["enum"]
+    assert "FinanceToolRuntime" in bundle["tool_protocol"]
+    assert "停复牌" in bundle["market_rules"]
+    assert "反驳" in bundle["risk_protocol"]
+    assert "risk_rebuttal" in bundle["output_schema"]["properties"]["report_sections"]["properties"]
+    assert "summary_zh" in bundle["reporting_constraints"]
+    assert any(section["name"] == "tool_protocol" for section in bundle["sections"])
+    assert bundle["audit_summary"]["prompt_char_count"] > 0
+    assert bundle["audit_summary"]["tool_count"] >= 1
+    assert bundle["audit_summary"]["section_lengths"]["tool_protocol"] > 0
+
+    high_risk_bundle = build_prompt_bundle(
+        model_role="high_risk_reviewer",
+        context_envelope=data,
+        role_name="risk_rebuttal",
+    )
+    assert high_risk_bundle["template_id"] == "high_risk_reviewer"
+    assert high_risk_bundle["output_schema"]["properties"]["review_status"]["enum"] == [
+        "approve",
+        "downgrade",
+        "reject",
+        "need_more_data",
+    ]
+    assert "反驳" in high_risk_bundle["risk_protocol"]
+    assert "补证据" in high_risk_bundle["stable"]
+
+    dispatcher_bundle = build_prompt_bundle(
+        model_role="top_level_dispatcher",
+        context_envelope=data,
+    )
+    assert dispatcher_bundle["output_schema"]["properties"]["status"]["enum"] == [
+        "ready",
+        "need_more_data",
+        "blocked",
+    ]
+
+    crypto_envelope = build_workflow_context_envelope(
+        workflow_type="swap_decision",
+        market_type="crypto",
+        asset_ids=["asset:crypto:BTCUSDT"],
+        asset_contexts={
+            "asset:crypto:BTCUSDT": {
+                "profile": {
+                    "asset_id": "asset:crypto:BTCUSDT",
+                    "symbol": "BTCUSDT",
+                    "market": "crypto",
+                },
+                "factor": {
+                    "indicator_frame": {"rsi_14": 63.1},
+                    "factor_frame": {"status": "available", "missing_groups": []},
+                    "score": {"total_score": 78.0},
+                },
+                "signal_risk": {
+                    "signal": {"direction": "bullish", "confidence": 0.76},
+                    "risks": [{"risk_id": "risk:funding", "severity": "high"}],
+                },
+                "memory": {"memories": []},
+            }
+        },
+        trigger_event={"trigger_type": "manual"},
+        available_tools=["factor.get_asset_factor_context"],
+    ).to_dict()
+    crypto_bundle = build_prompt_bundle(
+        model_role="primary_financial_analyst",
+        context_envelope=crypto_envelope,
+    )
+    assert crypto_bundle["market_type"] == "crypto"
+    assert "24/7" in crypto_bundle["market_rules"]
+    assert "资金费率" in crypto_bundle["market_rules"]
 
     print("ok")
 
