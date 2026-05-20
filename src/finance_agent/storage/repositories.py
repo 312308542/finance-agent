@@ -2105,6 +2105,7 @@ class AssistantTriggerRepository:
         trigger_event_id: str,
         agent_task_id: str,
         dispatched_at: datetime,
+        agent_runtime: str | None = None,
         payload: JsonDict | None = None,
     ) -> AssistantTriggerEventORM:
         """标记触发事件已经派发到 Agent 唤醒队列。"""
@@ -2120,7 +2121,7 @@ class AssistantTriggerRepository:
             dedup_key=event.dedup_key,
             severity=event.severity,
             status="dispatched",
-            agent_runtime=event.agent_runtime,
+            agent_runtime=agent_runtime or event.agent_runtime,
             agent_task_id=agent_task_id,
             requested_workflow_type=event.requested_workflow_type,
             portfolio_id=event.portfolio_id,
@@ -2462,7 +2463,19 @@ class MemoryRepository:
             )
         )
         self.session.flush()
-        return self.session.get_one(AssistantMemoryORM, memory_id)
+        memory = self.session.get_one(AssistantMemoryORM, memory_id)
+        self.session.refresh(memory)
+        return memory
+
+    def get_memory(self, memory_id: str) -> AssistantMemoryORM | None:
+        """按 ID 查询单条 Finance Memory。"""
+
+        return self.session.get(AssistantMemoryORM, memory_id)
+
+    def get_review_task(self, review_task_id: str) -> ReviewTaskORM | None:
+        """按 ID 查询复盘任务。"""
+
+        return self.session.get(ReviewTaskORM, review_task_id)
 
     def upsert_embedding(
         self,
@@ -2501,7 +2514,42 @@ class MemoryRepository:
             )
         )
         self.session.flush()
-        return self.session.get_one(MemoryEmbeddingORM, embedding_id)
+        embedding_row = self.session.get_one(MemoryEmbeddingORM, embedding_id)
+        self.session.refresh(embedding_row)
+        return embedding_row
+
+    def list_embeddings(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str | None = None,
+        memory_type: str | None = None,
+        limit: int = 200,
+    ) -> list[tuple[MemoryEmbeddingORM, AssistantMemoryORM | None]]:
+        """查询 Finance Memory 语义索引，并尽量带回对应记忆。"""
+
+        statement = (
+            select(MemoryEmbeddingORM, AssistantMemoryORM)
+            .outerjoin(
+                AssistantMemoryORM,
+                MemoryEmbeddingORM.memory_id == AssistantMemoryORM.memory_id,
+            )
+            .where(MemoryEmbeddingORM.owner_id == owner_id)
+        )
+        if asset_id:
+            statement = statement.where(
+                (AssistantMemoryORM.asset_id == asset_id)
+                | (AssistantMemoryORM.memory_id.is_(None))
+            )
+        if memory_type:
+            statement = statement.where(
+                (AssistantMemoryORM.memory_type == memory_type)
+                | (AssistantMemoryORM.memory_id.is_(None))
+            )
+        rows = self.session.execute(
+            statement.order_by(MemoryEmbeddingORM.created_at.desc()).limit(limit)
+        ).all()
+        return [(embedding, memory) for embedding, memory in rows]
 
     def upsert_edge(
         self,
@@ -2603,7 +2651,9 @@ class MemoryRepository:
             )
         )
         self.session.flush()
-        return self.session.get_one(ReviewTaskORM, review_task_id)
+        task = self.session.get_one(ReviewTaskORM, review_task_id)
+        self.session.refresh(task)
+        return task
 
     def get_edge(
         self,
