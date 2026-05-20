@@ -70,10 +70,18 @@ def run_factor_smoke(args: argparse.Namespace) -> JsonDict:
             timeframe=args.timeframe,
             horizon=args.horizon,
         )
+        factor_frame = FactorService(session).factors.get_latest_factor_frame(
+            asset_id=args.asset_id,
+            horizon=args.horizon,
+        )
+        factor_groups = (
+            list(factor_frame.payload.get("factor_groups") or []) if factor_frame else []
+        )
 
     return {
         "indicator": indicator.__dict__,
         "factor": factor.__dict__,
+        "factor_groups": factor_groups,
     }
 
 

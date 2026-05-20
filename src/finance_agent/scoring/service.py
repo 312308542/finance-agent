@@ -177,18 +177,22 @@ def score_weights(market: str) -> dict[str, float]:
 
     if market.startswith("crypto"):
         return {
-            "technical": 0.45,
+            "technical": 0.38,
             "derivatives": 0.25,
-            "event": 0.15,
-            "risk": 0.15,
+            "liquidity": 0.12,
+            "event": 0.10,
+            "event_decay": 0.05,
+            "risk": 0.10,
         }
     return {
-        "technical": 0.30,
-        "fundamental": 0.25,
+        "technical": 0.28,
+        "fundamental": 0.22,
         "valuation": 0.15,
         "capital_flow": 0.15,
-        "event": 0.10,
-        "risk": 0.05,
+        "liquidity": 0.08,
+        "event": 0.07,
+        "event_decay": 0.02,
+        "risk": 0.03,
     }
 
 

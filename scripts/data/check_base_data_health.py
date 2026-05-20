@@ -46,6 +46,20 @@ DEFAULT_PROVIDER_KEYS = [
     "binance_derivative_snapshot",
 ]
 
+FRESHNESS_THRESHOLDS_HOURS = {
+    "market_bars": 12,
+    "indicator_frames": 24,
+    "factor_frames": 24,
+    "asset_scores": 24,
+    "signal_snapshots": 24,
+    "capital_flow_snapshots": 24,
+    "fundamental_snapshots": 72,
+    "event_records": 48,
+    "risk_findings": 48,
+    "crypto_derivative_snapshots": 12,
+    "screening_results": 24,
+}
+
 
 def main() -> None:
     """执行基础数据层健康检查。"""
@@ -58,6 +72,7 @@ def main() -> None:
     with session_scope(session_factory) as session:
         provider_rows = load_provider_status(session, limit=args.limit)
         table_counts = load_table_counts(session)
+        freshness_rows = load_table_freshness(session)
         universe_counts = load_universe_counts(session)
 
     provider_keys = sorted(set(DEFAULT_PROVIDER_KEYS) | {row["endpoint"] for row in provider_rows})
@@ -65,11 +80,13 @@ def main() -> None:
         "checked_at": datetime.now(tz=UTC).isoformat(),
         "cache": cache_status.__dict__,
         "table_counts": table_counts,
+        "freshness": freshness_rows,
         "universe_counts": universe_counts,
         "provider_summary": summarize_providers(provider_rows),
         "providers": provider_rows,
         "provider_circuits": runtime.list_provider_states(provider_keys),
-        "gaps": infer_gaps(table_counts, provider_rows),
+        "gaps": infer_gaps(table_counts, provider_rows, freshness_rows),
+        "refresh_hints": build_refresh_hints(table_counts, freshness_rows, provider_rows),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
 
@@ -153,6 +170,51 @@ def load_table_counts(session: Any) -> JsonDict:
     return {row["table_name"]: int(row["count"]) for row in rows}
 
 
+def load_table_freshness(session: Any) -> list[JsonDict]:
+    """读取关键表最新更新时间，用于判断数据是否过期。"""
+
+    rows = session.execute(
+        text(
+            """
+            select table_name, max(as_of) as latest_as_of
+            from (
+                select 'market_bars' as table_name, timestamp as as_of from market_bars
+                union all select 'indicator_frames', as_of from indicator_frames
+                union all select 'factor_frames', as_of from factor_frames
+                union all select 'asset_scores', as_of from asset_scores
+                union all select 'signal_snapshots', as_of from signal_snapshots
+                union all select 'capital_flow_snapshots', as_of from capital_flow_snapshots
+                union all select 'fundamental_snapshots', as_of from fundamental_snapshots
+                union all
+                select 'event_records', coalesce(published_at, collected_at) from event_records
+                union all select 'risk_findings', as_of from risk_findings
+                union all
+                select 'crypto_derivative_snapshots', as_of from crypto_derivative_snapshots
+                union all select 'screening_results', as_of from screening_results
+            ) as freshness
+            group by table_name
+            order by table_name
+            """
+        )
+    ).mappings()
+    freshness: list[JsonDict] = []
+    now = datetime.now(tz=UTC)
+    for row in rows:
+        latest_as_of = row["latest_as_of"]
+        age_hours = None
+        if latest_as_of is not None:
+            age_hours = (now - latest_as_of.astimezone(UTC)).total_seconds() / 3600
+        freshness.append(
+            {
+                "table_name": row["table_name"],
+                "latest_as_of": latest_as_of.isoformat() if latest_as_of is not None else None,
+                "age_hours": round(age_hours, 2) if age_hours is not None else None,
+                "threshold_hours": FRESHNESS_THRESHOLDS_HOURS.get(row["table_name"]),
+            }
+        )
+    return freshness
+
+
 def load_universe_counts(session: Any) -> list[JsonDict]:
     """读取候选池成员数量。"""
 
@@ -184,7 +246,11 @@ def summarize_providers(provider_rows: list[JsonDict]) -> JsonDict:
     }
 
 
-def infer_gaps(table_counts: JsonDict, provider_rows: list[JsonDict]) -> list[str]:
+def infer_gaps(
+    table_counts: JsonDict,
+    provider_rows: list[JsonDict],
+    freshness_rows: list[JsonDict] | None = None,
+) -> list[str]:
     """根据表计数和最近 Provider 状态推断基础数据缺口。"""
 
     gaps: list[str] = []
@@ -209,7 +275,63 @@ def infer_gaps(table_counts: JsonDict, provider_rows: list[JsonDict]) -> list[st
     hot_rank = latest_by_endpoint.get("stock_hot_rank_em", {})
     if hot_rank.get("source_coverage") == "rank_only":
         gaps.append("A 股人气榜当前只有排名种子，实时价格需要从行情层补齐")
+    freshness_rows = freshness_rows or []
+    for row in freshness_rows:
+        table_name = str(row.get("table_name") or "")
+        age_hours = row.get("age_hours")
+        threshold_hours = row.get("threshold_hours")
+        if (
+            isinstance(age_hours, (int, float))
+            and isinstance(threshold_hours, int)
+            and age_hours > threshold_hours
+        ):
+            gaps.append(f"{table_name} 最近数据已过期，建议补采")
     return gaps
+
+
+def build_refresh_hints(
+    table_counts: JsonDict,
+    freshness_rows: list[JsonDict],
+    provider_rows: list[JsonDict],
+) -> list[JsonDict]:
+    """给调度器和健康面板生成补采建议。"""
+
+    latest_by_endpoint = {row["endpoint"]: row for row in provider_rows}
+    hints: list[JsonDict] = []
+    for row in freshness_rows:
+        table_name = str(row.get("table_name") or "")
+        age_hours = row.get("age_hours")
+        threshold_hours = row.get("threshold_hours")
+        if not isinstance(age_hours, (int, float)) or not isinstance(threshold_hours, int):
+            continue
+        if age_hours <= threshold_hours:
+            continue
+        hints.append(
+            {
+                "table_name": table_name,
+                "age_hours": age_hours,
+                "threshold_hours": threshold_hours,
+                "action": "refresh",
+                "reason": f"{table_name} 超过 freshness 阈值，需要补采",
+            }
+        )
+    if int(table_counts.get("capital_flow_snapshots") or 0) <= 0:
+        hints.append(
+            {
+                "table_name": "capital_flow_snapshots",
+                "action": "refresh",
+                "reason": "资金流表为空，建议优先补采 A 股资金流分组",
+            }
+        )
+    if latest_by_endpoint.get("stock_zh_a_stop_em", {}).get("status") == "error":
+        hints.append(
+            {
+                "table_name": "event_records",
+                "action": "fallback",
+                "reason": "A 股停复牌源失败，建议补替代源或降级为健康检查提示",
+            }
+        )
+    return hints
 
 
 if __name__ == "__main__":

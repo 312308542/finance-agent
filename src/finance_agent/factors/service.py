@@ -129,14 +129,28 @@ class FactorService:
                 history=capital_flow_history,
                 spec=self.spec.ashare,
             ),
+            build_liquidity_group(
+                indicator,
+                capital_flow=capital_flow,
+                spec=self.spec.ashare,
+            ),
             build_derivatives_group(
                 derivative,
                 history=derivative_history,
                 spec=self.spec.crypto,
             ),
             build_event_group(events),
+            build_event_decay_group(events),
             build_risk_group(risks),
         ]
+        if market.startswith("crypto"):
+            groups = [
+                group
+                for group in groups
+                if group["group"] not in {"fundamental", "valuation", "capital_flow"}
+            ]
+        elif market.startswith("ashare"):
+            groups = [group for group in groups if group["group"] != "derivatives"]
         missing_groups = [item["group"] for item in groups if item["status"] == "unavailable"]
         partial_groups = [item["group"] for item in groups if item["status"] == "partial"]
         source_ids = collect_source_ids(
@@ -351,6 +365,72 @@ def build_capital_flow_group(
     }
 
 
+def build_liquidity_group(
+    indicator: IndicatorFrameORM | None,
+    *,
+    capital_flow: CapitalFlowSnapshotORM | None = None,
+    spec: AshareFactorSpec = DEFAULT_FACTOR_SPEC.ashare,
+) -> JsonDict:
+    """构建流动性因子组。"""
+
+    if indicator is None:
+        return unavailable_group("liquidity", ["indicator_frame"])
+
+    values = dict(indicator.payload.get("computed_values") or {})
+    amount_avg_20d = values.get("amount_avg_20d")
+    amount_zscore_20d = values.get("amount_zscore_20d")
+    volatility_20d = values.get("volatility_20d")
+    max_drawdown_20d = values.get("max_drawdown_20d")
+    turnover_rate = decimal_to_float(capital_flow.turnover_rate) if capital_flow else None
+    illiquidity_score = normalized_illiquidity(
+        amount_avg_20d=amount_avg_20d,
+        amount_zscore_20d=amount_zscore_20d,
+        volatility_20d=volatility_20d,
+        turnover_rate=turnover_rate,
+    )
+    factors = {
+        "amount_avg_20d": amount_avg_20d,
+        "amount_zscore_20d": amount_zscore_20d,
+        "volatility_20d": volatility_20d,
+        "turnover_rate": turnover_rate,
+        "illiquidity_score": illiquidity_score,
+        "max_drawdown_20d": max_drawdown_20d,
+    }
+    required_factor_keys = [
+        "amount_avg_20d",
+        "amount_zscore_20d",
+        "volatility_20d",
+        "illiquidity_score",
+        "max_drawdown_20d",
+    ]
+    if indicator.market.startswith("ashare"):
+        required_factor_keys.append("turnover_rate")
+    missing = [key for key in required_factor_keys if factors.get(key) is None]
+    score_inputs = {
+        "amount_avg_20d_score": positive_float_score(amount_avg_20d, scale=1_000_000_000),
+        "amount_zscore_20d_score": inverse_float_score(
+            abs(amount_zscore_20d) if amount_zscore_20d is not None else None,
+            scale=3,
+        ),
+        "volatility_20d_score": inverse_float_score(volatility_20d, scale=0.6),
+        "turnover_rate_score": positive_float_score(turnover_rate, scale=1),
+        "illiquidity_risk_score": inverse_float_score(illiquidity_score, scale=1),
+    }
+    return {
+        "group": "liquidity",
+        "status": "available" if not missing else "partial",
+        "score": average_score(score_inputs),
+        "factors": factors,
+        "missing_factors": missing,
+        "source_ids": unique_source_ids(
+            filter(
+                None,
+                [indicator.indicator_frame_id, capital_flow.snapshot_id if capital_flow else None],
+            )
+        ),
+    }
+
+
 def build_derivatives_group(
     snapshot: CryptoDerivativeSnapshotORM | None,
     *,
@@ -431,6 +511,49 @@ def build_event_group(events: list[EventRecordORM]) -> JsonDict:
         "group": "event",
         "status": "available",
         "score": clamp_score(80 - negative_count * 10),
+        "factors": factors,
+        "missing_factors": [],
+        "source_ids": [item.event_id for item in events],
+    }
+
+
+def build_event_decay_group(events: list[EventRecordORM]) -> JsonDict:
+    """构建事件衰减因子组。"""
+
+    if not events:
+        return unavailable_group("event_decay", ["event_records"])
+
+    now = datetime.now(tz=UTC)
+    decay_scores: list[float] = []
+    weighted_negative = 0.0
+    weighted_positive = 0.0
+    for item in events:
+        published_at = item.published_at or item.collected_at
+        if published_at is None:
+            continue
+        age_hours = max(0.0, (now - published_at.astimezone(UTC)).total_seconds() / 3600)
+        decay = math.exp(-age_hours / 48.0)
+        decay_scores.append(decay)
+        if item.sentiment == "negative":
+            weighted_negative += decay
+        elif item.sentiment == "positive":
+            weighted_positive += decay
+
+    if not decay_scores:
+        return unavailable_group("event_decay", ["event_records"])
+
+    factors = {
+        "event_decay_score": sum(decay_scores) / len(decay_scores),
+        "weighted_negative_event_count": weighted_negative,
+        "weighted_positive_event_count": weighted_positive,
+        "recent_event_count": len(events),
+    }
+    return {
+        "group": "event_decay",
+        "status": "available",
+        "score": clamp_score(
+            100 * factors["event_decay_score"] - weighted_negative * 20 + weighted_positive * 5
+        ),
         "factors": factors,
         "missing_factors": [],
         "source_ids": [item.event_id for item in events],
@@ -598,6 +721,31 @@ def long_short_crowding(value: Decimal | None) -> float | None:
     if value is None:
         return None
     return clamp(decimal_to_float(abs(value - Decimal("1"))) or 0, 0, 1)
+
+
+def normalized_illiquidity(
+    *,
+    amount_avg_20d: float | None,
+    amount_zscore_20d: float | None,
+    volatility_20d: float | None,
+    turnover_rate: float | None,
+) -> float | None:
+    """把流动性要素压成 0-1 的非流动性风险分数。"""
+
+    components: list[float] = []
+    if amount_avg_20d is not None:
+        amount_score = inverse_float_score(amount_avg_20d, scale=1_000_000_000)
+        components.append((amount_score or 0) / 100)
+    if amount_zscore_20d is not None:
+        components.append(clamp(abs(amount_zscore_20d) / 5, 0, 1))
+    if volatility_20d is not None:
+        components.append(clamp(volatility_20d / 1, 0, 1))
+    if turnover_rate is not None:
+        turnover_score = inverse_float_score(turnover_rate, scale=1)
+        components.append((turnover_score or 0) / 100)
+    if not components:
+        return None
+    return clamp(sum(components) / len(components), 0, 1)
 
 
 def history_percentile(
