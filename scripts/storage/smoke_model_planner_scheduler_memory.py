@@ -191,6 +191,13 @@ def main() -> None:
         if scheduler_result["agent_processed_count"] < 1:
             raise AssertionError(f"常驻调度必须派发并处理 Agent 事件，实际={scheduler_result}")
 
+        cycle = scheduler_result["cycle_results"][0]
+        task_result = cycle["agent_result"]["runs"][0]
+        workflow_run_id = task_result["workflow_run_id"]
+        feedback_decision = session.get(DecisionLogORM, decision.decision_id)
+        if feedback_decision is None:
+            raise AssertionError("必须能查询到用户反馈决策日志。")
+
         decision_count = session.scalar(
             select(func.count())
             .select_from(DecisionLogORM)
@@ -201,6 +208,19 @@ def main() -> None:
         completed = session.get_one(ReviewTaskORM, review_task.review_task_id)
         if completed.result_summary is None:
             raise AssertionError("复盘结果必须保存在 review_tasks.result_summary。")
+
+        from finance_agent.storage.orm import AgentWorkflowRunORM
+
+        agent_workflow = session.get_one(AgentWorkflowRunORM, workflow_run_id)
+        prompt_bundle = (agent_workflow.payload or {}).get("model_prompt_bundle") or {}
+        if prompt_bundle.get("model_role") != "primary_financial_analyst":
+            raise AssertionError(f"模型 Planner 必须写入 prompt bundle，实际={prompt_bundle}")
+        if "DeepSeek" not in prompt_bundle.get("stable", ""):
+            raise AssertionError("模型 Planner Prompt 必须包含主分析模型稳定提示词。")
+        if task_result["workflow_type"] not in prompt_bundle.get("context", ""):
+            raise AssertionError("模型 Planner Prompt 必须包含 Workflow 上下文。")
+        if not (agent_workflow.payload or {}).get("model_prompt_envelope"):
+            raise AssertionError("模型 Planner 必须保存 prompt envelope 供审计回放。")
 
     print(
         {

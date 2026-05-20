@@ -5,8 +5,10 @@ from __future__ import annotations
 from hashlib import sha1
 from typing import Any
 
+from finance_agent.agents.runtime.context_envelope import build_workflow_context_envelope
 from finance_agent.agents.runtime.model_config import ModelRegistry, load_model_registry
 from finance_agent.agents.runtime.model_router import ModelRoutingPolicy
+from finance_agent.agents.runtime.prompts import build_prompt_bundle
 from finance_agent.agents.tools.runtime import FinanceToolRuntime
 from finance_agent.agents.loop.state import AgentLoopContext, AgentLoopPlan
 from finance_agent.graph.stores import DryRunGraphStore
@@ -126,6 +128,16 @@ class ModelFinanceAgentPlanner:
             context=context,
             tool_calls=extended_tool_calls,
         )
+        prompt_envelope = build_planner_prompt_envelope(
+            event=event,
+            workflow_type=workflow_type,
+            tool_calls=extended_tool_calls,
+            tool_results_summary=tool_results_summary,
+        )
+        prompt_bundle = build_prompt_bundle(
+            model_role="primary_financial_analyst",
+            context_envelope=prompt_envelope,
+        )
         model_decision = self._build_model_decision(
             context=context,
             route=route.to_dict(),
@@ -133,12 +145,15 @@ class ModelFinanceAgentPlanner:
             registry_source=registry.source,
             tool_results_summary=tool_results_summary,
             fallback_plan=fallback_plan,
+            prompt_bundle=prompt_bundle,
         )
         initial_state = dict(fallback_plan.initial_state)
         initial_state["model_planner"] = model_decision
         initial_state["model_routes"] = [route.to_dict()]
         initial_state["planned_tool_calls"] = list(extended_tool_calls)
         initial_state["tool_results_summary"] = tool_results_summary
+        initial_state["model_prompt_bundle"] = prompt_bundle
+        initial_state["model_prompt_envelope"] = prompt_envelope
         return AgentLoopPlan(
             action=fallback_plan.action,
             reason=model_decision["reason"],
@@ -213,6 +228,7 @@ class ModelFinanceAgentPlanner:
         registry_source: str,
         tool_results_summary: list[dict[str, Any]],
         fallback_plan: AgentLoopPlan,
+        prompt_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         """构建模型 Planner 审计输出。"""
 
@@ -238,6 +254,12 @@ class ModelFinanceAgentPlanner:
             "requested_workflow_type": event.requested_workflow_type,
             "tool_result_count": len(tool_results_summary),
             "fallback_action": fallback_plan.action,
+            "prompt_model_role": prompt_bundle.get("model_role"),
+            "prompt_role_name": prompt_bundle.get("role_name"),
+            "prompt_sections": [
+                key for key in ("stable", "context", "volatile", "role")
+                if prompt_bundle.get(key)
+            ],
         }
 
 
@@ -303,6 +325,67 @@ def build_model_planned_tool_calls(event: object) -> tuple[dict[str, object], ..
     return tuple(dedupe_tool_calls(calls))
 
 
+def build_planner_prompt_envelope(
+    *,
+    event: object,
+    workflow_type: str,
+    tool_calls: tuple[dict[str, object], ...],
+    tool_results_summary: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """为内部模型 Planner 构造轻量 Prompt Envelope。"""
+
+    asset_ids = [event.asset_id] if event.asset_id else []
+    asset_contexts = {
+        event.asset_id: {
+            "profile": {
+                "asset_id": event.asset_id,
+                "market": infer_event_market_type(event),
+            },
+            "memory": {
+                "memories": extract_tool_memory_items(tool_results_summary),
+            },
+            "signal_risk": {
+                "risks": extract_tool_risk_items(tool_results_summary),
+            },
+        }
+    } if event.asset_id else {}
+    return build_workflow_context_envelope(
+        workflow_type=workflow_type,
+        market_type=infer_event_market_type(event),
+        asset_ids=asset_ids,
+        asset_contexts=asset_contexts,
+        portfolio_context={"portfolio_id": event.portfolio_id}
+        if event.portfolio_id
+        else None,
+        watchlist_context={"watchlist_id": event.watchlist_id}
+        if event.watchlist_id
+        else None,
+        recommendation_context={"run_id": event.recommendation_run_id}
+        if event.recommendation_run_id
+        else None,
+        trigger_event={
+            "trigger_event_id": event.trigger_event_id,
+            "trigger_type": event.trigger_type,
+            "trigger_ref": event.trigger_ref,
+            "severity": event.severity,
+            "requested_workflow_type": event.requested_workflow_type,
+            "reason": (event.payload or {}).get("reason"),
+        },
+        available_tools=[
+            str(call.get("tool")) for call in tool_calls if call.get("tool")
+        ],
+        memory_summary={
+            "memory_count": count_summary_items(tool_results_summary, "memories"),
+            "items": extract_tool_memory_items(tool_results_summary),
+        },
+        risk_summary={
+            "risk_count": count_summary_items(tool_results_summary, "risks"),
+            "high_risk_count": count_high_risk_summary_items(tool_results_summary),
+            "items": extract_tool_risk_items(tool_results_summary),
+        },
+    ).to_dict()
+
+
 def build_planned_tool_calls(event: object) -> tuple[dict[str, object], ...]:
     """记录内部 Agent 决策前预计会读取的事实工具。"""
 
@@ -340,6 +423,68 @@ def build_planned_tool_calls(event: object) -> tuple[dict[str, object], ...]:
             )
         )
     return tuple(calls)
+
+
+def infer_event_market_type(event: object) -> str:
+    """从触发事件推断市场类型。"""
+
+    payload = event.payload or {}
+    market = payload.get("market")
+    if isinstance(market, str) and market.strip():
+        return market.strip()
+    return "ashare"
+
+
+def extract_tool_memory_items(tool_results_summary: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """从工具摘要中提取少量记忆条目，供 Prompt volatile 层使用。"""
+
+    items: list[dict[str, Any]] = []
+    for result in tool_results_summary:
+        summary = result.get("summary") or {}
+        memories = summary.get("memories") or summary.get("items") or {}
+        sample = memories.get("sample") if isinstance(memories, dict) else None
+        if isinstance(sample, list):
+            for item in sample:
+                if isinstance(item, dict):
+                    items.append(item)
+    return items[:5]
+
+
+def extract_tool_risk_items(tool_results_summary: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """从工具摘要中提取少量风险条目，供 Prompt volatile 层使用。"""
+
+    items: list[dict[str, Any]] = []
+    for result in tool_results_summary:
+        summary = result.get("summary") or {}
+        risks = summary.get("risks") or summary.get("risk_items") or {}
+        sample = risks.get("sample") if isinstance(risks, dict) else None
+        if isinstance(sample, list):
+            for item in sample:
+                if isinstance(item, dict):
+                    items.append(item)
+    return items[:5]
+
+
+def count_summary_items(tool_results_summary: list[dict[str, Any]], key: str) -> int:
+    """统计工具摘要中的列表数量。"""
+
+    total = 0
+    for result in tool_results_summary:
+        summary = result.get("summary") or {}
+        value = summary.get(key)
+        if isinstance(value, dict):
+            total += int(value.get("count") or 0)
+    return total
+
+
+def count_high_risk_summary_items(tool_results_summary: list[dict[str, Any]]) -> int:
+    """统计工具摘要样本中的高风险数量。"""
+
+    return sum(
+        1
+        for item in extract_tool_risk_items(tool_results_summary)
+        if item.get("severity") in {"high", "critical"}
+    )
 
 
 def dedupe_tool_calls(calls: list[dict[str, object]]) -> list[dict[str, object]]:

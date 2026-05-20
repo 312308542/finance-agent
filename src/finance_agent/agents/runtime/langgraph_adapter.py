@@ -63,6 +63,11 @@ class LangGraphWorkflowAdapter:
             audit_payload["context_envelope_summary"] = summarize_context_envelope(
                 context_envelope
             )
+        prompt_payload = extract_model_prompt_payload(
+            initial_state=initial_state,
+            final_state=final_state,
+        )
+        audit_payload.update(prompt_payload)
         self.audit.start_run(
             workflow_run_id=workflow_run_id,
             owner_id=owner_id,
@@ -103,6 +108,7 @@ class LangGraphWorkflowAdapter:
             payload={
                 "engine": "langgraph",
                 "final_keys": sorted(final_state),
+                **prompt_payload,
                 **(
                     {
                         "context_envelope": context_envelope,
@@ -202,3 +208,27 @@ def summarize_context_envelope(context_envelope: dict[str, Any]) -> dict[str, An
         "volatile_keys": sorted(volatile),
         "audit_keys": sorted(audit),
     }
+
+
+def extract_model_prompt_payload(
+    *,
+    initial_state: WorkflowState,
+    final_state: WorkflowState,
+) -> dict[str, Any]:
+    """提取模型 Planner 生成的 Prompt 审计字段。"""
+
+    payload: dict[str, Any] = {}
+    prompt_bundle = final_state.get("model_prompt_bundle") or initial_state.get(
+        "model_prompt_bundle"
+    )
+    if isinstance(prompt_bundle, dict):
+        payload["model_prompt_bundle"] = prompt_bundle
+    prompt_envelope = final_state.get("model_prompt_envelope") or initial_state.get(
+        "model_prompt_envelope"
+    )
+    if isinstance(prompt_envelope, dict):
+        payload["model_prompt_envelope"] = prompt_envelope
+        payload["model_prompt_envelope_summary"] = summarize_context_envelope(
+            prompt_envelope
+        )
+    return payload
