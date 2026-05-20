@@ -52,6 +52,17 @@ class LangGraphWorkflowAdapter:
     ) -> WorkflowState:
         """记录一次已经由 LangGraph 执行完成的工作流。"""
 
+        context_envelope = extract_context_envelope(initial_state=initial_state, final_state=final_state)
+        audit_payload = {
+            "engine": "langgraph",
+            "node_count": len(node_events),
+            "initial_keys": sorted(initial_state),
+        }
+        if context_envelope is not None:
+            audit_payload["context_envelope"] = context_envelope
+            audit_payload["context_envelope_summary"] = summarize_context_envelope(
+                context_envelope
+            )
         self.audit.start_run(
             workflow_run_id=workflow_run_id,
             owner_id=owner_id,
@@ -60,11 +71,7 @@ class LangGraphWorkflowAdapter:
             trigger_ref=trigger_ref,
             started_at=started_at,
             input_ref=input_ref,
-            payload={
-                "engine": "langgraph",
-                "node_count": len(node_events),
-                "initial_keys": sorted(initial_state),
-            },
+            payload=audit_payload,
         )
         for index, event in enumerate(node_events, start=1):
             self.audit.record_event(
@@ -96,6 +103,16 @@ class LangGraphWorkflowAdapter:
             payload={
                 "engine": "langgraph",
                 "final_keys": sorted(final_state),
+                **(
+                    {
+                        "context_envelope": context_envelope,
+                        "context_envelope_summary": summarize_context_envelope(
+                            context_envelope
+                        ),
+                    }
+                    if context_envelope is not None
+                    else {}
+                ),
             },
         )
         return final_state
@@ -148,3 +165,40 @@ def classify_workflow_event_type(name: str) -> str:
     if name == "report_draft":
         return "report_draft"
     return "workflow_node_completed"
+
+
+def extract_context_envelope(
+    *,
+    initial_state: WorkflowState,
+    final_state: WorkflowState,
+) -> dict[str, Any] | None:
+    """从工作流状态中提取共享上下文封装。"""
+
+    context_envelope = final_state.get("context_envelope")
+    if isinstance(context_envelope, dict):
+        return context_envelope
+    context_envelope = initial_state.get("context_envelope")
+    if isinstance(context_envelope, dict):
+        return context_envelope
+    return None
+
+
+def summarize_context_envelope(context_envelope: dict[str, Any]) -> dict[str, Any]:
+    """提取适合写入审计表的上下文摘要。"""
+
+    stable = context_envelope.get("stable") or {}
+    context = context_envelope.get("context") or {}
+    volatile = context_envelope.get("volatile") or {}
+    role_views = context_envelope.get("role_views") or {}
+    audit = context_envelope.get("audit") or {}
+    return {
+        "version": context_envelope.get("version"),
+        "workflow_type": context_envelope.get("workflow_type"),
+        "market_type": context_envelope.get("market_type"),
+        "asset_count": len(context.get("asset_ids") or []),
+        "role_view_count": len(role_views),
+        "stable_keys": sorted(stable),
+        "context_keys": sorted(context),
+        "volatile_keys": sorted(volatile),
+        "audit_keys": sorted(audit),
+    }

@@ -12,11 +12,13 @@ from typing import Any
 
 from finance_agent.agents.reports import build_chinese_decision_report
 from finance_agent.agents.runtime import (
+    build_workflow_context_envelope,
     HighRiskReviewPolicy,
     ModelRoutingPolicy,
     ReviewDecisionContext,
 )
 from finance_agent.agents.tools import FinanceToolRuntime
+from finance_agent.graph.stores import DryRunGraphStore
 from finance_agent.agents.workflows.portfolio_monitoring import (
     PortfolioMonitoringWorkflow,
 )
@@ -42,6 +44,95 @@ class LangGraphWorkflowBuilder:
     workflow_type: str
     description: str
     build: Callable[[], Any]
+
+
+def infer_market_type(state: WorkflowGraphState, *, default: str = "ashare") -> str:
+    """从 workflow state 里推断市场类型。"""
+
+    explicit = state.get("market_type")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+
+    asset_contexts = state.get("asset_contexts") or {}
+    for asset_context in asset_contexts.values():
+        profile = asset_context.get("profile") or {}
+        market = profile.get("market")
+        if isinstance(market, str) and market.strip():
+            return market.strip()
+
+    workflow_input = state.get("workflow_input")
+    recommendations = getattr(workflow_input, "recommendations", None)
+    if recommendations:
+        first = recommendations[0]
+        market = getattr(first, "market", None)
+        if isinstance(market, str) and market.strip():
+            return market.strip()
+
+    return default
+
+
+def attach_context_envelope(
+    state: WorkflowGraphState,
+    *,
+    workflow_type: str,
+) -> dict[str, Any]:
+    """把共享上下文 envelope 写入 state。"""
+
+    return build_workflow_context_envelope(
+        workflow_type=workflow_type,
+        market_type=infer_market_type(state),
+        asset_ids=state.get("asset_ids", []),
+        asset_contexts=state.get("asset_contexts", {}),
+        portfolio_context=state.get("portfolio_context"),
+        watchlist_context=state.get("watchlist_context"),
+        recommendation_context=state.get("recommendation_context"),
+        trigger_event=state.get("trigger_event"),
+        available_tools=state.get("available_tools", []),
+    ).to_dict()
+
+
+def build_recommendation_context_envelope(state: WorkflowGraphState):
+    """为推荐决策 workflow 构建共享上下文 envelope。"""
+
+    workflow_input: RecommendationDecisionInput = state["workflow_input"]
+    asset_contexts = {
+        recommendation.asset_id: {
+            "profile": {
+                "asset_id": recommendation.asset_id,
+                "symbol": recommendation.symbol,
+                "market": recommendation.market,
+            },
+            "factor": state.get("factor_contexts", {}).get(recommendation.asset_id, {}),
+            "signal_risk": {
+                "signal": workflow_input.signals_by_asset.get(recommendation.asset_id),
+                "risks": workflow_input.risks_by_asset.get(recommendation.asset_id, ()),
+            },
+            "memory": {
+                "memories": workflow_input.memories_by_asset.get(recommendation.asset_id, ()),
+            },
+        }
+        for recommendation in workflow_input.recommendations
+    }
+    return build_workflow_context_envelope(
+        workflow_type="recommendation_decision",
+        market_type=infer_market_type(state),
+        asset_ids=[recommendation.asset_id for recommendation in workflow_input.recommendations],
+        asset_contexts=asset_contexts,
+        portfolio_context={
+            "portfolio_id": workflow_input.portfolio_id,
+            "positions": [position.position_id for position in workflow_input.positions],
+        },
+        watchlist_context={
+            "watchlist_id": workflow_input.watchlist.watchlist_id,
+            "items": [item.watchlist_item_id for item in workflow_input.watchlist_items],
+        },
+        recommendation_context={
+            "run_id": workflow_input.recommendation_run_id,
+            "recommendations": [recommendation.recommendation_id for recommendation in workflow_input.recommendations],
+        },
+        trigger_event=state.get("trigger_event"),
+        available_tools=state.get("available_tools", []),
+    )
 
 
 def _load_langgraph() -> tuple[Any, Any, Any]:
@@ -131,6 +222,7 @@ def build_operational_roundtable_graph(
         )
         return {
             **state,
+            "context_envelope": attach_context_envelope(state, workflow_type=workflow_type),
             "model_routes": [*state.get("model_routes", []), *model_routes],
             "roundtable_opinions": opinions,
             "node_trace": [*state.get("node_trace", []), "roundtable_discussion"],
@@ -196,6 +288,8 @@ def build_operational_roundtable_graph(
         )
         return {
             **state,
+            "context_envelope": state.get("context_envelope")
+            or attach_context_envelope(state, workflow_type=workflow_type),
             "report": report,
             "node_trace": [*state.get("node_trace", []), "report_draft"],
         }
@@ -337,6 +431,7 @@ def build_roundtable_report_graph(
         )
         return {
             **state,
+            "context_envelope": attach_context_envelope(state, workflow_type=workflow_type),
             "model_routes": [*state.get("model_routes", []), *model_routes],
             "roundtable_opinions": opinions,
             "node_trace": [*state.get("node_trace", []), "roundtable_discussion"],
@@ -424,6 +519,8 @@ def build_roundtable_report_graph(
         )
         return {
             **state,
+            "context_envelope": state.get("context_envelope")
+            or attach_context_envelope(state, workflow_type=workflow_type),
             "report": report,
             "node_trace": [*state.get("node_trace", []), "report_draft"],
         }
@@ -522,6 +619,7 @@ def build_recommendation_decision_graph() -> Any:
             )
         return {
             **state,
+            "context_envelope": build_recommendation_context_envelope(state).to_dict(),
             "model_routes": [*state.get("model_routes", []), *model_routes],
             "roundtable_opinions": opinions,
             "node_trace": [*state.get("node_trace", []), "roundtable_discussion"],
@@ -615,6 +713,8 @@ def build_recommendation_decision_graph() -> Any:
         )
         return {
             **state,
+            "context_envelope": state.get("context_envelope")
+            or build_recommendation_context_envelope(state).to_dict(),
             "report": report,
             "node_trace": [*state.get("node_trace", []), "report_draft"],
         }
@@ -644,7 +744,7 @@ def build_tool_runtime(state: WorkflowGraphState) -> FinanceToolRuntime:
     session = state.get("session")
     if session is None:
         raise ValueError("推荐决策圆桌 Workflow 需要 session 或 tool_runtime。")
-    return FinanceToolRuntime(session)
+    return FinanceToolRuntime(session, graph_store=DryRunGraphStore())
 
 
 def serialize_recommendation_decision(decision: Any) -> dict[str, Any]:
