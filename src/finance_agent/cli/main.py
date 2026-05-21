@@ -148,6 +148,20 @@ def build_parser() -> argparse.ArgumentParser:
     conflicts.add_argument("--asset-id", default=None, help="可选：限制到单资产。")
     conflicts.add_argument("--limit", type=int, default=10, help="返回上限。")
 
+    memory = subparsers.add_parser("memory", help="Finance Memory 长期金融记忆。")
+    memory_commands = memory.add_subparsers(dest="command", required=True)
+    recall_memory = memory_commands.add_parser("recall", help="按语义召回标的金融记忆。")
+    recall_memory.add_argument("--owner-id", required=True, help="用户/账户 ID。")
+    recall_memory.add_argument("--asset-id", required=True, help="资产 ID。")
+    recall_memory.add_argument("--query", required=True, help="召回查询语义。")
+    recall_memory.add_argument("--memory-type", default=None, help="可选：限制记忆类型。")
+    recall_memory.add_argument("--limit", type=int, default=10, help="返回上限。")
+    timeline_memory = memory_commands.add_parser("timeline", help="读取标的金融记忆时间线。")
+    timeline_memory.add_argument("--owner-id", required=True, help="用户/账户 ID。")
+    timeline_memory.add_argument("--asset-id", required=True, help="资产 ID。")
+    timeline_memory.add_argument("--memory-type", default=None, help="可选：限制记忆类型。")
+    timeline_memory.add_argument("--limit", type=int, default=20, help="返回上限。")
+
     triggers = subparsers.add_parser("triggers", help="V1.2 触发事件评估与 Agent 唤醒。")
     trigger_commands = triggers.add_subparsers(dest="command", required=True)
     evaluate = trigger_commands.add_parser("evaluate", help="评估已入库事实并生成触发事件。")
@@ -166,8 +180,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="常驻轮询触发评估、派发和内部 Agent Loop；本地测试可限制 max-cycles。",
     )
     add_trigger_request_arguments(assistant_loop)
-    assistant_loop.add_argument("--trigger-limit", type=int, default=20, help="每轮最多派发事件数。")
-    assistant_loop.add_argument("--agent-limit", type=int, default=20, help="每轮最多处理 Agent 任务数。")
+    assistant_loop.add_argument(
+        "--trigger-limit",
+        type=int,
+        default=20,
+        help="每轮最多派发事件数。",
+    )
+    assistant_loop.add_argument(
+        "--agent-limit",
+        type=int,
+        default=20,
+        help="每轮最多处理 Agent 任务数。",
+    )
     assistant_loop.add_argument(
         "--interval-seconds",
         type=float,
@@ -224,32 +248,59 @@ def build_parser() -> argparse.ArgumentParser:
     add_model_common_arguments(model_config)
     model_init = model_commands.add_parser("init", help="初始化数据库模型供应商和默认路由。")
     model_init.add_argument("--overwrite", action="store_true", help="覆盖已有模型配置。")
-    model_init.add_argument("--deepseek-base-url", default=None, help="DeepSeek OpenAI-compatible 地址。")
+    model_init.add_argument(
+        "--deepseek-base-url",
+        default=None,
+        help="DeepSeek OpenAI-compatible 地址。",
+    )
     model_init.add_argument("--deepseek-api-key", default=None, help="DeepSeek API Key。")
     model_init.add_argument("--openai-base-url", default=None, help="OpenAI-compatible 地址。")
     model_init.add_argument("--openai-api-key", default=None, help="OpenAI API Key。")
     model_init.add_argument("--embedding-model-key", default=None, help="默认 embedding 模型 key。")
     model_init.add_argument("--rerank-model-key", default=None, help="默认 rerank 模型 key。")
-    model_list = model_commands.add_parser("list", help="查看数据库模型供应商、模型实例和路由规则。")
+    model_list = model_commands.add_parser(
+        "list",
+        help="查看数据库模型供应商、模型实例和路由规则。",
+    )
     model_list.add_argument(
         "--include-disabled",
         action="store_true",
         help="包含已停用的配置。",
     )
-    model_set_provider = model_commands.add_parser("set-provider", help="新增或更新模型供应商配置。")
-    model_set_provider.add_argument("--provider-key", required=True, help="供应商 key，例如 deepseek。")
-    model_set_provider.add_argument("--provider-vendor", required=True, help="供应商类型，例如 deepseek/openai。")
+    model_set_provider = model_commands.add_parser(
+        "set-provider",
+        help="新增或更新模型供应商配置。",
+    )
+    model_set_provider.add_argument(
+        "--provider-key",
+        required=True,
+        help="供应商 key，例如 deepseek。",
+    )
+    model_set_provider.add_argument(
+        "--provider-vendor",
+        required=True,
+        help="供应商类型，例如 deepseek/openai。",
+    )
     model_set_provider.add_argument("--provider-name", required=True, help="供应商显示名。")
     model_set_provider.add_argument("--base-url", default=None, help="OpenAI-compatible base_url。")
     model_set_provider.add_argument("--api-key", default=None, help="API Key。")
-    model_set_provider.add_argument("--timeout-seconds", type=int, default=30, help="请求超时秒数。")
+    model_set_provider.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=30,
+        help="请求超时秒数。",
+    )
     model_set_provider.add_argument("--disabled", action="store_true", help="写入为停用状态。")
     model_set_model = model_commands.add_parser("set-model", help="新增或更新模型实例配置。")
     model_set_model.add_argument("--provider-key", required=True, help="供应商 key。")
     model_set_model.add_argument("--model-key", required=True, help="模型 key。")
     model_set_model.add_argument("--model-name", required=True, help="真实模型名称。")
     model_set_model.add_argument("--model-type", default="llm", help="模型类型，默认 llm。")
-    model_set_model.add_argument("--role", default=None, help="模型职责，例如 primary_financial_analyst。")
+    model_set_model.add_argument(
+        "--role",
+        default=None,
+        help="模型职责，例如 primary_financial_analyst。",
+    )
     model_set_model.add_argument("--route-priority", type=int, default=0, help="路由优先级。")
     model_set_model.add_argument("--timeout-seconds", type=int, default=30, help="请求超时秒数。")
     model_set_model.add_argument("--disabled", action="store_true", help="写入为停用状态。")
@@ -306,7 +357,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="hybrid_search",
         help="检索方式，例如 semantic_search/full_text_search/hybrid_search。",
     )
-    model_set_retrieval.add_argument("--embedding-model-key", default=None, help="embedding 模型 key。")
+    model_set_retrieval.add_argument(
+        "--embedding-model-key",
+        default=None,
+        help="embedding 模型 key。",
+    )
     model_set_retrieval.add_argument("--rerank-model-key", default=None, help="rerank 模型 key。")
     model_set_retrieval.add_argument("--top-k", type=int, default=8, help="召回条数。")
     model_set_retrieval.add_argument(
@@ -413,6 +468,8 @@ def dispatch(args: argparse.Namespace) -> JsonDict:
             return dispatch_reports(interface, args).to_dict()
         if args.group == "graph":
             return dispatch_graph(interface, args).to_dict()
+        if args.group == "memory":
+            return dispatch_memory(interface, args).to_dict()
         if args.group == "triggers":
             return dispatch_triggers(session, args)
         if args.group == "agent":
@@ -590,6 +647,27 @@ def dispatch_graph(interface: FinanceAgentInterface, args: argparse.Namespace):
             limit=args.limit,
         )
     raise ValueError(f"未知 graph 命令：{args.command}")
+
+
+def dispatch_memory(interface: FinanceAgentInterface, args: argparse.Namespace):
+    """处理 Finance Memory 命令。"""
+
+    if args.command == "recall":
+        return interface.memory_recall_asset_context(
+            owner_id=args.owner_id,
+            asset_id=args.asset_id,
+            query=args.query,
+            memory_type=args.memory_type,
+            limit=args.limit,
+        )
+    if args.command == "timeline":
+        return interface.memory_get_asset_timeline(
+            owner_id=args.owner_id,
+            asset_id=args.asset_id,
+            memory_type=args.memory_type,
+            limit=args.limit,
+        )
+    raise ValueError(f"未知 memory 命令：{args.command}")
 
 
 def dispatch_triggers(session: Any, args: argparse.Namespace) -> JsonDict:

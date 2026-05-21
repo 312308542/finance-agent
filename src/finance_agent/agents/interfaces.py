@@ -230,6 +230,48 @@ class FinanceAgentInterface:
             arguments={"owner_id": owner_id, "asset_id": asset_id, "limit": limit},
         )
 
+    def memory_recall_asset_context(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str,
+        query: str,
+        memory_type: str | None = None,
+        limit: int = 10,
+    ) -> AgentInterfaceResult:
+        """读取标的 Finance Memory 相似召回和时间线。"""
+
+        return self.call_tool(
+            name="memory.get_asset_memory_context",
+            arguments={
+                "owner_id": owner_id,
+                "asset_id": asset_id,
+                "query": query,
+                "memory_type": memory_type,
+                "limit": limit,
+            },
+        )
+
+    def memory_get_asset_timeline(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str,
+        memory_type: str | None = None,
+        limit: int = 20,
+    ) -> AgentInterfaceResult:
+        """读取标的 Finance Memory 时间线。"""
+
+        return self.call_tool(
+            name="memory.get_asset_memory_timeline",
+            arguments={
+                "owner_id": owner_id,
+                "asset_id": asset_id,
+                "memory_type": memory_type,
+                "limit": limit,
+            },
+        )
+
     def run_workflow(
         self,
         *,

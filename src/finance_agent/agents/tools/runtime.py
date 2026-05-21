@@ -14,7 +14,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from finance_agent.application import PortfolioService, WatchlistService
+from finance_agent.application import MemoryService, PortfolioService, WatchlistService
 from finance_agent.graph import GraphSyncService, create_graph_store
 from finance_agent.graph.stores import MemoryGraphStore
 from finance_agent.storage.orm import (
@@ -72,6 +72,7 @@ class FinanceToolRuntime:
         self.signals = SignalSnapshotRepository(session)
         self.risks = RiskRepository(session)
         self.memories = MemoryRepository(session)
+        self.memory_service = MemoryService(session)
         self.data_quality = DataQualityRepository(session)
         self._tools: dict[str, FinanceTool] = {}
         self._register_builtin_tools()
@@ -137,8 +138,22 @@ class FinanceToolRuntime:
         self.register(
             FinanceTool(
                 name="memory.recall_asset_memories",
-                description="召回标的相关 Finance Memory。",
+                description="召回标的相关 Finance Memory，返回相似召回和资产时间线。",
                 handler=self.recall_asset_memories,
+            )
+        )
+        self.register(
+            FinanceTool(
+                name="memory.get_asset_memory_context",
+                description="按查询语义读取标的 Finance Memory 相似历史和时间线。",
+                handler=self.get_asset_memory_context,
+            )
+        )
+        self.register(
+            FinanceTool(
+                name="memory.get_asset_memory_timeline",
+                description="读取单标的 Finance Memory 时间线。",
+                handler=self.get_asset_memory_timeline,
             )
         )
         self.register(
@@ -289,16 +304,74 @@ class FinanceToolRuntime:
         asset_id: str | None = None,
         memory_type: str | None = None,
         limit: int = 10,
+        query: str | None = None,
     ) -> JsonDict:
         """召回 Finance Memory。"""
 
-        memories = self.memories.list_active_memories(
+        if asset_id and query:
+            return self.memory_service.build_memory_context(
+                owner_id=owner_id,
+                asset_id=asset_id,
+                memory_type=memory_type,
+                query=query,
+                limit=limit,
+            )
+        memories = self.memories.list_memories(
             owner_id=owner_id,
             asset_id=asset_id,
             memory_type=memory_type,
+            statuses=("active", "stale"),
             limit=limit,
         )
-        return {"memories": [serialize_memory(memory) for memory in memories]}
+        result: JsonDict = {"memories": [serialize_memory(memory) for memory in memories]}
+        if asset_id:
+            result["timeline"] = self.memory_service.get_asset_memory_timeline(
+                owner_id=owner_id,
+                asset_id=asset_id,
+                memory_type=memory_type,
+                limit=limit,
+            )
+        return result
+
+    def get_asset_memory_context(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str,
+        query: str,
+        memory_type: str | None = None,
+        limit: int = 10,
+    ) -> JsonDict:
+        """读取带相似召回和时间线的 Finance Memory 上下文。"""
+
+        return self.memory_service.build_memory_context(
+            owner_id=owner_id,
+            asset_id=asset_id,
+            query=query,
+            memory_type=memory_type,
+            limit=limit,
+        )
+
+    def get_asset_memory_timeline(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str,
+        memory_type: str | None = None,
+        limit: int = 20,
+    ) -> JsonDict:
+        """读取单标的 Finance Memory 时间线。"""
+
+        return {
+            "owner_id": owner_id,
+            "asset_id": asset_id,
+            "timeline": self.memory_service.get_asset_memory_timeline(
+                owner_id=owner_id,
+                asset_id=asset_id,
+                memory_type=memory_type,
+                limit=limit,
+            ),
+        }
 
     def trace_asset_graph(
         self,

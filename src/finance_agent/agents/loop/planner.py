@@ -778,6 +778,13 @@ def build_model_planned_tool_calls(event: object) -> tuple[dict[str, object], ..
                     "asset_id": event.asset_id,
                     "limit": 10,
                 },
+                {
+                    "tool": "memory.get_asset_memory_context",
+                    "owner_id": event.owner_id,
+                    "asset_id": event.asset_id,
+                    "query": build_memory_query_for_event(event),
+                    "limit": 8,
+                },
             )
         )
     elif event.owner_id:
@@ -885,6 +892,7 @@ def build_planned_tool_calls(event: object) -> tuple[dict[str, object], ...]:
                     "tool": "memory.recall_asset_memories",
                     "owner_id": event.owner_id,
                     "asset_id": event.asset_id,
+                    "query": build_memory_query_for_event(event),
                 },
             )
         )
@@ -901,18 +909,36 @@ def infer_event_market_type(event: object) -> str:
     return "ashare"
 
 
+def build_memory_query_for_event(event: object) -> str:
+    """为触发事件构造 Finance Memory 召回查询。"""
+
+    payload = event.payload or {}
+    parts = [
+        str(event.trigger_type or ""),
+        str(event.requested_workflow_type or ""),
+        str(payload.get("reason") or ""),
+        str(payload.get("summary") or ""),
+        str(payload.get("trigger_condition") or ""),
+        str(payload.get("suggested_action") or ""),
+        str(event.asset_id or ""),
+    ]
+    query = " ".join(part for part in parts if part.strip())
+    return query or "候选池 持续观察 买入 卖出 换股 风险 复盘"
+
+
 def extract_tool_memory_items(tool_results_summary: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """从工具摘要中提取少量记忆条目，供 Prompt volatile 层使用。"""
 
     items: list[dict[str, Any]] = []
     for result in tool_results_summary:
         summary = result.get("summary") or {}
-        memories = summary.get("memories") or summary.get("items") or {}
-        sample = memories.get("sample") if isinstance(memories, dict) else None
-        if isinstance(sample, list):
-            for item in sample:
-                if isinstance(item, dict):
-                    items.append(item)
+        for key in ("memories", "similar_memories", "timeline", "items"):
+            memories = summary.get(key) or {}
+            sample = memories.get("sample") if isinstance(memories, dict) else None
+            if isinstance(sample, list):
+                for item in sample:
+                    if isinstance(item, dict):
+                        items.append(item)
     return items[:5]
 
 
@@ -940,6 +966,11 @@ def count_summary_items(tool_results_summary: list[dict[str, Any]], key: str) ->
         value = summary.get(key)
         if isinstance(value, dict):
             total += int(value.get("count") or 0)
+        if key == "memories":
+            for alias in ("similar_memories", "timeline"):
+                alias_value = summary.get(alias)
+                if isinstance(alias_value, dict):
+                    total += int(alias_value.get("count") or 0)
     return total
 
 

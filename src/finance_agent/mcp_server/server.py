@@ -245,6 +245,44 @@ def create_mcp_server() -> Any:
         )
 
     @mcp.tool()
+    def memory_recall_asset_context(
+        owner_id: str,
+        asset_id: str,
+        query: str,
+        memory_type: str | None = None,
+        limit: int = 10,
+    ) -> JsonDict:
+        """按语义召回标的 Finance Memory，并返回资产时间线。"""
+
+        return run_with_interface(
+            lambda interface: interface.memory_recall_asset_context(
+                owner_id=owner_id,
+                asset_id=asset_id,
+                query=query,
+                memory_type=memory_type,
+                limit=limit,
+            ).to_dict()
+        )
+
+    @mcp.tool()
+    def memory_get_asset_timeline(
+        owner_id: str,
+        asset_id: str,
+        memory_type: str | None = None,
+        limit: int = 20,
+    ) -> JsonDict:
+        """读取标的 Finance Memory 时间线。"""
+
+        return run_with_interface(
+            lambda interface: interface.memory_get_asset_timeline(
+                owner_id=owner_id,
+                asset_id=asset_id,
+                memory_type=memory_type,
+                limit=limit,
+            ).to_dict()
+        )
+
+    @mcp.tool()
     def evaluate_triggers(
         owner_id: str,
         as_of: str | None = None,
