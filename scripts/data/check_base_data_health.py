@@ -18,6 +18,7 @@ from typing import Any
 
 from sqlalchemy import text
 
+from finance_agent.application.data_production_service import DataBackfillPlanner
 from finance_agent.cache import create_cache_client
 from finance_agent.data.collection_runtime import CollectionRuntime
 from finance_agent.storage.db import create_session_factory, session_scope
@@ -41,6 +42,8 @@ DEFAULT_PROVIDER_KEYS = [
     "stock_dzjy_mrmx",
     "stock_margin_sse",
     "stock_margin_szse",
+    "tool_trade_date_hist_sina",
+    "crypto_calendar_24x7",
     "ccxt_binance_load_markets",
     "ccxt_binance_fetch_ohlcv",
     "binance_derivative_snapshot",
@@ -52,6 +55,7 @@ FRESHNESS_THRESHOLDS_HOURS = {
     "factor_frames": 24,
     "asset_scores": 24,
     "signal_snapshots": 24,
+    "market_calendars": 24,
     "capital_flow_snapshots": 24,
     "fundamental_snapshots": 72,
     "event_records": 48,
@@ -88,6 +92,13 @@ def main() -> None:
         "gaps": infer_gaps(table_counts, provider_rows, freshness_rows),
         "refresh_hints": build_refresh_hints(table_counts, freshness_rows, provider_rows),
     }
+    summary["backfill_jobs"] = [
+        job.to_scheduler_job()
+        for job in DataBackfillPlanner().build_backfill_jobs(
+            health_summary=summary,
+            now=datetime.now(tz=UTC),
+        )
+    ]
     print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
 
 
@@ -156,6 +167,7 @@ def load_table_counts(session: Any) -> JsonDict:
             union all select 'assets', count(1) from assets
             union all select 'asset_universes', count(1) from asset_universes
             union all select 'asset_universe_members', count(1) from asset_universe_members
+            union all select 'market_calendars', count(1) from market_calendars
             union all select 'market_bars', count(1) from market_bars
             union all select 'capital_flow_snapshots', count(1) from capital_flow_snapshots
             union all select 'fundamental_snapshots', count(1) from fundamental_snapshots
@@ -183,6 +195,8 @@ def load_table_freshness(session: Any) -> list[JsonDict]:
                 union all select 'factor_frames', as_of from factor_frames
                 union all select 'asset_scores', as_of from asset_scores
                 union all select 'signal_snapshots', as_of from signal_snapshots
+                union all
+                select 'market_calendars', trade_date::timestamptz from market_calendars
                 union all select 'capital_flow_snapshots', as_of from capital_flow_snapshots
                 union all select 'fundamental_snapshots', as_of from fundamental_snapshots
                 union all
@@ -257,6 +271,7 @@ def infer_gaps(
     required_tables = [
         "assets",
         "asset_universe_members",
+        "market_calendars",
         "market_bars",
         "capital_flow_snapshots",
         "fundamental_snapshots",

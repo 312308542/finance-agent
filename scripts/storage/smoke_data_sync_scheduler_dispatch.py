@@ -25,6 +25,7 @@ from collect_base_data import (  # noqa: E402
     run_ashare_risk,
     run_crypto,
 )
+
 from finance_agent.scheduler import BaseDataScheduler, load_scheduler_config  # noqa: E402
 
 
@@ -86,12 +87,17 @@ def main() -> None:
     assert_tasks(
         run_ashare_p0,
         default_collection_args(group=["ashare-p0"], sync_task_type="universe_refresh"),
-        ["ashare_p0_assets"],
+        ["ashare_p0_calendar", "ashare_p0_assets"],
+    )
+    assert_tasks(
+        run_ashare_p0,
+        default_collection_args(group=["ashare-p0"], sync_task_type="calendar_refresh"),
+        ["ashare_p0_calendar"],
     )
     assert_tasks(
         run_ashare_p0,
         default_collection_args(group=["ashare-p0"], sync_task_type="market_bars_backfill"),
-        ["ashare_p0_ohlcv"],
+        ["ashare_p0_calendar", "ashare_p0_ohlcv"],
     )
     assert_tasks(
         run_ashare_p1,
@@ -129,17 +135,22 @@ def main() -> None:
     assert_tasks(
         run_crypto,
         default_collection_args(group=["crypto"], sync_task_type="universe_refresh"),
-        ["crypto_markets"],
+        ["crypto_calendar", "crypto_markets"],
+    )
+    assert_tasks(
+        run_crypto,
+        default_collection_args(group=["crypto"], sync_task_type="calendar_refresh"),
+        ["crypto_calendar"],
     )
     assert_tasks(
         run_crypto,
         default_collection_args(group=["crypto"], sync_task_type="market_bars_backfill"),
-        ["crypto_ohlcv"],
+        ["crypto_calendar", "crypto_ohlcv"],
     )
     assert_tasks(
         run_crypto,
         default_collection_args(group=["crypto"], sync_task_type="derivative_refresh"),
-        ["crypto_derivative_snapshot"],
+        ["crypto_calendar", "crypto_derivative_snapshot"],
     )
 
     print({"status": "ok", "checked": len(planned_args)})
@@ -156,7 +167,9 @@ def assert_tasks(
     runner(object(), args, runtime)
     actual_tasks = [item["task"] for item in runtime.calls]
     if actual_tasks != expected_tasks:
-        raise AssertionError(f"任务分发不符合预期：expected={expected_tasks}, actual={actual_tasks}")
+        raise AssertionError(
+            f"任务分发不符合预期：expected={expected_tasks}, actual={actual_tasks}"
+        )
 
 
 if __name__ == "__main__":

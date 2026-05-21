@@ -13,6 +13,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from finance_agent.application.data_production_service import (
+    DataBackfillPlanner,
+    ProductionUniverseService,
+)
 from finance_agent.data.sync_config import (
     DataSyncConfig,
     build_preset_config,
@@ -25,6 +29,7 @@ from finance_agent.data.sync_config import (
     validate_data_sync_config,
 )
 from finance_agent.data.sync_tui import render_data_sync_tui
+from finance_agent.storage.db import create_session_factory, session_scope
 
 JsonDict = dict[str, Any]
 
@@ -94,10 +99,52 @@ def add_data_arguments(subparsers: argparse._SubParsersAction[argparse.ArgumentP
         help="脚本化 TUI 动作，供 smoke 和自动化测试使用。",
     )
 
+    production = data_commands.add_parser("production", help="数据层生产化策略工具。")
+    production_commands = production.add_subparsers(dest="subcommand", required=True)
+    backfill = production_commands.add_parser(
+        "backfill-plan",
+        help="根据健康检查 JSON 生成缺口补采计划。",
+    )
+    backfill.add_argument(
+        "--health-file",
+        required=True,
+        help="check_base_data_health 输出 JSON 文件。",
+    )
+    backfill.add_argument("--interval-seconds", type=int, default=300, help="导出调度任务间隔。")
+    backfill.add_argument("--batch-size", type=int, default=200, help="导出调度任务批量大小。")
+    merge = production_commands.add_parser("merge-universe", help="合并同市场多个候选池。")
+    merge.add_argument("--target-universe-id", required=True, help="目标候选池 ID。")
+    merge.add_argument("--name", required=True, help="目标候选池名称。")
+    merge.add_argument("--source-universe-ids", required=True, help="逗号分隔的来源候选池 ID。")
+    merge.add_argument(
+        "--strategy-context",
+        default="production_universe_merge",
+        help="策略上下文。",
+    )
+    merge.add_argument(
+        "--source-weights",
+        default=None,
+        help="可选 JSON，对来源候选池 ID 设置权重，例如 {\"u1\":2.0}。",
+    )
+    avoid = production_commands.add_parser(
+        "rebuild-avoid-pool",
+        help="根据资产状态和风险发现重建回避池。",
+    )
+    avoid.add_argument("--universe-id", required=True, help="回避池候选池 ID。")
+    avoid.add_argument("--name", required=True, help="回避池名称。")
+    avoid.add_argument(
+        "--market",
+        required=True,
+        choices=["ashare", "crypto_spot", "crypto_future"],
+    )
+    avoid.add_argument("--strategy-context", default="avoid_pool", help="策略上下文。")
+
 
 def dispatch_data(args: argparse.Namespace) -> JsonDict:
     """执行数据同步配置命令。"""
 
+    if args.command == "production":
+        return dispatch_data_production(args)
     if args.command != "config":
         raise ValueError(f"未知 data 命令：{args.command}")
 
@@ -166,6 +213,63 @@ def dispatch_data(args: argparse.Namespace) -> JsonDict:
     raise ValueError(f"未知 data config 命令：{args.subcommand}")
 
 
+def dispatch_data_production(args: argparse.Namespace) -> JsonDict:
+    """执行数据层生产化策略命令。"""
+
+    if args.subcommand == "backfill-plan":
+        health_payload = json.loads(Path(args.health_file).read_text(encoding="utf-8-sig"))
+        jobs = DataBackfillPlanner().build_backfill_jobs(health_summary=health_payload)
+        return {
+            "status": "ok",
+            "data": {
+                "jobs": [
+                    job.to_scheduler_job(
+                        interval_seconds=args.interval_seconds,
+                        batch_size=args.batch_size,
+                    )
+                    for job in jobs
+                ],
+                "job_count": len(jobs),
+            },
+        }
+
+    if args.subcommand in {"merge-universe", "rebuild-avoid-pool"}:
+        session_factory = create_session_factory(args.database_url)
+        with session_scope(session_factory) as session:
+            service = ProductionUniverseService(session)
+            if args.subcommand == "merge-universe":
+                plans = service.merge_universes(
+                    target_universe_id=args.target_universe_id,
+                    name=args.name,
+                    source_universe_ids=parse_market_arg(args.source_universe_ids),
+                    source_weights=parse_optional_json_object(args.source_weights),
+                    strategy_context=args.strategy_context,
+                )
+                return {
+                    "status": "ok",
+                    "data": {
+                        "target_universe_id": args.target_universe_id,
+                        "member_count": len(plans),
+                        "members": [plan.to_repository_payload() for plan in plans],
+                    },
+                }
+            plans = service.rebuild_avoid_pool(
+                universe_id=args.universe_id,
+                name=args.name,
+                market=args.market,
+                strategy_context=args.strategy_context,
+            )
+            return {
+                "status": "ok",
+                "data": {
+                    "universe_id": args.universe_id,
+                    "member_count": len(plans),
+                    "members": [plan.to_repository_payload() for plan in plans],
+                },
+            }
+    raise ValueError(f"未知 data production 命令：{args.subcommand}")
+
+
 def build_config_from_args(args: argparse.Namespace) -> DataSyncConfig:
     """根据 CLI 参数构建数据同步配置。"""
 
@@ -203,3 +307,14 @@ def parse_market_arg(value: str | None) -> list[str]:
     if not value:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def parse_optional_json_object(value: str | None) -> JsonDict | None:
+    """解析可选 JSON 对象。"""
+
+    if not value:
+        return None
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError("参数必须是 JSON 对象。")
+    return parsed

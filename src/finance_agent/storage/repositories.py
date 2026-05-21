@@ -42,11 +42,12 @@ from finance_agent.storage.orm import (
     FundamentalSnapshotORM,
     IndicatorFrameORM,
     MarketBarORM,
+    MarketCalendarORM,
     MemoryEmbeddingORM,
-    MonitoringAlertORM,
     ModelInstanceORM,
     ModelProviderORM,
     ModelRoutingRuleORM,
+    MonitoringAlertORM,
     PortfolioORM,
     PortfolioSnapshotORM,
     PositionORM,
@@ -54,8 +55,8 @@ from finance_agent.storage.orm import (
     RawRecordORM,
     RecommendationRunORM,
     RecommendationRunUniverseORM,
-    ReviewTaskORM,
     RetrievalProfileORM,
+    ReviewTaskORM,
     RiskFindingORM,
     ScreeningResultItemORM,
     ScreeningResultORM,
@@ -405,6 +406,14 @@ class UniverseRepository:
 
         return self.session.get_one(AssetUniverseORM, universe_id)
 
+    def list_universes(self, universe_ids: Sequence[str]) -> list[AssetUniverseORM]:
+        """按 ID 列表查询候选池定义。"""
+
+        if not universe_ids:
+            return []
+        statement = select(AssetUniverseORM).where(AssetUniverseORM.universe_id.in_(universe_ids))
+        return list(self.session.scalars(statement.order_by(AssetUniverseORM.universe_id)))
+
     def get_member(self, *, universe_id: str, asset_id: str) -> AssetUniverseMemberORM:
         """根据候选池和资产 ID 查询成员。"""
 
@@ -425,6 +434,113 @@ class UniverseRepository:
         if included_only:
             statement = statement.where(AssetUniverseMemberORM.included.is_(True))
         return list(self.session.scalars(statement.order_by(AssetUniverseMemberORM.symbol)))
+
+
+class MarketCalendarRepository:
+    """交易日历仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_calendar_entry(
+        self,
+        *,
+        calendar_id: str,
+        market: str,
+        exchange: str,
+        trade_date: date,
+        is_trading_day: bool,
+        session_type: str,
+        timezone: str,
+        source: str,
+        open_at: datetime | None = None,
+        close_at: datetime | None = None,
+        status: str = "available",
+        payload: JsonDict | None = None,
+    ) -> MarketCalendarORM:
+        """按市场、交易所、日期和 session 幂等写入交易日历。"""
+
+        values = {
+            "calendar_id": calendar_id,
+            "market": market,
+            "exchange": exchange,
+            "trade_date": trade_date,
+            "is_trading_day": is_trading_day,
+            "open_at": open_at,
+            "close_at": close_at,
+            "session_type": session_type,
+            "timezone": timezone,
+            "status": status,
+            "source": source,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(MarketCalendarORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"calendar_id", "market", "exchange", "trade_date", "session_type"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="uq_market_calendars_session",
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.get_calendar_entry(
+            market=market,
+            exchange=exchange,
+            trade_date=trade_date,
+            session_type=session_type,
+        )
+
+    def replace_calendar_entries(
+        self,
+        entries: Sequence[dict[str, Any]],
+    ) -> list[MarketCalendarORM]:
+        """批量幂等写入交易日历。"""
+
+        saved: list[MarketCalendarORM] = []
+        for entry in entries:
+            saved.append(self.upsert_calendar_entry(**entry))
+        return saved
+
+    def get_calendar_entry(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        trade_date: date,
+        session_type: str = "regular",
+    ) -> MarketCalendarORM:
+        """查询单个交易日历条目。"""
+
+        statement = select(MarketCalendarORM).where(
+            MarketCalendarORM.market == market,
+            MarketCalendarORM.exchange == exchange,
+            MarketCalendarORM.trade_date == trade_date,
+            MarketCalendarORM.session_type == session_type,
+        )
+        return self.session.scalars(statement).one()
+
+    def list_calendar_entries(
+        self,
+        *,
+        market: str,
+        start_date: date,
+        end_date: date,
+        exchange: str | None = None,
+    ) -> list[MarketCalendarORM]:
+        """查询时间窗口内的交易日历。"""
+
+        statement = select(MarketCalendarORM).where(
+            MarketCalendarORM.market == market,
+            MarketCalendarORM.trade_date >= start_date,
+            MarketCalendarORM.trade_date <= end_date,
+        )
+        if exchange:
+            statement = statement.where(MarketCalendarORM.exchange == exchange)
+        return list(self.session.scalars(statement.order_by(MarketCalendarORM.trade_date)))
 
 
 class MarketDataRepository:
@@ -3797,7 +3913,10 @@ class ModelRuntimeConfigRepository:
     def get_enabled_provider_map(self) -> dict[str, ModelProviderORM]:
         """返回启用供应商的 provider_key 映射。"""
 
-        return {provider.provider_key: provider for provider in self.list_providers(enabled_only=True)}
+        return {
+            provider.provider_key: provider
+            for provider in self.list_providers(enabled_only=True)
+        }
 
     def find_route_model(
         self,

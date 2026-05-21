@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
+from finance_agent.application.data_production_service import MarketCalendarService
 from finance_agent.cache import create_cache_client
 from finance_agent.data.collection_runtime import (
     CollectionRuntime,
@@ -24,8 +25,10 @@ from finance_agent.data.collectors import (
     AshareRiskSentimentCollector,
     CryptoDataCollector,
 )
+from finance_agent.data.models import ProviderResult
+from finance_agent.data.providers import AkshareProvider
 from finance_agent.storage.db import create_session_factory, session_scope
-from finance_agent.storage.repositories import AssetRepository
+from finance_agent.storage.repositories import AssetRepository, MarketCalendarRepository
 
 JsonDict = dict[str, Any]
 
@@ -314,8 +317,33 @@ def run_ashare_p0(
 
     collector = AshareP0Collector(session)
     task_type = task_type_name(args)
+    if task_type == "calendar_refresh":
+        return [
+            runtime.run_task(
+                task="ashare_p0_calendar",
+                provider_key="tool_trade_date_hist_sina",
+                parameters={"start": args.ashare_start, "end": args.ashare_end},
+                force=args.force_provider,
+                collect=lambda: collect_ashare_calendar(
+                    session,
+                    start=args.ashare_start,
+                    end=args.ashare_end,
+                ),
+            )
+        ]
     if task_type == "universe_refresh":
         return [
+            runtime.run_task(
+                task="ashare_p0_calendar",
+                provider_key="tool_trade_date_hist_sina",
+                parameters={"start": args.ashare_start, "end": args.ashare_end},
+                force=args.force_provider,
+                collect=lambda: collect_ashare_calendar(
+                    session,
+                    start=args.ashare_start,
+                    end=args.ashare_end,
+                ),
+            ),
             runtime.run_task(
                 task="ashare_p0_assets",
                 provider_key="stock_zh_a_spot",
@@ -332,6 +360,17 @@ def run_ashare_p0(
     if task_type == "realtime_quote_refresh":
         return [
             runtime.run_task(
+                task="ashare_p0_calendar",
+                provider_key="tool_trade_date_hist_sina",
+                parameters={"start": args.ashare_start, "end": args.ashare_end},
+                force=args.force_provider,
+                collect=lambda: collect_ashare_calendar(
+                    session,
+                    start=args.ashare_start,
+                    end=args.ashare_end,
+                ),
+            ),
+            runtime.run_task(
                 task="ashare_p0_assets",
                 provider_key="stock_zh_a_spot",
                 parameters={"limit": args.limit},
@@ -346,6 +385,17 @@ def run_ashare_p0(
         ]
     if task_type == "market_bars_backfill":
         return [
+            runtime.run_task(
+                task="ashare_p0_calendar",
+                provider_key="tool_trade_date_hist_sina",
+                parameters={"start": args.ashare_start, "end": args.ashare_end},
+                force=args.force_provider,
+                collect=lambda: collect_ashare_calendar(
+                    session,
+                    start=args.ashare_start,
+                    end=args.ashare_end,
+                ),
+            ),
             runtime.run_task(
                 task="ashare_p0_ohlcv",
                 provider_key="stock_zh_a_hist",
@@ -369,6 +419,17 @@ def run_ashare_p0(
             )
         ]
     return [
+        runtime.run_task(
+            task="ashare_p0_calendar",
+            provider_key="tool_trade_date_hist_sina",
+            parameters={"start": args.ashare_start, "end": args.ashare_end},
+            force=args.force_provider,
+            collect=lambda: collect_ashare_calendar(
+                session,
+                start=args.ashare_start,
+                end=args.ashare_end,
+            ),
+        ),
         runtime.run_task(
             task="ashare_p0_assets",
             provider_key="stock_zh_a_spot",
@@ -502,13 +563,15 @@ def build_ashare_p1_universe_tasks(
                     "limit": member_limit,
                 },
                 force=args.force_provider,
-                collect=lambda index_code=index_code, index_name=index_name: collector.collect_index_members(
-                    index_code=index_code,
-                    index_name=index_name,
-                    universe_id=f"universe:base:ashare:p1:index:{index_code}",
-                    universe_name=f"基础数据指数种子池-{index_name}",
-                    strategy_context="base_data_collect",
-                    limit=member_limit,
+                collect=lambda index_code=index_code, index_name=index_name: (
+                    collector.collect_index_members(
+                        index_code=index_code,
+                        index_name=index_name,
+                        universe_id=f"universe:base:ashare:p1:index:{index_code}",
+                        universe_name=f"基础数据指数种子池-{index_name}",
+                        strategy_context="base_data_collect",
+                        limit=member_limit,
+                    )
                 ),
             )
         )
@@ -606,7 +669,12 @@ def build_ashare_p1_default_tasks(
     ]
 
 
-def fetch_catalog_entries(result: Any, *, key: str, default: list[dict[str, str]] | list[str]) -> list[Any]:
+def fetch_catalog_entries(
+    result: Any,
+    *,
+    key: str,
+    default: list[dict[str, str]] | list[str],
+) -> list[Any]:
     """从目录 Provider 结果中抽取条目；失败时使用默认值。"""
 
     payload = getattr(result, "payload", {}) or {}
@@ -689,7 +757,11 @@ def run_ashare_p2(
             runtime.run_task(
                 task="ashare_p2_performance_report",
                 provider_key="stock_yjbb_em",
-                parameters={"date": args.report_date, "report_type": "业绩报表", "limit": args.limit},
+                parameters={
+                    "date": args.report_date,
+                    "report_type": "业绩报表",
+                    "limit": args.limit,
+                },
                 force=args.force_provider,
                 collect=lambda: collector.collect_performance_report(
                     date=args.report_date,
@@ -949,8 +1021,34 @@ def run_crypto(
 
     collector = CryptoDataCollector(session)
     task_type = task_type_name(args)
+    crypto_market = crypto_market_name(args.crypto_market_type)
+    if task_type == "calendar_refresh":
+        return [
+            runtime.run_task(
+                task="crypto_calendar",
+                provider_key="crypto_calendar_24x7",
+                parameters={"market": crypto_market, "lookback": args.lookback},
+                force=args.force_provider,
+                collect=lambda: collect_crypto_calendar(
+                    session,
+                    market=crypto_market,
+                    lookback=args.lookback,
+                ),
+            )
+        ]
     if task_type == "universe_refresh":
         return [
+            runtime.run_task(
+                task="crypto_calendar",
+                provider_key="crypto_calendar_24x7",
+                parameters={"market": crypto_market, "lookback": args.lookback},
+                force=args.force_provider,
+                collect=lambda: collect_crypto_calendar(
+                    session,
+                    market=crypto_market,
+                    lookback=args.lookback,
+                ),
+            ),
             runtime.run_task(
                 task="crypto_markets",
                 provider_key="ccxt_binance_load_markets",
@@ -967,6 +1065,17 @@ def run_crypto(
         ]
     if task_type == "market_bars_backfill":
         return [
+            runtime.run_task(
+                task="crypto_calendar",
+                provider_key="crypto_calendar_24x7",
+                parameters={"market": crypto_market, "lookback": args.lookback},
+                force=args.force_provider,
+                collect=lambda: collect_crypto_calendar(
+                    session,
+                    market=crypto_market,
+                    lookback=args.lookback,
+                ),
+            ),
             runtime.run_task(
                 task="crypto_ohlcv",
                 provider_key="ccxt_binance_fetch_ohlcv",
@@ -988,6 +1097,17 @@ def run_crypto(
     if task_type == "derivative_refresh":
         return [
             runtime.run_task(
+                task="crypto_calendar",
+                provider_key="crypto_calendar_24x7",
+                parameters={"market": crypto_market, "lookback": args.lookback},
+                force=args.force_provider,
+                collect=lambda: collect_crypto_calendar(
+                    session,
+                    market=crypto_market,
+                    lookback=args.lookback,
+                ),
+            ),
+            runtime.run_task(
                 task="crypto_derivative_snapshot",
                 provider_key="binance_derivative_snapshot",
                 parameters={"symbol": args.crypto_symbol},
@@ -996,6 +1116,17 @@ def run_crypto(
             )
         ]
     return [
+        runtime.run_task(
+            task="crypto_calendar",
+            provider_key="crypto_calendar_24x7",
+            parameters={"market": crypto_market, "lookback": args.lookback},
+            force=args.force_provider,
+            collect=lambda: collect_crypto_calendar(
+                session,
+                market=crypto_market,
+                lookback=args.lookback,
+            ),
+        ),
         runtime.run_task(
             task="crypto_markets",
             provider_key="ccxt_binance_load_markets",
@@ -1040,6 +1171,129 @@ def task_type_name(args: argparse.Namespace) -> str | None:
     """从参数中读取当前同步任务类型。"""
 
     return getattr(args, "sync_task_type", None)
+
+
+def collect_ashare_calendar(
+    session: Any,
+    *,
+    start: str,
+    end: str,
+) -> Any:
+    """采集并写入 A 股交易日历。"""
+
+    collected_at = datetime.now(tz=UTC)
+    start_date = parse_yyyymmdd(start)
+    end_date = parse_yyyymmdd(end)
+    try:
+        provider = AkshareProvider()
+        trading_dates = provider.fetch_trade_dates(start_date=start_date, end_date=end_date)
+        entries = MarketCalendarService().build_ashare_calendar_entries(
+            trading_dates=trading_dates,
+            start_date=start_date,
+            end_date=end_date,
+            source="akshare:tool_trade_date_hist_sina",
+        )
+        repo = MarketCalendarRepository(session)
+        repo.replace_calendar_entries([entry.__dict__ for entry in entries])
+        result = ProviderResult(
+            provider_name="akshare",
+            status="available" if entries else "unavailable",
+            collected_at=collected_at,
+            payload={
+                "actual_source": "akshare:tool_trade_date_hist_sina",
+                "row_count": len(entries),
+                "trading_day_count": sum(1 for entry in entries if entry.is_trading_day),
+            },
+        )
+    except Exception as exc:
+        result = ProviderResult(
+            provider_name="akshare",
+            status="error",
+            collected_at=collected_at,
+            error_message=str(exc),
+            payload={"actual_source": "akshare:tool_trade_date_hist_sina"},
+        )
+    return SimpleArchivedProviderResult(result=result, raw_record_id=None)
+
+
+def collect_crypto_calendar(
+    session: Any,
+    *,
+    market: str,
+    lookback: str | None,
+) -> Any:
+    """写入数字货币 7x24 交易日历。"""
+
+    collected_at = datetime.now(tz=UTC)
+    end_date = collected_at.date()
+    start_date = end_date - timedelta(days=parse_lookback_days(lookback, default_days=7))
+    try:
+        entries = MarketCalendarService().build_crypto_calendar_entries(
+            start_date=start_date,
+            end_date=end_date,
+            market=market,
+            source="internal:crypto_calendar_24x7",
+        )
+        repo = MarketCalendarRepository(session)
+        repo.replace_calendar_entries([entry.__dict__ for entry in entries])
+        result = ProviderResult(
+            provider_name="internal",
+            status="available",
+            collected_at=collected_at,
+            payload={
+                "actual_source": "internal:crypto_calendar_24x7",
+                "market": market,
+                "row_count": len(entries),
+            },
+        )
+    except Exception as exc:
+        result = ProviderResult(
+            provider_name="internal",
+            status="error",
+            collected_at=collected_at,
+            error_message=str(exc),
+            payload={"actual_source": "internal:crypto_calendar_24x7", "market": market},
+        )
+    return SimpleArchivedProviderResult(result=result, raw_record_id=None)
+
+
+class SimpleArchivedProviderResult:
+    """给内部日历任务复用 CollectionRuntime 摘要结构的轻量包装。"""
+
+    def __init__(self, *, result: ProviderResult, raw_record_id: str | None) -> None:
+        self.result = result
+        self.raw_record_id = raw_record_id
+
+
+def parse_yyyymmdd(value: str) -> date:
+    """解析 YYYYMMDD 日期字符串。"""
+
+    return datetime.strptime(value, "%Y%m%d").date()
+
+
+def parse_lookback_days(value: str | None, *, default_days: int) -> int:
+    """把配置中的 lookback 转换为天数。"""
+
+    if not value:
+        return default_days
+    text = str(value).strip().lower()
+    try:
+        if text.endswith("h"):
+            hours = int(text[:-1])
+            return max(1, hours // 24)
+        if text.endswith("d"):
+            return max(1, int(text[:-1]))
+        return max(1, int(text))
+    except ValueError:
+        return default_days
+
+
+def crypto_market_name(market_type: str) -> str:
+    """把 ccxt 市场类型转换为系统市场名。"""
+
+    if market_type in {"future", "swap"}:
+        return "crypto_future"
+    return "crypto_spot"
 
 
 def batch_ashare_symbols(

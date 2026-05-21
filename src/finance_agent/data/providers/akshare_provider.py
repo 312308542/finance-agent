@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import akshare as ak
@@ -377,6 +377,23 @@ class AkshareProvider:
                 "换手率",
             ]
         ]
+
+    def fetch_trade_dates(self, *, start_date: date, end_date: date) -> list[date]:
+        """获取 A 股交易日历，用于 K 线缺口补采和调度对齐。"""
+
+        df = ak.tool_trade_date_hist_sina()
+        if "trade_date" in df.columns:
+            column = "trade_date"
+        elif "交易日" in df.columns:
+            column = "交易日"
+        else:
+            column = df.columns[0]
+        parsed = pd.to_datetime(df[column], errors="coerce").dt.date
+        return sorted(
+            trade_date
+            for trade_date in parsed.dropna().tolist()
+            if start_date <= trade_date <= end_date
+        )
 
     def health_check(self) -> dict[str, Any]:
         """轻量健康检查。"""
