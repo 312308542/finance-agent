@@ -2821,6 +2821,61 @@ class MemoryRepository:
             )
         )
 
+    def list_memories(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str | None = None,
+        memory_type: str | None = None,
+        statuses: Sequence[str] | None = ("active",),
+        limit: int = 20,
+    ) -> list[AssistantMemoryORM]:
+        """按资产、类型和状态查询 Finance Memory。"""
+
+        statement = select(AssistantMemoryORM).where(AssistantMemoryORM.owner_id == owner_id)
+        if asset_id:
+            statement = statement.where(AssistantMemoryORM.asset_id == asset_id)
+        if memory_type:
+            statement = statement.where(AssistantMemoryORM.memory_type == memory_type)
+        if statuses is not None:
+            statement = statement.where(AssistantMemoryORM.status.in_(tuple(statuses)))
+        return list(
+            self.session.scalars(
+                statement.order_by(
+                    AssistantMemoryORM.updated_at.desc(),
+                    AssistantMemoryORM.confidence.desc(),
+                ).limit(limit)
+            )
+        )
+
+    def list_memories_by_source_decision(
+        self,
+        *,
+        owner_id: str,
+        source_decision_id: str,
+        asset_id: str | None = None,
+        statuses: Sequence[str] | None = ("active",),
+        limit: int = 20,
+    ) -> list[AssistantMemoryORM]:
+        """查询由同一决策沉淀出来的 Finance Memory。"""
+
+        statement = select(AssistantMemoryORM).where(
+            AssistantMemoryORM.owner_id == owner_id,
+            AssistantMemoryORM.source_decision_id == source_decision_id,
+        )
+        if asset_id:
+            statement = statement.where(AssistantMemoryORM.asset_id == asset_id)
+        if statuses is not None:
+            statement = statement.where(AssistantMemoryORM.status.in_(tuple(statuses)))
+        return list(
+            self.session.scalars(
+                statement.order_by(
+                    AssistantMemoryORM.updated_at.desc(),
+                    AssistantMemoryORM.confidence.desc(),
+                ).limit(limit)
+            )
+        )
+
 
 class ChatMemoryRepository:
     """CLI 聊天会话和消息仓储。
