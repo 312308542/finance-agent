@@ -189,6 +189,7 @@ def summarize_archive(task: str, archive: ArchivedProviderResult) -> CollectionT
             "actual_source": result.payload.get("actual_source"),
             "fallback_used": result.payload.get("fallback_used"),
             "source_coverage": result.payload.get("source_coverage"),
+            "rate_limited": result.payload.get("rate_limited"),
         },
     )
 

@@ -7,6 +7,7 @@ from typing import Any
 
 import ccxt
 
+from finance_agent.application.data_production_service import BinanceRateLimitPolicy
 from finance_agent.data.models import AssetListResult, MarketBarsResult
 from finance_agent.data.normalizers import normalize_crypto_markets, normalize_crypto_ohlcv
 
@@ -35,6 +36,9 @@ class CcxtBinanceProvider:
                 "options": {"defaultType": default_type},
             }
         )
+        self.rate_limit_policy = BinanceRateLimitPolicy(
+            base_urls=("https://api.binance.com", "https://api1.binance.com", "https://api2.binance.com")
+        )
 
     def fetch_assets(self, *, limit: int | None = None) -> AssetListResult:
         """获取 Binance 交易对列表。"""
@@ -53,6 +57,10 @@ class CcxtBinanceProvider:
                 status="error",
                 collected_at=collected_at,
                 error_message=str(exc),
+                payload={
+                    "default_type": self.default_type,
+                    "rate_limited": self.rate_limit_policy.is_rate_limited(exc),
+                },
             )
         return AssetListResult(
             provider_name=self.provider_name,
@@ -98,6 +106,12 @@ class CcxtBinanceProvider:
                 status="error",
                 collected_at=collected_at,
                 error_message=str(exc),
+                payload={
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "default_type": self.default_type,
+                    "rate_limited": self.rate_limit_policy.is_rate_limited(exc),
+                },
             )
         return MarketBarsResult(
             provider_name=self.provider_name,
