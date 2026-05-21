@@ -7,15 +7,18 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 import akshare as ak
 
 from finance_agent.data.models import RiskFindingsResult, SentimentSignalsResult
 from finance_agent.data.normalizers import (
     normalize_ashare_block_trades,
+    normalize_ashare_delist_list,
     normalize_ashare_hot_rank,
     normalize_ashare_lhb_detail,
     normalize_ashare_margin_summary,
+    normalize_ashare_st_list,
     normalize_ashare_stop_list,
     normalize_ashare_zt_pool,
 )
@@ -28,15 +31,18 @@ class AshareRiskProvider:
     provider_name = "akshare"
 
     def fetch_stop_list(self, *, limit: int | None = None) -> RiskFindingsResult:
-        """获取停牌列表，用于不可交易风险过滤。"""
+        """获取停复牌、ST 和退市相关风险，用于不可交易风险过滤。"""
 
         collected_at = datetime.now(tz=UTC)
         endpoint = "stock_zh_a_stop_em"
         primary_source = f"akshare:{endpoint}"
         fallback_trace: list[dict[str, str]] = []
+        actual_source = primary_source
+        source_coverage = None
+        risks: list[Any] = []
+        events: list[Any] = []
         try:
             df = ak.stock_zh_a_stop_em()
-            actual_source = primary_source
         except Exception as exc:
             fallback_trace.append({"source": primary_source, "error_message": str(exc)})
             try:
@@ -51,40 +57,51 @@ class AshareRiskProvider:
                         "error_message": str(fallback_exc),
                     }
                 )
-                return RiskFindingsResult(
-                    provider_name=self.provider_name,
-                    status="error",
+                df = None
+        if df is not None:
+            try:
+                risks, events = normalize_ashare_stop_list(
+                    df,
+                    source=actual_source,
                     collected_at=collected_at,
-                    error_message=str(fallback_exc),
-                    payload={
-                        "endpoint": endpoint,
-                        "primary_source": primary_source,
-                        "fallback_trace": fallback_trace,
-                    },
+                    limit=limit,
                 )
-        try:
-            risks, events = normalize_ashare_stop_list(
-                df,
-                source=actual_source,
+                source_coverage = df.attrs.get("source_coverage")
+            except Exception as exc:
+                fallback_trace.append(
+                    {
+                        "source": actual_source,
+                        "status": "normalize_error",
+                        "error_message": str(exc),
+                    }
+                )
+        supplemental_risks, supplemental_events, supplemental_trace = (
+            self._fetch_supplemental_trading_status_risks(
                 collected_at=collected_at,
                 limit=limit,
             )
-        except Exception as exc:
+        )
+        risks.extend(supplemental_risks)
+        events.extend(supplemental_events)
+        fallback_trace.extend(supplemental_trace)
+        if not risks and not events and df is None:
             return RiskFindingsResult(
                 provider_name=self.provider_name,
                 status="error",
                 collected_at=collected_at,
-                error_message=str(exc),
+                error_message="停复牌主源、curl_cffi fallback 和补充替代源均未返回可用风险数据",
                 payload={
                     "endpoint": endpoint,
                     "primary_source": primary_source,
-                    "actual_source": actual_source,
                     "fallback_trace": fallback_trace,
                 },
             )
+        status = "available" if risks or events else "unavailable"
+        if df is None and (risks or events):
+            status = "partial"
         return RiskFindingsResult(
             provider_name=self.provider_name,
-            status="available" if risks or events else "unavailable",
+            status=status,
             collected_at=collected_at,
             risks=risks,
             events=events,
@@ -95,9 +112,50 @@ class AshareRiskProvider:
                 "actual_source": actual_source,
                 "fallback_used": actual_source != primary_source,
                 "fallback_trace": fallback_trace,
-                "source_coverage": df.attrs.get("source_coverage"),
+                "source_coverage": source_coverage,
+                "risk_types": sorted({risk.risk_type for risk in risks}),
             },
         )
+
+    def _fetch_supplemental_trading_status_risks(
+        self,
+        *,
+        collected_at: datetime,
+        limit: int | None,
+    ) -> tuple[list[Any], list[Any], list[dict[str, str]]]:
+        """采集 ST 和退市替代源，补充单一停牌接口覆盖不足的问题。"""
+
+        risks: list[Any] = []
+        events: list[Any] = []
+        trace: list[dict[str, str]] = []
+        for endpoint, loader, normalizer in (
+            ("stock_zh_a_st_em", ak.stock_zh_a_st_em, normalize_ashare_st_list),
+            ("stock_info_sh_delist", ak.stock_info_sh_delist, normalize_ashare_delist_list),
+            ("stock_info_sz_delist", ak.stock_info_sz_delist, normalize_ashare_delist_list),
+            ("stock_staq_net_stop", ak.stock_staq_net_stop, normalize_ashare_delist_list),
+        ):
+            source = f"akshare:{endpoint}"
+            try:
+                df = loader()
+                normalized_risks, normalized_events = normalizer(
+                    df,
+                    source=source,
+                    collected_at=collected_at,
+                    limit=limit,
+                )
+                risks.extend(normalized_risks)
+                events.extend(normalized_events)
+                trace.append(
+                    {
+                        "source": source,
+                        "status": "available" if normalized_risks or normalized_events else "empty",
+                    }
+                )
+            except AttributeError as exc:
+                trace.append({"source": source, "status": "missing", "error_message": str(exc)})
+            except Exception as exc:
+                trace.append({"source": source, "status": "error", "error_message": str(exc)})
+        return risks, events, trace
 
     def fetch_lhb_detail(
         self,

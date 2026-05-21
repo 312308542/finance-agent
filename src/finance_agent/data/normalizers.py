@@ -691,6 +691,136 @@ def normalize_ashare_stop_list(
     return risks, events
 
 
+def normalize_ashare_st_list(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    collected_at: datetime,
+    limit: int | None = None,
+) -> tuple[list[RiskFindingData], list[EventRecordData]]:
+    """归一化 A 股 ST/风险警示列表为回避风险。"""
+
+    risks: list[RiskFindingData] = []
+    events: list[EventRecordData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        symbol = normalize_ashare_symbol(str(_first_present(row, ["代码", "股票代码"]) or ""))
+        if not symbol:
+            continue
+        name = str(_first_present(row, ["名称", "股票简称", "股票名称"]) or symbol).strip()
+        risk_at = (
+            parse_ashare_datetime(_first_present(row, ["日期", "公告日期", "交易日期"]))
+            or collected_at
+        )
+        title = f"{name}({symbol}) 风险警示"
+        description = str(_first_present(row, ["原因", "风险原因", "备注"]) or "ST/风险警示")
+        asset_id = f"ashare:{symbol}"
+        event_id = stable_id("event", source, "st_risk", symbol, risk_at.isoformat())
+        risk_id = stable_id("risk", source, "st_risk", symbol, risk_at.isoformat())
+        events.append(
+            EventRecordData(
+                event_id=event_id,
+                asset_id=asset_id,
+                symbol=symbol,
+                market="ashare",
+                event_type="st_risk",
+                title=title[:255],
+                summary=description,
+                sentiment="negative",
+                importance="high",
+                source=source,
+                published_at=risk_at,
+                collected_at=collected_at,
+                payload={"raw": row},
+            )
+        )
+        risks.append(
+            RiskFindingData(
+                risk_id=risk_id,
+                asset_id=asset_id,
+                scope="asset",
+                risk_type="st_risk",
+                severity="high",
+                score=Decimal("0.9"),
+                title=title[:255],
+                description=description,
+                as_of=risk_at,
+                evidence_ids=[event_id],
+                payload={"raw": row, "event_id": event_id},
+            )
+        )
+    return risks, events
+
+
+def normalize_ashare_delist_list(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    collected_at: datetime,
+    limit: int | None = None,
+) -> tuple[list[RiskFindingData], list[EventRecordData]]:
+    """归一化 A 股退市相关列表为退市风险和事件。"""
+
+    risks: list[RiskFindingData] = []
+    events: list[EventRecordData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        symbol = normalize_ashare_symbol(
+            str(_first_present(row, ["代码", "证券代码", "股票代码"]) or "")
+        )
+        if not symbol:
+            continue
+        name = str(
+            _first_present(row, ["名称", "证券简称", "股票简称", "股票名称"]) or symbol
+        ).strip()
+        delist_at = (
+            parse_ashare_datetime(
+                _first_present(row, ["退市日期", "终止上市日期", "摘牌日期", "日期", "公告日期"])
+            )
+            or collected_at
+        )
+        reason = str(
+            _first_present(row, ["原因", "退市原因", "终止上市原因", "备注"]) or "退市风险"
+        )
+        title = f"{name}({symbol}) 退市相关风险"
+        asset_id = f"ashare:{symbol}"
+        event_id = stable_id("event", source, "delist_risk", symbol, delist_at.isoformat())
+        risk_id = stable_id("risk", source, "delist_risk", symbol, delist_at.isoformat())
+        events.append(
+            EventRecordData(
+                event_id=event_id,
+                asset_id=asset_id,
+                symbol=symbol,
+                market="ashare",
+                event_type="delist_risk",
+                title=title[:255],
+                summary=reason,
+                sentiment="negative",
+                importance="high",
+                source=source,
+                published_at=delist_at,
+                collected_at=collected_at,
+                payload={"raw": row},
+            )
+        )
+        risks.append(
+            RiskFindingData(
+                risk_id=risk_id,
+                asset_id=asset_id,
+                scope="asset",
+                risk_type="delist_risk",
+                severity="critical",
+                score=Decimal("1.0"),
+                title=title[:255],
+                description=reason,
+                as_of=delist_at,
+                evidence_ids=[event_id],
+                payload={"raw": row, "event_id": event_id},
+            )
+        )
+    return risks, events
+
+
 def normalize_ashare_hot_rank(
     df: pd.DataFrame,
     *,
