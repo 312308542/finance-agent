@@ -271,10 +271,12 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 - `AshareRiskSentimentCollector` 已接入第一批 P2 风险/情绪数据，并可通过 `collect_base_data.py --group ashare-risk` 统一采集。
 - 当前网络下 `stock_hot_rank_em` 可用；若 AKShare 普通请求断连，可走仓库侧 `eastmoney:curl_cffi:stock_hot_rank_em` fallback。该 fallback 在报价段断连时会降级为 `source_coverage=rank_only`，只作为热度种子，不承诺实时价格字段完整。
 - 当前网络下 `stock_zt_pool_em`、`stock_lhb_detail_em`、`stock_dzjy_mrmx`、`stock_margin_sse`、`stock_margin_szse` 可用，分别写入候选池、事件、证据和 `risk_findings`。
-- 当前网络下 `stock_zh_a_stop_em` 仍可能被 Eastmoney `clist/get` 上游断开；AKShare 失败和仓库侧 `curl_cffi` fallback 失败都会进入 `raw_records`，后续需要补充停复牌/退市替代源。
+- 当前网络下 `stock_zh_a_stop_em` 仍可能被 Eastmoney `clist/get` 上游断开；AKShare 失败和仓库侧 `curl_cffi` fallback 失败都会进入 `raw_records`。已补充 `stock_zh_a_st_em`、沪深退市和两网退市/暂停上市等替代源，主停牌源失败时仍可用 `partial` 状态写入 ST/退市风险。
+- A 股交易日历已接入 `AkshareProvider.fetch_trade_dates()`，底层使用 `tool_trade_date_hist_sina` 写入 `market_calendars`；`collect_base_data.py` 会在 A 股 Universe、行情补采和独立 `calendar_refresh` 中刷新日历。
+- `scripts/data/check_base_data_health.py` 已把 `market_calendars` 纳入健康检查，并输出可供 `finance-agent data production backfill-plan` 使用的 `backfill_jobs`。
 
 下一步应补：
 
-1. 接入正式基础数据调度器，按 A 股交易日、盘中/盘后刷新窗口和 Provider 健康状态分组执行。
-2. 继续补停复牌、退市、限售解禁和质押等风险替代源，降低单一 Eastmoney 接口断连影响。
-3. 在因子计算服务中使用 AKShare 已落库的行情、资金流、财务估值、事件和风险数据。
+1. 继续补限售解禁、质押、北向资金和更多市场级风险源，降低单一接口断连影响。
+2. 在推荐运行入口引用回避池和多候选池合并结果，避免高风险标的进入 Agent 决策候选。
+3. 在因子计算服务中继续扩展 AKShare 已落库的行情、资金流、财务估值、事件和风险数据。
