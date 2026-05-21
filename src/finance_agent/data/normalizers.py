@@ -208,6 +208,53 @@ def normalize_ashare_board_members(
     return seeds
 
 
+def normalize_ashare_index_members(
+    df: pd.DataFrame,
+    *,
+    index_code: str,
+    index_name: str,
+    source: str,
+    as_of: datetime,
+    limit: int | None = None,
+) -> list[UniverseSeedData]:
+    """归一化 AKShare 指数成分股。"""
+
+    seeds: list[UniverseSeedData] = []
+    rows = df.head(limit) if limit else df
+    for index, row in enumerate(rows.to_dict("records"), start=1):
+        raw_symbol = _first_present(row, ["成分券代码", "品种代码", "代码", "股票代码"])
+        symbol = strip_ashare_exchange_prefix(str(raw_symbol or ""))
+        if not symbol:
+            continue
+        name = str(
+            _first_present(row, ["成分券名称", "品种名称", "名称", "股票名称"])
+            or symbol
+        ).strip()
+        effective_index_name = str(
+            _first_present(row, ["指数名称"]) or index_name or index_code
+        ).strip()
+        seeds.append(
+            UniverseSeedData(
+                seed_id=stable_id("seed", "index", index_code, symbol),
+                source_name=effective_index_name,
+                source_type="index",
+                symbol=symbol,
+                name=name,
+                market="ashare",
+                asset_id=f"ashare:{symbol}",
+                rank_hint=index,
+                as_of=parse_ashare_datetime(_first_present(row, ["日期", "纳入日期"])) or as_of,
+                payload={
+                    "raw": row,
+                    "index_code": index_code,
+                    "index_name": effective_index_name,
+                    "source": source,
+                },
+            )
+        )
+    return seeds
+
+
 def normalize_ashare_fund_flow_rank(
     df: pd.DataFrame,
     *,

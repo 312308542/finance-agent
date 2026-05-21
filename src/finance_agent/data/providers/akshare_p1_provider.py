@@ -13,11 +13,13 @@ import akshare as ak
 from finance_agent.data.models import (
     CapitalFlowSnapshotsResult,
     EventRecordsResult,
+    ProviderResult,
     UniverseSeedsResult,
 )
 from finance_agent.data.normalizers import (
     normalize_ashare_board_members,
     normalize_ashare_fund_flow_rank,
+    normalize_ashare_index_members,
     normalize_ashare_notice_reports,
     normalize_ashare_stock_news,
 )
@@ -28,6 +30,158 @@ class AshareSectorProvider:
     """A 股行业/概念种子 Provider。"""
 
     provider_name = "akshare"
+
+    def fetch_index_catalog(self, *, limit: int | None = None) -> ProviderResult:
+        """获取 A 股指数目录，供 Universe 刷新自动展开指数成分。"""
+
+        collected_at = datetime.now(tz=UTC)
+        try:
+            df = ak.index_stock_info()
+            indexes = _extract_index_catalog(df, limit=limit)
+        except Exception as exc:
+            return ProviderResult(
+                provider_name=self.provider_name,
+                status="error",
+                collected_at=collected_at,
+                error_message=str(exc),
+                payload={"endpoint": "index_stock_info"},
+            )
+        return ProviderResult(
+            provider_name=self.provider_name,
+            status="available" if indexes else "unavailable",
+            collected_at=collected_at,
+            payload={
+                "endpoint": "index_stock_info",
+                "row_count": len(indexes),
+                "indexes": indexes,
+            },
+        )
+
+    def fetch_industry_names(self, *, limit: int | None = None) -> ProviderResult:
+        """获取东方财富行业板块目录。"""
+
+        collected_at = datetime.now(tz=UTC)
+        try:
+            df = ak.stock_board_industry_name_em()
+            names = _extract_name_catalog(df, ["板块名称", "名称", "行业名称"], limit=limit)
+        except Exception as exc:
+            return ProviderResult(
+                provider_name=self.provider_name,
+                status="error",
+                collected_at=collected_at,
+                error_message=str(exc),
+                payload={"endpoint": "stock_board_industry_name_em"},
+            )
+        return ProviderResult(
+            provider_name=self.provider_name,
+            status="available" if names else "unavailable",
+            collected_at=collected_at,
+            payload={
+                "endpoint": "stock_board_industry_name_em",
+                "row_count": len(names),
+                "names": names,
+            },
+        )
+
+    def fetch_concept_names(self, *, limit: int | None = None) -> ProviderResult:
+        """获取东方财富概念板块目录。"""
+
+        collected_at = datetime.now(tz=UTC)
+        try:
+            df = ak.stock_board_concept_name_em()
+            names = _extract_name_catalog(df, ["板块名称", "名称", "概念名称"], limit=limit)
+        except Exception as exc:
+            return ProviderResult(
+                provider_name=self.provider_name,
+                status="error",
+                collected_at=collected_at,
+                error_message=str(exc),
+                payload={"endpoint": "stock_board_concept_name_em"},
+            )
+        return ProviderResult(
+            provider_name=self.provider_name,
+            status="available" if names else "unavailable",
+            collected_at=collected_at,
+            payload={
+                "endpoint": "stock_board_concept_name_em",
+                "row_count": len(names),
+                "names": names,
+            },
+        )
+
+    def fetch_index_members(
+        self,
+        *,
+        index_code: str,
+        index_name: str | None = None,
+        limit: int | None = None,
+    ) -> UniverseSeedsResult:
+        """获取指数成分股作为候选池种子。"""
+
+        collected_at = datetime.now(tz=UTC)
+        fallback_trace: list[dict[str, str]] = []
+        primary_source = "akshare:index_stock_cons_csindex"
+        try:
+            df = ak.index_stock_cons_csindex(symbol=index_code)
+            actual_source = primary_source
+        except Exception as exc:
+            fallback_trace.append({"source": primary_source, "error_message": str(exc)})
+            try:
+                df = ak.index_stock_cons_sina(symbol=index_code)
+                actual_source = "akshare:index_stock_cons_sina"
+            except Exception as sina_exc:
+                fallback_trace.append(
+                    {
+                        "source": "akshare:index_stock_cons_sina",
+                        "error_message": str(sina_exc),
+                    }
+                )
+                try:
+                    df = ak.index_stock_cons(symbol=index_code)
+                    actual_source = "akshare:index_stock_cons"
+                except Exception as fallback_exc:
+                    fallback_trace.append(
+                        {
+                            "source": "akshare:index_stock_cons",
+                            "error_message": str(fallback_exc),
+                        }
+                    )
+                    return UniverseSeedsResult(
+                        provider_name=self.provider_name,
+                        status="error",
+                        collected_at=collected_at,
+                        error_message=str(fallback_exc),
+                        payload={
+                            "endpoint": "index_stock_cons_csindex",
+                            "symbol": index_code,
+                            "primary_source": primary_source,
+                            "fallback_trace": fallback_trace,
+                        },
+                    )
+        seeds = normalize_ashare_index_members(
+            df,
+            index_code=index_code,
+            index_name=index_name or index_code,
+            source=actual_source,
+            as_of=collected_at,
+            limit=limit,
+        )
+        return UniverseSeedsResult(
+            provider_name=self.provider_name,
+            status="available" if seeds else "unavailable",
+            collected_at=collected_at,
+            seeds=seeds,
+            payload={
+                "endpoint": "index_stock_cons_csindex",
+                "symbol": index_code,
+                "index_name": index_name,
+                "row_count": len(seeds),
+                "primary_source": primary_source,
+                "actual_source": actual_source,
+                "fallback_used": actual_source != primary_source,
+                "fallback_trace": fallback_trace,
+            },
+        )
 
     def fetch_industry_members(
         self,
@@ -347,3 +501,48 @@ class AshareEventProvider:
                 "row_count": len(events),
             },
         )
+
+
+def _extract_name_catalog(
+    df: object,
+    candidates: list[str],
+    *,
+    limit: int | None = None,
+) -> list[str]:
+    """从 AKShare 目录 DataFrame 中提取板块名称。"""
+
+    rows = df.head(limit).to_dict("records") if limit else df.to_dict("records")
+    names: list[str] = []
+    for row in rows:
+        value = _first_present(row, candidates)
+        name = str(value or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _extract_index_catalog(df: object, *, limit: int | None = None) -> list[dict[str, str]]:
+    """从 AKShare 指数目录 DataFrame 中提取指数代码和名称。"""
+
+    rows = df.head(limit).to_dict("records") if limit else df.to_dict("records")
+    indexes: list[dict[str, str]] = []
+    for row in rows:
+        code = str(
+            _first_present(row, ["index_code", "指数代码", "代码", "symbol"]) or ""
+        ).strip()
+        name = str(
+            _first_present(row, ["display_name", "指数名称", "名称", "name"]) or code
+        ).strip()
+        if code:
+            indexes.append({"code": code, "name": name or code})
+    return indexes
+
+
+def _first_present(row: dict[str, object], candidates: list[str]) -> object | None:
+    """返回第一列存在且非空的值。"""
+
+    for key in candidates:
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return value
+    return None

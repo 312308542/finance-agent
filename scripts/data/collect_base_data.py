@@ -25,6 +25,7 @@ from finance_agent.data.collectors import (
     CryptoDataCollector,
 )
 from finance_agent.storage.db import create_session_factory, session_scope
+from finance_agent.storage.repositories import AssetRepository
 
 JsonDict = dict[str, Any]
 
@@ -32,6 +33,13 @@ ALL_GROUPS = ("ashare-p0", "ashare-p1", "ashare-p2", "ashare-risk", "crypto")
 COLLECTION_ARG_DEFAULTS: JsonDict = {
     "group": ["ashare-p1"],
     "limit": 5,
+    "sync_task_type": None,
+    "mode": None,
+    "sources": [],
+    "data_packages": [],
+    "batch_size": 200,
+    "lookback": None,
+    "symbol_source": "market_assets",
     "ashare_symbol": "000001",
     "ashare_name": "平安银行",
     "ashare_start": "20260501",
@@ -40,6 +48,10 @@ COLLECTION_ARG_DEFAULTS: JsonDict = {
     "ashare_adjust": "qfq",
     "industry": "银行",
     "concept": "融资融券",
+    "index_catalog_limit": 20,
+    "industry_catalog_limit": 120,
+    "concept_catalog_limit": 200,
+    "catalog_member_limit": 0,
     "flow_window": "5日",
     "report_date": "20250331",
     "risk_start": "20260501",
@@ -106,7 +118,6 @@ def collect_base_data(args: argparse.Namespace) -> JsonDict:
         selected_groups = set(args.group)
         if "all" in selected_groups:
             selected_groups = set(ALL_GROUPS)
-
         if "ashare-p0" in selected_groups:
             results.extend(run_ashare_p0(session, args, runtime))
         if "ashare-p1" in selected_groups:
@@ -122,6 +133,9 @@ def collect_base_data(args: argparse.Namespace) -> JsonDict:
         "started_at": started_at.isoformat(),
         "finished_at": datetime.now(tz=UTC).isoformat(),
         "groups": args.group,
+        "sync_task_type": getattr(args, "sync_task_type", None),
+        "mode": getattr(args, "mode", None),
+        "data_packages": getattr(args, "data_packages", []),
         "cache": cache_status.__dict__,
         "total_tasks": len(results),
         "available": sum(1 for item in results if item.status == "available"),
@@ -190,6 +204,30 @@ def parse_args() -> argparse.Namespace:
         "--concept",
         default=COLLECTION_ARG_DEFAULTS["concept"],
         help="A 股概念种子名称",
+    )
+    parser.add_argument(
+        "--index-catalog-limit",
+        type=int,
+        default=COLLECTION_ARG_DEFAULTS["index_catalog_limit"],
+        help="Universe 刷新时自动展开的指数目录数量；0 表示不限制",
+    )
+    parser.add_argument(
+        "--industry-catalog-limit",
+        type=int,
+        default=COLLECTION_ARG_DEFAULTS["industry_catalog_limit"],
+        help="Universe 刷新时自动展开的行业目录数量；0 表示不限制",
+    )
+    parser.add_argument(
+        "--concept-catalog-limit",
+        type=int,
+        default=COLLECTION_ARG_DEFAULTS["concept_catalog_limit"],
+        help="Universe 刷新时自动展开的概念目录数量；0 表示不限制",
+    )
+    parser.add_argument(
+        "--catalog-member-limit",
+        type=int,
+        default=COLLECTION_ARG_DEFAULTS["catalog_member_limit"],
+        help="每个指数/行业/概念成员采集条数；0 表示不限制，调度任务 limit 只控制目录数量",
     )
     parser.add_argument(
         "--flow-window",
@@ -275,6 +313,61 @@ def run_ashare_p0(
     """执行 A 股 P0 资产和行情采集。"""
 
     collector = AshareP0Collector(session)
+    task_type = task_type_name(args)
+    if task_type == "universe_refresh":
+        return [
+            runtime.run_task(
+                task="ashare_p0_assets",
+                provider_key="stock_zh_a_spot",
+                parameters={"limit": args.limit},
+                force=args.force_provider,
+                collect=lambda: collector.collect_assets(
+                    universe_id="universe:base:ashare:p0:all_a",
+                    universe_name="基础数据全 A 候选池",
+                    strategy_context="base_data_collect",
+                    limit=args.limit,
+                ),
+            )
+        ]
+    if task_type == "realtime_quote_refresh":
+        return [
+            runtime.run_task(
+                task="ashare_p0_assets",
+                provider_key="stock_zh_a_spot",
+                parameters={"limit": args.limit},
+                force=args.force_provider,
+                collect=lambda: collector.collect_assets(
+                    universe_id="universe:base:ashare:p0:all_a",
+                    universe_name="基础数据全 A 候选池",
+                    strategy_context="base_data_collect",
+                    limit=args.limit,
+                ),
+            )
+        ]
+    if task_type == "market_bars_backfill":
+        return [
+            runtime.run_task(
+                task="ashare_p0_ohlcv",
+                provider_key="stock_zh_a_hist",
+                parameters={
+                    "symbol": args.ashare_symbol,
+                    "timeframe": args.ashare_timeframe,
+                    "start": args.ashare_start,
+                    "end": args.ashare_end,
+                    "adjust": args.ashare_adjust,
+                    "limit": args.limit,
+                },
+                force=args.force_provider,
+                collect=lambda: collector.collect_ohlcv(
+                    symbol=args.ashare_symbol,
+                    timeframe=args.ashare_timeframe,
+                    start=args.ashare_start,
+                    end=args.ashare_end,
+                    limit=args.limit,
+                    adjust=args.ashare_adjust,
+                ),
+            )
+        ]
     return [
         runtime.run_task(
             task="ashare_p0_assets",
@@ -282,8 +375,8 @@ def run_ashare_p0(
             parameters={"limit": args.limit},
             force=args.force_provider,
             collect=lambda: collector.collect_assets(
-                universe_id="universe:base:ashare:p0:all_a_sample",
-                universe_name="基础数据采集 A 股样例池",
+                universe_id="universe:base:ashare:p0:all_a",
+                universe_name="基础数据全 A 候选池",
                 strategy_context="base_data_collect",
                 limit=args.limit,
             ),
@@ -320,55 +413,233 @@ def run_ashare_p1(
     """执行 A 股 P1 行业、概念、资金流和新闻采集。"""
 
     collector = AshareP1Collector(session)
-    return [
-        runtime.run_task(
-            task="ashare_p1_industry_members",
-            provider_key="stock_board_industry_cons_em",
-            parameters={"industry": args.industry, "limit": args.limit},
-            force=args.force_provider,
-            collect=lambda: collector.collect_industry_members(
-                industry_name=args.industry,
-                universe_id=f"universe:base:ashare:p1:industry:{args.industry}",
-                universe_name=f"基础数据采集行业种子池-{args.industry}",
-                strategy_context="base_data_collect",
-                limit=args.limit,
+    task_type = task_type_name(args)
+    if task_type == "universe_refresh":
+        return build_ashare_p1_universe_tasks(collector, args, runtime)
+    if task_type == "capital_flow_refresh":
+        return [
+            runtime.run_task(
+                task="ashare_p1_flow_rank",
+                provider_key="stock_individual_fund_flow_rank",
+                parameters={"indicator": args.flow_window, "limit": args.limit},
+                force=args.force_provider,
+                collect=lambda: collector.collect_flow_rank(
+                    indicator=args.flow_window,
+                    limit=args.limit,
+                ),
+            )
+        ]
+    if task_type == "event_refresh":
+        return [
+            runtime.run_task(
+                task="ashare_p1_stock_news",
+                provider_key="stock_news_em",
+                parameters={"symbol": args.ashare_symbol, "limit": min(args.limit, 3)},
+                force=args.force_provider,
+                collect=lambda: collector.collect_stock_news(
+                    symbol=args.ashare_symbol,
+                    asset_name=args.ashare_name,
+                    limit=min(args.limit, 3),
+                ),
             ),
-        ),
-        runtime.run_task(
-            task="ashare_p1_concept_members",
-            provider_key="stock_board_concept_cons_em",
-            parameters={"concept": args.concept, "limit": args.limit},
-            force=args.force_provider,
-            collect=lambda: collector.collect_concept_members(
-                concept_name=args.concept,
-                universe_id=f"universe:base:ashare:p1:concept:{args.concept}",
-                universe_name=f"基础数据采集概念种子池-{args.concept}",
-                strategy_context="base_data_collect",
-                limit=args.limit,
+            runtime.run_task(
+                task="ashare_p1_notice_reports",
+                provider_key="stock_notice_report",
+                parameters={"symbol": "全部", "date": args.risk_end, "limit": min(args.limit, 10)},
+                force=args.force_provider,
+                collect=lambda: collector.collect_notice_reports(
+                    symbol="全部",
+                    date=args.risk_end,
+                    limit=min(args.limit, 10),
+                ),
             ),
+        ]
+    return build_ashare_p1_default_tasks(collector, args, runtime)
+
+
+def build_ashare_p1_universe_tasks(
+    collector: AshareP1Collector,
+    args: argparse.Namespace,
+    runtime: CollectionRuntime,
+) -> list[CollectionTaskResult]:
+    """按目录自动展开 A 股 P1 的 universe_refresh 任务。"""
+
+    tasks: list[CollectionTaskResult] = []
+    index_sources = fetch_catalog_entries(
+        collector.sector_provider.fetch_index_catalog(limit=positive_limit(args.index_catalog_limit)),
+        key="indexes",
+        default=[{"code": "000300", "name": "沪深300"}],
+    )
+    industry_sources = fetch_catalog_entries(
+        collector.sector_provider.fetch_industry_names(
+            limit=positive_limit(args.industry_catalog_limit)
         ),
+        key="names",
+        default=[args.industry],
+    )
+    concept_sources = fetch_catalog_entries(
+        collector.sector_provider.fetch_concept_names(
+            limit=positive_limit(args.concept_catalog_limit)
+        ),
+        key="names",
+        default=[args.concept],
+    )
+    member_limit = normalize_member_limit(args.catalog_member_limit)
+    index_limit = positive_limit(args.limit)
+
+    for item in index_sources:
+        index_code = str(item.get("code") or "").strip()
+        index_name = str(item.get("name") or index_code).strip()
+        if not index_code:
+            continue
+        tasks.append(
+            runtime.run_task(
+                task=f"ashare_p1_index_members:{index_code}",
+                provider_key="index_stock_cons_csindex",
+                parameters={
+                    "index_code": index_code,
+                    "index_name": index_name,
+                    "limit": member_limit,
+                },
+                force=args.force_provider,
+                collect=lambda index_code=index_code, index_name=index_name: collector.collect_index_members(
+                    index_code=index_code,
+                    index_name=index_name,
+                    universe_id=f"universe:base:ashare:p1:index:{index_code}",
+                    universe_name=f"基础数据指数种子池-{index_name}",
+                    strategy_context="base_data_collect",
+                    limit=member_limit,
+                ),
+            )
+        )
+
+    for industry_name in industry_sources:
+        normalized_name = str(industry_name).strip()
+        if not normalized_name:
+            continue
+        tasks.append(
+            runtime.run_task(
+                task=f"ashare_p1_industry_members:{normalized_name}",
+                provider_key="stock_board_industry_cons_em",
+                parameters={"industry": normalized_name, "limit": member_limit},
+                force=args.force_provider,
+                collect=lambda industry_name=normalized_name: collector.collect_industry_members(
+                    industry_name=industry_name,
+                    universe_id=f"universe:base:ashare:p1:industry:{industry_name}",
+                    universe_name=f"基础数据采集行业种子池-{industry_name}",
+                    strategy_context="base_data_collect",
+                    limit=member_limit,
+                ),
+            )
+        )
+
+    for concept_name in concept_sources:
+        normalized_name = str(concept_name).strip()
+        if not normalized_name:
+            continue
+        tasks.append(
+            runtime.run_task(
+                task=f"ashare_p1_concept_members:{normalized_name}",
+                provider_key="stock_board_concept_cons_em",
+                parameters={"concept": normalized_name, "limit": member_limit},
+                force=args.force_provider,
+                collect=lambda concept_name=normalized_name: collector.collect_concept_members(
+                    concept_name=concept_name,
+                    universe_id=f"universe:base:ashare:p1:concept:{concept_name}",
+                    universe_name=f"基础数据采集概念种子池-{concept_name}",
+                    strategy_context="base_data_collect",
+                    limit=member_limit,
+                ),
+            )
+        )
+
+    tasks.append(
         runtime.run_task(
             task="ashare_p1_flow_rank",
             provider_key="stock_individual_fund_flow_rank",
-            parameters={"indicator": args.flow_window, "limit": args.limit},
+            parameters={"indicator": args.flow_window, "limit": index_limit},
             force=args.force_provider,
             collect=lambda: collector.collect_flow_rank(
                 indicator=args.flow_window,
-                limit=args.limit,
+                limit=index_limit,
             ),
-        ),
+        )
+    )
+    return tasks
+
+
+def build_ashare_p1_default_tasks(
+    collector: AshareP1Collector,
+    args: argparse.Namespace,
+    runtime: CollectionRuntime,
+) -> list[CollectionTaskResult]:
+    """构建 A 股 P1 的默认任务包。"""
+
+    return [
+        *build_ashare_p1_universe_tasks(collector, args, runtime),
         runtime.run_task(
             task="ashare_p1_stock_news",
             provider_key="stock_news_em",
-            parameters={"symbol": args.ashare_symbol, "limit": min(args.limit, 3)},
+            parameters={"symbol": args.ashare_symbol, "limit": bounded_limit(args.limit, 3)},
             force=args.force_provider,
             collect=lambda: collector.collect_stock_news(
                 symbol=args.ashare_symbol,
                 asset_name=args.ashare_name,
-                limit=min(args.limit, 3),
+                limit=bounded_limit(args.limit, 3),
+            ),
+        ),
+        runtime.run_task(
+            task="ashare_p1_notice_reports",
+            provider_key="stock_notice_report",
+            parameters={
+                "symbol": "全部",
+                "date": args.risk_end,
+                "limit": bounded_limit(args.limit, 10),
+            },
+            force=args.force_provider,
+            collect=lambda: collector.collect_notice_reports(
+                symbol="全部",
+                date=args.risk_end,
+                limit=bounded_limit(args.limit, 10),
             ),
         ),
     ]
+
+
+def fetch_catalog_entries(result: Any, *, key: str, default: list[dict[str, str]] | list[str]) -> list[Any]:
+    """从目录 Provider 结果中抽取条目；失败时使用默认值。"""
+
+    payload = getattr(result, "payload", {}) or {}
+    entries = payload.get(key)
+    if isinstance(entries, list) and entries:
+        return entries
+    return list(default)
+
+
+def positive_limit(value: Any) -> int | None:
+    """把 0 转换为不限，其他值保持正整数。"""
+
+    if value in {None, "", 0, "0"}:
+        return None
+    number = int(value)
+    if number <= 0:
+        return None
+    return number
+
+
+def normalize_member_limit(value: Any) -> int | None:
+    """把成员展开限制标准化。"""
+
+    limit = positive_limit(value)
+    return limit if limit is not None else None
+
+
+def bounded_limit(limit: int | None, upper: int) -> int:
+    """对可为空的限制值取上限。"""
+
+    if limit is None:
+        return upper
+    return min(limit, upper)
 
 
 def run_ashare_p2(
@@ -379,6 +650,64 @@ def run_ashare_p2(
     """执行 A 股 P2 财务、估值和业绩采集。"""
 
     collector = AshareP2Collector(session)
+    task_type = task_type_name(args)
+    if task_type == "fundamental_refresh":
+        symbols = batch_ashare_symbols(
+            session,
+            limit=args.limit,
+            fallback_symbol=args.ashare_symbol,
+        )
+        tasks: list[CollectionTaskResult] = []
+        for symbol in symbols:
+            tasks.extend(
+                [
+                    runtime.run_task(
+                        task="ashare_p2_financial_indicators",
+                        provider_key="stock_financial_analysis_indicator_em",
+                        parameters={"symbol": symbol, "limit": args.limit},
+                        force=args.force_provider,
+                        collect=lambda symbol=symbol: collector.collect_financial_indicators(
+                            symbol=symbol,
+                            asset_name=asset_name_for_symbol(session, symbol),
+                            limit=args.limit,
+                        ),
+                    ),
+                    runtime.run_task(
+                        task="ashare_p2_valuation",
+                        provider_key="stock_value_em",
+                        parameters={"symbol": symbol, "limit": args.limit},
+                        force=args.force_provider,
+                        collect=lambda symbol=symbol: collector.collect_valuation(
+                            symbol=symbol,
+                            asset_name=asset_name_for_symbol(session, symbol),
+                            limit=args.limit,
+                        ),
+                    ),
+                ]
+            )
+        tasks.append(
+            runtime.run_task(
+                task="ashare_p2_performance_report",
+                provider_key="stock_yjbb_em",
+                parameters={"date": args.report_date, "report_type": "业绩报表", "limit": args.limit},
+                force=args.force_provider,
+                collect=lambda: collector.collect_performance_report(
+                    date=args.report_date,
+                    report_type="业绩报表",
+                    limit=args.limit,
+                ),
+            )
+        )
+        tasks.append(
+            runtime.run_task(
+                task="ashare_p2_dividend_yield",
+                provider_key="stock_a_gxl_lg",
+                parameters={"limit": args.limit},
+                force=args.force_provider,
+                collect=lambda: collector.collect_dividend_yield(limit=args.limit),
+            )
+        )
+        return tasks
     return [
         runtime.run_task(
             task="ashare_p2_financial_indicators",
@@ -413,6 +742,13 @@ def run_ashare_p2(
                 limit=args.limit,
             ),
         ),
+        runtime.run_task(
+            task="ashare_p2_dividend_yield",
+            provider_key="stock_a_gxl_lg",
+            parameters={"limit": args.limit},
+            force=args.force_provider,
+            collect=lambda: collector.collect_dividend_yield(limit=args.limit),
+        ),
     ]
 
 
@@ -424,6 +760,96 @@ def run_ashare_risk(
     """执行 A 股风险和短线情绪采集。"""
 
     collector = AshareRiskSentimentCollector(session)
+    task_type = task_type_name(args)
+    if task_type == "risk_sentiment_refresh":
+        return [
+            runtime.run_task(
+                task="ashare_risk_stop_list",
+                provider_key="stock_zh_a_stop_em",
+                parameters={"limit": args.limit},
+                force=args.force_provider,
+                collect=lambda: collector.collect_stop_list(limit=args.limit),
+            ),
+            runtime.run_task(
+                task="ashare_sentiment_hot_rank",
+                provider_key="stock_hot_rank_em",
+                parameters={"limit": args.limit},
+                force=args.force_provider,
+                collect=lambda: collector.collect_hot_rank(
+                    universe_id="universe:base:ashare:p2:sentiment:hot_rank",
+                    universe_name="A 股人气榜观察池",
+                    strategy_context="base_data_collect",
+                    limit=args.limit,
+                ),
+            ),
+            runtime.run_task(
+                task="ashare_sentiment_zt_pool",
+                provider_key="stock_zt_pool_em",
+                parameters={"date": args.risk_end, "limit": args.limit},
+                force=args.force_provider,
+                collect=lambda: collector.collect_zt_pool(
+                    date=args.risk_end,
+                    universe_id=f"universe:base:ashare:p2:sentiment:zt_pool:{args.risk_end}",
+                    universe_name=f"A 股涨停池-{args.risk_end}",
+                    strategy_context="base_data_collect",
+                    limit=args.limit,
+                ),
+            ),
+            runtime.run_task(
+                task="ashare_risk_lhb_detail",
+                provider_key="stock_lhb_detail_em",
+                parameters={
+                    "start_date": args.risk_start,
+                    "end_date": args.risk_end,
+                    "limit": args.limit,
+                },
+                force=args.force_provider,
+                collect=lambda: collector.collect_lhb_detail(
+                    start_date=args.risk_start,
+                    end_date=args.risk_end,
+                    limit=args.limit,
+                ),
+            ),
+            runtime.run_task(
+                task="ashare_risk_block_trades",
+                provider_key="stock_dzjy_mrmx",
+                parameters={
+                    "symbol": args.risk_block_symbol,
+                    "start_date": args.risk_start,
+                    "end_date": args.risk_end,
+                    "limit": args.limit,
+                },
+                force=args.force_provider,
+                collect=lambda: collector.collect_block_trades(
+                    symbol=args.risk_block_symbol,
+                    start_date=args.risk_start,
+                    end_date=args.risk_end,
+                    limit=args.limit,
+                ),
+            ),
+            runtime.run_task(
+                task="ashare_risk_margin_sse",
+                provider_key="stock_margin_sse",
+                parameters={
+                    "start_date": args.risk_start,
+                    "end_date": args.risk_end,
+                    "limit": args.limit,
+                },
+                force=args.force_provider,
+                collect=lambda: collector.collect_margin_sse(
+                    start_date=args.risk_start,
+                    end_date=args.risk_end,
+                    limit=args.limit,
+                ),
+            ),
+            runtime.run_task(
+                task="ashare_risk_margin_szse",
+                provider_key="stock_margin_szse",
+                parameters={"date": args.risk_end, "limit": args.limit},
+                force=args.force_provider,
+                collect=lambda: collector.collect_margin_szse(date=args.risk_end, limit=args.limit),
+            ),
+        ]
     return [
         runtime.run_task(
             task="ashare_risk_stop_list",
@@ -439,7 +865,7 @@ def run_ashare_risk(
             force=args.force_provider,
             collect=lambda: collector.collect_hot_rank(
                 universe_id="universe:base:ashare:p2:sentiment:hot_rank",
-                universe_name="基础数据采集 A 股人气榜种子池",
+                universe_name="A 股人气榜观察池",
                 strategy_context="base_data_collect",
                 limit=args.limit,
             ),
@@ -452,7 +878,7 @@ def run_ashare_risk(
             collect=lambda: collector.collect_zt_pool(
                 date=args.risk_end,
                 universe_id=f"universe:base:ashare:p2:sentiment:zt_pool:{args.risk_end}",
-                universe_name=f"基础数据采集 A 股涨停池-{args.risk_end}",
+                universe_name=f"A 股涨停池-{args.risk_end}",
                 strategy_context="base_data_collect",
                 limit=args.limit,
             ),
@@ -522,6 +948,53 @@ def run_crypto(
     """执行数字货币资产、K 线和衍生品快照采集。"""
 
     collector = CryptoDataCollector(session)
+    task_type = task_type_name(args)
+    if task_type == "universe_refresh":
+        return [
+            runtime.run_task(
+                task="crypto_markets",
+                provider_key="ccxt_binance_load_markets",
+                parameters={"market_type": args.crypto_market_type, "limit": args.limit},
+                force=args.force_provider,
+                collect=lambda: collector.collect_markets(
+                    market_type=args.crypto_market_type,
+                    universe_id=f"universe:base:crypto:{args.crypto_market_type}:binance",
+                    universe_name=f"基础数据采集 Binance {args.crypto_market_type} 候选池",
+                    strategy_context="base_data_collect",
+                    limit=args.limit,
+                ),
+            )
+        ]
+    if task_type == "market_bars_backfill":
+        return [
+            runtime.run_task(
+                task="crypto_ohlcv",
+                provider_key="ccxt_binance_fetch_ohlcv",
+                parameters={
+                    "symbol": args.crypto_symbol,
+                    "timeframe": args.crypto_timeframe,
+                    "market_type": args.crypto_market_type,
+                    "limit": args.limit,
+                },
+                force=args.force_provider,
+                collect=lambda: collector.collect_ohlcv(
+                    symbol=args.crypto_symbol,
+                    timeframe=args.crypto_timeframe,
+                    market_type=args.crypto_market_type,
+                    limit=args.limit,
+                ),
+            )
+        ]
+    if task_type == "derivative_refresh":
+        return [
+            runtime.run_task(
+                task="crypto_derivative_snapshot",
+                provider_key="binance_derivative_snapshot",
+                parameters={"symbol": args.crypto_symbol},
+                force=args.force_provider,
+                collect=lambda: collector.collect_derivative_snapshot(symbol=args.crypto_symbol),
+            )
+        ]
     return [
         runtime.run_task(
             task="crypto_markets",
@@ -561,6 +1034,44 @@ def run_crypto(
             collect=lambda: collector.collect_derivative_snapshot(symbol=args.crypto_symbol),
         ),
     ]
+
+
+def task_type_name(args: argparse.Namespace) -> str | None:
+    """从参数中读取当前同步任务类型。"""
+
+    return getattr(args, "sync_task_type", None)
+
+
+def batch_ashare_symbols(
+    session: Any,
+    *,
+    limit: int | None = None,
+    fallback_symbol: str,
+) -> list[str]:
+    """按 A 股资产表批量获取采集标的。"""
+
+    try:
+        repo = AssetRepository(session)
+        assets = repo.find_by_market("ashare")
+        symbols = [asset.symbol for asset in assets]
+    except Exception:
+        symbols = []
+    if not symbols:
+        symbols = [fallback_symbol]
+    if limit:
+        return symbols[:limit]
+    return symbols
+
+
+def asset_name_for_symbol(session: Any, symbol: str) -> str | None:
+    """查询资产名称，供财务快照回填。"""
+
+    try:
+        repo = AssetRepository(session)
+        asset = repo.get_asset_or_none(f"ashare:{symbol}")
+    except Exception:
+        return None
+    return asset.name if asset is not None else None
 
 
 if __name__ == "__main__":

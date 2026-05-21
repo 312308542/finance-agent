@@ -615,6 +615,75 @@ class AshareP1Collector:
         )
         return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
+    def collect_index_members(
+        self,
+        *,
+        index_code: str,
+        index_name: str,
+        universe_id: str,
+        universe_name: str,
+        strategy_context: str,
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集指数成分种子，并写入候选池定义和成员。"""
+
+        result = self.sector_provider.fetch_index_members(
+            index_code=index_code,
+            index_name=index_name,
+            limit=limit,
+        )
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="index_stock_cons_csindex",
+            request_params={"index_code": index_code, "index_name": index_name, "limit": limit},
+        )
+
+        self.universes.upsert_universe(
+            universe_id=universe_id,
+            name=universe_name,
+            source=f"akshare:index_stock_cons_csindex:{index_code}",
+            market="ashare",
+            strategy_context=strategy_context,
+            as_of=result.collected_at,
+            total_before_filter=len(result.seeds),
+            total_after_filter=len(result.seeds),
+            status=result.status,
+            payload={
+                "provider_payload": result.payload,
+                "raw_record_id": raw_record_id,
+                "error": result.error_message,
+            },
+        )
+        if result.status != "available":
+            return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+        for seed in result.seeds:
+            self.assets.upsert_asset(
+                asset_id=seed.asset_id,
+                symbol=seed.symbol,
+                name=seed.name,
+                market=seed.market,
+                asset_type="stock",
+                payload=seed.payload,
+            )
+        self.universes.replace_members(
+            universe_id=universe_id,
+            members=[
+                {
+                    "member_id": f"universe_member:{universe_id}:{seed.symbol}",
+                    "asset_id": seed.asset_id,
+                    "symbol": seed.symbol,
+                    "market": seed.market,
+                    "as_of": seed.as_of or result.collected_at,
+                    "rank_hint": seed.rank_hint,
+                    "payload": seed.payload | {"raw_record_id": raw_record_id},
+                }
+                for seed in result.seeds
+            ],
+        )
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
     def collect_concept_members(
         self,
         *,
@@ -788,6 +857,64 @@ class AshareP1Collector:
             )
         return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
+    def collect_notice_reports(
+        self,
+        *,
+        symbol: str = "全部",
+        date: str,
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集公告披露事件，并写入事件和证据表。"""
+
+        result = self.event_provider.fetch_notice_reports(
+            symbol=symbol,
+            date=date,
+            limit=limit,
+        )
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_notice_report",
+            request_params={"symbol": symbol, "date": date, "limit": limit},
+            symbol=symbol if symbol != "全部" else None,
+        )
+        if result.status != "available":
+            return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+        for event in result.events:
+            self.events.upsert_event(
+                event_id=event.event_id,
+                asset_id=event.asset_id,
+                symbol=event.symbol,
+                market=event.market,
+                event_type=event.event_type,
+                title=event.title,
+                summary=event.summary,
+                sentiment=event.sentiment,
+                importance=event.importance,
+                source=event.source,
+                url=event.url,
+                published_at=event.published_at,
+                collected_at=event.collected_at,
+                payload=event.payload | {"raw_record_id": raw_record_id},
+            )
+        for item in result.evidence:
+            self.events.upsert_evidence(
+                evidence_id=item.evidence_id,
+                evidence_type=item.evidence_type,
+                asset_id=item.asset_id,
+                source=item.source,
+                title=item.title,
+                summary=item.summary,
+                data_ref=item.data_ref,
+                url=item.url,
+                reliability=item.reliability,
+                as_of=item.as_of,
+                collected_at=item.collected_at,
+                payload=item.payload | {"raw_record_id": raw_record_id},
+            )
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
 
 class AshareP2Collector:
     """A 股 P2 财务和估值采集编排器。"""
@@ -897,6 +1024,31 @@ class AshareP2Collector:
         )
         self._persist_fundamental_snapshots(result, raw_record_id=raw_record_id)
         return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def collect_financial_profile(
+        self,
+        *,
+        symbol: str,
+        asset_name: str | None = None,
+        report_date: str | None = None,
+        limit: int | None = None,
+    ) -> list[ArchivedProviderResult]:
+        """一次采集单标的财务指标、估值、业绩和全市场股息率。"""
+
+        results = [
+            self.collect_financial_indicators(symbol=symbol, asset_name=asset_name, limit=limit),
+            self.collect_valuation(symbol=symbol, asset_name=asset_name, limit=limit),
+        ]
+        if report_date:
+            results.append(
+                self.collect_performance_report(
+                    date=report_date,
+                    report_type="业绩报表",
+                    limit=limit,
+                )
+            )
+        results.append(self.collect_dividend_yield(limit=limit))
+        return results
 
     def _persist_fundamental_snapshots(
         self,

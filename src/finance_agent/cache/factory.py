@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib import import_module
 
 from finance_agent.cache.null_cache import NullCacheClient
-from finance_agent.cache.redis_cache import create_redis_cache
 from finance_agent.ports.cache import CacheClient, LockClient
 
 
@@ -35,6 +35,7 @@ def create_cache_client(
         return cache, cache, CacheStartupStatus(backend="null", status="available")
 
     try:
+        create_redis_cache = import_module("finance_agent.cache.redis_cache").create_redis_cache
         cache = create_redis_cache()
         cache.ping()
         return cache, cache, CacheStartupStatus(backend="redis", status="available")
