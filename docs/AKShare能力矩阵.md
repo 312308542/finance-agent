@@ -79,6 +79,8 @@ AKShare 在本系统里应视为 **A 股数据 Provider 族**，不是单一 K �
 | 实时行情 | `stock_zh_a_spot_em`、`stock_zh_a_spot_tx` | 资产主数据、全 A 种子池、实时价格、成交额、PE/PB、市值 | P0 |
 | 历史行情 | `stock_zh_a_hist`、`stock_zh_a_hist_tx` | K 线、技术指标、回测价格序列 | P0 |
 | 股票列表 | `股票列表-A股/上证/深证/北证` 相关接口 | 资产主数据、交易所归属、可交易状态 | P0 |
+| 指数目录 | `index_stock_info` | 指数代码目录、指数成分批量展开 | P1 |
+| 指数成分 | `index_stock_cons_csindex`、`index_stock_cons_sina`、`index_stock_cons` | 指数候选池、指数成分关系、指数轮动 | P1 |
 | 停复牌/退市 | `stock_zh_a_stop_em`、两网及退市、暂停/终止上市 | 初筛硬过滤、风险提示 | P0 |
 | 行业板块 | `stock_board_industry_*` | 行业种子池、行业动量、行业轮动 | P1 |
 | 概念板块 | `stock_board_concept_*` | 主题种子池、主题热度、事件解释 | P1 |
@@ -114,11 +116,13 @@ AKShare 在本系统里应视为 **A 股数据 Provider 族**，不是单一 K �
 候选池不只来自全 A。这里的“候选池”指 `AssetUniverse`，是推荐链路的输入，不是推荐结论。一次推荐运行可以指定一个种子源，也可以把多个种子源合并、去重后形成候选池。
 
 - 全 A 种子源：实时行情或股票列表。
-- 指数成分种子源：沪深 300、中证 500、创业板等指数成分。
+- 指数目录种子源：`index_stock_info` 自动展开沪深 300、中证 500、创业板等指数成分。
+- 指数成分种子源：`index_stock_cons_csindex`、`index_stock_cons_sina`、`index_stock_cons`。
 - 行业成分种子源：行业板块成分。
 - 概念成分种子源：概念板块成分。
 - 资金流榜单种子源：主力资金、北向资金、行业资金排名，只说明近期资金有异动，不能直接视为推荐。
 - 情绪/热度种子源：热度榜、涨停池、盘口异动，只用于纳入观察和解释短线情绪，不能直接视为推荐。
+- 公告种子源：公告、披露、停复牌、财报披露状态，用于事件和风险扩展。
 - 风险排除源：停牌、退市整理、ST、流动性不足、数据缺失，用于从候选池里剔除或降级。
 
 Agent 分析之后输出的是推荐榜、观察池和回避池。为避免混淆，后续代码和文档里应尽量使用 `universe_source`、`seed_source`、`AssetUniverse`、`watchlist`、`avoid_list` 这些更明确的命名。
