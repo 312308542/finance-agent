@@ -103,6 +103,11 @@ finance-agent chat --owner-id owner:demo --session-id chat:owner-demo:xxxx --mes
 
 聊天窗口会把会话写入 `assistant_chat_sessions`，把用户消息和 Agent 回复写入 `assistant_chat_messages`，用于跨进程恢复和 `/history` 历史查看。它只保存普通聊天上下文；可审计的金融长期记忆仍由 Workflow、决策日志、复盘和用户反馈写入 `assistant_memories`。
 
+当前聊天窗口已支持两类模式：
+
+- 固定意图模式：查询 Workflow、工具、模型配置、路由预览和历史消息时，直接走确定性接口，不调用外部模型。
+- 模型工具循环模式：普通自然语言问题在主分析模型 ready 时，模型可以按需请求 `FinanceToolRuntime` 只读工具，例如因子、信号风险、Finance Memory 和图谱工具；工具结果压缩后再交给模型输出 `summary_zh`。模型不可用、输出不可解析或请求非法工具时，会降级为能力说明，不阻断会话。
+
 ## 3. MCP 入口
 
 MCP Server 入口：
@@ -141,7 +146,7 @@ MCP 依赖写入 `pyproject.toml`：`mcp>=1.16,<2.0`。当前本地已验证 `mc
 
 - CLI 和 MCP 不直接调用 AKShare、Binance、ccxt 或网页。
 - CLI 和 MCP 不直接计算指标、因子、评分或信号。
-- CLI 和 MCP 不直接调用外部 LLM。
+- CLI 和 MCP 不让外部 LLM 直接访问行情源；CLI 聊天和内部 Agent Loop 可在模型配置 ready 时调用 OpenAI-compatible 模型，但模型只能通过白名单只读工具读取已入库事实。
 - CLI 和 MCP 不绕过 `FinanceAssistantService` 写决策、记忆或审计。
 - CLI 和 MCP 图谱入口不直接写业务事实，只把 PostgreSQL 事实源同步为可重建图谱投影。
 - 图谱入口只使用配置选择的一个图数据库后端，不自动切换后端。
@@ -157,6 +162,8 @@ python scripts/storage/smoke_agent_cli_interface.py
 python scripts/storage/smoke_agent_mcp_server.py
 python scripts/storage/smoke_graph_store.py
 python scripts/storage/smoke_v12_trigger_events.py
+python scripts/storage/smoke_real_model_agent_loop_planner.py
+python scripts/storage/smoke_agent_chat_model_tool_loop.py
 ```
 
 已验证：
@@ -166,5 +173,7 @@ python scripts/storage/smoke_v12_trigger_events.py
 - CLI 可以运行 `asset_deep_analysis` 圆桌报告 Workflow。
 - CLI/MCP 可通过独立 graph 命令和 tool 调用覆盖图谱健康检查、初始化、同步、路径追踪、入池原因链、相似历史决策、风险传导和记忆冲突。
 - CLI 聊天窗口可以持久化 `chat_session_id`，并通过 `--session-id` 恢复最近聊天流水。
+- CLI 聊天窗口可在模型 ready 时进入模型工具循环，按需调用只读事实工具并返回中文摘要。
+- 内部 Agent Loop 默认使用模型增强 planner；没有模型配置时自动 fallback，不破坏触发闭环。
 - MCP SDK 安装后可以创建 MCP Server。
 - V1.2 触发层能生成 6 类触发事件、冷却去重，并通过 CLI 重复评估返回结构化 JSON。

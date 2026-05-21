@@ -90,6 +90,8 @@ Hermes 适合做上层运行时，但不适合直接替代本项目的金融业�
 | 上层外部自由 loop | Hermes Agent | 不放进本项目 Workflow |
 | 上层内部受控 loop | InternalFinanceAgentLoop | 可使用 LangGraph，但必须有轮次、工具调用和 Workflow 调用预算 |
 
+当前 `InternalFinanceAgentLoop` 已默认使用模型增强 Planner。模型配置 ready 时会通过 OpenAI-compatible 客户端调用主分析模型，让模型按需请求只读事实工具、Finance Memory 和图谱工具；模型不可用、输出不可解析或请求越权时，会自动回到确定性 fallback。这个 loop 只决定是否补事实、是否跳过和调用哪个 Domain Workflow，不直接输出真实交易动作。
+
 标准步骤：
 
 ```mermaid
@@ -162,7 +164,7 @@ flowchart LR
 - `disclaimer`：非投资建议声明。
 - `markdown`：可直接展示或归档的中文 Markdown。
 
-当前阶段只落地模型路由与复核协议，不真实调用外部 LLM。Hermes-Agent 或后续模型客户端应消费 `model_route` / `model_review` 审计事件里的 `model_key`、`review_input` 和证据引用，再把真实复核结果回写到同一条 Workflow 审计链路。
+当前阶段内部 Agent Loop 已具备真实主分析模型 Planner 调用能力，并会把 `model_loop_messages`、`model_tool_observations`、`model_final_decision`、`model_prompt_bundle` 和 `model_prompt_envelope` 写入审计上下文。Workflow 圆桌节点和高风险复核仍以路由协议为主，后续再把 GPT-5.5 Pro 复核结果回写到同一条 Workflow 审计链路。
 
 ## 6.2 CLI 与 MCP 入口
 

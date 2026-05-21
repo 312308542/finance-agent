@@ -154,7 +154,57 @@ flowchart LR
 
 Agent Loop 可以跳过 Workflow，但必须给出结构化原因，例如数据不足、重复触发、冷却期内、风险已知且无新证据。
 
-## 9. 第一阶段落地范围
+## 9. 模型 Planner 真实调用落地
+
+当前内部 Agent Loop 默认使用 `ModelFinanceAgentPlanner`。它不是把模型输出直接当成交易动作，而是在确定性 fallback 外套一层受控模型循环：
+
+```mermaid
+flowchart TD
+    A["触发事件"] --> B["确定性 fallback 计划\n校验 Workflow 和上下文"]
+    B --> C{"主分析模型 ready?"}
+    C -->|否| H["执行 fallback\n仍写入 prompt / 工具摘要审计"]
+    C -->|是| D["模型规划第 1 轮\n只输出 JSON"]
+    D --> E{"请求事实工具?"}
+    E -->|是| F["FinanceToolRuntime\n只读已入库事实 / 记忆 / 图谱"]
+    F --> G["压缩观察结果\n写入 model_tool_observations"]
+    G --> D
+    E -->|否| I{"选择 Workflow 或跳过?"}
+    I -->|运行 Workflow| J["run_workflow\n仅允许 6 个白名单 Workflow"]
+    I -->|跳过| K["skip\n写明原因"]
+    I -->|不可解析| H
+```
+
+关键约束：
+
+- 模型客户端为 OpenAI-compatible Chat Completions，配置来自数据库、JSON 或环境变量。
+- 模型必须输出 JSON；解析失败、请求非法工具、选择非法 Workflow 或调用异常时自动回到确定性 fallback。
+- 工具调用只允许使用 Planner 提供的白名单工具，例如 `factor.get_asset_factor_context`、`signal_risk.get_asset_context`、`memory.trace_asset_graph`、`memory.find_memory_conflicts`。
+- 工具只读取 PostgreSQL + TimescaleDB、Finance Memory 和配置选择的 GraphStore，不直接调用 AKShare、Binance、ccxt 或网页。
+- 每个触发事件仍只允许有限轮次、有限工具调用和最多 1 次 Workflow 调用。
+- 审计字段会写入 `model_planner`、`model_loop_messages`、`model_tool_observations`、`model_final_decision`、`model_prompt_bundle` 和 `model_prompt_envelope`。
+
+## 10. CLI 聊天模型循环
+
+`finance-agent chat` 已从命令式帮助窗口升级为轻量对话入口。固定意图仍走确定性命令：
+
+- Workflow 清单。
+- 工具清单。
+- 模型配置。
+- 路由预览。
+- 历史消息。
+- 退出。
+
+普通自然语言问题在主分析模型 ready 时进入受控聊天循环：
+
+1. 模型读取问题、最近聊天历史和可用只读工具清单。
+2. 需要事实时返回 `tool_requests`。
+3. 聊天窗口调用 `FinanceAgentInterface.call_tool()`，压缩观察结果。
+4. 模型基于观察结果返回 `summary_zh`。
+5. 聊天消息和模型审计摘要写入 `assistant_chat_messages`。
+
+模型不可用时，聊天窗口不会阻断用户，而是提示可用命令和模型配置入口。
+
+## 11. 第一阶段落地范围
 
 第一阶段只做最小可用内部运行时：
 
@@ -164,6 +214,8 @@ Agent Loop 可以跳过 Workflow，但必须给出结构化原因，例如数据
 4. 写入 Agent 任务处理摘要、跳过原因或失败原因。（已完成基础版，决策日志和记忆继续由 Domain Workflow 负责）
 5. 提供 CLI：`finance-agent agent run-once` / `finance-agent agent run-task`。（已完成基础版）
 6. 提供 smoke：验证触发事件可以被内部 Agent Loop 消费，并且不会重复处理。（已完成）
+7. 接入真实模型 Planner 的受控工具循环，并保留 fallback。（已完成）
+8. 接入 CLI 聊天模型工具循环，用于自然语言查询已入库事实。（已完成）
 
 第一阶段不做：
 
@@ -173,7 +225,7 @@ Agent Loop 可以跳过 Workflow，但必须给出结构化原因，例如数据
 - 多模型并发辩论。
 - 未通过配置启用的图数据库后端；同一运行环境只能选择 Neo4j / DozerDB 或 Apache AGE 之一，内部 Agent 不做双写双读。
 
-## 10. 后续实现建议
+## 12. 后续实现建议
 
 建议新增目录：
 
@@ -182,14 +234,14 @@ src/finance_agent/agents/loop/
   state.py          # AgentLoopState 和动作枚举
   graph.py          # LangGraph 状态图构建
   runner.py         # 领取任务、执行图、提交事务
-  planner.py        # 确定性 planner，后续接 DeepSeek V4 Pro
+  planner.py        # 模型增强 planner + 确定性 fallback
   persistence.py    # 任务状态和审计写入
 ```
 
 当前基础版已落地 `state.py`、`planner.py`、`runner.py`、`graph.py` 和 `__init__.py`。其中：
 
 - `runner.py` 负责从 `assistant_trigger_events` 领取已派发任务、调用 `FinanceAgentInterface.run_workflow()`、回写 `agent_loop_status` 和 `workflow_run_id`。
-- `planner.py` 当前是确定性策略，后续可接 DeepSeek V4 Pro 做 `PlanNextStep`。
+- `planner.py` 已接入 DeepSeek V4 Pro 等 OpenAI-compatible 模型的受控规划循环；模型不可用时回到确定性策略。
 - `graph.py` 先作为 LangGraph loop 扩展入口保留，避免第一阶段过度抽象。
 - 暂未新增 `persistence.py`，因为当前持久化已由 `AssistantTriggerRepository` 承担；后续若增加 `agent_loop_runs` / `agent_loop_events` 再拆出。
 
@@ -210,5 +262,5 @@ finance-agent agent run-task --agent-task-id agent_task:...
 
 1. 先实现确定性 planner，保证触发事件能闭环。（已完成）
 2. 再接 LangGraph 图节点和审计事件。
-3. 再接模型客户端，让 DeepSeek V4 Pro 参与 `PlanNextStep` 和 `DecideAction`。
-4. 最后接 Scheduler/Hermes 常驻唤醒。
+3. 再接真实高风险复核结果回写，让 GPT-5.5 Pro 复核卖出、换股和强风险动作。
+4. 最后接 Hermes 常驻唤醒、前端状态页和人工确认闭环。
