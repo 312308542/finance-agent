@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ from finance_agent.agents.runtime import (
 from finance_agent.agents.runtime.model_tui import render_model_tui
 from finance_agent.scheduler import AssistantLoopScheduler, AssistantLoopSchedulerConfig
 from finance_agent.storage.db import create_session_factory, session_scope
-from finance_agent.storage.repositories import ChatMemoryRepository
+from finance_agent.storage.repositories import ChatMemoryRepository, ModelRuntimeConfigRepository
 from finance_agent.triggers import TriggerEvaluationRequest, TriggerService
 
 JsonDict = dict[str, Any]
@@ -214,10 +215,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     agent_run_loop.add_argument("--as-of", default=None, help="ISO 时间，默认每轮当前时间。")
 
+
     models = subparsers.add_parser("models", help="模型配置、路由预览和本地测试。")
     model_commands = models.add_subparsers(dest="command", required=True)
     model_config = model_commands.add_parser("config", help="查看模型配置脱敏摘要。")
     add_model_common_arguments(model_config)
+    model_init = model_commands.add_parser("init", help="初始化数据库模型供应商和默认路由。")
+    model_init.add_argument("--overwrite", action="store_true", help="覆盖已有模型配置。")
+    model_init.add_argument("--deepseek-base-url", default=None, help="DeepSeek OpenAI-compatible 地址。")
+    model_init.add_argument("--deepseek-api-key", default=None, help="DeepSeek API Key。")
+    model_init.add_argument("--openai-base-url", default=None, help="OpenAI-compatible 地址。")
+    model_init.add_argument("--openai-api-key", default=None, help="OpenAI API Key。")
+    model_init.add_argument("--embedding-model-key", default=None, help="默认 embedding 模型 key。")
+    model_init.add_argument("--rerank-model-key", default=None, help="默认 rerank 模型 key。")
+    model_list = model_commands.add_parser("list", help="查看数据库模型供应商、模型实例和路由规则。")
+    model_list.add_argument(
+        "--include-disabled",
+        action="store_true",
+        help="包含已停用的配置。",
+    )
+    model_set_provider = model_commands.add_parser("set-provider", help="新增或更新模型供应商配置。")
+    model_set_provider.add_argument("--provider-key", required=True, help="供应商 key，例如 deepseek。")
+    model_set_provider.add_argument("--provider-vendor", required=True, help="供应商类型，例如 deepseek/openai。")
+    model_set_provider.add_argument("--provider-name", required=True, help="供应商显示名。")
+    model_set_provider.add_argument("--base-url", default=None, help="OpenAI-compatible base_url。")
+    model_set_provider.add_argument("--api-key", default=None, help="API Key。")
+    model_set_provider.add_argument("--timeout-seconds", type=int, default=30, help="请求超时秒数。")
+    model_set_provider.add_argument("--disabled", action="store_true", help="写入为停用状态。")
+    model_set_model = model_commands.add_parser("set-model", help="新增或更新模型实例配置。")
+    model_set_model.add_argument("--provider-key", required=True, help="供应商 key。")
+    model_set_model.add_argument("--model-key", required=True, help="模型 key。")
+    model_set_model.add_argument("--model-name", required=True, help="真实模型名称。")
+    model_set_model.add_argument("--model-type", default="llm", help="模型类型，默认 llm。")
+    model_set_model.add_argument("--role", default=None, help="模型职责，例如 primary_financial_analyst。")
+    model_set_model.add_argument("--route-priority", type=int, default=0, help="路由优先级。")
+    model_set_model.add_argument("--timeout-seconds", type=int, default=30, help="请求超时秒数。")
+    model_set_model.add_argument("--disabled", action="store_true", help="写入为停用状态。")
+    model_set_route = model_commands.add_parser("set-route", help="设置模型路由规则。")
+    model_set_route.add_argument("--workflow-type", default="*", help="Workflow 类型，* 表示全局。")
+    model_set_route.add_argument("--task", default="*", help="任务名，* 表示全局。")
+    model_set_route.add_argument("--role", required=True, help="路由角色。")
+    model_set_route.add_argument("--model-key", required=True, help="路由到的模型 key。")
+    model_set_route.add_argument("--decision-type", default="", help="可选决策类型。")
+    model_set_route.add_argument("--reason", default=None, help="路由原因说明。")
+    model_set_route.add_argument("--priority", type=int, default=0, help="规则优先级。")
+    model_set_route.add_argument("--disabled", action="store_true", help="写入为停用状态。")
+    retrieval_list = model_commands.add_parser("retrieval", help="查看数据库检索配置。")
+    retrieval_list.add_argument(
+        "--include-disabled",
+        action="store_true",
+        help="包含已停用的检索配置。",
+    )
     route_preview = model_commands.add_parser("route-preview", help="预览 Workflow 模型路由。")
     add_model_common_arguments(route_preview)
     route_preview.add_argument("--workflow-type", required=True, help="Workflow 类型。")
@@ -243,10 +291,49 @@ def build_parser() -> argparse.ArgumentParser:
     add_model_common_arguments(model_tui)
     model_tui.add_argument(
         "--scripted",
-        choices=["config", "route-preview", "test"],
+        choices=["config", "route-preview", "test", "retrieval"],
         default=None,
         help="脚本化 TUI 动作，用于本地 smoke。",
     )
+    model_set_retrieval = model_commands.add_parser("set-retrieval", help="新增或更新检索配置。")
+    model_set_retrieval.add_argument("--profile-key", required=True, help="检索配置 key。")
+    model_set_retrieval.add_argument("--profile-name", required=True, help="检索配置显示名。")
+    model_set_retrieval.add_argument("--usage-scope", default="finance_memory", help="使用范围。")
+    model_set_retrieval.add_argument(
+        "--search-method",
+        default="hybrid_search",
+        help="检索方式，例如 semantic_search/full_text_search/hybrid_search。",
+    )
+    model_set_retrieval.add_argument("--embedding-model-key", default=None, help="embedding 模型 key。")
+    model_set_retrieval.add_argument("--rerank-model-key", default=None, help="rerank 模型 key。")
+    model_set_retrieval.add_argument("--top-k", type=int, default=8, help="召回条数。")
+    model_set_retrieval.add_argument(
+        "--score-threshold",
+        default=None,
+        help="分数阈值，Decimal 字符串。",
+    )
+    model_set_retrieval.add_argument(
+        "--reranking-enable",
+        action="store_true",
+        help="启用 rerank。",
+    )
+    model_set_retrieval.add_argument(
+        "--reranking-mode",
+        default=None,
+        help="rerank 模式，例如 reranking_model/weighted_score。",
+    )
+    model_set_retrieval.add_argument(
+        "--semantic-weight",
+        default=None,
+        help="混合检索语义权重。",
+    )
+    model_set_retrieval.add_argument(
+        "--keyword-weight",
+        default=None,
+        help="混合检索关键词权重。",
+    )
+    model_set_retrieval.add_argument("--default", action="store_true", help="标记为默认配置。")
+    model_set_retrieval.add_argument("--disabled", action="store_true", help="写入为停用状态。")
     return parser
 
 
@@ -296,6 +383,11 @@ def add_model_common_arguments(parser: argparse.ArgumentParser) -> None:
     """注册模型命令通用参数。"""
 
     parser.add_argument("--config-file", default=None, help="模型配置 JSON 文件路径。")
+    parser.add_argument(
+        "--no-db",
+        action="store_true",
+        help="只读取 JSON/环境变量，不读取数据库模型配置。",
+    )
 
 
 def dispatch(args: argparse.Namespace) -> JsonDict:
@@ -332,7 +424,10 @@ def dispatch_chat(interface: FinanceAgentInterface, args: argparse.Namespace) ->
     session = FinanceAgentChatSession(
         owner_id=args.owner_id,
         interface=interface,
-        model_registry=load_model_registry(args.config_file),
+        model_registry=load_model_registry(
+            args.config_file,
+            database_url=getattr(args, "database_url", None),
+        ),
         chat_memory=chat_memory,
         chat_session_id=chat_session_id,
         history_limit=args.history_limit,
@@ -565,7 +660,40 @@ def dispatch_agent(session: Any, args: argparse.Namespace) -> JsonDict:
 def dispatch_models(args: argparse.Namespace) -> JsonDict:
     """处理模型配置和测试命令。"""
 
-    registry = load_model_registry(args.config_file)
+    if args.command in {
+        "init",
+        "list",
+        "set-provider",
+        "set-model",
+        "set-route",
+        "set-retrieval",
+        "retrieval",
+    }:
+        session_factory = create_session_factory(args.database_url)
+        with session_scope(session_factory) as session:
+            return dispatch_model_database_commands(ModelRuntimeConfigRepository(session), args)
+
+    registry = load_model_registry(
+        args.config_file,
+        database_url=args.database_url,
+        prefer_database=not getattr(args, "no_db", False),
+    )
+    repository = None
+    if registry.source == "database":
+        session_factory = create_session_factory(args.database_url)
+        with session_scope(session_factory) as session:
+            repository = ModelRuntimeConfigRepository(session)
+            return dispatch_model_runtime_commands(args, registry, repository)
+    return dispatch_model_runtime_commands(args, registry, repository)
+
+
+def dispatch_model_runtime_commands(
+    args: argparse.Namespace,
+    registry: Any,
+    repository: ModelRuntimeConfigRepository | None,
+) -> JsonDict:
+    """处理不直接修改数据库的模型命令。"""
+
     if args.command == "config":
         return {"status": "ok", "data": registry.to_safe_dict()}
     if args.command == "route-preview":
@@ -579,6 +707,7 @@ def dispatch_models(args: argparse.Namespace) -> JsonDict:
                     asset_id=args.asset_id,
                     decision_type=args.decision_type,
                     high_risk=args.high_risk,
+                    model_config_repository=repository,
                 )
             },
         }
@@ -599,11 +728,215 @@ def dispatch_models(args: argparse.Namespace) -> JsonDict:
             "data": {
                 "output": render_model_tui(
                     registry=registry,
+                    model_config_repository=repository,
                     scripted=args.scripted,
                 )
             },
         }
     raise ValueError(f"未知 models 命令：{args.command}")
+
+
+def dispatch_model_database_commands(
+    repository: ModelRuntimeConfigRepository,
+    args: argparse.Namespace,
+) -> JsonDict:
+    """处理数据库模型配置命令。"""
+
+    if args.command == "init":
+        return {
+            "status": "ok",
+            "data": repository.seed_default_model_runtime_config(
+                overwrite=args.overwrite,
+                deepseek_base_url=args.deepseek_base_url,
+                deepseek_api_key=args.deepseek_api_key,
+                openai_base_url=args.openai_base_url,
+                openai_api_key=args.openai_api_key,
+                embedding_model_key=args.embedding_model_key,
+                rerank_model_key=args.rerank_model_key,
+            ),
+        }
+    if args.command == "list":
+        return {
+            "status": "ok",
+            "data": {
+                "providers": [
+                    serialize_model_provider(provider)
+                    for provider in repository.list_providers(
+                        enabled_only=not args.include_disabled
+                    )
+                ],
+                "models": [
+                    serialize_model_instance(model)
+                    for model in repository.list_model_instances(
+                        enabled_only=not args.include_disabled
+                    )
+                ],
+                "routing_rules": [
+                    serialize_model_routing_rule(rule)
+                    for rule in repository.list_routing_rules(
+                        enabled_only=not args.include_disabled
+                    )
+                ],
+            },
+        }
+    if args.command == "set-provider":
+        provider = repository.upsert_provider(
+            provider_key=args.provider_key,
+            provider_vendor=args.provider_vendor,
+            provider_name=args.provider_name,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            timeout_seconds=args.timeout_seconds,
+            is_enabled=not args.disabled,
+        )
+        return {"status": "ok", "data": serialize_model_provider(provider)}
+    if args.command == "set-model":
+        model = repository.upsert_model_instance(
+            provider_key=args.provider_key,
+            model_key=args.model_key,
+            model_name=args.model_name,
+            model_type=args.model_type,
+            role=args.role,
+            route_priority=args.route_priority,
+            timeout_seconds=args.timeout_seconds,
+            is_enabled=not args.disabled,
+        )
+        return {"status": "ok", "data": serialize_model_instance(model)}
+    if args.command == "set-route":
+        route = repository.upsert_routing_rule(
+            workflow_type=args.workflow_type,
+            task=args.task,
+            role=args.role,
+            model_key=args.model_key,
+            decision_type=args.decision_type,
+            reason=args.reason,
+            priority=args.priority,
+            is_enabled=not args.disabled,
+        )
+        return {"status": "ok", "data": serialize_model_routing_rule(route)}
+    if args.command == "set-retrieval":
+        profile = repository.upsert_retrieval_profile(
+            profile_key=args.profile_key,
+            profile_name=args.profile_name,
+            usage_scope=args.usage_scope,
+            search_method=args.search_method,
+            embedding_model_key=args.embedding_model_key,
+            rerank_model_key=args.rerank_model_key,
+            top_k=args.top_k,
+            score_threshold=parse_decimal_arg(args.score_threshold),
+            reranking_enable=args.reranking_enable,
+            reranking_mode=args.reranking_mode,
+            weights=build_retrieval_weights(args),
+            is_enabled=not args.disabled,
+            is_default=args.default,
+        )
+        return {"status": "ok", "data": serialize_retrieval_profile(profile)}
+    if args.command == "retrieval":
+        return {
+            "status": "ok",
+            "data": {
+                "retrieval_profiles": [
+                    serialize_retrieval_profile(profile)
+                    for profile in repository.list_retrieval_profiles(
+                        enabled_only=not args.include_disabled
+                    )
+                ]
+            },
+        }
+    raise ValueError(f"未知 models 数据库命令：{args.command}")
+
+
+def serialize_model_provider(provider: Any) -> JsonDict:
+    """序列化模型供应商配置，避免输出明文密钥。"""
+
+    from finance_agent.agents.runtime.model_config import mask_secret
+
+    return {
+        "provider_key": provider.provider_key,
+        "provider_vendor": provider.provider_vendor,
+        "provider_name": provider.provider_name,
+        "base_url": provider.base_url,
+        "api_key": mask_secret(provider.api_key),
+        "timeout_seconds": provider.timeout_seconds,
+        "is_enabled": provider.is_enabled,
+        "is_default": provider.is_default,
+        "payload": provider.payload,
+    }
+
+
+def serialize_model_instance(model: Any) -> JsonDict:
+    """序列化模型实例配置。"""
+
+    return {
+        "model_key": model.model_key,
+        "provider_key": model.provider_key,
+        "model_type": model.model_type,
+        "model_name": model.model_name,
+        "role": model.role,
+        "route_priority": model.route_priority,
+        "timeout_seconds": model.timeout_seconds,
+        "is_enabled": model.is_enabled,
+        "is_default": model.is_default,
+        "payload": model.payload,
+    }
+
+
+def serialize_model_routing_rule(rule: Any) -> JsonDict:
+    """序列化模型路由规则。"""
+
+    return {
+        "workflow_type": rule.workflow_type,
+        "task": rule.task,
+        "role": rule.role,
+        "decision_type": rule.decision_type,
+        "model_key": rule.model_key,
+        "reason": rule.reason,
+        "priority": rule.priority,
+        "is_enabled": rule.is_enabled,
+        "payload": rule.payload,
+    }
+
+
+def serialize_retrieval_profile(profile: Any) -> JsonDict:
+    """序列化检索配置。"""
+
+    return {
+        "profile_key": profile.profile_key,
+        "profile_name": profile.profile_name,
+        "usage_scope": profile.usage_scope,
+        "search_method": profile.search_method,
+        "embedding_model_key": profile.embedding_model_key,
+        "rerank_model_key": profile.rerank_model_key,
+        "top_k": profile.top_k,
+        "score_threshold": str(profile.score_threshold)
+        if profile.score_threshold is not None
+        else None,
+        "reranking_enable": profile.reranking_enable,
+        "reranking_mode": profile.reranking_mode,
+        "weights": profile.weights,
+        "is_enabled": profile.is_enabled,
+        "is_default": profile.is_default,
+        "payload": profile.payload,
+    }
+
+
+def parse_decimal_arg(value: str | None) -> Decimal | None:
+    """解析可选 Decimal 命令行参数。"""
+
+    if value is None or value == "":
+        return None
+    return Decimal(value)
+
+
+def build_retrieval_weights(args: argparse.Namespace) -> JsonDict:
+    """从 CLI 参数构建检索权重配置。"""
+
+    weights: JsonDict = {}
+    if args.semantic_weight is not None:
+        weights["semantic"] = float(args.semantic_weight)
+    if args.keyword_weight is not None:
+        weights["keyword"] = float(args.keyword_weight)
+    return weights
 
 
 def build_trigger_request(args: argparse.Namespace) -> TriggerEvaluationRequest:
