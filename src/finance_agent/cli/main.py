@@ -22,6 +22,7 @@ from finance_agent.agents.runtime import (
     test_model_endpoint,
 )
 from finance_agent.agents.runtime.model_tui import render_model_tui
+from finance_agent.cli.data_sync import add_data_arguments, dispatch_data
 from finance_agent.scheduler import AssistantLoopScheduler, AssistantLoopSchedulerConfig
 from finance_agent.storage.db import create_session_factory, session_scope
 from finance_agent.storage.repositories import ChatMemoryRepository, ModelRuntimeConfigRepository
@@ -215,6 +216,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     agent_run_loop.add_argument("--as-of", default=None, help="ISO 时间，默认每轮当前时间。")
 
+    add_data_arguments(subparsers)
 
     models = subparsers.add_parser("models", help="模型配置、路由预览和本地测试。")
     model_commands = models.add_subparsers(dest="command", required=True)
@@ -395,6 +397,8 @@ def dispatch(args: argparse.Namespace) -> JsonDict:
 
     if args.group == "models":
         return dispatch_models(args)
+    if args.group == "data":
+        return dispatch_data(args)
 
     session_factory = create_session_factory(args.database_url)
     with session_scope(session_factory) as session:
