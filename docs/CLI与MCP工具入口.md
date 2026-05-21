@@ -93,6 +93,22 @@ finance-agent graph conflicts --owner-id owner:demo --asset-id asset:demo:600519
 
 图谱命令只访问当前配置选择的一个后端：默认 `neo4j` / DozerDB，也可以显式配置为 `apache_age`；不做双写、双读或自动 fallback。
 
+Finance Memory 命令示例：
+
+```bash
+finance-agent memory recall \
+  --owner-id owner:demo \
+  --asset-id asset:demo:600519 \
+  --query "入池后是否应该继续观察"
+
+finance-agent memory timeline \
+  --owner-id owner:demo \
+  --asset-id asset:demo:600519 \
+  --memory-type watchlist_daily_reason
+```
+
+`memory recall` 返回语义相似记忆和资产时间线，排序会综合向量相似度、记忆置信度和时间衰减；`memory timeline` 用于查看候选池入池原因、每日关注原因、用户反馈和复盘结论的历史轨迹。
+
 CLI 聊天窗口示例：
 
 ```bash
@@ -139,6 +155,8 @@ finance-agent-mcp
 | `graph_find_similar_decision_paths` | 查找相似历史决策路径 |
 | `graph_detect_risk_contagion` | 检测风险传导路径 |
 | `graph_find_memory_conflicts` | 发现 Finance Memory 冲突 |
+| `memory_recall_asset_context` | 按语义召回标的 Finance Memory，并返回资产时间线 |
+| `memory_get_asset_timeline` | 读取标的 Finance Memory 时间线 |
 
 MCP 依赖写入 `pyproject.toml`：`mcp>=1.16,<2.0`。当前本地已验证 `mcp 1.27.1` 可以创建 server。
 
