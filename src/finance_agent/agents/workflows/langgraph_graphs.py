@@ -19,6 +19,7 @@ from finance_agent.agents.runtime import (
 )
 from finance_agent.agents.tools import FinanceToolRuntime
 from finance_agent.graph.stores import DryRunGraphStore
+from finance_agent.storage.repositories import ModelRuntimeConfigRepository
 from finance_agent.agents.workflows.portfolio_monitoring import (
     PortfolioMonitoringWorkflow,
 )
@@ -181,7 +182,6 @@ def build_operational_roundtable_graph(
 
     StateGraph, START, END = _load_langgraph()
     review_policy = HighRiskReviewPolicy()
-    model_policy = ModelRoutingPolicy()
     graph = StateGraph(dict)
 
     def load_context(state: WorkflowGraphState) -> WorkflowGraphState:
@@ -202,6 +202,7 @@ def build_operational_roundtable_graph(
         }
 
     def roundtable_discussion(state: WorkflowGraphState) -> WorkflowGraphState:
+        model_policy = build_model_policy(state)
         model_routes = [
             model_policy.route_primary(
                 workflow_type=workflow_type,
@@ -245,6 +246,7 @@ def build_operational_roundtable_graph(
         }
 
     def high_risk_review(state: WorkflowGraphState) -> WorkflowGraphState:
+        model_policy = build_model_policy(state)
         review_items = build_high_risk_review_items(
             workflow_type=workflow_type,
             decisions=state.get("workflow_decisions", []),
@@ -390,7 +392,6 @@ def build_roundtable_report_graph(
 
     StateGraph, START, END = _load_langgraph()
     review_policy = HighRiskReviewPolicy()
-    model_policy = ModelRoutingPolicy()
     graph = StateGraph(dict)
 
     def load_context(state: WorkflowGraphState) -> WorkflowGraphState:
@@ -411,6 +412,7 @@ def build_roundtable_report_graph(
         }
 
     def roundtable_discussion(state: WorkflowGraphState) -> WorkflowGraphState:
+        model_policy = build_model_policy(state)
         model_routes = [
             model_policy.route_primary(
                 workflow_type=workflow_type,
@@ -453,6 +455,7 @@ def build_roundtable_report_graph(
         }
 
     def high_risk_review(state: WorkflowGraphState) -> WorkflowGraphState:
+        model_policy = build_model_policy(state)
         review_items = []
         for decision in state.get("workflow_decisions", []):
             asset_context = state.get("asset_contexts", {}).get(decision["asset_id"], {})
@@ -552,7 +555,6 @@ def build_recommendation_decision_graph() -> Any:
     StateGraph, START, END = _load_langgraph()
     workflow = RecommendationDecisionWorkflow()
     review_policy = HighRiskReviewPolicy()
-    model_policy = ModelRoutingPolicy()
     graph = StateGraph(dict)
 
     def load_context(state: WorkflowGraphState) -> WorkflowGraphState:
@@ -591,6 +593,7 @@ def build_recommendation_decision_graph() -> Any:
         }
 
     def roundtable_discussion(state: WorkflowGraphState) -> WorkflowGraphState:
+        model_policy = build_model_policy(state)
         workflow_input: RecommendationDecisionInput = state["workflow_input"]
         opinions: list[dict[str, Any]] = []
         model_routes = [
@@ -636,6 +639,7 @@ def build_recommendation_decision_graph() -> Any:
         }
 
     def high_risk_review(state: WorkflowGraphState) -> WorkflowGraphState:
+        model_policy = build_model_policy(state)
         result = state["result"]
         workflow_input: RecommendationDecisionInput = state["workflow_input"]
         data_quality = state.get("data_quality", {})
@@ -745,6 +749,18 @@ def build_tool_runtime(state: WorkflowGraphState) -> FinanceToolRuntime:
     if session is None:
         raise ValueError("推荐决策圆桌 Workflow 需要 session 或 tool_runtime。")
     return FinanceToolRuntime(session, graph_store=DryRunGraphStore())
+
+
+def build_model_policy(state: WorkflowGraphState) -> ModelRoutingPolicy:
+    """从 Workflow state 构建模型路由策略。"""
+
+    repository = state.get("model_config_repository")
+    if isinstance(repository, ModelRuntimeConfigRepository):
+        return ModelRoutingPolicy(model_config_repository=repository)
+    session = state.get("session")
+    if session is None:
+        return ModelRoutingPolicy()
+    return ModelRoutingPolicy(model_config_repository=ModelRuntimeConfigRepository(session))
 
 
 def serialize_recommendation_decision(decision: Any) -> dict[str, Any]:

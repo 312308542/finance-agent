@@ -11,9 +11,11 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
+    Boolean,
     Date,
     DateTime,
     Index,
+    Integer,
     Numeric,
     PrimaryKeyConstraint,
     String,
@@ -1407,4 +1409,165 @@ class AgentWorkflowEventORM(Base):
     )
     payload: Mapped[JsonDict] = mapped_column(
         JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class ModelProviderORM(Base):
+    """模型供应商配置表，保存供应商的基础连接信息。"""
+
+    __tablename__ = "model_providers"
+    __table_args__ = (
+        UniqueConstraint("provider_key", name="uq_model_providers_provider_key"),
+        Index("idx_model_providers_vendor", "provider_vendor"),
+        Index("idx_model_providers_enabled", "is_enabled"),
+        Index("idx_model_providers_default", "is_default"),
+    )
+
+    provider_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    provider_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_vendor: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    base_url: Mapped[str | None] = mapped_column(Text)
+    api_key: Mapped[str | None] = mapped_column(Text)
+    timeout_seconds: Mapped[int] = mapped_column(
+        Integer, server_default=text("30"), nullable=False
+    )
+    is_enabled: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("true"), nullable=False
+    )
+    is_default: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class ModelInstanceORM(Base):
+    """模型实例配置表，绑定具体供应商、模型名和路由角色。"""
+
+    __tablename__ = "model_instances"
+    __table_args__ = (
+        UniqueConstraint("model_key", name="uq_model_instances_model_key"),
+        Index("idx_model_instances_provider_enabled", "provider_key", "is_enabled"),
+        Index("idx_model_instances_role_enabled", "role", "is_enabled"),
+        Index("idx_model_instances_model_type", "model_type"),
+        Index("idx_model_instances_default", "is_default"),
+    )
+
+    model_instance_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    provider_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    model_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str | None] = mapped_column(String(64))
+    route_priority: Mapped[int] = mapped_column(
+        Integer, server_default=text("0"), nullable=False
+    )
+    timeout_seconds: Mapped[int] = mapped_column(
+        Integer, server_default=text("30"), nullable=False
+    )
+    is_enabled: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("true"), nullable=False
+    )
+    is_default: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class ModelRoutingRuleORM(Base):
+    """模型路由规则表，允许在线切换常规分析和高风险复核模型。"""
+
+    __tablename__ = "model_routing_rules"
+    __table_args__ = (
+        UniqueConstraint(
+            "workflow_type",
+            "task",
+            "role",
+            "decision_type",
+            name="uq_model_routing_rules_scope",
+        ),
+        Index("idx_model_routing_rules_workflow", "workflow_type", "task"),
+        Index("idx_model_routing_rules_role_enabled", "role", "is_enabled"),
+    )
+
+    rule_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    workflow_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    task: Mapped[str] = mapped_column(String(64), nullable=False)
+    role: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    decision_type: Mapped[str] = mapped_column(
+        String(64), server_default=text("''"), nullable=False
+    )
+    reason: Mapped[str | None] = mapped_column(Text)
+    priority: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
+    is_enabled: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("true"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class RetrievalProfileORM(Base):
+    """检索配置表，保存 embedding、rerank 和 retrieval 参数。"""
+
+    __tablename__ = "retrieval_profiles"
+    __table_args__ = (
+        UniqueConstraint("profile_key", name="uq_retrieval_profiles_profile_key"),
+        Index("idx_retrieval_profiles_scope_default", "usage_scope", "is_default"),
+        Index("idx_retrieval_profiles_enabled", "is_enabled"),
+    )
+
+    profile_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    profile_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    profile_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    usage_scope: Mapped[str] = mapped_column(String(64), nullable=False)
+    search_method: Mapped[str] = mapped_column(String(32), nullable=False)
+    embedding_model_key: Mapped[str | None] = mapped_column(String(128))
+    rerank_model_key: Mapped[str | None] = mapped_column(String(128))
+    top_k: Mapped[int] = mapped_column(Integer, server_default=text("4"), nullable=False)
+    score_threshold: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    reranking_enable: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), nullable=False
+    )
+    reranking_mode: Mapped[str | None] = mapped_column(String(32))
+    weights: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    is_enabled: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("true"), nullable=False
+    )
+    is_default: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("false"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
     )

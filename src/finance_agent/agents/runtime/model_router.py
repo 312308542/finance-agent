@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
+
+from finance_agent.storage.repositories import ModelRuntimeConfigRepository
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,12 @@ class ModelRoutingPolicy:
     review_model_name = "GPT-5.5 Pro"
     review_provider = "openai"
 
+    def __init__(
+        self,
+        model_config_repository: ModelRuntimeConfigRepository | None = None,
+    ) -> None:
+        self.model_config_repository = model_config_repository
+
     def route_primary(
         self,
         *,
@@ -52,6 +60,19 @@ class ModelRoutingPolicy:
     ) -> ModelRoute:
         """生成常规分析模型路由。"""
 
+        db_route = self._route_from_db(
+            workflow_type=workflow_type,
+            task=task,
+            role="primary_financial_analyst",
+            decision_type=decision_type,
+            fallback_reason=reason,
+        )
+        if db_route is not None:
+            return replace(
+                db_route,
+                asset_id=asset_id,
+                decision_type=decision_type,
+            )
         return ModelRoute(
             task=task,
             model_key=self.primary_model_key,
@@ -74,6 +95,19 @@ class ModelRoutingPolicy:
     ) -> ModelRoute:
         """生成高风险复核模型路由。"""
 
+        db_route = self._route_from_db(
+            workflow_type=workflow_type,
+            task="high_risk_review",
+            role="high_risk_reviewer",
+            decision_type=decision_type,
+            fallback_reason=reason,
+        )
+        if db_route is not None:
+            return replace(
+                db_route,
+                asset_id=asset_id,
+                decision_type=decision_type,
+            )
         return ModelRoute(
             task="high_risk_review",
             model_key=self.review_model_key,
@@ -129,3 +163,41 @@ class ModelRoutingPolicy:
                 "risk_context": reason,
             },
         }
+
+    def _route_from_db(
+        self,
+        *,
+        workflow_type: str,
+        task: str,
+        role: str,
+        decision_type: str | None,
+        fallback_reason: str,
+    ) -> ModelRoute | None:
+        """从数据库路由规则生成模型路由，未配置时返回空。"""
+
+        if self.model_config_repository is None:
+            return None
+        match = self.model_config_repository.find_route_model(
+            workflow_type=workflow_type,
+            task=task,
+            role=role,
+            decision_type=decision_type,
+        )
+        if match is None:
+            return None
+        rule, model = match
+        providers = self.model_config_repository.get_enabled_provider_map()
+        provider = providers.get(model.provider_key)
+        if provider is None:
+            return None
+        return ModelRoute(
+            task=task,
+            model_key=model.model_key,
+            model_name=model.model_name,
+            provider=provider.provider_vendor,
+            role=role,
+            reason=rule.reason or fallback_reason,
+            workflow_type=workflow_type,
+            asset_id=None,
+            decision_type=decision_type,
+        )

@@ -15,6 +15,8 @@ from typing import Any
 import requests
 
 from finance_agent.agents.runtime.model_router import ModelRoute, ModelRoutingPolicy
+from finance_agent.storage.db import create_session_factory, session_scope
+from finance_agent.storage.repositories import ModelRuntimeConfigRepository
 
 JsonDict = dict[str, Any]
 
@@ -31,6 +33,7 @@ class ModelEndpointConfig:
     role: str | None = None
     enabled: bool = True
     timeout_seconds: float = 30.0
+    provider_key: str | None = None
 
     @property
     def ready(self) -> bool:
@@ -53,6 +56,7 @@ class ModelRegistry:
 
     models: dict[str, ModelEndpointConfig]
     source: str
+    retrieval_profiles: dict[str, JsonDict] | None = None
 
     def get(self, model_key: str) -> ModelEndpointConfig | None:
         """按模型 key 读取配置。"""
@@ -68,16 +72,45 @@ class ModelRegistry:
                 model_key: config.to_safe_dict()
                 for model_key, config in sorted(self.models.items())
             },
+            "retrieval_profiles": self.retrieval_profiles or {},
         }
 
 
-def load_model_registry(config_file: str | None = None) -> ModelRegistry:
-    """从 JSON 文件或环境变量加载模型配置。"""
+def load_model_registry(
+    config_file: str | None = None,
+    *,
+    database_url: str | None = None,
+    prefer_database: bool = True,
+) -> ModelRegistry:
+    """按 DB、JSON 文件、环境变量的顺序加载模型配置。"""
 
     resolved_file = config_file or os.getenv("FINANCE_AGENT_MODELS_CONFIG_FILE")
     if resolved_file:
         return load_model_registry_from_file(Path(resolved_file))
+    if prefer_database:
+        registry = load_model_registry_from_database(database_url)
+        if registry is not None:
+            return registry
     return load_model_registry_from_env()
+
+
+def load_model_registry_from_database(database_url: str | None = None) -> ModelRegistry | None:
+    """从数据库模型配置表加载模型注册表。"""
+
+    try:
+        session_factory = create_session_factory(database_url)
+        with session_scope(session_factory) as session:
+            repository = ModelRuntimeConfigRepository(session)
+            models = build_model_configs_from_repository(repository)
+            if not models:
+                return None
+            return ModelRegistry(
+                models=models,
+                source="database",
+                retrieval_profiles=build_retrieval_profiles_from_repository(repository),
+            )
+    except Exception:
+        return None
 
 
 def load_model_registry_from_file(path: Path) -> ModelRegistry:
@@ -108,6 +141,7 @@ def load_model_registry_from_env() -> ModelRegistry:
             api_key=os.getenv("FINANCE_AGENT_DEEPSEEK_API_KEY"),
             role="primary_financial_analyst",
             enabled=parse_bool(os.getenv("FINANCE_AGENT_DEEPSEEK_ENABLED"), default=True),
+            provider_key="deepseek",
         ),
         "gpt-5.5-pro": ModelEndpointConfig(
             model_key="gpt-5.5-pro",
@@ -117,6 +151,7 @@ def load_model_registry_from_env() -> ModelRegistry:
             api_key=os.getenv("FINANCE_AGENT_OPENAI_API_KEY"),
             role="high_risk_reviewer",
             enabled=parse_bool(os.getenv("FINANCE_AGENT_OPENAI_ENABLED"), default=True),
+            provider_key="openai",
         ),
     }
     return ModelRegistry(models=models, source="env")
@@ -136,7 +171,61 @@ def build_model_config(model_key: str, payload: object) -> ModelEndpointConfig:
         role=payload.get("role"),
         enabled=parse_bool(payload.get("enabled"), default=True),
         timeout_seconds=float(payload.get("timeout_seconds") or 30.0),
+        provider_key=payload.get("provider_key"),
     )
+
+
+def build_model_configs_from_repository(
+    repository: ModelRuntimeConfigRepository,
+) -> dict[str, ModelEndpointConfig]:
+    """把数据库中的供应商和模型实例聚合成运行时配置。"""
+
+    providers = repository.get_enabled_provider_map()
+    models: dict[str, ModelEndpointConfig] = {}
+    for model in repository.list_model_instances(enabled_only=True):
+        provider = providers.get(model.provider_key)
+        if provider is None:
+            continue
+        timeout_seconds = float(model.timeout_seconds or provider.timeout_seconds or 30)
+        models[model.model_key] = ModelEndpointConfig(
+            model_key=model.model_key,
+            provider=provider.provider_vendor,
+            model_name=model.model_name,
+            base_url=provider.base_url,
+            api_key=provider.api_key,
+            role=model.role,
+            enabled=bool(model.is_enabled and provider.is_enabled),
+            timeout_seconds=timeout_seconds,
+            provider_key=model.provider_key,
+        )
+    return models
+
+
+def build_retrieval_profiles_from_repository(
+    repository: ModelRuntimeConfigRepository,
+) -> dict[str, JsonDict]:
+    """把数据库中的检索配置转换为脱敏运行时摘要。"""
+
+    profiles: dict[str, JsonDict] = {}
+    for profile in repository.list_retrieval_profiles(enabled_only=True):
+        profiles[profile.profile_key] = {
+            "profile_key": profile.profile_key,
+            "profile_name": profile.profile_name,
+            "usage_scope": profile.usage_scope,
+            "search_method": profile.search_method,
+            "embedding_model_key": profile.embedding_model_key,
+            "rerank_model_key": profile.rerank_model_key,
+            "top_k": profile.top_k,
+            "score_threshold": str(profile.score_threshold)
+            if profile.score_threshold is not None
+            else None,
+            "reranking_enable": profile.reranking_enable,
+            "reranking_mode": profile.reranking_mode,
+            "weights": profile.weights,
+            "is_default": profile.is_default,
+            "payload": profile.payload,
+        }
+    return profiles
 
 
 def preview_model_routes(
@@ -147,10 +236,11 @@ def preview_model_routes(
     asset_id: str | None = None,
     decision_type: str | None = None,
     high_risk: bool = False,
+    model_config_repository: ModelRuntimeConfigRepository | None = None,
 ) -> list[JsonDict]:
     """预览当前 Workflow 会路由到哪些模型。"""
 
-    policy = ModelRoutingPolicy()
+    policy = ModelRoutingPolicy(model_config_repository=model_config_repository)
     routes: list[ModelRoute] = [
         policy.route_primary(
             workflow_type=workflow_type,

@@ -44,6 +44,9 @@ from finance_agent.storage.orm import (
     MarketBarORM,
     MemoryEmbeddingORM,
     MonitoringAlertORM,
+    ModelInstanceORM,
+    ModelProviderORM,
+    ModelRoutingRuleORM,
     PortfolioORM,
     PortfolioSnapshotORM,
     PositionORM,
@@ -52,6 +55,7 @@ from finance_agent.storage.orm import (
     RecommendationRunORM,
     RecommendationRunUniverseORM,
     ReviewTaskORM,
+    RetrievalProfileORM,
     RiskFindingORM,
     ScreeningResultItemORM,
     ScreeningResultORM,
@@ -3493,3 +3497,469 @@ class DerivativeDataRepository:
             )
         )
         return list(reversed(rows))
+
+
+class ModelRuntimeConfigRepository:
+    """模型供应商、模型实例、路由规则和检索配置仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_provider(
+        self,
+        *,
+        provider_key: str,
+        provider_vendor: str,
+        provider_name: str,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        timeout_seconds: int = 30,
+        is_enabled: bool = True,
+        is_default: bool = False,
+        payload: JsonDict | None = None,
+    ) -> ModelProviderORM:
+        """按 provider_key 幂等写入模型供应商配置。"""
+
+        values = {
+            "provider_id": f"model_provider:{provider_key}",
+            "provider_key": provider_key,
+            "provider_vendor": provider_vendor,
+            "provider_name": provider_name,
+            "base_url": base_url,
+            "api_key": api_key,
+            "timeout_seconds": timeout_seconds,
+            "is_enabled": is_enabled,
+            "is_default": is_default,
+            "payload": _json_safe(payload or {}),
+            "updated_at": datetime.now().astimezone(),
+        }
+        statement = insert(ModelProviderORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"provider_id", "provider_key"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="uq_model_providers_provider_key",
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.get_provider(provider_key)
+
+    def upsert_model_instance(
+        self,
+        *,
+        provider_key: str,
+        model_key: str,
+        model_name: str,
+        model_type: str = "llm",
+        role: str | None = None,
+        route_priority: int = 0,
+        timeout_seconds: int = 30,
+        is_enabled: bool = True,
+        is_default: bool = False,
+        payload: JsonDict | None = None,
+    ) -> ModelInstanceORM:
+        """按 model_key 幂等写入模型实例配置。"""
+
+        values = {
+            "model_instance_id": f"model_instance:{model_key}",
+            "provider_key": provider_key,
+            "model_key": model_key,
+            "model_type": model_type,
+            "model_name": model_name,
+            "role": role,
+            "route_priority": route_priority,
+            "timeout_seconds": timeout_seconds,
+            "is_enabled": is_enabled,
+            "is_default": is_default,
+            "payload": _json_safe(payload or {}),
+            "updated_at": datetime.now().astimezone(),
+        }
+        statement = insert(ModelInstanceORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"model_instance_id", "model_key"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="uq_model_instances_model_key",
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.get_model_instance(model_key)
+
+    def upsert_routing_rule(
+        self,
+        *,
+        workflow_type: str,
+        task: str,
+        role: str,
+        model_key: str,
+        decision_type: str = "",
+        reason: str | None = None,
+        priority: int = 0,
+        is_enabled: bool = True,
+        payload: JsonDict | None = None,
+    ) -> ModelRoutingRuleORM:
+        """写入模型路由规则，用于覆盖默认路由策略。"""
+
+        decision_type = decision_type or ""
+        values = {
+            "rule_id": build_model_route_rule_id(
+                workflow_type=workflow_type,
+                task=task,
+                role=role,
+                decision_type=decision_type,
+            ),
+            "workflow_type": workflow_type,
+            "task": task,
+            "role": role,
+            "model_key": model_key,
+            "decision_type": decision_type,
+            "reason": reason,
+            "priority": priority,
+            "is_enabled": is_enabled,
+            "payload": _json_safe(payload or {}),
+            "updated_at": datetime.now().astimezone(),
+        }
+        statement = insert(ModelRoutingRuleORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"rule_id", "workflow_type", "task", "role", "decision_type"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="uq_model_routing_rules_scope",
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.get_routing_rule(
+            workflow_type=workflow_type,
+            task=task,
+            role=role,
+            decision_type=decision_type,
+        )
+
+    def upsert_retrieval_profile(
+        self,
+        *,
+        profile_key: str,
+        profile_name: str,
+        usage_scope: str,
+        search_method: str,
+        embedding_model_key: str | None = None,
+        rerank_model_key: str | None = None,
+        top_k: int = 4,
+        score_threshold: Decimal | None = None,
+        reranking_enable: bool = False,
+        reranking_mode: str | None = None,
+        weights: JsonDict | None = None,
+        is_enabled: bool = True,
+        is_default: bool = False,
+        payload: JsonDict | None = None,
+    ) -> RetrievalProfileORM:
+        """写入检索配置，供后续向量/RAG 召回链路复用。"""
+
+        values = {
+            "profile_id": f"retrieval_profile:{profile_key}",
+            "profile_key": profile_key,
+            "profile_name": profile_name,
+            "usage_scope": usage_scope,
+            "search_method": search_method,
+            "embedding_model_key": embedding_model_key,
+            "rerank_model_key": rerank_model_key,
+            "top_k": top_k,
+            "score_threshold": score_threshold,
+            "reranking_enable": reranking_enable,
+            "reranking_mode": reranking_mode,
+            "weights": _json_safe(weights or {}),
+            "is_enabled": is_enabled,
+            "is_default": is_default,
+            "payload": _json_safe(payload or {}),
+            "updated_at": datetime.now().astimezone(),
+        }
+        statement = insert(RetrievalProfileORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"profile_id", "profile_key"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="uq_retrieval_profiles_profile_key",
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.get_retrieval_profile(profile_key)
+
+    def get_provider(self, provider_key: str) -> ModelProviderORM:
+        """按 provider_key 查询供应商。"""
+
+        statement = select(ModelProviderORM).where(ModelProviderORM.provider_key == provider_key)
+        return self.session.scalars(statement).one()
+
+    def get_model_instance(self, model_key: str) -> ModelInstanceORM:
+        """按 model_key 查询模型实例。"""
+
+        statement = select(ModelInstanceORM).where(ModelInstanceORM.model_key == model_key)
+        return self.session.scalars(statement).one()
+
+    def get_routing_rule(
+        self,
+        *,
+        workflow_type: str,
+        task: str,
+        role: str,
+        decision_type: str = "",
+    ) -> ModelRoutingRuleORM:
+        """查询一条精确路由规则。"""
+
+        statement = select(ModelRoutingRuleORM).where(
+            ModelRoutingRuleORM.workflow_type == workflow_type,
+            ModelRoutingRuleORM.task == task,
+            ModelRoutingRuleORM.role == role,
+            ModelRoutingRuleORM.decision_type == (decision_type or ""),
+        )
+        return self.session.scalars(statement).one()
+
+    def get_retrieval_profile(self, profile_key: str) -> RetrievalProfileORM:
+        """按 profile_key 查询检索配置。"""
+
+        statement = select(RetrievalProfileORM).where(
+            RetrievalProfileORM.profile_key == profile_key
+        )
+        return self.session.scalars(statement).one()
+
+    def list_providers(self, *, enabled_only: bool = False) -> list[ModelProviderORM]:
+        """列出模型供应商。"""
+
+        statement = select(ModelProviderORM)
+        if enabled_only:
+            statement = statement.where(ModelProviderORM.is_enabled.is_(True))
+        return list(self.session.scalars(statement.order_by(ModelProviderORM.provider_key)))
+
+    def list_model_instances(self, *, enabled_only: bool = False) -> list[ModelInstanceORM]:
+        """列出模型实例。"""
+
+        statement = select(ModelInstanceORM)
+        if enabled_only:
+            statement = statement.where(ModelInstanceORM.is_enabled.is_(True))
+        return list(
+            self.session.scalars(
+                statement.order_by(
+                    ModelInstanceORM.route_priority.desc(),
+                    ModelInstanceORM.model_key,
+                )
+            )
+        )
+
+    def list_routing_rules(self, *, enabled_only: bool = False) -> list[ModelRoutingRuleORM]:
+        """列出模型路由规则。"""
+
+        statement = select(ModelRoutingRuleORM)
+        if enabled_only:
+            statement = statement.where(ModelRoutingRuleORM.is_enabled.is_(True))
+        return list(
+            self.session.scalars(
+                statement.order_by(
+                    ModelRoutingRuleORM.workflow_type,
+                    ModelRoutingRuleORM.task,
+                    ModelRoutingRuleORM.role,
+                    ModelRoutingRuleORM.priority.desc(),
+                )
+            )
+        )
+
+    def list_retrieval_profiles(
+        self,
+        *,
+        enabled_only: bool = False,
+    ) -> list[RetrievalProfileORM]:
+        """列出检索配置。"""
+
+        statement = select(RetrievalProfileORM)
+        if enabled_only:
+            statement = statement.where(RetrievalProfileORM.is_enabled.is_(True))
+        return list(
+            self.session.scalars(
+                statement.order_by(RetrievalProfileORM.usage_scope, RetrievalProfileORM.profile_key)
+            )
+        )
+
+    def get_enabled_provider_map(self) -> dict[str, ModelProviderORM]:
+        """返回启用供应商的 provider_key 映射。"""
+
+        return {provider.provider_key: provider for provider in self.list_providers(enabled_only=True)}
+
+    def find_route_model(
+        self,
+        *,
+        workflow_type: str,
+        task: str,
+        role: str,
+        decision_type: str | None = None,
+    ) -> tuple[ModelRoutingRuleORM, ModelInstanceORM] | None:
+        """按精确到宽松的顺序查找可用路由和模型实例。"""
+
+        decision_candidates = [decision_type or "", ""]
+        scopes = [
+            (workflow_type, task),
+            (workflow_type, "*"),
+            ("*", task),
+            ("*", "*"),
+        ]
+        for candidate_decision_type in decision_candidates:
+            for candidate_workflow_type, candidate_task in scopes:
+                statement = (
+                    select(ModelRoutingRuleORM)
+                    .where(
+                        ModelRoutingRuleORM.workflow_type == candidate_workflow_type,
+                        ModelRoutingRuleORM.task == candidate_task,
+                        ModelRoutingRuleORM.role == role,
+                        ModelRoutingRuleORM.decision_type == candidate_decision_type,
+                        ModelRoutingRuleORM.is_enabled.is_(True),
+                    )
+                    .order_by(ModelRoutingRuleORM.priority.desc())
+                    .limit(1)
+                )
+                rule = self.session.scalars(statement).one_or_none()
+                if rule is None:
+                    continue
+                model = self.find_enabled_model(rule.model_key)
+                if model is not None:
+                    return rule, model
+        return None
+
+    def find_enabled_model(self, model_key: str) -> ModelInstanceORM | None:
+        """查找启用中的模型实例。"""
+
+        statement = (
+            select(ModelInstanceORM)
+            .where(
+                ModelInstanceORM.model_key == model_key,
+                ModelInstanceORM.is_enabled.is_(True),
+            )
+            .limit(1)
+        )
+        return self.session.scalars(statement).one_or_none()
+
+    def count_model_instances(self) -> int:
+        """统计模型实例数量。"""
+
+        statement = select(func.count()).select_from(ModelInstanceORM)
+        return int(self.session.scalar(statement) or 0)
+
+    def seed_default_model_runtime_config(
+        self,
+        *,
+        overwrite: bool = False,
+        deepseek_base_url: str | None = None,
+        deepseek_api_key: str | None = None,
+        openai_base_url: str | None = None,
+        openai_api_key: str | None = None,
+        embedding_model_key: str | None = None,
+        rerank_model_key: str | None = None,
+    ) -> JsonDict:
+        """写入默认双模型和默认检索配置。"""
+
+        if not overwrite and self.count_model_instances() > 0:
+            return {
+                "seeded": False,
+                "reason": "数据库中已经存在模型实例，未覆盖现有配置。",
+                "model_count": self.count_model_instances(),
+            }
+
+        self.upsert_provider(
+            provider_key="deepseek",
+            provider_vendor="deepseek",
+            provider_name="DeepSeek",
+            base_url=deepseek_base_url,
+            api_key=deepseek_api_key,
+            is_default=True,
+        )
+        self.upsert_provider(
+            provider_key="openai",
+            provider_vendor="openai",
+            provider_name="OpenAI",
+            base_url=openai_base_url,
+            api_key=openai_api_key,
+            is_default=False,
+        )
+        self.upsert_model_instance(
+            provider_key="deepseek",
+            model_key="deepseek-v4-pro",
+            model_name="DeepSeek V4 Pro",
+            role="primary_financial_analyst",
+            is_default=True,
+            route_priority=100,
+        )
+        self.upsert_model_instance(
+            provider_key="openai",
+            model_key="gpt-5.5-pro",
+            model_name="GPT-5.5 Pro",
+            role="high_risk_reviewer",
+            is_default=False,
+            route_priority=90,
+        )
+        self.upsert_routing_rule(
+            workflow_type="*",
+            task="*",
+            role="primary_financial_analyst",
+            model_key="deepseek-v4-pro",
+            reason="常规金融分析默认使用 DeepSeek V4 Pro。",
+            priority=100,
+        )
+        self.upsert_routing_rule(
+            workflow_type="*",
+            task="high_risk_review",
+            role="high_risk_reviewer",
+            model_key="gpt-5.5-pro",
+            reason="高风险复核默认使用 GPT-5.5 Pro。",
+            priority=100,
+        )
+        self.upsert_retrieval_profile(
+            profile_key="finance_memory_default",
+            profile_name="Finance Memory 默认检索配置",
+            usage_scope="finance_memory",
+            search_method="hybrid_search",
+            embedding_model_key=embedding_model_key,
+            rerank_model_key=rerank_model_key,
+            top_k=8,
+            reranking_enable=bool(rerank_model_key),
+            reranking_mode="reranking_model" if rerank_model_key else "weighted_score",
+            weights={
+                "semantic": 0.65,
+                "keyword": 0.35,
+            },
+            is_default=True,
+        )
+        return {
+            "seeded": True,
+            "providers": ["deepseek", "openai"],
+            "models": ["deepseek-v4-pro", "gpt-5.5-pro"],
+            "routing_rules": ["primary_financial_analyst", "high_risk_reviewer"],
+            "retrieval_profiles": ["finance_memory_default"],
+        }
+
+
+def build_model_route_rule_id(
+    *,
+    workflow_type: str,
+    task: str,
+    role: str,
+    decision_type: str,
+) -> str:
+    """生成模型路由规则 ID。"""
+
+    clean = ":".join(
+        part.replace(":", "_") for part in (workflow_type, task, role, decision_type or "any")
+    )
+    return f"model_route:{clean}"
