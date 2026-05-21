@@ -1,16 +1,23 @@
-"""内部金融 Agent Loop 的确定性规划器。"""
+"""内部金融 Agent Loop 的规划器。"""
 
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
 from hashlib import sha1
 from typing import Any
 
+from finance_agent.agents.loop.state import AgentLoopContext, AgentLoopPlan
 from finance_agent.agents.runtime.context_envelope import build_workflow_context_envelope
+from finance_agent.agents.runtime.model_client import (
+    ModelClient,
+    ModelClientResponse,
+    OpenAICompatibleModelClient,
+)
 from finance_agent.agents.runtime.model_config import ModelRegistry, load_model_registry
 from finance_agent.agents.runtime.model_router import ModelRoutingPolicy
 from finance_agent.agents.runtime.prompts import build_prompt_bundle
 from finance_agent.agents.tools.runtime import FinanceToolRuntime
-from finance_agent.agents.loop.state import AgentLoopContext, AgentLoopPlan
 from finance_agent.graph.stores import DryRunGraphStore
 
 SUPPORTED_WORKFLOW_TYPES = {
@@ -21,6 +28,19 @@ SUPPORTED_WORKFLOW_TYPES = {
     "swap_decision",
     "daily_review",
 }
+
+
+@dataclass(frozen=True)
+class ModelPlannerLoopResult:
+    """模型 Planner 循环的审计结果。"""
+
+    status: str
+    iterations: int
+    final_decision: dict[str, Any] | None
+    tool_observations: list[dict[str, Any]]
+    tool_results_summary: list[dict[str, Any]]
+    message_audit: list[dict[str, Any]]
+    error_message: str | None = None
 
 
 class InternalFinanceAgentPlanner:
@@ -85,9 +105,9 @@ class InternalFinanceAgentPlanner:
 class ModelFinanceAgentPlanner:
     """模型增强版内部 Agent Planner。
 
-    当前阶段先完成“模型可接入”的规划层闭环：用确定性 planner 保证执行边界，
-    再把模型路由、可调用工具、图谱记忆召回和 dry-run 状态写入审计上下文。
-    当真实模型端点配置完成后，上层模型客户端可以替换 `_build_model_decision`。
+    有真实模型端点时，Planner 会进行受控的“模型 -> 工具 -> 观察 -> 模型”循环，
+    让模型按需读取已入库事实、Workflow、记忆和图谱工具；没有模型或模型失败时，
+    回到确定性 planner，保证触发事件仍能闭环。
     """
 
     def __init__(
@@ -95,11 +115,13 @@ class ModelFinanceAgentPlanner:
         *,
         model_registry: ModelRegistry | None = None,
         tool_runtime: FinanceToolRuntime | None = None,
+        model_client: ModelClient | None = None,
         fallback_planner: InternalFinanceAgentPlanner | None = None,
         execute_fact_tools: bool = True,
     ) -> None:
         self.model_registry = model_registry
         self.tool_runtime = tool_runtime
+        self.model_client = model_client or OpenAICompatibleModelClient()
         self.fallback_planner = fallback_planner or InternalFinanceAgentPlanner()
         self.execute_fact_tools = execute_fact_tools
         self.routing_policy = ModelRoutingPolicy()
@@ -118,16 +140,18 @@ class ModelFinanceAgentPlanner:
             task="internal_agent_planning",
             asset_id=event.asset_id,
             decision_type=event.trigger_type,
-            reason="内部 Agent Loop 规划优先使用 DeepSeek V4 Pro；未配置端点时走 dry-run fallback。",
+            reason=(
+                "内部 Agent Loop 规划优先使用 DeepSeek V4 Pro；"
+                "未配置端点时走 dry-run fallback。"
+            ),
         )
         registry = self._load_registry()
         config = registry.get(route.model_key)
         model_ready = bool(config and config.ready)
         extended_tool_calls = build_model_planned_tool_calls(event)
-        tool_results_summary = self._collect_tool_results(
-            context=context,
-            tool_calls=extended_tool_calls,
-        )
+        allowed_tool_calls = tuple(extended_tool_calls)
+        tool_results_summary = []
+        model_loop_result: ModelPlannerLoopResult | None = None
         prompt_envelope = build_planner_prompt_envelope(
             event=event,
             workflow_type=workflow_type,
@@ -138,6 +162,42 @@ class ModelFinanceAgentPlanner:
             model_role="primary_financial_analyst",
             context_envelope=prompt_envelope,
         )
+        if model_ready and config is not None:
+            model_loop_result = self._run_model_loop(
+                context=context,
+                config=config,
+                fallback_plan=fallback_plan,
+                prompt_bundle=prompt_bundle,
+                prompt_envelope=prompt_envelope,
+                allowed_tool_calls=allowed_tool_calls,
+            )
+            if model_loop_result.tool_results_summary:
+                tool_results_summary = model_loop_result.tool_results_summary
+                prompt_envelope = build_planner_prompt_envelope(
+                    event=event,
+                    workflow_type=workflow_type,
+                    tool_calls=allowed_tool_calls,
+                    tool_results_summary=tool_results_summary,
+                )
+                prompt_bundle = build_prompt_bundle(
+                    model_role="primary_financial_analyst",
+                    context_envelope=prompt_envelope,
+                )
+        elif self.execute_fact_tools:
+            tool_results_summary = self._collect_tool_results(
+                context=context,
+                tool_calls=extended_tool_calls,
+            )
+            prompt_envelope = build_planner_prompt_envelope(
+                event=event,
+                workflow_type=workflow_type,
+                tool_calls=extended_tool_calls,
+                tool_results_summary=tool_results_summary,
+            )
+            prompt_bundle = build_prompt_bundle(
+                model_role="primary_financial_analyst",
+                context_envelope=prompt_envelope,
+            )
         model_decision = self._build_model_decision(
             context=context,
             route=route.to_dict(),
@@ -146,6 +206,12 @@ class ModelFinanceAgentPlanner:
             tool_results_summary=tool_results_summary,
             fallback_plan=fallback_plan,
             prompt_bundle=prompt_bundle,
+            model_loop_result=model_loop_result,
+        )
+        selected_plan = self._apply_model_loop_result(
+            fallback_plan=fallback_plan,
+            model_loop_result=model_loop_result,
+            model_decision=model_decision,
         )
         initial_state = dict(fallback_plan.initial_state)
         initial_state["model_planner"] = model_decision
@@ -154,13 +220,26 @@ class ModelFinanceAgentPlanner:
         initial_state["tool_results_summary"] = tool_results_summary
         initial_state["model_prompt_bundle"] = prompt_bundle
         initial_state["model_prompt_envelope"] = prompt_envelope
+        if model_loop_result is not None:
+            initial_state["model_loop_messages"] = model_loop_result.message_audit
+            initial_state["model_tool_observations"] = model_loop_result.tool_observations
+            initial_state["model_final_decision"] = model_loop_result.final_decision
         return AgentLoopPlan(
-            action=fallback_plan.action,
+            action=selected_plan.action,
             reason=model_decision["reason"],
-            workflow_type=fallback_plan.workflow_type,
-            workflow_run_id=fallback_plan.workflow_run_id,
+            workflow_type=selected_plan.workflow_type,
+            workflow_run_id=selected_plan.workflow_run_id,
             initial_state=initial_state,
-            tool_calls=extended_tool_calls,
+            tool_calls=tuple(
+                selected_plan.tool_calls
+                or tuple(
+                    observation
+                    for observation in (
+                        model_loop_result.tool_observations if model_loop_result else ()
+                    )
+                )
+                or extended_tool_calls
+            ),
         )
 
     def _load_registry(self) -> ModelRegistry:
@@ -219,6 +298,195 @@ class ModelFinanceAgentPlanner:
                 )
         return summaries
 
+    def _run_model_loop(
+        self,
+        *,
+        context: AgentLoopContext,
+        config: Any,
+        fallback_plan: AgentLoopPlan,
+        prompt_bundle: dict[str, Any],
+        prompt_envelope: dict[str, Any],
+        allowed_tool_calls: tuple[dict[str, object], ...],
+    ) -> ModelPlannerLoopResult:
+        """运行受控模型规划循环。"""
+
+        allowed_tools = build_allowed_tool_map(allowed_tool_calls)
+        tool_observations: list[dict[str, Any]] = []
+        tool_results_summary: list[dict[str, Any]] = []
+        message_audit: list[dict[str, Any]] = []
+        final_decision: dict[str, Any] | None = None
+        error_message: str | None = None
+
+        for iteration in range(1, max(context.limits.max_steps, 1) + 1):
+            try:
+                response = self.model_client.invoke_json(
+                    config=config,
+                    messages=build_model_planner_messages(
+                        prompt_bundle=prompt_bundle,
+                        prompt_envelope=prompt_envelope,
+                        fallback_plan=fallback_plan,
+                        allowed_tool_calls=allowed_tool_calls,
+                        tool_observations=tool_observations,
+                    ),
+                    temperature=0.1,
+                )
+            except Exception as exc:
+                error_message = str(exc)
+                break
+
+            message_audit.append(build_model_response_audit(response, iteration=iteration))
+            decision = response.parsed_json or {}
+            if not decision:
+                error_message = "模型未返回可解析 JSON，已回退确定性计划。"
+                break
+
+            requested_tools = normalize_model_tool_requests(
+                decision.get("tool_requests"),
+                allowed_tools=allowed_tools,
+                executed_count=len(tool_observations),
+                max_tool_calls=context.limits.max_tool_calls,
+            )
+            if requested_tools:
+                observations = self._execute_model_requested_tools(
+                    context=context,
+                    requested_tools=requested_tools,
+                )
+                tool_observations.extend(observations)
+                tool_results_summary.extend(
+                    {
+                        "tool": observation.get("tool"),
+                        "status": observation.get("status"),
+                        **(
+                            {"summary": observation["summary"]}
+                            if observation.get("summary") is not None
+                            else {}
+                        ),
+                        **(
+                            {"error": observation["error"]}
+                            if observation.get("error") is not None
+                            else {}
+                        ),
+                    }
+                    for observation in observations
+                )
+                continue
+
+            final_decision = decision
+            break
+
+        status = (
+            "model_planned_workflow"
+            if is_model_workflow_decision(final_decision)
+            else "model_skipped"
+            if is_model_skip_decision(final_decision)
+            else "model_fallback"
+        )
+        return ModelPlannerLoopResult(
+            status=status,
+            iterations=len(message_audit),
+            final_decision=final_decision,
+            tool_observations=tool_observations,
+            tool_results_summary=tool_results_summary,
+            message_audit=message_audit,
+            error_message=error_message,
+        )
+
+    def _execute_model_requested_tools(
+        self,
+        *,
+        context: AgentLoopContext,
+        requested_tools: tuple[dict[str, Any], ...],
+    ) -> list[dict[str, Any]]:
+        """执行模型请求的白名单工具。"""
+
+        runtime = self._resolve_tool_runtime(context)
+        if runtime is None:
+            return [
+                {
+                    "tool": request["tool"],
+                    "arguments": request.get("arguments") or {},
+                    "status": "skipped",
+                    "reason": "缺少数据库会话，无法执行模型请求的事实工具。",
+                }
+                for request in requested_tools
+            ]
+
+        observations: list[dict[str, Any]] = []
+        for request in requested_tools:
+            tool_name = str(request["tool"])
+            arguments = dict(request.get("arguments") or {})
+            try:
+                result = runtime.call(tool_name, **arguments)
+                observations.append(
+                    {
+                        "tool": tool_name,
+                        "arguments": arguments,
+                        "status": "ok",
+                        "summary": summarize_tool_result(result),
+                        "reason": request.get("reason"),
+                    }
+                )
+            except Exception as exc:
+                observations.append(
+                    {
+                        "tool": tool_name,
+                        "arguments": arguments,
+                        "status": "failed",
+                        "error": str(exc),
+                        "reason": request.get("reason"),
+                    }
+                )
+        return observations
+
+    def _apply_model_loop_result(
+        self,
+        *,
+        fallback_plan: AgentLoopPlan,
+        model_loop_result: ModelPlannerLoopResult | None,
+        model_decision: dict[str, Any],
+    ) -> AgentLoopPlan:
+        """把模型最终决策映射为受控 AgentLoopPlan。"""
+
+        if model_loop_result is None:
+            return fallback_plan
+        final_decision = model_loop_result.final_decision or {}
+        if is_model_skip_decision(final_decision):
+            return AgentLoopPlan(
+                action="skip",
+                reason=model_decision["reason"],
+                workflow_type=fallback_plan.workflow_type,
+                workflow_run_id=fallback_plan.workflow_run_id,
+                initial_state=fallback_plan.initial_state,
+                tool_calls=tuple(model_loop_result.tool_observations),
+            )
+        if is_model_workflow_decision(final_decision):
+            workflow_type = str(
+                final_decision.get("workflow_type") or fallback_plan.workflow_type or ""
+            )
+            if workflow_type not in SUPPORTED_WORKFLOW_TYPES:
+                return fallback_plan
+            return AgentLoopPlan(
+                action="run_workflow",
+                reason=model_decision["reason"],
+                workflow_type=workflow_type,
+                workflow_run_id=fallback_plan.workflow_run_id
+                if workflow_type == fallback_plan.workflow_type
+                else build_internal_agent_workflow_run_id(
+                    owner_id=str(fallback_plan.initial_state.get("owner_id") or "owner"),
+                    workflow_type=workflow_type,
+                    agent_task_id=str(
+                        (fallback_plan.initial_state.get("trigger_event") or {}).get(
+                            "trigger_event_id"
+                        )
+                        or fallback_plan.workflow_run_id
+                        or workflow_type
+                    ),
+                ),
+                initial_state=fallback_plan.initial_state,
+                tool_calls=tuple(model_loop_result.tool_observations),
+            )
+        return fallback_plan
+
     def _build_model_decision(
         self,
         *,
@@ -229,31 +497,50 @@ class ModelFinanceAgentPlanner:
         tool_results_summary: list[dict[str, Any]],
         fallback_plan: AgentLoopPlan,
         prompt_bundle: dict[str, Any],
+        model_loop_result: ModelPlannerLoopResult | None = None,
     ) -> dict[str, Any]:
         """构建模型 Planner 审计输出。"""
 
         event = context.event
-        status = "ready_for_model_call" if model_ready else "dry_run_fallback"
-        reason = (
-            f"模型 Planner 已为 {fallback_plan.workflow_type} 生成工具和 Workflow 计划；"
-            "当前模型端点已具备真实调用配置。"
-            if model_ready
-            else (
-                f"模型 Planner 未检测到真实模型端点配置，按已入库触发事件、"
-                f"事实工具和确定性 fallback 执行 {fallback_plan.workflow_type}。"
+        if model_loop_result is not None:
+            status = model_loop_result.status
+            final_decision = model_loop_result.final_decision or {}
+            summary = final_decision.get("summary_zh") or final_decision.get("reasoning_brief_zh")
+            if status == "model_planned_workflow":
+                reason = str(summary or f"模型 Planner 已决定执行 {fallback_plan.workflow_type}。")
+            elif status == "model_skipped":
+                reason = str(summary or "模型 Planner 判断本次触发暂不需要调用 Workflow。")
+            else:
+                reason = (
+                    f"模型 Planner 未形成可执行计划，按确定性 fallback 执行 "
+                    f"{fallback_plan.workflow_type}。"
+                )
+        else:
+            status = "ready_for_model_call" if model_ready else "dry_run_fallback"
+            reason = (
+                f"模型 Planner 已为 {fallback_plan.workflow_type} 生成工具和 Workflow 计划；"
+                "当前模型端点已具备真实调用配置。"
+                if model_ready
+                else (
+                    f"模型 Planner 未检测到真实模型端点配置，按已入库触发事件、"
+                    f"事实工具和确定性 fallback 执行 {fallback_plan.workflow_type}。"
+                )
             )
-        )
         return {
             "planner": "ModelFinanceAgentPlanner",
             "status": status,
             "reason": reason,
-            "model_call_executed": False,
+            "model_call_executed": bool(model_loop_result and model_loop_result.iterations),
             "registry_source": registry_source,
             "route": route,
             "trigger_event_id": event.trigger_event_id,
             "requested_workflow_type": event.requested_workflow_type,
             "tool_result_count": len(tool_results_summary),
             "fallback_action": fallback_plan.action,
+            "fallback_workflow_type": fallback_plan.workflow_type,
+            "model_loop_iterations": model_loop_result.iterations if model_loop_result else 0,
+            "model_error_message": model_loop_result.error_message if model_loop_result else None,
+            "model_final_decision": model_loop_result.final_decision if model_loop_result else None,
             "prompt_model_role": prompt_bundle.get("model_role"),
             "prompt_role_name": prompt_bundle.get("role_name"),
             "prompt_sections": [
@@ -278,6 +565,185 @@ def validate_workflow_context(event: object) -> str | None:
     if workflow_type in {"asset_deep_analysis", "swap_decision"} and not event.asset_id:
         return f"{workflow_type} 缺少 asset_id，内部 Agent 跳过。"
     return None
+
+
+def build_allowed_tool_map(
+    tool_calls: tuple[dict[str, object], ...],
+) -> dict[str, list[dict[str, object]]]:
+    """把 Planner 允许的工具调用转成按工具名分组的白名单。"""
+
+    allowed: dict[str, list[dict[str, object]]] = {}
+    for call in tool_calls:
+        tool_name = str(call.get("tool") or "")
+        if not tool_name:
+            continue
+        allowed.setdefault(tool_name, []).append(call)
+    return allowed
+
+
+def build_model_planner_messages(
+    *,
+    prompt_bundle: dict[str, Any],
+    prompt_envelope: dict[str, Any],
+    fallback_plan: AgentLoopPlan,
+    allowed_tool_calls: tuple[dict[str, object], ...],
+    tool_observations: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """构建模型 Planner 的 Chat Completions 消息。"""
+
+    allowed_workflows = sorted(SUPPORTED_WORKFLOW_TYPES)
+    user_payload = {
+        "task": "internal_finance_agent_planning",
+        "fallback_plan": {
+            "action": fallback_plan.action,
+            "workflow_type": fallback_plan.workflow_type,
+            "reason": fallback_plan.reason,
+        },
+        "context_envelope": prompt_envelope,
+        "allowed_tool_calls": list(allowed_tool_calls),
+        "tool_observations": tool_observations,
+        "allowed_workflow_types": allowed_workflows,
+        "output_contract": {
+            "when_need_more_data": {
+                "status": "need_more_data",
+                "summary_zh": "为什么需要更多事实",
+                "tool_requests": [
+                    {
+                        "tool": "必须来自 allowed_tool_calls.tool",
+                        "arguments": "只能使用对应 allowed_tool_calls 中已有参数或其子集",
+                        "reason": "调用原因",
+                    }
+                ],
+                "reasoning_brief_zh": "简短理由",
+            },
+            "when_ready": {
+                "status": "ready",
+                "action": "run_workflow",
+                "workflow_type": "必须来自 allowed_workflow_types",
+                "summary_zh": "中文摘要",
+                "confidence": 0.0,
+                "risk_flags": [],
+                "reasoning_brief_zh": "简短理由",
+            },
+            "when_skip": {
+                "status": "blocked",
+                "action": "skip",
+                "summary_zh": "中文跳过原因",
+                "reasoning_brief_zh": "简短理由",
+            },
+        },
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                f"{prompt_bundle.get('stable', '')}\n"
+                "你现在只负责内部 Agent Loop 规划。必须只输出一个 JSON 对象，"
+                "不得输出 Markdown、解释性前后缀或隐藏推理链。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(user_payload, ensure_ascii=False, sort_keys=True),
+        },
+    ]
+
+
+def build_model_response_audit(
+    response: ModelClientResponse,
+    *,
+    iteration: int,
+) -> dict[str, Any]:
+    """提取单轮模型响应审计摘要。"""
+
+    payload = response.to_audit_dict()
+    payload["iteration"] = iteration
+    return payload
+
+
+def normalize_model_tool_requests(
+    value: object,
+    *,
+    allowed_tools: dict[str, list[dict[str, object]]],
+    executed_count: int,
+    max_tool_calls: int,
+) -> tuple[dict[str, Any], ...]:
+    """过滤并标准化模型请求的工具调用。"""
+
+    if not isinstance(value, list):
+        return ()
+    remaining = max(max_tool_calls - executed_count, 0)
+    if remaining <= 0:
+        return ()
+    requests: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        tool_name = str(item.get("tool") or "")
+        if tool_name not in allowed_tools:
+            continue
+        arguments = item.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {}
+        normalized_arguments = normalize_allowed_tool_arguments(
+            tool_name=tool_name,
+            requested_arguments=arguments,
+            allowed_tools=allowed_tools,
+        )
+        requests.append(
+            {
+                "tool": tool_name,
+                "arguments": normalized_arguments,
+                "reason": item.get("reason"),
+            }
+        )
+        if len(requests) >= remaining:
+            break
+    return tuple(requests)
+
+
+def normalize_allowed_tool_arguments(
+    *,
+    tool_name: str,
+    requested_arguments: dict[str, Any],
+    allowed_tools: dict[str, list[dict[str, object]]],
+) -> dict[str, Any]:
+    """把模型参数约束回 Planner 提供的白名单参数集合。"""
+
+    allowed_variants = allowed_tools.get(tool_name) or []
+    if not allowed_variants:
+        return {}
+    base = {key: value for key, value in allowed_variants[0].items() if key != "tool"}
+    normalized = dict(base)
+    for key, value in requested_arguments.items():
+        if key in base:
+            normalized[key] = value
+    return normalized
+
+
+def is_model_workflow_decision(decision: dict[str, Any] | None) -> bool:
+    """判断模型是否选择运行受支持 Workflow。"""
+
+    if not isinstance(decision, dict):
+        return False
+    action = str(decision.get("action") or "").strip()
+    status = str(decision.get("status") or "").strip()
+    workflow_type = str(decision.get("workflow_type") or "").strip()
+    return (
+        status in {"ready", "run_workflow", "completed"}
+        and action in {"run_workflow", "workflow", ""}
+        and workflow_type in SUPPORTED_WORKFLOW_TYPES
+    )
+
+
+def is_model_skip_decision(decision: dict[str, Any] | None) -> bool:
+    """判断模型是否明确选择跳过。"""
+
+    if not isinstance(decision, dict):
+        return False
+    action = str(decision.get("action") or "").strip()
+    status = str(decision.get("status") or "").strip()
+    return action == "skip" or status in {"blocked", "skip", "skipped"}
 
 
 def build_model_planned_tool_calls(event: object) -> tuple[dict[str, object], ...]:
@@ -493,7 +959,9 @@ def dedupe_tool_calls(calls: list[dict[str, object]]) -> list[dict[str, object]]
     seen: set[tuple[tuple[str, str], ...]] = set()
     result: list[dict[str, object]] = []
     for call in calls:
-        key = tuple(sorted((str(item_key), str(item_value)) for item_key, item_value in call.items()))
+        key = tuple(
+            sorted((str(item_key), str(item_value)) for item_key, item_value in call.items())
+        )
         if key in seen:
             continue
         seen.add(key)

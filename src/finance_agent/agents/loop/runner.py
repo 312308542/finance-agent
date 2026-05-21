@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from finance_agent.agents.interfaces import FinanceAgentInterface
 from finance_agent.agents.loop.graph import build_internal_agent_loop_graph
-from finance_agent.agents.loop.planner import InternalFinanceAgentPlanner
+from finance_agent.agents.loop.planner import InternalFinanceAgentPlanner, ModelFinanceAgentPlanner
 from finance_agent.agents.loop.state import (
     AgentLoopContext,
     AgentLoopDaemonResult,
@@ -25,8 +25,8 @@ class InternalFinanceAgentLoopRunner:
     """项目内受控金融 Agent Loop。
 
     它消费触发层派发出的 Agent 唤醒事件，再由规划器决定是否调用底层金融团队
-    Workflow。当前实现是确定性规划器，后续可以把 planner 替换为 LangGraph
-    loop，但 runner 的幂等、边界和审计语义保持不变。
+    Workflow。默认使用模型增强 Planner；模型不可用或输出不可执行时会回到确定性
+    fallback，runner 的幂等、边界和审计语义保持不变。
     """
 
     def __init__(
@@ -39,7 +39,7 @@ class InternalFinanceAgentLoopRunner:
         self.session = session
         self.triggers = AssistantTriggerRepository(session)
         self.interface = FinanceAgentInterface(session)
-        self.planner = planner or InternalFinanceAgentPlanner()
+        self.planner = planner or ModelFinanceAgentPlanner()
         self.limits = limits or AgentLoopLimits()
 
     def run_once(
