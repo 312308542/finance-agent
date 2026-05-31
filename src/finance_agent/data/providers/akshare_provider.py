@@ -25,6 +25,11 @@ class AkshareProvider:
 
     provider_name = "akshare"
 
+    def __init__(self, *, request_timeout_seconds: float = 15.0) -> None:
+        """设置 AKShare 单次 HTTP 请求超时。"""
+
+        self.request_timeout_seconds = request_timeout_seconds
+
     def fetch_assets(self, *, limit: int | None = None) -> AssetListResult:
         """获取 A 股可交易资产列表。"""
 
@@ -86,19 +91,13 @@ class AkshareProvider:
         """获取 A 股历史 K 线。"""
 
         collected_at = datetime.now(tz=UTC)
-        primary_source = "akshare:stock_zh_a_hist"
+        primary_source = "akshare:stock_zh_a_hist_tx"
         fallback_trace: list[dict[str, str]] = []
         try:
-            df = self._fetch_ohlcv_eastmoney(
-                symbol=symbol,
-                timeframe=timeframe,
-                start=start,
-                end=end,
-                adjust=adjust,
-            )
+            df = self._fetch_ohlcv_tencent(symbol=symbol, start=start, end=end, adjust=adjust)
             if limit:
                 df = df.tail(limit)
-            bars = normalize_ashare_hist(
+            bars = normalize_ashare_hist_tx(
                 df,
                 symbol=symbol,
                 timeframe=timeframe,
@@ -109,26 +108,27 @@ class AkshareProvider:
         except Exception as exc:
             fallback_trace.append({"source": primary_source, "error_message": str(exc)})
             try:
-                df = self._fetch_ohlcv_tencent(
+                df = self._fetch_ohlcv_eastmoney(
                     symbol=symbol,
+                    timeframe=timeframe,
                     start=start,
                     end=end,
                     adjust=adjust,
                 )
                 if limit:
                     df = df.tail(limit)
-                bars = normalize_ashare_hist_tx(
+                bars = normalize_ashare_hist(
                     df,
                     symbol=symbol,
                     timeframe=timeframe,
-                    source="akshare:stock_zh_a_hist_tx",
+                    source="akshare:stock_zh_a_hist",
                     adjustment=adjust,
                 )
-                actual_source = "akshare:stock_zh_a_hist_tx"
+                actual_source = "akshare:stock_zh_a_hist"
             except Exception as fallback_exc:
                 fallback_trace.append(
                     {
-                        "source": "akshare:stock_zh_a_hist_tx",
+                        "source": "akshare:stock_zh_a_hist",
                         "error_message": str(fallback_exc),
                     }
                 )
@@ -262,6 +262,7 @@ class AkshareProvider:
             start_date=start or "20000101",
             end_date=end or "20991231",
             adjust=adjust,
+            timeout=self.request_timeout_seconds,
         )
 
     def _fetch_ohlcv_tencent(
@@ -279,6 +280,7 @@ class AkshareProvider:
             start_date=start or "20000101",
             end_date=end or "20991231",
             adjust=adjust,
+            timeout=self.request_timeout_seconds,
         )
 
     def _fetch_ohlcv_eastmoney_curl_cffi(

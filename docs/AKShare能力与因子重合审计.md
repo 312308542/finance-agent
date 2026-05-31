@@ -31,7 +31,7 @@
 
 | 因子组 | AKShare 输入 | 当前状态 | 推荐落点 |
 | --- | --- | --- | --- |
-| 资产与流动性 | `stock_zh_a_spot_em`、`stock_zh_a_spot_tx` | 已接入 P0 | `assets`、`asset_universes`、`raw_records` |
+| 资产与流动性 | `stock_zh_a_spot_em`、`stock_zh_a_spot_tx` | 已接入 P0 | `assets`、`asset_profiles`、`asset_status_snapshots`、`realtime_quote_snapshots`、`asset_universes`、`raw_records` |
 | K 线 | `stock_zh_a_hist`、`stock_zh_a_hist_tx` | 已接入 P0 | `market_bars` |
 | 行业/主题 | `stock_board_industry_cons_em`、`stock_board_concept_cons_em` | 已接入 P1，带 fallback | `asset_universes`、`asset_universe_members` |
 | 个股资金流 | `stock_individual_fund_flow_rank`、`stock_individual_fund_flow` | 排名已接入，个股明细待增强 | `capital_flow_snapshots` |

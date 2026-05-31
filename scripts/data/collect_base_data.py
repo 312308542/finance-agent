@@ -8,8 +8,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
+import sys
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
+
+from sqlalchemy import func, select
 
 from finance_agent.application.data_production_service import MarketCalendarService
 from finance_agent.cache import create_cache_client
@@ -28,9 +34,11 @@ from finance_agent.data.collectors import (
 from finance_agent.data.models import ProviderResult
 from finance_agent.data.providers import AkshareProvider
 from finance_agent.storage.db import create_session_factory, session_scope
+from finance_agent.storage.orm import MarketBarORM
 from finance_agent.storage.repositories import AssetRepository, MarketCalendarRepository
 
 JsonDict = dict[str, Any]
+logger = logging.getLogger(__name__)
 
 ALL_GROUPS = ("ashare-p0", "ashare-p1", "ashare-p2", "ashare-risk", "crypto")
 COLLECTION_ARG_DEFAULTS: JsonDict = {
@@ -74,9 +82,40 @@ COLLECTION_ARG_DEFAULTS: JsonDict = {
 def main() -> None:
     """解析命令行参数并执行基础数据采集。"""
 
+    configure_logging_from_environment()
     args = parse_args()
     summary = collect_base_data(args)
     print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+
+
+def configure_logging_from_environment() -> None:
+    """为直接运行采集脚本和调度子进程配置控制台日志。"""
+
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        return
+
+    level_name = os.getenv("FINANCE_AGENT_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s [pid=%(process)d thread=%(threadName)s] "
+        "%(name)s - %(message)s"
+    )
+    root_logger.setLevel(level)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(level)
+    root_logger.addHandler(console_handler)
+
+    process_log_file = os.getenv("FINANCE_AGENT_PROCESS_LOG_FILE")
+    if process_log_file:
+        path = Path(process_log_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(level)
+        root_logger.addHandler(file_handler)
 
 
 def default_collection_args(**overrides: Any) -> argparse.Namespace:
@@ -103,9 +142,26 @@ def default_collection_args(**overrides: Any) -> argparse.Namespace:
 def collect_base_data(args: argparse.Namespace) -> JsonDict:
     """按传入参数执行基础数据采集，并返回结构化摘要。"""
 
+    configure_logging_from_environment()
     session_factory = create_session_factory()
     started_at = datetime.now(tz=UTC)
+    logger.info(
+        "基础数据采集开始 groups=%s sync_task_type=%s mode=%s data_packages=%s "
+        "cache_backend=%s limit=%s",
+        args.group,
+        getattr(args, "sync_task_type", None),
+        getattr(args, "mode", None),
+        getattr(args, "data_packages", []),
+        args.cache_backend,
+        args.limit,
+    )
     cache, locks, cache_status = create_cache_client(backend=args.cache_backend)
+    logger.info(
+        "基础数据采集缓存就绪 backend=%s status=%s message=%s",
+        args.cache_backend,
+        getattr(cache_status, "status", None),
+        getattr(cache_status, "message", None),
+    )
     runtime = CollectionRuntime(
         cache=cache,
         locks=locks,
@@ -148,6 +204,17 @@ def collect_base_data(args: argparse.Namespace) -> JsonDict:
         "locked": sum(1 for item in results if item.status == "locked"),
         "results": [item.__dict__ for item in results],
     }
+    logger.info(
+        "基础数据采集完成 groups=%s total_tasks=%s available=%s error=%s unavailable=%s "
+        "skipped=%s locked=%s",
+        summary["groups"],
+        summary["total_tasks"],
+        summary["available"],
+        summary["error"],
+        summary["unavailable"],
+        summary["skipped"],
+        summary["locked"],
+    )
     return summary
 
 
@@ -167,6 +234,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=COLLECTION_ARG_DEFAULTS["limit"],
         help="每类列表型任务采集条数",
+    )
+    parser.add_argument(
+        "--sync-task-type",
+        default=COLLECTION_ARG_DEFAULTS["sync_task_type"],
+        help="同步任务类型，例如 market_bars_backfill、universe_refresh、event_refresh。",
+    )
+    parser.add_argument(
+        "--symbol-source",
+        default=COLLECTION_ARG_DEFAULTS["symbol_source"],
+        choices=["manual", "market_assets", "universe"],
+        help="K 线等按标的采集任务的代码来源。",
     )
     parser.add_argument(
         "--ashare-symbol",
@@ -384,7 +462,7 @@ def run_ashare_p0(
             )
         ]
     if task_type == "market_bars_backfill":
-        return [
+        tasks = [
             runtime.run_task(
                 task="ashare_p0_calendar",
                 provider_key="tool_trade_date_hist_sina",
@@ -395,29 +473,34 @@ def run_ashare_p0(
                     start=args.ashare_start,
                     end=args.ashare_end,
                 ),
-            ),
-            runtime.run_task(
-                task="ashare_p0_ohlcv",
-                provider_key="stock_zh_a_hist",
-                parameters={
-                    "symbol": args.ashare_symbol,
-                    "timeframe": args.ashare_timeframe,
-                    "start": args.ashare_start,
-                    "end": args.ashare_end,
-                    "adjust": args.ashare_adjust,
-                    "limit": args.limit,
-                },
-                force=args.force_provider,
-                collect=lambda: collector.collect_ohlcv(
-                    symbol=args.ashare_symbol,
-                    timeframe=args.ashare_timeframe,
-                    start=args.ashare_start,
-                    end=args.ashare_end,
-                    limit=args.limit,
-                    adjust=args.ashare_adjust,
-                ),
             )
         ]
+        symbols = resolve_ashare_collection_symbols(session, args)
+        for symbol in symbols:
+            tasks.append(
+                runtime.run_task(
+                    task="ashare_p0_ohlcv",
+                    provider_key=ashare_ohlcv_provider_key(symbol),
+                    parameters={
+                        "symbol": symbol,
+                        "timeframe": args.ashare_timeframe,
+                        "start": args.ashare_start,
+                        "end": args.ashare_end,
+                        "adjust": args.ashare_adjust,
+                        "limit": args.limit,
+                    },
+                    force=args.force_provider,
+                    collect=lambda symbol=symbol: collector.collect_ohlcv(
+                        symbol=symbol,
+                        timeframe=args.ashare_timeframe,
+                        start=args.ashare_start,
+                        end=args.ashare_end,
+                        limit=args.limit,
+                        adjust=args.ashare_adjust,
+                    ),
+                )
+            )
+        return tasks
     return [
         runtime.run_task(
             task="ashare_p0_calendar",
@@ -444,7 +527,7 @@ def run_ashare_p0(
         ),
         runtime.run_task(
             task="ashare_p0_ohlcv",
-            provider_key="stock_zh_a_hist",
+            provider_key=ashare_ohlcv_provider_key(args.ashare_symbol),
             parameters={
                 "symbol": args.ashare_symbol,
                 "timeframe": args.ashare_timeframe,
@@ -1064,7 +1147,7 @@ def run_crypto(
             )
         ]
     if task_type == "market_bars_backfill":
-        return [
+        tasks = [
             runtime.run_task(
                 task="crypto_calendar",
                 provider_key="crypto_calendar_24x7",
@@ -1076,24 +1159,29 @@ def run_crypto(
                     lookback=args.lookback,
                 ),
             ),
-            runtime.run_task(
-                task="crypto_ohlcv",
-                provider_key="ccxt_binance_fetch_ohlcv",
-                parameters={
-                    "symbol": args.crypto_symbol,
-                    "timeframe": args.crypto_timeframe,
-                    "market_type": args.crypto_market_type,
-                    "limit": args.limit,
-                },
-                force=args.force_provider,
-                collect=lambda: collector.collect_ohlcv(
-                    symbol=args.crypto_symbol,
-                    timeframe=args.crypto_timeframe,
-                    market_type=args.crypto_market_type,
-                    limit=args.limit,
-                ),
-            )
         ]
+        symbols = resolve_crypto_collection_symbols(session, args, market=crypto_market)
+        for symbol in symbols:
+            tasks.append(
+                runtime.run_task(
+                    task="crypto_ohlcv",
+                    provider_key=crypto_ohlcv_provider_key(args.crypto_market_type, symbol),
+                    parameters={
+                        "symbol": symbol,
+                        "timeframe": args.crypto_timeframe,
+                        "market_type": args.crypto_market_type,
+                        "limit": args.limit,
+                    },
+                    force=args.force_provider,
+                    collect=lambda symbol=symbol: collector.collect_ohlcv(
+                        symbol=symbol,
+                        timeframe=args.crypto_timeframe,
+                        market_type=args.crypto_market_type,
+                        limit=args.limit,
+                    ),
+                )
+            )
+        return tasks
     if task_type == "derivative_refresh":
         return [
             runtime.run_task(
@@ -1296,18 +1384,43 @@ def crypto_market_name(market_type: str) -> str:
     return "crypto_spot"
 
 
+def ashare_ohlcv_provider_key(symbol: str) -> str:
+    """生成按标的隔离的 A 股 K 线熔断键。"""
+
+    return f"stock_zh_a_hist_tx:{symbol}"
+
+
+def crypto_ohlcv_provider_key(market_type: str, symbol: str) -> str:
+    """生成按币对隔离的 Binance K 线熔断键。"""
+
+    return f"ccxt_binance_fetch_ohlcv:{market_type}:{symbol.replace('/', '').upper()}"
+
+
 def batch_ashare_symbols(
     session: Any,
     *,
     limit: int | None = None,
     fallback_symbol: str,
 ) -> list[str]:
-    """按 A 股资产表批量获取采集标的。"""
+    """按 K 线覆盖缺口选择 A 股补采标的。"""
 
     try:
         repo = AssetRepository(session)
         assets = repo.find_by_market("ashare")
-        symbols = [asset.symbol for asset in assets]
+        coverage = _fetch_ashare_bar_coverage(
+            session,
+            [asset.asset_id for asset in assets],
+            timeframe="1d",
+        )
+        ranked_assets = sorted(
+            assets,
+            key=lambda asset: (
+                coverage.get(asset.asset_id, (0, None))[0],
+                coverage.get(asset.asset_id, (0, None))[1] or datetime.min.replace(tzinfo=UTC),
+                asset.symbol,
+            ),
+        )
+        symbols = [asset.symbol for asset in ranked_assets]
     except Exception:
         symbols = []
     if not symbols:
@@ -1315,6 +1428,135 @@ def batch_ashare_symbols(
     if limit:
         return symbols[:limit]
     return symbols
+
+
+def _fetch_ashare_bar_coverage(
+    session: Any,
+    asset_ids: list[str],
+    *,
+    timeframe: str,
+) -> dict[str, tuple[int, datetime | None]]:
+    """查询 A 股标的已有 K 线覆盖情况。"""
+
+    if not asset_ids:
+        return {}
+    statement = (
+        select(
+            MarketBarORM.asset_id,
+            func.count(MarketBarORM.timestamp),
+            func.max(MarketBarORM.timestamp),
+        )
+        .where(
+            MarketBarORM.market == "ashare",
+            MarketBarORM.timeframe == timeframe,
+            MarketBarORM.asset_id.in_(asset_ids),
+        )
+        .group_by(MarketBarORM.asset_id)
+    )
+    return {
+        str(asset_id): (int(count or 0), latest)
+        for asset_id, count, latest in session.execute(statement)
+    }
+
+
+def resolve_ashare_collection_symbols(session: Any, args: argparse.Namespace) -> list[str]:
+    """根据采集参数解析本次 A 股 K 线补采标的。"""
+
+    symbol_source = str(getattr(args, "symbol_source", "") or "").strip()
+    if symbol_source in {"market_assets", "universe"}:
+        return batch_ashare_symbols(
+            session,
+            limit=getattr(args, "limit", None),
+            fallback_symbol=args.ashare_symbol,
+        )
+    return [args.ashare_symbol]
+
+
+def batch_crypto_symbols(
+    session: Any,
+    *,
+    market: str,
+    timeframe: str,
+    limit: int | None = None,
+    fallback_symbol: str,
+) -> list[str]:
+    """按 K 线覆盖缺口选择数字货币补采标的。"""
+
+    try:
+        repo = AssetRepository(session)
+        assets = repo.find_by_market(market)
+        coverage = _fetch_crypto_bar_coverage(
+            session,
+            [asset.asset_id for asset in assets],
+            timeframe=timeframe,
+            market=market,
+        )
+        ranked_assets = sorted(
+            assets,
+            key=lambda asset: (
+                coverage.get(asset.asset_id, (0, None))[0],
+                coverage.get(asset.asset_id, (0, None))[1] or datetime.min.replace(tzinfo=UTC),
+                asset.symbol,
+            ),
+        )
+        symbols = [asset.symbol for asset in ranked_assets]
+    except Exception:
+        symbols = []
+    if not symbols:
+        symbols = [fallback_symbol]
+    if limit:
+        return symbols[:limit]
+    return symbols
+
+
+def _fetch_crypto_bar_coverage(
+    session: Any,
+    asset_ids: list[str],
+    *,
+    timeframe: str,
+    market: str,
+) -> dict[str, tuple[int, datetime | None]]:
+    """查询数字货币标的已有 K 线覆盖情况。"""
+
+    if not asset_ids:
+        return {}
+    statement = (
+        select(
+            MarketBarORM.asset_id,
+            func.count(MarketBarORM.timestamp),
+            func.max(MarketBarORM.timestamp),
+        )
+        .where(
+            MarketBarORM.market == market,
+            MarketBarORM.timeframe == timeframe,
+            MarketBarORM.asset_id.in_(asset_ids),
+        )
+        .group_by(MarketBarORM.asset_id)
+    )
+    return {
+        str(asset_id): (int(count or 0), latest)
+        for asset_id, count, latest in session.execute(statement)
+    }
+
+
+def resolve_crypto_collection_symbols(
+    session: Any,
+    args: argparse.Namespace,
+    *,
+    market: str,
+) -> list[str]:
+    """根据采集参数解析本次数字货币 K 线补采标的。"""
+
+    symbol_source = str(getattr(args, "symbol_source", "") or "").strip()
+    if symbol_source in {"market_assets", "universe"}:
+        return batch_crypto_symbols(
+            session,
+            market=market,
+            timeframe=args.crypto_timeframe,
+            limit=getattr(args, "limit", None),
+            fallback_symbol=args.crypto_symbol,
+        )
+    return [args.crypto_symbol]
 
 
 def asset_name_for_symbol(session: Any, symbol: str) -> str | None:

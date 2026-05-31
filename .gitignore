@@ -4,6 +4,9 @@ Thumbs.db
 Desktop.ini
 .idea/
 .vscode/
+.claude/
+CLAUDE.md
+AGENTS.md
 *.swp
 *.swo
 
@@ -47,6 +50,7 @@ logs/
 tmp/
 temp/
 .cache/
+runtime/
 
 # 数据库与本地数据
 *.sqlite

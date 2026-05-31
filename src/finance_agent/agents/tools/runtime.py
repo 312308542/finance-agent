@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -119,6 +119,13 @@ class FinanceToolRuntime:
                 name="recommendation.get_run",
                 description="读取一次推荐运行及其推荐结果。",
                 handler=self.get_recommendation_run,
+            )
+        )
+        self.register(
+            FinanceTool(
+                name="recommendation.get_latest",
+                description="读取最近可用推荐运行及其推荐结果。",
+                handler=self.get_latest_recommendations,
             )
         )
         self.register(
@@ -236,6 +243,35 @@ class FinanceToolRuntime:
         )
         return {
             "run": serialize_recommendation_run(run),
+            "recommendations": [
+                serialize_asset_recommendation(recommendation)
+                for recommendation in recommendations
+            ],
+        }
+
+    def get_latest_recommendations(
+        self,
+        *,
+        market: str | None = None,
+        limit: int = 20,
+    ) -> JsonDict:
+        """读取最近可用推荐运行和前 N 条推荐结果。"""
+
+        runs = self.recommendations.list_available_runs_since(
+            since=datetime.now() - timedelta(days=30),
+            market=market,
+            limit=5,
+        )
+        if not runs:
+            return {"runs": [], "active_run": None, "recommendations": []}
+        active_run = runs[0]
+        recommendations = self.recommendations.list_top_recommendations(
+            run_id=active_run.run_id,
+            limit=limit,
+        )
+        return {
+            "runs": [serialize_recommendation_run(run) for run in runs],
+            "active_run": serialize_recommendation_run(active_run),
             "recommendations": [
                 serialize_asset_recommendation(recommendation)
                 for recommendation in recommendations

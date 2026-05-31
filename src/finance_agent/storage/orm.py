@@ -35,7 +35,7 @@ JsonDict = dict[str, Any]
 
 
 class AssetORM(Base):
-    """资产主数据表，统一承载 A 股和数字货币资产。"""
+    """资产身份主表，统一承载 A 股和数字货币资产的稳定标识。"""
 
     __tablename__ = "assets"
     __table_args__ = (
@@ -67,6 +67,142 @@ class AssetORM(Base):
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class AssetProfileORM(Base):
+    """资产慢变资料附表，保存名称、行业等可被不同数据源补全的信息。
+
+    指数、行业、概念、热榜、涨停池等候选池成员关系由 asset_universe_members 承载，
+    不写入本表，避免同一资产因多个来源成员关系产生大量重复画像行。
+    """
+
+    __tablename__ = "asset_profiles"
+    __table_args__ = (
+        Index("idx_asset_profiles_asset_source", "asset_id", "source"),
+        Index("idx_asset_profiles_market_symbol", "market", "symbol"),
+        Index("idx_asset_profiles_sector", "sector"),
+    )
+
+    asset_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    source: Mapped[str] = mapped_column(String(128), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    exchange: Mapped[str | None] = mapped_column(String(64))
+    sector: Mapped[str | None] = mapped_column(String(128))
+    industry: Mapped[str | None] = mapped_column(String(128))
+    concept: Mapped[str | None] = mapped_column(String(128))
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class AssetProviderMappingORM(Base):
+    """资产在不同 Provider 中的代码映射。"""
+
+    __tablename__ = "asset_provider_mappings"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "provider_symbol",
+            "market",
+            name="uq_asset_provider_mappings_provider_symbol_market",
+        ),
+        Index("idx_asset_provider_mappings_asset", "asset_id"),
+        Index("idx_asset_provider_mappings_provider", "provider", "source"),
+    )
+
+    mapping_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_symbol: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider_exchange: Mapped[str | None] = mapped_column(String(64))
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'available'"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class AssetStatusSnapshotORM(Base):
+    """资产交易状态快照，承载停复牌、可交易、退市等动态状态。"""
+
+    __tablename__ = "asset_status_snapshots"
+    __table_args__ = (
+        Index("idx_asset_status_asset_asof", "asset_id", "as_of"),
+        Index("idx_asset_status_market_symbol_asof", "market", "symbol", "as_of"),
+        Index("idx_asset_status_status", "trading_status"),
+    )
+
+    asset_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    source: Mapped[str] = mapped_column(String(128), primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    tradable: Mapped[bool] = mapped_column(server_default=text("true"), nullable=False)
+    trading_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class RealtimeQuoteSnapshotORM(Base):
+    """实时行情快照附表，保存最新价、涨跌、成交量额等高频变化字段。"""
+
+    __tablename__ = "realtime_quote_snapshots"
+    __table_args__ = (
+        Index("idx_realtime_quotes_asset_asof", "asset_id", "as_of"),
+        Index("idx_realtime_quotes_market_symbol_asof", "market", "symbol", "as_of"),
+        Index("idx_realtime_quotes_source", "source"),
+    )
+
+    asset_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    source: Mapped[str] = mapped_column(String(128), primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    last_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    prev_close: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    open: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    high: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    low: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    volume: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    turnover_rate: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    change_amount: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    change_percent: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    bid_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    ask_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'available'"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
 
@@ -145,6 +281,15 @@ class RawRecordORM(Base):
         Index("idx_raw_records_status", "status"),
         Index("idx_raw_records_request_hash", "provider", "endpoint", "request_hash"),
         Index("idx_raw_records_content_hash", "content_hash"),
+        Index(
+            "uq_raw_records_exact_dedup",
+            "provider",
+            "endpoint",
+            "request_hash",
+            "content_hash",
+            "status",
+            unique=True,
+        ),
     )
 
     raw_record_id: Mapped[str] = mapped_column(String(192), primary_key=True)
@@ -305,6 +450,24 @@ class FundamentalSnapshotORM(Base):
         Index("idx_fundamental_as_of", "as_of"),
         Index("idx_fundamental_status", "status"),
         Index("idx_fundamental_source", "source"),
+        Index("idx_fundamental_asset_source_asof", "asset_id", "source", "as_of"),
+        Index("idx_fundamental_asset_source_period", "asset_id", "source", "report_period"),
+        Index(
+            "uq_fundamental_source_asset_asof_valuation",
+            "source",
+            "asset_id",
+            "as_of",
+            unique=True,
+            postgresql_where=text("report_period IS NULL"),
+        ),
+        Index(
+            "uq_fundamental_source_asset_period_report",
+            "source",
+            "asset_id",
+            "report_period",
+            unique=True,
+            postgresql_where=text("report_period IS NOT NULL"),
+        ),
     )
 
     snapshot_id: Mapped[str] = mapped_column(String(192), primary_key=True)

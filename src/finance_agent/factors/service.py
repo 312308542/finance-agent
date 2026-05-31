@@ -89,9 +89,15 @@ class FactorService:
             horizon=horizon,
             library=indicator_library,
         )
-        fundamental_history = self.fundamentals.list_recent_snapshots(
+        financial_indicator_history = self.fundamentals.list_recent_snapshots(
             asset_id=asset_id,
             limit=self.spec.ashare.valuation_history_limit,
+            source="akshare:stock_financial_analysis_indicator_em",
+        )
+        valuation_history = self.fundamentals.list_recent_snapshots(
+            asset_id=asset_id,
+            limit=self.spec.ashare.valuation_history_limit,
+            source="akshare:stock_value_em",
         )
         capital_flow_history = self.capital_flows.list_recent_snapshots(
             asset_id=asset_id,
@@ -101,7 +107,9 @@ class FactorService:
             asset_id=asset_id,
             limit=self.spec.crypto.derivative_history_limit,
         )
-        fundamental = fundamental_history[-1] if fundamental_history else None
+        fundamental_history = financial_indicator_history + valuation_history
+        fundamental = financial_indicator_history[-1] if financial_indicator_history else None
+        valuation = valuation_history[-1] if valuation_history else None
         capital_flow = capital_flow_history[-1] if capital_flow_history else None
         derivative = derivative_history[-1] if derivative_history else None
         events = self.events.list_recent_events(asset_id=asset_id, limit=20)
@@ -120,8 +128,8 @@ class FactorService:
             build_technical_group(indicator),
             build_fundamental_group(fundamental),
             build_valuation_group(
-                fundamental,
-                history=fundamental_history,
+                valuation,
+                history=valuation_history,
                 spec=self.spec.ashare,
             ),
             build_capital_flow_group(
@@ -607,10 +615,15 @@ def infer_symbol_market(
 ) -> tuple[str, str]:
     """从可用输入中推断 symbol 和 market。"""
 
+    symbol = fallback_symbol
+    market = fallback_market
     for item in (indicator, fundamental, capital_flow, derivative):
         if item is not None:
-            return item.symbol, item.market
-    return fallback_symbol or "unknown", fallback_market or "unknown"
+            symbol = symbol or item.symbol
+            market = market or getattr(item, "market", None)
+            if symbol and market:
+                return symbol, market
+    return symbol or "unknown", market or "unknown"
 
 
 def collect_source_ids(

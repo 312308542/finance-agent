@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -14,6 +15,7 @@ from finance_agent.data.collectors import ArchivedProviderResult
 from finance_agent.ports.cache import CacheClient, LockClient
 
 JsonDict = dict[str, Any]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -57,9 +59,16 @@ class CollectionRuntime:
     ) -> CollectionTaskResult:
         """带任务锁和 Provider 熔断保护地执行采集任务。"""
 
+        logger.info(
+            "采集任务开始 task=%s provider=%s parameters=%s force=%s",
+            task,
+            provider_key,
+            parameters,
+            force,
+        )
         circuit_state = self.get_provider_state(provider_key)
         if self.is_circuit_open(circuit_state) and not force:
-            return CollectionTaskResult(
+            result = CollectionTaskResult(
                 task=task,
                 status="skipped",
                 raw_record_id=None,
@@ -70,10 +79,18 @@ class CollectionRuntime:
                     "circuit_state": circuit_state,
                 },
             )
+            logger.warning(
+                "采集任务跳过 task=%s provider=%s status=%s error=%s",
+                task,
+                provider_key,
+                result.status,
+                result.error_message,
+            )
+            return result
 
         lock_key = collection_lock_key(task=task, parameters=parameters)
         if not self.locks.acquire_lock(lock_key, ttl_seconds=self.lock_ttl_seconds):
-            return CollectionTaskResult(
+            result = CollectionTaskResult(
                 task=task,
                 status="locked",
                 raw_record_id=None,
@@ -81,12 +98,40 @@ class CollectionRuntime:
                 error_message="同参数采集任务正在运行",
                 payload={"provider_key": provider_key, "lock_key": lock_key},
             )
+            logger.warning(
+                "采集任务被锁定 task=%s provider=%s lock_key=%s status=%s",
+                task,
+                provider_key,
+                lock_key,
+                result.status,
+            )
+            return result
 
         try:
             archive: ArchivedProviderResult = collect()
             result = summarize_archive(task, archive)
             self.record_provider_result(provider_key=provider_key, result=result)
+            log_method = logger.info if result.status == "available" else logger.warning
+            log_method(
+                "采集任务完成 task=%s provider=%s status=%s item_count=%s raw_record_id=%s "
+                "source=%s error=%s",
+                task,
+                provider_key,
+                result.status,
+                result.item_count,
+                result.raw_record_id,
+                result.payload.get("actual_source"),
+                result.error_message,
+            )
             return result
+        except Exception:
+            logger.exception(
+                "采集任务异常 task=%s provider=%s parameters=%s",
+                task,
+                provider_key,
+                parameters,
+            )
+            raise
         finally:
             self.locks.release_lock(lock_key)
 

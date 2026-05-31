@@ -76,6 +76,7 @@ def main() -> None:
     planned_args = {
         item["job"]: item["collection_args"]
         for item in dry_run["jobs"]
+        if "collection_args" in item
     }
     assert planned_args["ashare.universe.all"]["sync_task_type"] == "universe_refresh"
     assert planned_args["ashare.universe.all"]["group"] == ["ashare-p0", "ashare-p1", "ashare-risk"]

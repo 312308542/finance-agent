@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 JsonDict = dict[str, Any]
+DEFAULT_SCHEDULER_JOB_TIMEOUT_SECONDS = 3600
+DEFAULT_SCHEDULER_HEALTH_STALE_SECONDS = 300
+DEFAULT_SCHEDULER_MAX_CONCURRENT_JOBS = 4
 
 DataSyncPreset = Literal[
     "personal-comprehensive",
@@ -60,6 +63,8 @@ CRYPTO_DATA_PACKAGES = {
     "data_quality": "数据质量检查",
 }
 
+ASHARE_TIMELY_EVENT_INTERVAL_SECONDS = 5 * 60
+
 
 @dataclass(frozen=True)
 class MarketSyncConfig:
@@ -90,6 +95,7 @@ class DataSyncConfig:
     circuit_failure_threshold: int = 3
     circuit_cooldown_seconds: int = 900
     loop_idle_seconds: int = 5
+    max_concurrent_jobs: int = DEFAULT_SCHEDULER_MAX_CONCURRENT_JOBS
 
     def to_dict(self) -> JsonDict:
         """转换为可写入 JSON 的字典。"""
@@ -215,6 +221,10 @@ def parse_data_sync_config(payload: JsonDict) -> DataSyncConfig:
             default=900,
         ),
         loop_idle_seconds=positive_int(payload.get("loop_idle_seconds"), default=5),
+        max_concurrent_jobs=positive_int(
+            payload.get("max_concurrent_jobs"),
+            default=DEFAULT_SCHEDULER_MAX_CONCURRENT_JOBS,
+        ),
         markets=markets,
     )
 
@@ -244,6 +254,8 @@ def validate_data_sync_config(config: DataSyncConfig) -> DataSyncValidationResul
     warnings: list[str] = []
     if config.cache_backend not in {"auto", "redis", "null"}:
         errors.append("cache_backend 只能是 auto、redis 或 null。")
+    if config.max_concurrent_jobs > 16:
+        errors.append("max_concurrent_jobs 不能超过 16，避免本地采集线程过多。")
     if not config.markets:
         errors.append("至少需要启用一个市场。")
 
@@ -285,6 +297,7 @@ def preview_data_sync_config(config: DataSyncConfig) -> JsonDict:
         "enabled": config.enabled,
         "resource_profile": config.resource_profile,
         "cache_backend": config.cache_backend,
+        "max_concurrent_jobs": config.max_concurrent_jobs,
         "manual_symbol_required": any(task.manual_symbol_required for task in tasks),
         "enabled_markets": [
             market
@@ -292,6 +305,7 @@ def preview_data_sync_config(config: DataSyncConfig) -> JsonDict:
             if market_config.enabled
         ],
         "tasks": [task.to_dict() for task in tasks],
+        "processing": preview_data_processing_plan(config, tasks=tasks),
         "validation": validation.to_dict(),
     }
 
@@ -312,6 +326,207 @@ def preview_data_sync_tasks(config: DataSyncConfig) -> list[DataSyncTaskPreview]
     return tasks
 
 
+def preview_data_processing_plan(
+    config: DataSyncConfig,
+    *,
+    tasks: list[DataSyncTaskPreview] | None = None,
+) -> JsonDict:
+    """生成采集后清洗、指标、因子和推荐计算的展示计划。"""
+
+    sync_tasks = tasks if tasks is not None else preview_data_sync_tasks(config)
+    enabled_markets = [
+        market
+        for market, market_config in config.markets.items()
+        if market_config.enabled
+    ]
+    collection_task_keys = [task.task_key for task in sync_tasks]
+    normalization_status = "active_with_collection" if sync_tasks else "disabled"
+    recommendation_jobs = build_recommendation_scheduler_jobs(config)
+    analytics_status = "active_scheduled" if recommendation_jobs else "disabled"
+    scheduler_status = "covered_by_analytics_jobs" if recommendation_jobs else "disabled"
+    analytics_stages = [
+        {
+            "stage_key": "analytics.indicators",
+            "title": "技术指标计算",
+            "status": analytics_status,
+            "execution": "post_collection_pipeline",
+            "service": "IndicatorService.compute_for_asset",
+            "trigger": "market_bars 刷新后按候选池成员批量计算",
+            "frequency_policy": (
+                "跟随 K 线采集频率；A 股日线通常每小时补采后重算，"
+                "数字货币 1h 可 5 分钟检查一次增量窗口"
+            ),
+            "inputs": ["market_bars"],
+            "outputs": ["indicator_frames"],
+            "notes": ["计算 RSI、MACD、ATR、布林带、均线、收益率、波动率、回撤和成交额 z-score。"],
+        },
+        {
+            "stage_key": "analytics.factors",
+            "title": "因子归一化与分组",
+            "status": analytics_status,
+            "execution": "post_collection_pipeline",
+            "service": "FactorService.compute_for_asset",
+            "trigger": "指标、基本面、估值、资金流、事件或风险快照更新后计算",
+            "frequency_policy": (
+                "与最慢的基础输入做水位对齐；新闻和风险事件只触发增量因子刷新，"
+                "不必每次全量重算全市场"
+            ),
+            "inputs": [
+                "indicator_frames",
+                "fundamental_snapshots",
+                "capital_flow_snapshots",
+                "event_records",
+                "risk_findings",
+                "crypto_derivative_snapshots",
+            ],
+            "outputs": ["factor_frames"],
+            "notes": ["按市场过滤不适用因子组，记录缺失组和部分可用组。"],
+        },
+        {
+            "stage_key": "analytics.screening",
+            "title": "候选池初筛",
+            "status": analytics_status,
+            "execution": "post_collection_pipeline",
+            "service": "ScreeningService.apply_rules",
+            "trigger": "候选池和因子快照可用后执行",
+            "frequency_policy": "与目标候选池刷新频率同步；热点池可更高频，全 A 池建议限流分批",
+            "inputs": ["asset_universes", "asset_universe_members", "factor_frames"],
+            "outputs": ["screening_results", "screening_result_items"],
+            "notes": ["这是推荐排序前的规则过滤层。"],
+        },
+        {
+            "stage_key": "analytics.scoring",
+            "title": "多维评分",
+            "status": analytics_status,
+            "execution": "post_collection_pipeline",
+            "service": "ScoringService.score_screening",
+            "trigger": "初筛结果生成后执行",
+            "frequency_policy": "与初筛同频",
+            "inputs": ["screening_result_items", "factor_frames"],
+            "outputs": ["asset_scores"],
+            "notes": ["生成候选池内排序基础分。"],
+        },
+        {
+            "stage_key": "analytics.signals",
+            "title": "信号快照",
+            "status": analytics_status,
+            "execution": "post_collection_pipeline",
+            "service": "SignalService.compute_for_asset",
+            "trigger": "因子快照更新后执行",
+            "frequency_policy": "与因子同频；观察池触发读取最新 signal_snapshots",
+            "inputs": ["factor_frames"],
+            "outputs": ["signal_snapshots"],
+            "notes": ["生成方向、置信度、触发原因和解释字段。"],
+        },
+        {
+            "stage_key": "analytics.recommendations",
+            "title": "推荐排序",
+            "status": analytics_status,
+            "execution": "post_collection_pipeline",
+            "service": "UniverseRecommendationPipeline.run_for_universe",
+            "trigger": "明确 universe_id 后串联指标、因子、初筛、评分、信号和推荐",
+            "frequency_policy": (
+                "应在基础采集完成后触发；需要按 universe_id 去抖，"
+                "避免新闻 5 分钟增量同步导致全市场重复重算"
+            ),
+            "inputs": [
+                "asset_universes",
+                "asset_universe_members",
+                "asset_scores",
+                "signal_snapshots",
+            ],
+            "outputs": [
+                "recommendation_runs",
+                "recommendation_run_universes",
+                "asset_recommendations",
+            ],
+            "notes": ["基础数据调度器已把该流水线注册为独立 analytics job。"],
+        },
+    ]
+    normalization_stage = {
+        "stage_key": "normalization.collection_payloads",
+        "title": "采集清洗与标准化",
+        "status": normalization_status,
+        "execution": "inline_with_collection",
+        "service": "finance_agent.data.normalizers + collectors",
+        "trigger": "每个基础采集任务写库前同步执行",
+        "frequency_policy": "与基础采集任务完全同频",
+        "task_keys": collection_task_keys,
+        "inputs": ["provider_payloads", "raw_records"],
+        "outputs": [
+            "assets",
+            "asset_universes",
+            "asset_universe_members",
+            "market_bars",
+            "fundamental_snapshots",
+            "capital_flow_snapshots",
+            "event_records",
+            "risk_findings",
+            "crypto_derivative_snapshots",
+        ],
+        "notes": ["采集器负责字段命名、市场标识、时间戳、数值类型和标准表落库。"],
+    }
+    return {
+        "normalization": {
+            "title": "清洗与归一化",
+            "status": normalization_status,
+            "execution": "inline_with_collection",
+            "scheduler_status": "covered_by_collection_jobs" if sync_tasks else "disabled",
+            "frequency_policy": "与对应基础采集任务同步执行",
+            "task_count": len(sync_tasks),
+            "outputs": normalization_stage["outputs"],
+        },
+        "analytics": {
+            "title": "指标、因子、评分、信号与推荐",
+            "status": analytics_status,
+            "execution": "post_collection_pipeline",
+            "scheduler_status": scheduler_status,
+            "default_pipeline": "UniverseRecommendationPipeline.run_for_universe",
+            "required_runtime_input": None if recommendation_jobs else "universe_id",
+            "candidate_universe_patterns": candidate_universe_patterns(enabled_markets),
+            "scheduled_universe_ids": [
+                job["params"]["universe_id"] for job in recommendation_jobs
+            ],
+            "outputs": [
+                "indicator_frames",
+                "factor_frames",
+                "screening_results",
+                "asset_scores",
+                "signal_snapshots",
+                "recommendation_runs",
+                "asset_recommendations",
+            ],
+            "notes": [
+                "基础数据调度器会在独立 analytics job 中运行推荐流水线。",
+                "推荐流水线必须选择同市场候选池 universe_id 后再运行，不能使用 mixed 候选池。",
+            ],
+        },
+        "stages": [normalization_stage, *analytics_stages],
+    }
+
+
+def candidate_universe_patterns(markets: list[str]) -> list[str]:
+    """返回当前市场可用于后续推荐流水线的候选池 ID 模式。"""
+
+    patterns: list[str] = []
+    if "ashare" in markets:
+        patterns.extend(
+            [
+                "universe:base:ashare:p0:all_a",
+                "universe:base:ashare:p1:index:<index_code>",
+                "universe:base:ashare:p1:industry:<industry_name>",
+                "universe:base:ashare:p1:concept:<concept_name>",
+                "universe:base:ashare:p2:sentiment:hot_rank",
+                "universe:base:ashare:p2:sentiment:zt_pool:<date>",
+            ]
+        )
+    if "crypto_spot" in markets:
+        patterns.append("universe:base:crypto:spot:binance")
+    if "crypto_future" in markets:
+        patterns.append("universe:base:crypto:future:binance")
+    return patterns
+
+
 def export_scheduler_payload(config: DataSyncConfig) -> JsonDict:
     """导出供调度器或前端保存的任务计划。
 
@@ -330,11 +545,21 @@ def export_scheduler_payload(config: DataSyncConfig) -> JsonDict:
         "loop_idle_seconds": config.loop_idle_seconds,
         "max_job_retries": 2,
         "retry_backoff_seconds": 30,
-        "health_stale_seconds": 300,
-        "jobs": [build_scheduler_job(task) for task in tasks],
+        "job_timeout_seconds": DEFAULT_SCHEDULER_JOB_TIMEOUT_SECONDS,
+        "health_stale_seconds": DEFAULT_SCHEDULER_HEALTH_STALE_SECONDS,
+        "max_concurrent_jobs": config.max_concurrent_jobs,
+        "jobs": [
+            *[build_scheduler_job(task) for task in tasks],
+            *build_data_quality_scheduler_jobs(config),
+            *build_recommendation_scheduler_jobs(config),
+        ],
+        "processing": preview_data_processing_plan(config, tasks=tasks),
         "notes": [
             "该计划由数据同步配置向导生成，不要求用户手填股票代码。",
-            "run_base_data_scheduler.py 可直接读取该计划或原始数据同步配置并执行 dry-run / run-once / loop。",
+            (
+                "run_base_data_scheduler.py 可直接读取该计划或原始数据同步配置"
+                "并执行 dry-run / run-once / loop。"
+            ),
         ],
     }
 
@@ -359,12 +584,183 @@ def build_scheduler_job(task: DataSyncTaskPreview) -> JsonDict:
 
     return {
         "name": task.task_key,
+        "job_type": "collection",
         "group": group,
         "enabled": True,
         "interval_seconds": task.interval_seconds,
         "limit": task.batch_size,
         "market": task.market,
         "params": params,
+    }
+
+
+def build_recommendation_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
+    """为启用市场生成真实候选池推荐流水线任务。"""
+
+    if not config.enabled:
+        return []
+    jobs: list[JsonDict] = []
+    for market, market_config in sorted(config.markets.items()):
+        if not market_config.enabled:
+            continue
+        if market == "ashare":
+            jobs.append(
+                build_recommendation_scheduler_job(
+                    name="analytics.recommendations.ashare.all_a",
+                    market="ashare",
+                    universe_id="universe:base:ashare:p0:all_a",
+                    interval_seconds=market_config.interval_seconds.get("market_bars", 60 * 60),
+                    timeframe=(market_config.timeframes or ["1d"])[0],
+                    limit=min(market_config.batch_size, 200),
+                    min_bars=60,
+                    min_indicator_coverage_ratio=0.7,
+                    min_factor_coverage_ratio=0.5,
+                    min_available_factor_groups=3,
+                    auto_sync_watchlist=True,
+                    owner_id="default-owner",
+                    watchlist_id="watchlist:default-owner:ashare:recommendations",
+                    recommendation_intake_limit=20,
+                )
+            )
+        elif market == "crypto_spot":
+            jobs.append(
+                build_recommendation_scheduler_job(
+                    name="analytics.recommendations.crypto_spot.binance",
+                    market="crypto_spot",
+                    universe_id="universe:base:crypto:spot:binance",
+                    interval_seconds=market_config.interval_seconds.get("market_bars", 5 * 60),
+                    timeframe=(market_config.timeframes or ["1h"])[0],
+                    limit=min(market_config.batch_size, 150),
+                    window=120,
+                    min_bars=120,
+                    min_indicator_coverage_ratio=0.85,
+                    min_factor_coverage_ratio=0.6,
+                    min_available_factor_groups=2,
+                    auto_sync_watchlist=True,
+                    owner_id="default-owner",
+                    watchlist_id="watchlist:default-owner:crypto_spot:recommendations",
+                    recommendation_intake_limit=20,
+                )
+            )
+        elif market == "crypto_future":
+            jobs.append(
+                build_recommendation_scheduler_job(
+                    name="analytics.recommendations.crypto_future.binance",
+                    market="crypto_future",
+                    universe_id="universe:base:crypto:future:binance",
+                    interval_seconds=market_config.interval_seconds.get("market_bars", 5 * 60),
+                    timeframe=(market_config.timeframes or ["1h"])[0],
+                    limit=min(market_config.batch_size, 150),
+                    window=120,
+                    min_bars=120,
+                    min_indicator_coverage_ratio=0.85,
+                    min_factor_coverage_ratio=0.6,
+                    min_available_factor_groups=3,
+                    auto_sync_watchlist=True,
+                    owner_id="default-owner",
+                    watchlist_id="watchlist:default-owner:crypto_future:recommendations",
+                    recommendation_intake_limit=20,
+                )
+            )
+    return jobs
+
+
+def build_data_quality_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
+    """为启用 data_quality 的市场生成数据质量刷新任务。"""
+
+    if not config.enabled:
+        return []
+    jobs: list[JsonDict] = []
+    for market, market_config in sorted(config.markets.items()):
+        if not market_config.enabled or "data_quality" not in market_config.data_packages:
+            continue
+        timeframe = (market_config.timeframes or ["1d" if market == "ashare" else "1h"])[0]
+        if market == "ashare":
+            min_bars = 60
+            domains = [
+                "market_bars",
+                "realtime_quotes",
+                "indicator_frames",
+                "factor_frames",
+                "recommendations",
+            ]
+            interval_seconds = market_config.interval_seconds.get("market_bars", 60 * 60)
+            stale_after_seconds = 24 * 60 * 60
+        else:
+            min_bars = 120
+            domains = [
+                "market_bars",
+                "indicator_frames",
+                "factor_frames",
+                "recommendations",
+            ]
+            interval_seconds = market_config.interval_seconds.get("market_bars", 5 * 60)
+            stale_after_seconds = 2 * 60 * 60
+        jobs.append(
+            {
+                "name": f"quality.{market}",
+                "job_type": "data_quality_refresh",
+                "group": "analytics",
+                "enabled": True,
+                "interval_seconds": interval_seconds,
+                "limit": market_config.batch_size,
+                "market": market,
+                "params": {
+                    "market": market,
+                    "timeframe": timeframe,
+                    "horizon": "swing",
+                    "min_bars": min_bars,
+                    "stale_after_seconds": stale_after_seconds,
+                    "data_domains": domains,
+                },
+            }
+        )
+    return jobs
+
+
+def build_recommendation_scheduler_job(
+    *,
+    name: str,
+    market: str,
+    universe_id: str,
+    interval_seconds: int,
+    timeframe: str,
+    limit: int,
+    window: int = 120,
+    min_bars: int = 2,
+    min_indicator_coverage_ratio: float = 0.5,
+    min_factor_coverage_ratio: float = 0.0,
+    min_available_factor_groups: int = 1,
+    auto_sync_watchlist: bool = False,
+    owner_id: str | None = None,
+    watchlist_id: str | None = None,
+    recommendation_intake_limit: int | None = None,
+) -> JsonDict:
+    """生成单个推荐流水线调度任务。"""
+
+    return {
+        "name": name,
+        "job_type": "recommendation_pipeline",
+        "group": "analytics",
+        "enabled": True,
+        "interval_seconds": interval_seconds,
+        "limit": limit,
+        "market": market,
+        "params": {
+            "universe_id": universe_id,
+            "strategy": "balanced_swing_v1",
+            "horizon": "swing",
+            "timeframe": timeframe,
+            "window": window,
+            "min_bars": min_bars,
+            "min_indicator_coverage_ratio": min_indicator_coverage_ratio,
+            "min_factor_coverage_ratio": min_factor_coverage_ratio,
+            "min_available_factor_groups": min_available_factor_groups,
+            "auto_sync_watchlist": auto_sync_watchlist,
+            "owner_id": owner_id,
+            "watchlist_id": watchlist_id,
+            "recommendation_intake_limit": recommendation_intake_limit or limit,
+        },
     }
 
 
@@ -528,7 +924,10 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 market="ashare",
                 task_type="event_refresh",
                 title="刷新 A 股新闻和公告",
-                interval_seconds=config.interval_seconds.get("events", 60 * 60),
+                interval_seconds=config.interval_seconds.get(
+                    "events",
+                    ASHARE_TIMELY_EVENT_INTERVAL_SECONDS,
+                ),
                 mode="incremental_event_sync",
                 batch_size=config.batch_size,
                 lookback=f"{config.lookback_days}d",
@@ -543,7 +942,10 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 market="ashare",
                 task_type="risk_sentiment_refresh",
                 title="刷新 A 股风险和短线情绪",
-                interval_seconds=config.interval_seconds.get("risk_sentiment", 15 * 60),
+                interval_seconds=config.interval_seconds.get(
+                    "risk_sentiment",
+                    ASHARE_TIMELY_EVENT_INTERVAL_SECONDS,
+                ),
                 mode="incremental_snapshot",
                 batch_size=config.batch_size,
                 lookback=f"{config.lookback_days}d",
@@ -646,6 +1048,8 @@ def validate_data_sync_config_without_preview_recursion(
     warnings: list[str] = []
     if config.cache_backend not in {"auto", "redis", "null"}:
         errors.append("cache_backend 只能是 auto、redis 或 null。")
+    if config.max_concurrent_jobs > 16:
+        errors.append("max_concurrent_jobs 不能超过 16，避免本地采集线程过多。")
     enabled_market_count = 0
     for market, market_config in config.markets.items():
         if market not in MARKETS:
@@ -691,11 +1095,11 @@ def build_ashare_market_config(preset: str) -> MarketSyncConfig:
             "market_bars": 60 * 60,
             "fundamentals": 12 * 60 * 60,
             "capital_flow": 30 * 60,
-            "events": 60 * 60,
-            "risk_sentiment": 15 * 60,
+            "events": ASHARE_TIMELY_EVENT_INTERVAL_SECONDS,
+            "risk_sentiment": ASHARE_TIMELY_EVENT_INTERVAL_SECONDS,
         },
         batch_size=batch_size,
-        lookback_days=30,
+        lookback_days=180,
         timeframes=["1d"],
         filters={
             "exclude_st": True,
@@ -725,7 +1129,7 @@ def build_crypto_market_config(*, market: str, preset: str) -> MarketSyncConfig:
             "derivatives": 5 * 60,
         },
         batch_size=batch_size,
-        lookback_hours=72,
+        lookback_hours=168,
         timeframes=["1h"],
         filters={
             "quote_asset": "USDT",

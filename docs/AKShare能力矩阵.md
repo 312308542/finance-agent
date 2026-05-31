@@ -76,9 +76,9 @@ AKShare 在本系统里应视为 **A 股数据 Provider 族**，不是单一 K �
 
 | AKShare 能力 | 代表接口或模块 | 系统用途 | 优先级 |
 | --- | --- | --- | --- |
-| 实时行情 | `stock_zh_a_spot_em`、`stock_zh_a_spot_tx` | 资产主数据、全 A 种子池、实时价格、成交额、PE/PB、市值 | P0 |
+| 实时行情 | `stock_zh_a_spot_em`、`stock_zh_a_spot_tx` | 资产身份、资产资料、全 A 种子池、实时价格、成交额、PE/PB、市值 | P0 |
 | 历史行情 | `stock_zh_a_hist`、`stock_zh_a_hist_tx` | K 线、技术指标、回测价格序列 | P0 |
-| 股票列表 | `股票列表-A股/上证/深证/北证` 相关接口 | 资产主数据、交易所归属、可交易状态 | P0 |
+| 股票列表 | `股票列表-A股/上证/深证/北证` 相关接口 | 资产身份、Provider 映射、交易所归属、可交易状态 | P0 |
 | 指数目录 | `index_stock_info` | 指数代码目录、指数成分批量展开 | P1 |
 | 指数成分 | `index_stock_cons_csindex`、`index_stock_cons_sina`、`index_stock_cons` | 指数候选池、指数成分关系、指数轮动 | P1 |
 | 停复牌/退市 | `stock_zh_a_stop_em`、两网及退市、暂停/终止上市 | 初筛硬过滤、风险提示 | P0 |
@@ -178,7 +178,9 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 
 | 数据类型 | 当前表或建议表 | 说明 |
 | --- | --- | --- |
-| 资产主数据 | `assets` | A 股代码、名称、交易所、行业、状态 |
+| 资产身份 | `assets` | A 股代码、市场、交易所、资产类型等稳定身份 |
+| 资产资料 | `asset_profiles`、`asset_provider_mappings` | 名称、行业、概念和 Provider 代码映射 |
+| 实时状态和行情 | `asset_status_snapshots`、`realtime_quote_snapshots` | 可交易状态、停复牌、最新价、成交额、换手率 |
 | 候选池 | `asset_universes`、`asset_universe_members` | 由全 A、指数、行业/概念、资金流/热度等种子源生成的推荐输入范围，不是推荐结果 |
 | 原始响应 | `raw_records` | 所有 AKShare 原始响应归档 |
 | K 线 | `market_bars` | TimescaleDB hypertable |
@@ -199,7 +201,7 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 - `stock_zh_a_spot_em`，失败时 fallback 到 `stock_zh_a_spot_tx`。
 - `stock_zh_a_hist`，失败时 fallback 到 `stock_zh_a_hist_tx`。
 - 停牌/退市状态。
-- 写入 `assets`、`market_bars`、`AssetUniverse` 候选池输入范围。
+- 写入 `assets`、`asset_profiles`、`asset_provider_mappings`、`asset_status_snapshots`、`realtime_quote_snapshots`、`market_bars`、`asset_universes` 和 `asset_universe_members` 候选池输入范围。
 
 ### P1：让选股有基本解释
 

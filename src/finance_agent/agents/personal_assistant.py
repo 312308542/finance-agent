@@ -41,6 +41,9 @@ from finance_agent.storage.repositories import (
     SignalSnapshotRepository,
 )
 
+MAX_DATABASE_ID_LENGTH = 160
+COMPACT_ID_DIGEST_LENGTH = 24
+
 
 @dataclass(frozen=True)
 class PortfolioMonitoringRunSummary:
@@ -1586,26 +1589,39 @@ def map_recommendation_severity(*, action: str, conviction: str) -> str:
 def build_alert_id(*, run_id: str, asset_id: str) -> str:
     """生成监控提醒 ID。"""
 
-    return f"alert:{run_id}:{asset_id}"
+    return build_database_safe_id("alert", run_id, asset_id, keep_tail=(asset_id,))
 
 
 def build_decision_id(*, run_id: str, asset_id: str, decision_type: str) -> str:
     """生成决策日志 ID。"""
 
-    return f"decision:{run_id}:{asset_id}:{decision_type}"
+    return build_database_safe_id(
+        "decision",
+        run_id,
+        asset_id,
+        decision_type,
+        keep_tail=(asset_id, decision_type),
+    )
 
 
 def build_memory_id(*, run_id: str, asset_id: str) -> str:
     """生成 Finance Memory ID。"""
 
-    return f"memory:{run_id}:{asset_id}"
+    return build_database_safe_id("memory", run_id, asset_id, keep_tail=(asset_id,))
 
 
 def build_typed_memory_id(*, run_id: str, asset_id: str, memory_type: str) -> str:
     """生成带类型的 Finance Memory ID，避免一次运行中多种记忆互相覆盖。"""
 
     digest = sha1(f"{run_id}:{asset_id}:{memory_type}".encode()).hexdigest()[:10]
-    return f"memory:{run_id}:{asset_id}:{memory_type}:{digest}"
+    return build_database_safe_id(
+        "memory",
+        run_id,
+        asset_id,
+        memory_type,
+        digest,
+        keep_tail=(asset_id, memory_type, digest),
+    )
 
 
 def build_edge_id(*, source_id: str, target_id: str) -> str:
@@ -1618,4 +1634,27 @@ def build_edge_id(*, source_id: str, target_id: str) -> str:
 def build_review_task_id(*, run_id: str, asset_id: str) -> str:
     """生成复盘任务 ID。"""
 
-    return f"review:{run_id}:{asset_id}"
+    return build_database_safe_id("review", run_id, asset_id, keep_tail=(asset_id,))
+
+
+def build_database_safe_id(
+    prefix: str,
+    *parts: str,
+    keep_tail: tuple[str, ...] = (),
+    max_length: int = MAX_DATABASE_ID_LENGTH,
+) -> str:
+    """生成不超过数据库主键长度限制的稳定 ID。"""
+
+    raw_id = ":".join([prefix, *[str(part) for part in parts if str(part)]])
+    if len(raw_id) <= max_length:
+        return raw_id
+
+    digest = sha1(raw_id.encode()).hexdigest()[:COMPACT_ID_DIGEST_LENGTH]
+    readable_tail = ":".join(str(part) for part in keep_tail if str(part))
+    compact_id = ":".join(part for part in [prefix, readable_tail, digest] if part)
+    if len(compact_id) <= max_length:
+        return compact_id
+
+    reserved = len(prefix) + len(digest) + 2
+    tail_budget = max(0, max_length - reserved)
+    return f"{prefix}:{readable_tail[:tail_budget]}:{digest}"

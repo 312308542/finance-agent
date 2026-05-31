@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from finance_agent.agents.chat import FinanceAgentChatSession
+from finance_agent.agents.chat import FinanceAgentChatSession, to_openai_tool_name
 from finance_agent.agents.interfaces import AgentInterfaceResult
 from finance_agent.agents.runtime.model_client import ModelClientResponse
 from finance_agent.agents.runtime.model_config import ModelEndpointConfig, ModelRegistry
@@ -65,17 +65,35 @@ class FakeChatModelClient:
         *,
         config: ModelEndpointConfig,
         messages: list[JsonDict],
+        tools: list[JsonDict] | None = None,
+        tool_choice: str | JsonDict | None = None,
         temperature: float = 0.1,
     ) -> ModelClientResponse:
-        self.calls.append({"model_key": config.model_key, "message_count": len(messages)})
+        self.calls.append(
+            {
+                "model_key": config.model_key,
+                "message_count": len(messages),
+                "tools": tools,
+                "tool_choice": tool_choice,
+            }
+        )
         payload = self.responses.pop(0)
+        tool_calls = tuple(payload.get("tool_calls") or ())
+        content = str(payload.get("content") or "")
         return ModelClientResponse(
             model_key=config.model_key,
             provider=config.provider,
             model_name=config.model_name,
-            content=str(payload),
-            parsed_json=payload,
+            content=content,
+            parsed_json=None,
             raw_response={"fake": True},
+            assistant_message={
+                "role": "assistant",
+                "content": content or None,
+                "tool_calls": list(tool_calls),
+            },
+            tool_calls=tool_calls,
+            finish_reason="tool_calls" if tool_calls else "stop",
         )
 
 
@@ -99,23 +117,22 @@ def main() -> None:
         calls=[],
         responses=[
             {
-                "status": "need_more_data",
-                "summary_zh": "需要检查该标的的记忆冲突。",
-                "tool_requests": [
+                "tool_calls": [
                     {
-                        "tool": "memory.find_memory_conflicts",
-                        "arguments": {
-                            "owner_id": "owner:smoke:chat-model",
-                            "asset_id": "asset:600519",
-                            "limit": 5,
+                        "id": "call_conflicts",
+                        "type": "function",
+                        "function": {
+                            "name": to_openai_tool_name("memory.find_memory_conflicts"),
+                            "arguments": (
+                                '{"owner_id":"owner:smoke:chat-model",'
+                                '"asset_id":"asset:600519","limit":5}'
+                            ),
                         },
                     }
                 ],
             },
             {
-                "status": "ready",
-                "summary_zh": "该标的存在记忆冲突，建议先做风险复核再决定是否继续观察。",
-                "tool_requests": [],
+                "content": "该标的存在记忆冲突，建议先做风险复核再决定是否继续观察。",
             },
         ],
     )

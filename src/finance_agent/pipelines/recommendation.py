@@ -73,6 +73,9 @@ class UniverseRecommendationPipeline:
         window: int = 120,
         min_bars: int = 2,
         limit: int = 20,
+        min_indicator_coverage_ratio: float | None = None,
+        min_factor_coverage_ratio: float | None = None,
+        min_available_factor_groups: int = 1,
     ) -> UniverseRecommendationRunResult:
         """执行一次候选池推荐流水线。"""
 
@@ -80,6 +83,13 @@ class UniverseRecommendationPipeline:
         members = self.universes.list_members(universe_id)
         ensure_single_market_universe(universe.market, members)
         effective_timeframe = timeframe or default_timeframe(universe.market)
+        required_indicator_coverage = normalize_indicator_coverage_ratio(
+            market=universe.market,
+            configured=min_indicator_coverage_ratio,
+        )
+        required_factor_coverage = normalize_factor_coverage_ratio(
+            configured=min_factor_coverage_ratio,
+        )
         indicator_results: list[IndicatorComputationResult] = []
         factor_results: list[FactorComputationResult] = []
         signal_results: list[SignalComputationResult] = []
@@ -98,6 +108,45 @@ class UniverseRecommendationPipeline:
             if indicator is not None:
                 indicator_results.append(indicator)
 
+        indicator_count = count_successful_indicators(indicator_results)
+        if should_stop_for_indicator_coverage(
+            market=universe.market,
+            member_count=len(members),
+            indicator_count=indicator_count,
+            min_indicator_coverage_ratio=required_indicator_coverage,
+        ):
+            errors.append(
+                indicator_coverage_error(
+                    market=universe.market,
+                    member_count=len(members),
+                    indicator_count=indicator_count,
+                    min_indicator_coverage_ratio=required_indicator_coverage,
+                )
+            )
+            return UniverseRecommendationRunResult(
+                status="unavailable",
+                universe_id=universe_id,
+                market=universe.market,
+                strategy=strategy,
+                horizon=horizon,
+                timeframe=effective_timeframe,
+                member_count=len(members),
+                indicator_count=indicator_count,
+                factor_count=0,
+                signal_count=0,
+                screening_id=None,
+                scored_count=0,
+                recommendation_count=0,
+                recommendation_run_id=None,
+                top_recommendation_id=None,
+                errors=tuple(errors),
+            )
+
+        indicator_backed_members = members_with_successful_indicators(
+            members=members,
+            indicator_results=indicator_results,
+        )
+        for member in indicator_backed_members:
             factor = self._compute_factor(
                 member=member,
                 timeframe=effective_timeframe,
@@ -106,6 +155,43 @@ class UniverseRecommendationPipeline:
             )
             if factor is not None:
                 factor_results.append(factor)
+
+        factor_count = count_usable_factors(
+            factor_results,
+            min_available_factor_groups=min_available_factor_groups,
+        )
+        if should_stop_for_factor_coverage(
+            member_count=len(members),
+            factor_count=factor_count,
+            min_factor_coverage_ratio=required_factor_coverage,
+        ):
+            errors.append(
+                factor_coverage_error(
+                    market=universe.market,
+                    member_count=len(members),
+                    factor_count=factor_count,
+                    min_factor_coverage_ratio=required_factor_coverage,
+                    min_available_factor_groups=min_available_factor_groups,
+                )
+            )
+            return UniverseRecommendationRunResult(
+                status="unavailable",
+                universe_id=universe_id,
+                market=universe.market,
+                strategy=strategy,
+                horizon=horizon,
+                timeframe=effective_timeframe,
+                member_count=len(members),
+                indicator_count=indicator_count,
+                factor_count=factor_count,
+                signal_count=0,
+                screening_id=None,
+                scored_count=0,
+                recommendation_count=0,
+                recommendation_run_id=None,
+                top_recommendation_id=None,
+                errors=tuple(errors),
+            )
 
         screening = self.screenings.apply_rules(
             universe_id=universe_id,
@@ -117,7 +203,13 @@ class UniverseRecommendationPipeline:
             horizon=horizon,
         )
 
+        usable_factor_asset_ids = usable_factor_asset_ids_from_results(
+            factor_results,
+            min_available_factor_groups=min_available_factor_groups,
+        )
         for member in members:
+            if member.asset_id not in usable_factor_asset_ids:
+                continue
             signal = self._compute_signal(member=member, horizon=horizon, errors=errors)
             if signal is not None:
                 signal_results.append(signal)
@@ -146,8 +238,11 @@ class UniverseRecommendationPipeline:
             horizon=horizon,
             timeframe=effective_timeframe,
             member_count=len(members),
-            indicator_count=count_successful_indicators(indicator_results),
-            factor_count=count_available_factors(factor_results),
+            indicator_count=indicator_count,
+            factor_count=count_usable_factors(
+                factor_results,
+                min_available_factor_groups=min_available_factor_groups,
+            ),
             signal_count=count_successful_signals(signal_results),
             screening_id=screening.screening_id,
             scored_count=scoring.scored_count,
@@ -241,10 +336,146 @@ def count_available_factors(results: list[FactorComputationResult]) -> int:
     return sum(1 for item in results if item.status in {"available", "partial"})
 
 
+def count_usable_factors(
+    results: list[FactorComputationResult],
+    *,
+    min_available_factor_groups: int,
+) -> int:
+    """统计满足最小可用因子组数量的标的数量。"""
+
+    minimum_groups = max(1, min_available_factor_groups)
+    return sum(
+        1
+        for item in results
+        if item.status in {"available", "partial"}
+        and item.total_available_groups >= minimum_groups
+    )
+
+
+def usable_factor_asset_ids_from_results(
+    results: list[FactorComputationResult],
+    *,
+    min_available_factor_groups: int,
+) -> set[str]:
+    """返回可继续进入信号阶段的标的 ID。"""
+
+    minimum_groups = max(1, min_available_factor_groups)
+    return {
+        item.asset_id
+        for item in results
+        if item.status in {"available", "partial"}
+        and item.total_available_groups >= minimum_groups
+    }
+
+
+def members_with_successful_indicators(
+    *,
+    members: list[AssetUniverseMemberORM],
+    indicator_results: list[IndicatorComputationResult],
+) -> list[AssetUniverseMemberORM]:
+    """只保留已有指标快照的候选池成员，避免缺 K 线标的继续写入低质量因子。"""
+
+    available_asset_ids = {
+        item.asset_id for item in indicator_results if item.indicator_frame_id is not None
+    }
+    return [member for member in members if member.asset_id in available_asset_ids]
+
+
 def count_successful_signals(results: list[SignalComputationResult]) -> int:
     """统计成功写入信号快照的标的数量。"""
 
     return sum(1 for item in results if item.signal_id is not None)
+
+
+def normalize_indicator_coverage_ratio(
+    *,
+    market: str,
+    configured: float | None,
+) -> float:
+    """返回市场级指标覆盖率闸门。"""
+
+    if configured is not None:
+        return max(0.0, min(float(configured), 1.0))
+    return 0.5
+
+
+def normalize_factor_coverage_ratio(*, configured: float | None) -> float:
+    """返回因子覆盖率闸门。"""
+
+    if configured is not None:
+        return max(0.0, min(float(configured), 1.0))
+    return 0.0
+
+
+def should_stop_for_indicator_coverage(
+    *,
+    market: str,
+    member_count: int,
+    indicator_count: int,
+    min_indicator_coverage_ratio: float,
+) -> bool:
+    """判断是否因行情指标覆盖率不足而停止后续推荐。"""
+
+    if member_count <= 0 or min_indicator_coverage_ratio <= 0:
+        return False
+    return indicator_count / member_count < min_indicator_coverage_ratio
+
+
+def should_stop_for_factor_coverage(
+    *,
+    member_count: int,
+    factor_count: int,
+    min_factor_coverage_ratio: float,
+) -> bool:
+    """判断是否因可用因子覆盖率不足而停止后续推荐。"""
+
+    if member_count <= 0 or min_factor_coverage_ratio <= 0:
+        return False
+    return factor_count / member_count < min_factor_coverage_ratio
+
+
+def indicator_coverage_error(
+    *,
+    market: str,
+    member_count: int,
+    indicator_count: int,
+    min_indicator_coverage_ratio: float,
+) -> JsonDict:
+    """生成指标覆盖率不足的流水线错误摘要。"""
+
+    coverage_ratio = indicator_count / member_count if member_count else 0.0
+    return {
+        "stage": "indicator_coverage",
+        "market": market,
+        "successful_indicators": indicator_count,
+        "member_count": member_count,
+        "coverage_ratio": round(coverage_ratio, 6),
+        "required_coverage_ratio": min_indicator_coverage_ratio,
+        "message": "行情指标覆盖率不足，跳过本次因子、筛选、评分和推荐，等待 K 线补齐。",
+    }
+
+
+def factor_coverage_error(
+    *,
+    market: str,
+    member_count: int,
+    factor_count: int,
+    min_factor_coverage_ratio: float,
+    min_available_factor_groups: int,
+) -> JsonDict:
+    """生成因子覆盖率不足的流水线错误摘要。"""
+
+    coverage_ratio = factor_count / member_count if member_count else 0.0
+    return {
+        "stage": "factor_coverage",
+        "market": market,
+        "usable_factors": factor_count,
+        "member_count": member_count,
+        "coverage_ratio": round(coverage_ratio, 6),
+        "required_coverage_ratio": min_factor_coverage_ratio,
+        "min_available_factor_groups": max(1, min_available_factor_groups),
+        "message": "可用因子覆盖率不足，跳过本次筛选、评分、信号和推荐，等待基础数据补齐。",
+    }
 
 
 def run_status(

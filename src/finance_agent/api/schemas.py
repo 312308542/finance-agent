@@ -1,0 +1,105 @@
+"""Dashboard API 请求模型。"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+JsonDict = dict[str, Any]
+
+
+class WorkflowRunRequest(BaseModel):
+    """运行 Workflow 的请求。"""
+
+    workflow_type: str = Field(..., description="Workflow 类型")
+    owner_id: str = Field(..., description="用户 ID")
+    portfolio_id: str | None = None
+    watchlist_id: str | None = None
+    recommendation_run_id: str | None = None
+    asset_id: str | None = None
+    asset_ids: list[str] | None = None
+    source_asset_id: str | None = None
+    candidate_asset_id: str | None = None
+    horizon: str = "swing"
+    timeframe: str = "1d"
+    recommendation_limit: int = 20
+    initial_state: JsonDict | None = None
+
+
+class ChatRequest(BaseModel):
+    """Web 聊天请求。"""
+
+    owner_id: str = Field(..., description="用户 ID")
+    message: str = Field(..., description="用户消息")
+    session_id: str | None = None
+    history_limit: int = 20
+
+
+class ModelProviderUpdateRequest(BaseModel):
+    """模型供应商保存请求。"""
+
+    provider_vendor: str = Field(..., description="供应商类型")
+    provider_name: str = Field(..., description="供应商名称")
+    base_url: str | None = None
+    api_key: str | None = None
+    timeout_seconds: int = 30
+    is_enabled: bool = True
+    is_default: bool = False
+    payload: JsonDict | None = None
+
+
+class ModelProviderConnectivityTestRequest(BaseModel):
+    """OpenAI 兼容供应商连通性测试请求。"""
+
+    provider_key: str = Field(..., description="供应商 Key")
+    model_key: str = Field(..., description="模型 Key")
+    model_name: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    timeout_seconds: int = 30
+
+
+class ModelInstanceUpdateRequest(BaseModel):
+    """模型实例保存请求。"""
+
+    provider_key: str = Field(..., description="供应商 Key")
+    model_name: str = Field(..., description="模型名称")
+    model_type: str = "llm"
+    role: str | None = None
+    route_priority: int = 0
+    timeout_seconds: int = 30
+    is_enabled: bool = True
+    is_default: bool = False
+    payload: JsonDict | None = None
+
+
+class ModelRouteUpdateRequest(BaseModel):
+    """模型路由规则保存请求。"""
+
+    workflow_type: str = "*"
+    task: str = "*"
+    model_key: str = Field(..., description="目标模型 Key")
+    decision_type: str = ""
+    reason: str | None = None
+    priority: int = 0
+    is_enabled: bool = True
+    payload: JsonDict | None = None
+
+
+class DataSyncConfigUpdateRequest(BaseModel):
+    """数据同步配置保存请求。"""
+
+    preset: str = "personal-comprehensive"
+    markets: list[str] = Field(default_factory=lambda: ["ashare", "crypto_spot", "crypto_future"])
+    enabled: bool = True
+    cache_backend: str = "redis"
+    max_concurrent_jobs: int = Field(4, ge=1, le=16)
+    config: JsonDict | None = None
+
+
+class DataSchedulerStartRequest(BaseModel):
+    """基础数据调度器启动请求。"""
+
+    dry_run: bool = False
+    max_cycles: int | None = None

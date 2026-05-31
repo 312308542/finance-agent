@@ -1,0 +1,121 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { Buffer } from "node:buffer";
+import ts from "typescript";
+
+const source = await readFile(new URL("../src/dataSyncView.ts", import.meta.url), "utf8");
+const { outputText } = ts.transpileModule(source, {
+  compilerOptions: {
+    module: ts.ModuleKind.ES2022,
+    target: ts.ScriptTarget.ES2022,
+  },
+});
+
+const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toString("base64")}`;
+const {
+  summarizeSchedulerStatus,
+  pickEnabledMarkets,
+  processingStatusLabel,
+  schedulerStartFeedback,
+  summarizeSchedulerWritePolicy,
+  summarizeProcessingPlan,
+} = await import(moduleUrl);
+
+assert.deepEqual(
+  pickEnabledMarkets({
+    markets: {
+      ashare: { enabled: true },
+      crypto_spot: { enabled: false },
+      crypto_future: { enabled: true },
+    },
+  }),
+  ["ashare", "crypto_future"],
+);
+
+assert.deepEqual(
+  summarizeSchedulerStatus({
+    status: "healthy",
+    health: {
+      state: "running",
+      last_job: "crypto_spot.bars.1h",
+      last_job_status: "executed",
+    },
+    process: { running: true, pid: 1234 },
+  }),
+  {
+    tone: "green",
+    label: "运行中",
+    detail: "PID 1234 · crypto_spot.bars.1h / executed",
+  },
+);
+
+assert.equal(processingStatusLabel("requires_universe_selection"), "需选择候选池");
+
+assert.deepEqual(
+  schedulerStartFeedback(true, {
+    status: "ok",
+    message: "已启动 1 轮预演调度：只生成执行计划，不会写入数据库。",
+    data: { writes_enabled: false },
+  }),
+  {
+    statusText: "已启动 1 轮预演调度：只生成执行计划，不会写入数据库。",
+    modeLabel: "预演模式",
+    writePolicy: "不入库",
+  },
+);
+
+assert.deepEqual(
+  schedulerStartFeedback(false, {
+    status: "ok",
+    message: "已启动真实数据同步：会调用采集器并写入数据库。",
+    data: { writes_enabled: true },
+  }),
+  {
+    statusText: "已启动真实数据同步：会调用采集器并写入数据库。",
+    modeLabel: "真实同步",
+    writePolicy: "会入库",
+  },
+);
+
+assert.deepEqual(
+  summarizeSchedulerWritePolicy({
+    health: { status: "healthy", state: "running" },
+    process: { running: true, dry_run: false },
+  }),
+  {
+    statusText: "真实数据同步运行中：采集结果会写入数据库",
+    modeLabel: "真实同步",
+    writePolicy: "会入库",
+  },
+);
+
+assert.deepEqual(
+  summarizeSchedulerWritePolicy({
+    health: { status: "healthy", payload: { dry_run: true, state: "completed" } },
+    process: { running: false },
+  }),
+  {
+    statusText: "最近一次为预演调度：只生成计划，未写入数据库",
+    modeLabel: "预演模式",
+    writePolicy: "不入库",
+  },
+);
+
+assert.deepEqual(
+  summarizeProcessingPlan({
+    processing: {
+      normalization: { status: "active_with_collection" },
+      analytics: {
+        scheduler_status: "requires_universe_selection",
+        required_runtime_input: "universe_id",
+      },
+      stages: [{ stage_key: "normalization" }, { stage_key: "analytics.indicators" }],
+    },
+  }),
+  {
+    normalizationLabel: "随采集执行",
+    analyticsLabel: "需选择候选池",
+    stageCount: 2,
+    requiredInput: "universe_id",
+  },
+);

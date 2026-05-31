@@ -7,12 +7,14 @@ Collector 负责把 Provider 的结构化结果落到标准表，并把每次调
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm import Session
 
 from finance_agent.data.models import (
+    AssetData,
     AssetListResult,
     CapitalFlowSnapshotsResult,
     CryptoDerivativeSnapshotResult,
@@ -22,6 +24,7 @@ from finance_agent.data.models import (
     ProviderResult,
     RiskFindingsResult,
     SentimentSignalsResult,
+    UniverseSeedData,
     UniverseSeedsResult,
 )
 from finance_agent.data.providers import (
@@ -49,6 +52,7 @@ from finance_agent.storage.repositories import (
 )
 
 JsonDict = dict[str, Any]
+UNIVERSE_SEED_MAPPING_SOURCE = "akshare:universe_seed"
 
 
 @dataclass(frozen=True)
@@ -112,6 +116,48 @@ def archive_provider_result(
         collected_at=result.collected_at,
     )
     return record.raw_record_id
+
+
+def _nullable_decimal(value: Any) -> Decimal | None:
+    """把 Provider payload 中的可选数值安全转成 Decimal。"""
+
+    if value is None:
+        return None
+    text = str(value).replace(",", "").replace("%", "").strip()
+    if not text or text in {"-", "--", "nan", "None"}:
+        return None
+    try:
+        return Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _first_decimal(payload: JsonDict, names: tuple[str, ...]) -> Decimal | None:
+    """按多个可能字段名读取第一个可用数值。"""
+
+    raw = payload.get("raw")
+    if isinstance(raw, dict):
+        for name in names:
+            value = _nullable_decimal(raw.get(name))
+            if value is not None:
+                return value
+    for name in names:
+        value = _nullable_decimal(payload.get(name))
+        if value is not None:
+            return value
+    return None
+
+
+def _provider_from_source(source: str) -> str:
+    """从 `akshare:xxx`、`ccxt:xxx` 这类 source 中提取 provider 名。"""
+
+    return source.split(":", 1)[0] if ":" in source else source
+
+
+def _endpoint_from_source(source: str) -> str:
+    """从 source 中提取适合写入 raw_records.endpoint 的接口名。"""
+
+    return source.split(":", 1)[1] if ":" in source else source
 
 
 class CryptoDataCollector:
@@ -179,20 +225,11 @@ class CryptoDataCollector:
             return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
         for asset in result.assets:
-            self.assets.upsert_asset(
-                asset_id=asset.asset_id,
-                symbol=asset.symbol,
-                name=asset.name,
-                market=asset.market,
-                asset_type=asset.asset_type,
-                exchange=asset.exchange,
-                currency=asset.currency,
-                sector=asset.sector,
-                base_asset=asset.base_asset,
-                quote_asset=asset.quote_asset,
-                tradable=asset.tradable,
-                status=asset.status,
-                payload=asset.payload | {"raw_record_id": raw_record_id},
+            self._persist_asset_identity_and_details(
+                asset,
+                as_of=result.collected_at,
+                raw_record_id=raw_record_id,
+                source=f"ccxt:binance:{market_type}:load_markets",
             )
         self.universes.replace_members(
             universe_id=universe_id,
@@ -338,7 +375,7 @@ class CryptoDataCollector:
         source: str,
     ) -> None:
         base_asset, quote_asset = _split_crypto_symbol(symbol)
-        self.assets.upsert_asset(
+        self.assets.ensure_asset(
             asset_id=asset_id,
             symbol=symbol,
             name=f"{base_asset} / {quote_asset}" if quote_asset else symbol,
@@ -349,6 +386,72 @@ class CryptoDataCollector:
             base_asset=base_asset,
             quote_asset=quote_asset,
             payload={"source": source},
+        )
+        self.assets.upsert_asset_provider_mapping(
+            asset_id=asset_id,
+            symbol=symbol,
+            market=market,
+            provider=_provider_from_source(source),
+            provider_symbol=symbol,
+            provider_exchange="Binance",
+            source=source,
+        )
+
+    def _persist_asset_identity_and_details(
+        self,
+        asset: AssetData,
+        *,
+        as_of: datetime,
+        raw_record_id: str,
+        source: str,
+    ) -> None:
+        payload = asset.payload | {"raw_record_id": raw_record_id}
+        self.assets.ensure_asset(
+            asset_id=asset.asset_id,
+            symbol=asset.symbol,
+            name=asset.name,
+            market=asset.market,
+            asset_type=asset.asset_type,
+            exchange=asset.exchange,
+            currency=asset.currency,
+            sector=asset.sector,
+            base_asset=asset.base_asset,
+            quote_asset=asset.quote_asset,
+            tradable=asset.tradable,
+            status=asset.status,
+            payload=payload,
+        )
+        self.assets.upsert_asset_profile(
+            asset_id=asset.asset_id,
+            symbol=asset.symbol,
+            name=asset.name,
+            market=asset.market,
+            exchange=asset.exchange,
+            sector=asset.sector,
+            source=source,
+            as_of=as_of,
+            payload=payload,
+        )
+        self.assets.upsert_asset_provider_mapping(
+            asset_id=asset.asset_id,
+            symbol=asset.symbol,
+            market=asset.market,
+            provider=_provider_from_source(source),
+            provider_symbol=str(asset.payload.get("source_symbol") or asset.symbol),
+            provider_exchange=asset.exchange,
+            source=source,
+            status=asset.status,
+            payload=payload,
+        )
+        self.assets.upsert_asset_status_snapshot(
+            asset_id=asset.asset_id,
+            symbol=asset.symbol,
+            market=asset.market,
+            source=source,
+            as_of=as_of,
+            tradable=asset.tradable,
+            trading_status=asset.status,
+            payload=payload,
         )
 
 
@@ -416,20 +519,11 @@ class AshareP0Collector:
             return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
         for asset in result.assets:
-            self.assets.upsert_asset(
-                asset_id=asset.asset_id,
-                symbol=asset.symbol,
-                name=asset.name,
-                market=asset.market,
-                asset_type=asset.asset_type,
-                exchange=asset.exchange,
-                currency=asset.currency,
-                sector=asset.sector,
-                base_asset=asset.base_asset,
-                quote_asset=asset.quote_asset,
-                tradable=asset.tradable,
-                status=asset.status,
-                payload=asset.payload | {"raw_record_id": raw_record_id},
+            self._persist_asset_identity_and_details(
+                asset,
+                as_of=result.collected_at,
+                raw_record_id=raw_record_id,
+                source="akshare:stock_zh_a_spot",
             )
         self.universes.replace_members(
             universe_id=universe_id,
@@ -471,7 +565,9 @@ class AshareP0Collector:
         raw_record_id = archive_provider_result(
             self.raw_records,
             result,
-            endpoint="stock_zh_a_hist",
+            endpoint=_endpoint_from_source(
+                str(result.payload.get("primary_source") or "stock_zh_a_hist_tx")
+            ),
             request_params={
                 "symbol": symbol,
                 "timeframe": timeframe,
@@ -512,12 +608,7 @@ class AshareP0Collector:
     def _ensure_asset_stub(self, *, asset_id: str, symbol: str, source: str) -> None:
         """仅在资产不存在时写入占位资产，避免覆盖已有名称和交易所信息。"""
 
-        try:
-            self.assets.get_asset(asset_id)
-            return
-        except NoResultFound:
-            pass
-        self.assets.upsert_asset(
+        self.assets.ensure_asset(
             asset_id=asset_id,
             symbol=symbol,
             name=symbol,
@@ -525,6 +616,90 @@ class AshareP0Collector:
             asset_type="stock",
             currency="CNY",
             payload={"source": source},
+        )
+        self.assets.upsert_asset_provider_mapping(
+            asset_id=asset_id,
+            symbol=symbol,
+            market="ashare",
+            provider=_provider_from_source(source),
+            provider_symbol=symbol,
+            source=source,
+        )
+
+    def _persist_asset_identity_and_details(
+        self,
+        asset: AssetData,
+        *,
+        as_of: datetime,
+        raw_record_id: str,
+        source: str,
+    ) -> None:
+        payload = asset.payload | {"raw_record_id": raw_record_id}
+        self.assets.ensure_asset(
+            asset_id=asset.asset_id,
+            symbol=asset.symbol,
+            name=asset.name,
+            market=asset.market,
+            asset_type=asset.asset_type,
+            exchange=asset.exchange,
+            currency=asset.currency,
+            sector=asset.sector,
+            base_asset=asset.base_asset,
+            quote_asset=asset.quote_asset,
+            tradable=asset.tradable,
+            status=asset.status,
+            payload=payload,
+        )
+        self.assets.upsert_asset_profile(
+            asset_id=asset.asset_id,
+            symbol=asset.symbol,
+            name=asset.name,
+            market=asset.market,
+            exchange=asset.exchange,
+            sector=asset.sector,
+            source=source,
+            as_of=as_of,
+            payload=payload,
+        )
+        self.assets.upsert_asset_provider_mapping(
+            asset_id=asset.asset_id,
+            symbol=asset.symbol,
+            market=asset.market,
+            provider=_provider_from_source(source),
+            provider_symbol=str(asset.payload.get("source_symbol") or asset.symbol),
+            provider_exchange=asset.exchange,
+            source=source,
+            status=asset.status,
+            payload=payload,
+        )
+        self.assets.upsert_asset_status_snapshot(
+            asset_id=asset.asset_id,
+            symbol=asset.symbol,
+            market=asset.market,
+            source=source,
+            as_of=as_of,
+            tradable=asset.tradable,
+            trading_status=asset.status,
+            payload=payload,
+        )
+        self.assets.upsert_realtime_quote_snapshot(
+            asset_id=asset.asset_id,
+            symbol=asset.symbol,
+            market=asset.market,
+            source=source,
+            as_of=as_of,
+            last_price=_first_decimal(payload, ("最新价", "最新")),
+            prev_close=_first_decimal(payload, ("昨收", "昨收价")),
+            open_price=_first_decimal(payload, ("今开", "开盘")),
+            high=_first_decimal(payload, ("最高",)),
+            low=_first_decimal(payload, ("最低",)),
+            volume=_first_decimal(payload, ("成交量",)),
+            amount=_first_decimal(payload, ("成交额",)),
+            turnover_rate=_first_decimal(payload, ("换手率",)),
+            change_amount=_first_decimal(payload, ("涨跌额",)),
+            change_percent=_first_decimal(payload, ("涨跌幅",)),
+            status=asset.status,
+            payload=payload,
         )
 
 
@@ -590,13 +765,10 @@ class AshareP1Collector:
             return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
         for seed in result.seeds:
-            self.assets.upsert_asset(
-                asset_id=seed.asset_id,
-                symbol=seed.symbol,
-                name=seed.name,
-                market=seed.market,
-                asset_type="stock",
-                payload=seed.payload,
+            self._persist_seed_identity(
+                seed,
+                raw_record_id=raw_record_id,
+                source="akshare:stock_board_industry_cons_em",
             )
         self.universes.replace_members(
             universe_id=universe_id,
@@ -659,13 +831,10 @@ class AshareP1Collector:
             return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
         for seed in result.seeds:
-            self.assets.upsert_asset(
-                asset_id=seed.asset_id,
-                symbol=seed.symbol,
-                name=seed.name,
-                market=seed.market,
-                asset_type="stock",
-                payload=seed.payload,
+            self._persist_seed_identity(
+                seed,
+                raw_record_id=raw_record_id,
+                source=f"akshare:index_stock_cons_csindex:{index_code}",
             )
         self.universes.replace_members(
             universe_id=universe_id,
@@ -726,13 +895,10 @@ class AshareP1Collector:
             return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
         for seed in result.seeds:
-            self.assets.upsert_asset(
-                asset_id=seed.asset_id,
-                symbol=seed.symbol,
-                name=seed.name,
-                market=seed.market,
-                asset_type="stock",
-                payload=seed.payload,
+            self._persist_seed_identity(
+                seed,
+                raw_record_id=raw_record_id,
+                source="akshare:stock_board_concept_cons_em",
             )
         self.universes.replace_members(
             universe_id=universe_id,
@@ -770,7 +936,7 @@ class AshareP1Collector:
             return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
         for snapshot in result.snapshots:
-            self.assets.upsert_asset(
+            self.assets.ensure_asset(
                 asset_id=snapshot.asset_id,
                 symbol=snapshot.symbol,
                 name=snapshot.symbol,
@@ -815,13 +981,22 @@ class AshareP1Collector:
         if result.status != "available":
             return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
-        self.assets.upsert_asset(
+        self.assets.ensure_asset(
             asset_id=f"ashare:{symbol}",
             symbol=symbol,
             name=asset_name or symbol,
             market="ashare",
             asset_type="stock",
             payload={"source": "akshare:stock_news_em"},
+        )
+        self.assets.upsert_asset_profile(
+            asset_id=f"ashare:{symbol}",
+            symbol=symbol,
+            name=asset_name or symbol,
+            market="ashare",
+            source="akshare:stock_news_em",
+            as_of=result.collected_at,
+            payload={"raw_record_id": raw_record_id},
         )
         for event in result.events:
             self.events.upsert_event(
@@ -914,6 +1089,42 @@ class AshareP1Collector:
                 payload=item.payload | {"raw_record_id": raw_record_id},
             )
         return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def _persist_seed_identity(
+        self,
+        seed: UniverseSeedData,
+        *,
+        raw_record_id: str,
+        source: str,
+    ) -> None:
+        """把候选池种子的身份信息写入主表和 Provider 映射。
+
+        候选池成员关系应由 asset_universe_members 表承载；这里不再写 asset_profiles，
+        避免同一股票因属于多个指数、行业、概念或榜单而在资产画像表中膨胀。
+        """
+
+        payload = seed.payload | {
+            "raw_record_id": raw_record_id,
+            "universe_source": source,
+        }
+        self.assets.ensure_asset(
+            asset_id=seed.asset_id,
+            symbol=seed.symbol,
+            name=seed.name,
+            market=seed.market,
+            asset_type="stock",
+            currency="CNY",
+            payload=payload,
+        )
+        self.assets.upsert_asset_provider_mapping(
+            asset_id=seed.asset_id,
+            symbol=seed.symbol,
+            market=seed.market,
+            provider=_provider_from_source(source),
+            provider_symbol=seed.symbol,
+            source=UNIVERSE_SEED_MAPPING_SOURCE,
+            payload=payload,
+        )
 
 
 class AshareP2Collector:
@@ -1062,7 +1273,7 @@ class AshareP2Collector:
         if result.status != "available":
             return
         for snapshot in result.snapshots:
-            self.assets.upsert_asset(
+            self.assets.ensure_asset(
                 asset_id=snapshot.asset_id,
                 symbol=snapshot.symbol,
                 name=asset_name or snapshot.symbol,
@@ -1297,13 +1508,10 @@ class AshareRiskSentimentCollector:
             return
 
         for seed in result.seeds:
-            self.assets.upsert_asset(
-                asset_id=seed.asset_id,
-                symbol=seed.symbol,
-                name=seed.name,
-                market=seed.market,
-                asset_type="stock",
-                payload=seed.payload | {"raw_record_id": raw_record_id},
+            self._persist_seed_identity(
+                seed,
+                raw_record_id=raw_record_id,
+                source=universe_source,
             )
         self.universes.replace_members(
             universe_id=universe_id,
@@ -1337,6 +1545,38 @@ class AshareRiskSentimentCollector:
         self._persist_events(result.events, raw_record_id=raw_record_id)
         self._persist_evidence(result.evidence, raw_record_id=raw_record_id)
         self._persist_risks(result.risks, raw_record_id=raw_record_id)
+
+    def _persist_seed_identity(
+        self,
+        seed: UniverseSeedData,
+        *,
+        raw_record_id: str,
+        source: str,
+    ) -> None:
+        """把情绪候选池种子的身份信息写入主表和 Provider 映射。"""
+
+        payload = seed.payload | {
+            "raw_record_id": raw_record_id,
+            "universe_source": source,
+        }
+        self.assets.ensure_asset(
+            asset_id=seed.asset_id,
+            symbol=seed.symbol,
+            name=seed.name,
+            market=seed.market,
+            asset_type="stock",
+            currency="CNY",
+            payload=payload,
+        )
+        self.assets.upsert_asset_provider_mapping(
+            asset_id=seed.asset_id,
+            symbol=seed.symbol,
+            market=seed.market,
+            provider=_provider_from_source(source),
+            provider_symbol=seed.symbol,
+            source=UNIVERSE_SEED_MAPPING_SOURCE,
+            payload=payload,
+        )
 
     def _persist_events(
         self,

@@ -1,17 +1,21 @@
 {
-  "name": "hermes-agent-office",
+  "name": "finance-agent-console",
   "private": true,
   "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
+    "test:agent-routes": "node scripts/test-agent-model-routes.mjs",
+    "test:api-connectivity": "node scripts/test-api-model-provider-connectivity.mjs",
+    "test:model-config": "node scripts/test-model-config-view.mjs",
+    "test:data-sync": "node scripts/test-data-sync-view.mjs",
+    "test:chat-stream": "node scripts/test-chat-stream.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",
     "lucide-react": "^0.562.0",
-    "phaser": "^4.0.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
     "typescript": "^5.9.3",

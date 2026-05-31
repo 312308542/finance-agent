@@ -391,11 +391,17 @@ class FinanceAgentInterface:
 
         run = self.session.get(AgentWorkflowRunORM, workflow_run_id)
         events = self.assistant.langgraph_adapter.list_events(workflow_run_id)
+        node_trace = extract_node_trace(events)
+        model_routes = extract_model_routes(events, event_type="model_route")
+        review_model_routes = extract_model_routes(events, event_type="model_review")
         return AgentInterfaceResult(
             status="ok",
             data={
                 "run": serialize_workflow_run(run) if run else None,
                 "events": [serialize_workflow_event(event) for event in events],
+                "node_trace": node_trace,
+                "model_routes": model_routes,
+                "review_model_routes": review_model_routes,
             },
         )
 
@@ -637,6 +643,43 @@ def find_report_from_events(events: tuple[AgentWorkflowEventORM, ...]) -> JsonDi
     output = payload.get("output", {})
     report = output.get("report") or output
     return json_value(report)
+
+
+def extract_node_trace(events: tuple[AgentWorkflowEventORM, ...]) -> list[str]:
+    """从审计事件中提取节点执行顺序。"""
+
+    node_trace: list[str] = []
+    seen: set[str] = set()
+    for event in events:
+        if event.event_type not in {"workflow_node_completed", "high_risk_review", "report_draft"}:
+            continue
+        node_name = str(event.agent_name or "").strip()
+        if not node_name or node_name in seen:
+            continue
+        seen.add(node_name)
+        node_trace.append(node_name)
+    return node_trace
+
+
+def extract_model_routes(
+    events: tuple[AgentWorkflowEventORM, ...],
+    *,
+    event_type: str,
+) -> list[JsonDict]:
+    """从审计事件中提取模型路由记录。"""
+
+    routes: list[JsonDict] = []
+    for event in events:
+        if event.event_type != event_type:
+            continue
+        payload = event.payload or {}
+        output = payload.get("output") if isinstance(payload, dict) else None
+        if isinstance(output, dict):
+            if event_type == "model_review" and isinstance(output.get("route"), dict):
+                routes.append(json_value(output["route"]))
+            else:
+                routes.append(json_value(output))
+    return routes
 
 
 def build_agent_workflow_run_id(*, workflow_type: str, owner_id: str, as_of: datetime) -> str:

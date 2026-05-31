@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -13,22 +14,55 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 
+def configure_logging(*, log_level: str, process_log_file: str | None) -> None:
+    """配置调度器进程的控制台日志，并按需同步写入进程日志文件。"""
+
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s [pid=%(process)d thread=%(threadName)s] "
+        "%(name)s - %(message)s"
+    )
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(level)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(level)
+    root_logger.addHandler(console_handler)
+
+    if process_log_file:
+        path = Path(process_log_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(level)
+        root_logger.addHandler(file_handler)
+
+    # 采集任务会在超时保护子进程里执行，使用环境变量让子进程复用同一套日志出口。
+    import os
+
+    os.environ["FINANCE_AGENT_LOG_LEVEL"] = logging.getLevelName(level)
+    if process_log_file:
+        os.environ["FINANCE_AGENT_PROCESS_LOG_FILE"] = str(Path(process_log_file))
+
+
 def main() -> None:
     """解析参数并运行基础数据调度器。"""
 
-    from collect_base_data import collect_base_data, default_collection_args
+    from collect_base_data import default_collection_args
 
     from finance_agent.scheduler import (
         BaseDataScheduler,
         default_data_sync_config_payload,
         default_scheduler_payload,
         legacy_scheduler_payload,
-        load_data_sync_scheduler_payload,
         load_scheduler_config,
         read_scheduler_health,
     )
 
     args = parse_args()
+    configure_logging(log_level=args.log_level, process_log_file=args.process_log_file)
     if args.health_check:
         health = read_scheduler_health(
             args.status_file,
@@ -50,7 +84,6 @@ def main() -> None:
     config = load_scheduler_config(args.config)
     scheduler = BaseDataScheduler(
         config,
-        collect_base_data_func=collect_base_data,
         default_collection_args_func=default_collection_args,
         status_file=args.status_file,
         event_log_file=args.event_log_file,
@@ -111,6 +144,17 @@ def parse_args() -> argparse.Namespace:
         help="调度器结构化事件日志 JSONL 文件路径",
     )
     parser.add_argument(
+        "--process-log-file",
+        default=None,
+        help="同步写入调度器普通文本日志文件；不影响控制台输出",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="控制台日志级别",
+    )
+    parser.add_argument(
         "--health-check",
         action="store_true",
         help="读取 --status-file 并执行健康检查，不启动调度器",
@@ -149,7 +193,10 @@ def parse_args() -> argparse.Namespace:
         )
     )
     if template_modes > 1:
-        parser.error("--dump-default-config、--dump-default-data-sync-config、--dump-default-legacy-config 只能选择一个")
+        parser.error(
+            "--dump-default-config、--dump-default-data-sync-config、"
+            "--dump-default-legacy-config 只能选择一个"
+        )
     if args.max_cycles is not None and args.max_cycles <= 0:
         parser.error("--max-cycles 必须大于 0")
     if args.max_cycles is not None and not args.loop:

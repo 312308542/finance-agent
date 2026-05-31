@@ -14,7 +14,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, String, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -22,8 +22,11 @@ from finance_agent.storage.orm import (
     AgentWorkflowEventORM,
     AgentWorkflowRunORM,
     AssetORM,
+    AssetProfileORM,
+    AssetProviderMappingORM,
     AssetRecommendationORM,
     AssetScoreORM,
+    AssetStatusSnapshotORM,
     AssetThesisORM,
     AssetUniverseMemberORM,
     AssetUniverseORM,
@@ -53,6 +56,7 @@ from finance_agent.storage.orm import (
     PositionORM,
     PositionSnapshotORM,
     RawRecordORM,
+    RealtimeQuoteSnapshotORM,
     RecommendationRunORM,
     RecommendationRunUniverseORM,
     RetrievalProfileORM,
@@ -130,7 +134,7 @@ def _stable_json_hash(value: Any) -> str:
 
 
 class AssetRepository:
-    """资产主数据仓储。"""
+    """资产主数据和详情附表仓储。"""
 
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -184,6 +188,271 @@ class AssetRepository:
         )
         self.session.flush()
         return self.get_asset(asset_id)
+
+    def ensure_asset(
+        self,
+        *,
+        asset_id: str,
+        symbol: str,
+        name: str,
+        market: str,
+        asset_type: str,
+        exchange: str | None = None,
+        currency: str | None = None,
+        sector: str | None = None,
+        base_asset: str | None = None,
+        quote_asset: str | None = None,
+        tradable: bool = True,
+        status: str = "available",
+        payload: JsonDict | None = None,
+    ) -> AssetORM:
+        """只在资产不存在时写入身份主表，存在时不更新主表行。
+
+        基础采集任务会并发刷新行情、资金流、财务和事件。它们只需要确保
+        `assets` 有稳定身份记录，动态字段应进入附表，避免并发 `DO UPDATE`
+        反复争抢同一资产行。
+        """
+
+        values = {
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "name": name,
+            "market": market,
+            "asset_type": asset_type,
+            "exchange": exchange,
+            "currency": currency,
+            "sector": sector,
+            "base_asset": base_asset,
+            "quote_asset": quote_asset,
+            "tradable": tradable,
+            "status": status,
+            "payload": _json_safe(payload or {}),
+            "updated_at": datetime.now().astimezone(),
+        }
+        statement = insert(AssetORM).values(**values)
+        self.session.execute(
+            statement.on_conflict_do_nothing(
+                index_elements=[AssetORM.asset_id],
+            )
+        )
+        self.session.flush()
+        return self.get_asset(asset_id)
+
+    def upsert_asset_profile(
+        self,
+        *,
+        asset_id: str,
+        name: str,
+        market: str,
+        symbol: str,
+        source: str,
+        as_of: datetime,
+        exchange: str | None = None,
+        sector: str | None = None,
+        industry: str | None = None,
+        concept: str | None = None,
+        payload: JsonDict | None = None,
+    ) -> AssetProfileORM:
+        """按 `asset_id + source` 幂等写入资产慢变资料。"""
+
+        values = {
+            "asset_id": asset_id,
+            "source": source,
+            "name": name,
+            "market": market,
+            "symbol": symbol,
+            "exchange": exchange,
+            "sector": sector,
+            "industry": industry,
+            "concept": concept,
+            "as_of": as_of,
+            "payload": _json_safe(payload or {}),
+            "updated_at": datetime.now().astimezone(),
+        }
+        statement = insert(AssetProfileORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"asset_id", "source"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[AssetProfileORM.asset_id, AssetProfileORM.source],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(
+            AssetProfileORM,
+            {
+                "asset_id": asset_id,
+                "source": source,
+            },
+        )
+
+    def upsert_asset_provider_mapping(
+        self,
+        *,
+        asset_id: str,
+        market: str,
+        symbol: str,
+        provider: str,
+        provider_symbol: str,
+        source: str,
+        provider_exchange: str | None = None,
+        status: str = "available",
+        payload: JsonDict | None = None,
+    ) -> AssetProviderMappingORM:
+        """按 Provider 代码唯一键幂等写入资产映射。"""
+
+        mapping_id = f"asset_mapping:{provider}:{market}:{provider_symbol}".replace("/", "_")
+        values = {
+            "mapping_id": mapping_id,
+            "asset_id": asset_id,
+            "market": market,
+            "symbol": symbol,
+            "provider": provider,
+            "provider_symbol": provider_symbol,
+            "provider_exchange": provider_exchange,
+            "source": source,
+            "status": status,
+            "payload": _json_safe(payload or {}),
+            "updated_at": datetime.now().astimezone(),
+        }
+        statement = insert(AssetProviderMappingORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "mapping_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="uq_asset_provider_mappings_provider_symbol_market",
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(AssetProviderMappingORM, mapping_id)
+
+    def upsert_asset_status_snapshot(
+        self,
+        *,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        as_of: datetime,
+        source: str,
+        tradable: bool,
+        trading_status: str,
+        reason: str | None = None,
+        payload: JsonDict | None = None,
+    ) -> AssetStatusSnapshotORM:
+        """按 `asset_id + as_of + source` 幂等写入交易状态快照。"""
+
+        values = {
+            "asset_id": asset_id,
+            "as_of": as_of,
+            "source": source,
+            "symbol": symbol,
+            "market": market,
+            "tradable": tradable,
+            "trading_status": trading_status,
+            "reason": reason,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(AssetStatusSnapshotORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"asset_id", "as_of", "source"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[
+                    AssetStatusSnapshotORM.asset_id,
+                    AssetStatusSnapshotORM.as_of,
+                    AssetStatusSnapshotORM.source,
+                ],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(
+            AssetStatusSnapshotORM,
+            {
+                "asset_id": asset_id,
+                "as_of": as_of,
+                "source": source,
+            },
+        )
+
+    def upsert_realtime_quote_snapshot(
+        self,
+        *,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        as_of: datetime,
+        source: str,
+        last_price: Decimal | None = None,
+        prev_close: Decimal | None = None,
+        open_price: Decimal | None = None,
+        high: Decimal | None = None,
+        low: Decimal | None = None,
+        volume: Decimal | None = None,
+        amount: Decimal | None = None,
+        turnover_rate: Decimal | None = None,
+        change_amount: Decimal | None = None,
+        change_percent: Decimal | None = None,
+        bid_price: Decimal | None = None,
+        ask_price: Decimal | None = None,
+        status: str = "available",
+        payload: JsonDict | None = None,
+    ) -> RealtimeQuoteSnapshotORM:
+        """按 `asset_id + as_of + source` 幂等写入实时行情快照。"""
+
+        values = {
+            "asset_id": asset_id,
+            "as_of": as_of,
+            "source": source,
+            "symbol": symbol,
+            "market": market,
+            "last_price": last_price,
+            "prev_close": prev_close,
+            "open": open_price,
+            "high": high,
+            "low": low,
+            "volume": volume,
+            "amount": amount,
+            "turnover_rate": turnover_rate,
+            "change_amount": change_amount,
+            "change_percent": change_percent,
+            "bid_price": bid_price,
+            "ask_price": ask_price,
+            "status": status,
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(RealtimeQuoteSnapshotORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"asset_id", "as_of", "source"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[
+                    RealtimeQuoteSnapshotORM.asset_id,
+                    RealtimeQuoteSnapshotORM.as_of,
+                    RealtimeQuoteSnapshotORM.source,
+                ],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(
+            RealtimeQuoteSnapshotORM,
+            {
+                "asset_id": asset_id,
+                "as_of": as_of,
+                "source": source,
+            },
+        )
 
     def get_asset(self, asset_id: str) -> AssetORM:
         """根据资产 ID 查询资产，不存在则抛错。"""
@@ -262,9 +531,37 @@ class RawRecordRepository:
             "as_of": as_of,
             "collected_at": collected_at,
         }
-        self.session.execute(insert(RawRecordORM).values(**values))
+        statement = insert(RawRecordORM).values(**values)
+        update_values = {
+            "asset_id": statement.excluded.asset_id,
+            "symbol": statement.excluded.symbol,
+            "market": statement.excluded.market,
+            "request_params": statement.excluded.request_params,
+            "response_payload": statement.excluded.response_payload,
+            "provider_version": statement.excluded.provider_version,
+            "latency_ms": statement.excluded.latency_ms,
+            "retry_count": statement.excluded.retry_count,
+            "error_message": statement.excluded.error_message,
+            "as_of": statement.excluded.as_of,
+            "collected_at": func.greatest(
+                RawRecordORM.collected_at,
+                statement.excluded.collected_at,
+            ),
+        }
+        result = self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[
+                    RawRecordORM.provider,
+                    RawRecordORM.endpoint,
+                    RawRecordORM.request_hash,
+                    RawRecordORM.content_hash,
+                    RawRecordORM.status,
+                ],
+                set_=update_values,
+            ).returning(RawRecordORM.raw_record_id)
+        )
         self.session.flush()
-        return self.session.get_one(RawRecordORM, record_id)
+        return self.session.get_one(RawRecordORM, result.scalar_one())
 
     def count_by_provider(self, provider: str) -> int:
         """统计某个 Provider 已归档的原始记录数量。"""
@@ -1408,6 +1705,7 @@ class RecommendationRepository:
         since: datetime,
         market: str | None = None,
         limit: int = 20,
+        include_smoke: bool = False,
     ) -> list[RecommendationRunORM]:
         """查询最近完成或可用的推荐运行。"""
 
@@ -1417,11 +1715,34 @@ class RecommendationRepository:
         )
         if market:
             statement = statement.where(RecommendationRunORM.market == market)
-        return list(
+        if not include_smoke:
+            statement = statement.where(
+                RecommendationRunORM.run_id.not_ilike("%smoke%"),
+                RecommendationRunORM.strategy.not_ilike("%smoke%"),
+                func.coalesce(RecommendationRunORM.universe_id, "").not_ilike("%smoke%"),
+                RecommendationRunORM.payload.cast(String).not_ilike("%smoke%"),
+            )
+        runs = list(
             self.session.scalars(
                 statement.order_by(RecommendationRunORM.started_at.desc()).limit(limit)
             )
         )
+        if include_smoke:
+            return runs
+        return [run for run in runs if not is_smoke_recommendation_run(run)]
+
+
+def is_smoke_recommendation_run(run: Any) -> bool:
+    """判断推荐运行是否来自冒烟/样例数据。"""
+
+    values = [
+        getattr(run, "run_id", None),
+        getattr(run, "strategy", None),
+        getattr(run, "universe_id", None),
+        getattr(run, "summary", None),
+        getattr(run, "payload", None),
+    ]
+    return any("smoke" in str(value).lower() for value in values if value is not None)
 
 
 class FundamentalDataRepository:
@@ -3882,6 +4203,19 @@ class ModelRuntimeConfigRepository:
 
         statement = select(ModelInstanceORM).where(ModelInstanceORM.model_key == model_key)
         return self.session.scalars(statement).one()
+
+    def disable_model_instance(self, model_key: str) -> ModelInstanceORM:
+        """软删除模型实例，并停用所有指向它的路由规则。"""
+
+        model = self.get_model_instance(model_key)
+        model.is_enabled = False
+        model.updated_at = datetime.now().astimezone()
+        statement = select(ModelRoutingRuleORM).where(ModelRoutingRuleORM.model_key == model_key)
+        for route in self.session.scalars(statement):
+            route.is_enabled = False
+            route.updated_at = model.updated_at
+        self.session.flush()
+        return model
 
     def get_routing_rule(
         self,
