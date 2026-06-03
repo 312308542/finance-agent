@@ -24,18 +24,20 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from finance_agent.cache import create_cache_client
 from finance_agent.data.sync_config import (
     build_preset_config,
     export_scheduler_payload,
     load_data_sync_config,
 )
+from finance_agent.scheduler.base_data_progress import BaseDataTaskProgressRecorder
 
 JsonDict = dict[str, Any]
 logger = logging.getLogger(__name__)
 
 COLLECTION_GROUPS = {"all", "ashare-p0", "ashare-p1", "ashare-p2", "ashare-risk", "crypto"}
 JOB_TYPES = {"collection", "recommendation_pipeline", "data_quality_refresh"}
-DEFAULT_JOB_TIMEOUT_SECONDS = 3600
+DEFAULT_JOB_TIMEOUT_SECONDS = 6 * 60 * 60
 DEFAULT_HEALTH_STALE_SECONDS = 300
 DEFAULT_MAX_CONCURRENT_JOBS = 4
 STATUS_REPLACE_MAX_ATTEMPTS = 5
@@ -85,6 +87,48 @@ class ScheduledJobState:
     last_summary: JsonDict | None = None
     running: bool = False
     queued: bool = False
+
+
+def is_market_universe_job(job: BaseDataSchedulerJob) -> bool:
+    """判断任务是否为某个市场的资产池刷新任务。"""
+
+    return (
+        job.job_type == "collection"
+        and bool(job.market)
+        and str(job.params.get("sync_task_type") or "").strip() == "universe_refresh"
+    )
+
+
+def filter_due_states_by_market_universe(
+    due_states: list[ScheduledJobState],
+    *,
+    active_states: list[ScheduledJobState],
+) -> tuple[list[ScheduledJobState], list[ScheduledJobState]]:
+    """同一市场的资产池刷新优先执行，其它依赖资产池的任务等待下一轮。"""
+
+    active_universe_markets = {
+        str(state.job.market)
+        for state in active_states
+        if is_market_universe_job(state.job)
+    }
+    due_universe_markets = {
+        str(state.job.market)
+        for state in due_states
+        if is_market_universe_job(state.job)
+    }
+    blocked_markets = active_universe_markets | due_universe_markets
+    if not blocked_markets:
+        return due_states, []
+
+    runnable: list[ScheduledJobState] = []
+    blocked: list[ScheduledJobState] = []
+    for state in due_states:
+        market = str(state.job.market or "")
+        if market in blocked_markets and not is_market_universe_job(state.job):
+            blocked.append(state)
+        else:
+            runnable.append(state)
+    return runnable, blocked
 
 
 def default_scheduler_payload() -> JsonDict:
@@ -427,6 +471,24 @@ class BaseDataScheduler:
         self.started_at: datetime | None = None
         self._status_lock = threading.Lock()
         self._event_lock = threading.Lock()
+        self._progress = self._create_progress_recorder()
+
+    def _create_progress_recorder(self) -> BaseDataTaskProgressRecorder:
+        """创建进度记录器；Redis 不可用时自动降级为空实现。"""
+
+        try:
+            if self.config.cache_backend == "null":
+                cache, _, _ = create_cache_client(backend="null")
+                return BaseDataTaskProgressRecorder.from_cache_client(cache, cache_backend="null")
+            backend = "auto" if self.config.cache_backend == "auto" else "redis"
+            cache, _, cache_status = create_cache_client(backend=backend)
+            if cache_status.backend != "redis":
+                cache, _, _ = create_cache_client(backend="null")
+                return BaseDataTaskProgressRecorder.from_cache_client(cache, cache_backend="null")
+            return BaseDataTaskProgressRecorder.from_cache_client(cache, cache_backend="redis")
+        except Exception:
+            cache, _, _ = create_cache_client(backend="null")
+            return BaseDataTaskProgressRecorder.from_cache_client(cache, cache_backend="null")
 
     def plan(self) -> JsonDict:
         """生成当前调度计划，不触发采集。"""
@@ -631,6 +693,27 @@ class BaseDataScheduler:
                         for state in states
                         if not state.running and not state.queued and state.next_run_at <= now
                     ]
+                    due_states, blocked_due_states = filter_due_states_by_market_universe(
+                        due_states,
+                        active_states=[*running.values(), *queued],
+                    )
+                    if blocked_due_states:
+                        logger.info(
+                            "同市场资产池刷新优先执行，暂缓依赖任务 blocked_jobs=%s active_jobs=%s",
+                            [state.job.name for state in blocked_due_states],
+                            [state.job.name for state in [*running.values(), *queued]],
+                        )
+                    if blocked_due_states and not due_states:
+                        write_loop_status()
+                        if running or queued:
+                            wait(
+                                running.keys(),
+                                timeout=max(0.1, float(self.config.loop_idle_seconds)),
+                                return_when=FIRST_COMPLETED,
+                            )
+                        else:
+                            self._sleep(float(self.config.loop_idle_seconds))
+                        continue
                     if not due_states:
                         write_loop_status()
                         waiting_states = [
@@ -729,6 +812,8 @@ class BaseDataScheduler:
             "started_at": started_at.isoformat(),
         }
         args: Any = None
+        progress: BaseDataTaskProgressRecorder | None = None
+        progress_run_id: str | None = None
         if job.job_type == "collection":
             args = self.build_collection_args(job)
             planned["collection_args"] = vars(args)
@@ -755,6 +840,26 @@ class BaseDataScheduler:
                 job.market,
             )
             return summary
+
+        if job.job_type == "collection":
+            try:
+                progress = self._progress
+                progress_run_id = progress.job_started(
+                    job_name=job.name,
+                    title=str(job.params.get("title") or job.name),
+                    market=job.market,
+                    task_type=str(job.params.get("sync_task_type") or job.job_type),
+                    interval_seconds=job.interval_seconds,
+                    max_workers=self.config.max_concurrent_jobs,
+                )
+                args.progress_job_name = job.name
+                args.progress_run_id = progress_run_id
+                args.progress_ttl_seconds = max(job.interval_seconds + 1800, 900)
+                args.progress_cache_backend = progress.cache_backend
+            except Exception as exc:
+                progress = None
+                progress_run_id = None
+                logger.warning("初始化调度任务进度失败 job=%s error=%s", job.name, exc)
 
         max_attempts = self.config.max_job_retries + 1
         self.emit_event("job_start", job=job.name, market=job.market, max_attempts=max_attempts)
@@ -829,6 +934,13 @@ class BaseDataScheduler:
                     attempt,
                     last_error,
                 )
+                if progress is not None:
+                    progress.job_failed(
+                        job_name=job.name,
+                        run_id=progress_run_id,
+                        error_message=last_error or "unknown error",
+                        summary=failed,
+                    )
                 return failed
 
             executed = planned | {
@@ -859,6 +971,13 @@ class BaseDataScheduler:
                 attempt,
                 compact_collection_summary(summary),
             )
+            if progress is not None:
+                progress.job_completed(
+                    job_name=job.name,
+                    run_id=progress_run_id,
+                    status="completed",
+                    summary=summary if isinstance(summary, dict) else {},
+                )
             return executed
 
         raise RuntimeError("任务重试循环出现不可达状态")

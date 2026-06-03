@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 JsonDict = dict[str, Any]
-DEFAULT_SCHEDULER_JOB_TIMEOUT_SECONDS = 3600
+DEFAULT_SCHEDULER_JOB_TIMEOUT_SECONDS = 6 * 60 * 60
 DEFAULT_SCHEDULER_HEALTH_STALE_SECONDS = 300
 DEFAULT_SCHEDULER_MAX_CONCURRENT_JOBS = 4
 
@@ -64,6 +64,7 @@ CRYPTO_DATA_PACKAGES = {
 }
 
 ASHARE_TIMELY_EVENT_INTERVAL_SECONDS = 5 * 60
+DEFAULT_SYMBOL_FETCH_MAX_WORKERS = 4
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,7 @@ class MarketSyncConfig:
     data_packages: list[str] = field(default_factory=list)
     interval_seconds: dict[str, int] = field(default_factory=dict)
     batch_size: int = 200
+    max_workers: int = DEFAULT_SYMBOL_FETCH_MAX_WORKERS
     lookback_days: int = 30
     lookback_hours: int = 72
     timeframes: list[str] = field(default_factory=list)
@@ -114,6 +116,7 @@ class DataSyncTaskPreview:
     interval_seconds: int
     mode: str
     batch_size: int | None = None
+    max_workers: int | None = None
     lookback: str | None = None
     sources: list[str] = field(default_factory=list)
     data_packages: list[str] = field(default_factory=list)
@@ -240,6 +243,10 @@ def parse_market_config(market: str, payload: object) -> MarketSyncConfig:
         data_packages=string_list(payload.get("data_packages")),
         interval_seconds=parse_interval_seconds(payload.get("interval_seconds")),
         batch_size=positive_int(payload.get("batch_size"), default=200),
+        max_workers=positive_int(
+            payload.get("max_workers"),
+            default=DEFAULT_SYMBOL_FETCH_MAX_WORKERS,
+        ),
         lookback_days=positive_int(payload.get("lookback_days"), default=30),
         lookback_hours=positive_int(payload.get("lookback_hours"), default=72),
         timeframes=string_list(payload.get("timeframes")),
@@ -577,6 +584,8 @@ def build_scheduler_job(task: DataSyncTaskPreview) -> JsonDict:
         "lookback": task.lookback,
         "symbol_source": "market_assets",
     }
+    if task.max_workers is not None:
+        params["max_workers"] = task.max_workers
     if task.market == "ashare":
         params.update(build_ashare_collection_params(task))
     elif task.market in {"crypto_spot", "crypto_future"}:
@@ -786,9 +795,9 @@ def build_ashare_collection_params(task: DataSyncTaskPreview) -> JsonDict:
     params: JsonDict = {}
     if task.task_type == "universe_refresh":
         params["symbol_source"] = "universe"
-        params["index_catalog_limit"] = task.batch_size
-        params["industry_catalog_limit"] = task.batch_size
-        params["concept_catalog_limit"] = task.batch_size
+        params["index_catalog_limit"] = 0
+        params["industry_catalog_limit"] = 0
+        params["concept_catalog_limit"] = 0
         params["catalog_member_limit"] = 0
     if task.task_type == "market_bars_backfill":
         params["group"] = ["ashare-p0"]
@@ -796,7 +805,6 @@ def build_ashare_collection_params(task: DataSyncTaskPreview) -> JsonDict:
     if task.task_type == "realtime_quote_refresh":
         params["group"] = ["ashare-p0"]
         params["ashare_timeframe"] = "1d"
-        params["limit"] = task.batch_size
     if task.task_type == "fundamental_refresh":
         params["group"] = ["ashare-p2"]
     if task.task_type == "capital_flow_refresh":
@@ -863,6 +871,7 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                     interval_seconds=config.interval_seconds.get("market_bars", 60 * 60),
                     mode="incremental_backfill",
                     batch_size=config.batch_size,
+                    max_workers=config.max_workers,
                     lookback=f"{config.lookback_days}d",
                     sources=["market_bars"],
                     data_packages=["market_bars"],
@@ -893,6 +902,7 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 interval_seconds=config.interval_seconds.get("fundamentals", 12 * 60 * 60),
                 mode="incremental_snapshot",
                 batch_size=config.batch_size,
+                max_workers=config.max_workers,
                 lookback=f"{config.lookback_days}d",
                 sources=["financial_indicators", "performance_report", "valuation"],
                 data_packages=[
@@ -930,6 +940,7 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 ),
                 mode="incremental_event_sync",
                 batch_size=config.batch_size,
+                max_workers=config.max_workers,
                 lookback=f"{config.lookback_days}d",
                 sources=["stock_news", "notice_report"],
                 data_packages=["events"],
@@ -986,6 +997,7 @@ def preview_crypto_tasks(market: str, config: MarketSyncConfig) -> list[DataSync
                     interval_seconds=config.interval_seconds.get("market_bars", 5 * 60),
                     mode="incremental_backfill",
                     batch_size=config.batch_size,
+                    max_workers=config.max_workers,
                     lookback=f"{config.lookback_hours}h",
                     sources=["ccxt_fetch_ohlcv"],
                     data_packages=["market_bars"],
@@ -1001,6 +1013,7 @@ def preview_crypto_tasks(market: str, config: MarketSyncConfig) -> list[DataSync
                 interval_seconds=config.interval_seconds.get("derivatives", 5 * 60),
                 mode="incremental_snapshot",
                 batch_size=config.batch_size,
+                max_workers=config.max_workers,
                 lookback=f"{config.lookback_hours}h",
                 sources=["funding_rate", "open_interest", "long_short_ratio"],
                 data_packages=["derivatives"],
@@ -1034,6 +1047,10 @@ def validate_market_config(
         errors.append(f"{market} 至少需要一个数据采集包。")
     if market_config.batch_size > 500:
         warnings.append(f"{market} batch_size 较大，可能触发上游限流。")
+    if market_config.max_workers > 16:
+        errors.append(f"{market} max_workers 不能超过 16，避免并发请求过高。")
+    elif market_config.max_workers > 8:
+        warnings.append(f"{market} max_workers 较大，可能触发上游限流。")
     if market == "ashare" and "all_ashare" not in market_config.universe_sources:
         warnings.append("A 股未启用全 A，推荐系统覆盖面会依赖其他种子池。")
 

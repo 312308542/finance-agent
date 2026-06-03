@@ -6,6 +6,7 @@ from finance_agent.scheduler.assistant_loop_scheduler import (
     AssistantLoopSchedulerCycleResult,
     AssistantLoopSchedulerResult,
 )
+from finance_agent.scheduler.base_data_progress import build_progress_snapshot_response
 from finance_agent.scheduler.base_data_scheduler import (
     BaseDataScheduler,
     BaseDataSchedulerConfig,
@@ -29,6 +30,7 @@ __all__ = [
     "BaseDataScheduler",
     "BaseDataSchedulerConfig",
     "BaseDataSchedulerJob",
+    "build_progress_snapshot_response",
     "collect_base_data_with_timeout",
     "default_data_sync_config_payload",
     "default_scheduler_payload",

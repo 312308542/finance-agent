@@ -8,7 +8,12 @@ AKShare 某些东方财富接口在当前网络下会被上游断开普通 reque
 from __future__ import annotations
 
 import math
+import os
 import re
+import secrets
+import string
+import time
+from datetime import datetime
 from io import StringIO
 from typing import Any
 
@@ -25,6 +30,56 @@ EASTMONEY_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
     ),
 }
+EASTMONEY_COOKIE_ENV = "FINANCE_AGENT_EASTMONEY_COOKIE"
+_SYNTHETIC_EASTMONEY_COOKIE: str | None = None
+
+
+def eastmoney_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """生成东方财富浏览器态请求头；配置 cookie 时自动追加 Cookie。"""
+
+    headers = dict(EASTMONEY_HEADERS)
+    if extra:
+        headers.update(extra)
+    headers["Cookie"] = _eastmoney_cookie()
+    return headers
+
+
+def _eastmoney_cookie() -> str:
+    """读取用户配置的 Cookie；未配置时生成匿名浏览器 Cookie。"""
+
+    configured_cookie = os.getenv(EASTMONEY_COOKIE_ENV, "").strip()
+    if configured_cookie:
+        return configured_cookie
+    return _synthetic_eastmoney_cookie()
+
+
+def _synthetic_eastmoney_cookie() -> str:
+    """生成东方财富匿名访问 Cookie，用于没有浏览器 Cookie 的后台采集。"""
+
+    global _SYNTHETIC_EASTMONEY_COOKIE
+    if _SYNTHETIC_EASTMONEY_COOKIE:
+        return _SYNTHETIC_EASTMONEY_COOKIE
+
+    now_ms = int(time.time() * 1000)
+    first_seen = datetime.now().strftime("%Y-%m-%d%%20%H%%3A%M%%3A%S")
+    cookies = [
+        f"st_nvi={_random_alnum(26)}",
+        f"qgqp_b_id={secrets.token_hex(16)}",
+        f"nid18=000{secrets.token_hex(15)[:29]}",
+        f"nid18_create_time={now_ms}",
+        f"gviem={_random_alnum(22)}",
+        f"gviem_create_time={now_ms}",
+        f"st_pvi={secrets.randbelow(90_000_000_000_000) + 10_000_000_000_000}",
+        f"st_sp={first_seen}",
+        "st_inirUrl=https%3A%2F%2Fquote.eastmoney.com%2F",
+    ]
+    _SYNTHETIC_EASTMONEY_COOKIE = "; ".join(cookies)
+    return _SYNTHETIC_EASTMONEY_COOKIE
+
+
+def _random_alnum(length: int) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
 def fetch_industry_members(symbol: str) -> pd.DataFrame:
@@ -170,7 +225,7 @@ def fetch_hot_rank(*, limit: int | None = None) -> pd.DataFrame:
         },
         timeout=20,
         impersonate="chrome120",
-        headers=EASTMONEY_HEADERS | {"Referer": "https://guba.eastmoney.com/rank/"},
+        headers=eastmoney_headers({"Referer": "https://guba.eastmoney.com/rank/"}),
     )
     rank_response.raise_for_status()
     rank_df = pd.DataFrame((rank_response.json() or {}).get("data") or [])
@@ -939,7 +994,7 @@ def _curl_get_json(url: str, *, params: JsonDict) -> JsonDict:
         params=params,
         timeout=20,
         impersonate="chrome120",
-        headers=EASTMONEY_HEADERS,
+        headers=eastmoney_headers(),
     )
     response.raise_for_status()
     return response.json()

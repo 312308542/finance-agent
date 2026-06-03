@@ -16,9 +16,14 @@ from finance_agent.data.providers.akshare_risk_sentiment_provider import (
 )
 from finance_agent.data.providers.binance_native_provider import BinanceNativeProvider
 from finance_agent.data.providers.ccxt_binance_provider import CcxtBinanceProvider
+from finance_agent.data.providers.eastmoney_article_fetcher import (
+    ArticleFetchResult,
+    EastmoneyArticleFetcher,
+)
 
 __all__ = [
     "AkshareProvider",
+    "ArticleFetchResult",
     "AshareCapitalFlowProvider",
     "AshareEventProvider",
     "AshareFundamentalProvider",
@@ -28,4 +33,5 @@ __all__ = [
     "AshareValuationProvider",
     "BinanceNativeProvider",
     "CcxtBinanceProvider",
+    "EastmoneyArticleFetcher",
 ]

@@ -6,7 +6,7 @@ Redis 是可重建缓存和任务协调层，不是事实数据源。业务代�
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any, Protocol
 
 
 class CacheClient(Protocol):
@@ -20,6 +20,22 @@ class CacheClient(Protocol):
 
     def delete(self, key: str) -> None:
         """删除缓存键。"""
+
+    def append_json(
+        self,
+        key: str,
+        value: object,
+        *,
+        ttl_seconds: int | None = None,
+        max_length: int | None = None,
+    ) -> None:
+        """向 JSON 列表追加一项。"""
+
+    def list_json(self, key: str, *, limit: int | None = None) -> list[Any]:
+        """读取 JSON 列表。"""
+
+    def expire(self, key: str, ttl_seconds: int) -> None:
+        """更新缓存键 TTL。"""
 
 
 class LockClient(Protocol):

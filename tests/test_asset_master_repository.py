@@ -65,6 +65,31 @@ def test_ensure_asset_uses_do_nothing_to_avoid_hot_row_updates() -> None:
     assert session.flushed is True
 
 
+def test_upsert_asset_master_updates_only_changed_stable_identity_fields() -> None:
+    """低频主数据刷新应允许修复占位资产，同时避免无差异时反复更新主表。"""
+
+    session = _FakeSession()
+
+    AssetRepository(session).upsert_asset_master(
+        asset_id="ashare:300001",
+        symbol="300001",
+        name="特锐德",
+        market="ashare",
+        asset_type="stock",
+        exchange="SZSE",
+        currency="CNY",
+        payload={"source": "akshare:stock_zh_a_spot"},
+    )
+
+    sql = _compiled(session.executed[0])
+
+    assert "ON CONFLICT (asset_id) DO UPDATE" in sql
+    assert "assets.name IS DISTINCT FROM excluded.name" in sql
+    assert "assets.exchange IS DISTINCT FROM excluded.exchange" in sql
+    assert "assets.currency IS DISTINCT FROM excluded.currency" in sql
+    assert session.flushed is True
+
+
 def test_asset_detail_repositories_write_side_tables() -> None:
     """资产动态资料写入附表，避免多个采集任务争抢 assets 同一行更新锁。"""
 
@@ -136,10 +161,7 @@ def test_raw_record_repository_deduplicates_exact_provider_payloads() -> None:
 
     sql = _compiled(session.executed[0])
 
-    assert (
-        "ON CONFLICT (provider, endpoint, request_hash, content_hash, status) DO UPDATE"
-        in sql
-    )
+    assert "ON CONFLICT (provider, endpoint, request_hash, content_hash, status) DO UPDATE" in sql
     assert "RETURNING raw_records.raw_record_id" in sql
     assert result == {"key": "raw:canonical"}
     assert session.flushed is True

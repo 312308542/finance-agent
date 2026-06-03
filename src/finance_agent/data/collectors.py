@@ -6,8 +6,9 @@ Collector 负责把 Provider 的结构化结果落到标准表，并把每次调
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+import logging
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -38,6 +39,7 @@ from finance_agent.data.providers import (
     AshareValuationProvider,
     BinanceNativeProvider,
     CcxtBinanceProvider,
+    EastmoneyArticleFetcher,
 )
 from finance_agent.storage.repositories import (
     AssetRepository,
@@ -52,6 +54,7 @@ from finance_agent.storage.repositories import (
 )
 
 JsonDict = dict[str, Any]
+logger = logging.getLogger(__name__)
 UNIVERSE_SEED_MAPPING_SOURCE = "akshare:universe_seed"
 
 
@@ -205,6 +208,15 @@ class CryptoDataCollector:
             market=market,
         )
 
+        if result.status != "available":
+            logger.warning(
+                "Binance 资产池刷新失败，保留上一版 universe 元信息 market=%s status=%s error=%s",
+                market,
+                result.status,
+                result.error_message,
+            )
+            return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
         self.universes.upsert_universe(
             universe_id=universe_id,
             name=universe_name,
@@ -221,8 +233,6 @@ class CryptoDataCollector:
                 "error": result.error_message,
             },
         )
-        if result.status != "available":
-            return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
         for asset in result.assets:
             self._persist_asset_identity_and_details(
@@ -406,7 +416,7 @@ class CryptoDataCollector:
         source: str,
     ) -> None:
         payload = asset.payload | {"raw_record_id": raw_record_id}
-        self.assets.ensure_asset(
+        self.assets.upsert_asset_master(
             asset_id=asset.asset_id,
             symbol=asset.symbol,
             name=asset.name,
@@ -635,7 +645,7 @@ class AshareP0Collector:
         source: str,
     ) -> None:
         payload = asset.payload | {"raw_record_id": raw_record_id}
-        self.assets.ensure_asset(
+        self.assets.upsert_asset_master(
             asset_id=asset.asset_id,
             symbol=asset.symbol,
             name=asset.name,
@@ -713,6 +723,7 @@ class AshareP1Collector:
         sector_provider: AshareSectorProvider | None = None,
         flow_provider: AshareCapitalFlowProvider | None = None,
         event_provider: AshareEventProvider | None = None,
+        article_fetcher: Any | None = None,
     ) -> None:
         self.assets = AssetRepository(session)
         self.universes = UniverseRepository(session)
@@ -722,6 +733,9 @@ class AshareP1Collector:
         self.sector_provider = sector_provider or AshareSectorProvider()
         self.flow_provider = flow_provider or AshareCapitalFlowProvider()
         self.event_provider = event_provider or AshareEventProvider()
+        self.article_fetcher = (
+            article_fetcher if article_fetcher is not None else EastmoneyArticleFetcher()
+        )
 
     def collect_industry_members(
         self,
@@ -971,6 +985,8 @@ class AshareP1Collector:
         """采集个股新闻，并写入事件和证据表。"""
 
         result = self.event_provider.fetch_stock_news(symbol=symbol, limit=limit)
+        if result.status == "available":
+            result = self._enrich_stock_news_articles(result)
         raw_record_id = archive_provider_result(
             self.raw_records,
             result,
@@ -988,15 +1004,6 @@ class AshareP1Collector:
             market="ashare",
             asset_type="stock",
             payload={"source": "akshare:stock_news_em"},
-        )
-        self.assets.upsert_asset_profile(
-            asset_id=f"ashare:{symbol}",
-            symbol=symbol,
-            name=asset_name or symbol,
-            market="ashare",
-            source="akshare:stock_news_em",
-            as_of=result.collected_at,
-            payload={"raw_record_id": raw_record_id},
         )
         for event in result.events:
             self.events.upsert_event(
@@ -1031,6 +1038,105 @@ class AshareP1Collector:
                 payload=item.payload | {"raw_record_id": raw_record_id},
             )
         return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def _enrich_stock_news_articles(self, result: EventRecordsResult) -> EventRecordsResult:
+        """按新闻链接补抓原文，并把抓取状态写入事件和证据 payload。"""
+
+        if getattr(self, "article_fetcher", None) is None:
+            return result
+
+        article_cache: dict[str, JsonDict] = {}
+        articles_by_event_id: dict[str, JsonDict] = {}
+        enriched_events = []
+
+        for event in result.events:
+            article_payload: JsonDict | None = None
+            if event.url:
+                if event.url not in article_cache:
+                    article_cache[event.url] = self._fetch_article_payload(event.url)
+                base_payload = article_cache[event.url]
+                article_payload = base_payload | {"source_excerpt": event.summary}
+                articles_by_event_id[event.event_id] = article_payload
+
+            enriched_events.append(
+                replace(
+                    event,
+                    payload=(
+                        event.payload | {"article": article_payload}
+                        if article_payload
+                        else event.payload
+                    ),
+                )
+            )
+
+        enriched_evidence = []
+        for item in result.evidence:
+            article_payload = articles_by_event_id.get(str(item.data_ref or ""))
+            enriched_evidence.append(
+                replace(
+                    item,
+                    payload=(
+                        item.payload | {"article": article_payload}
+                        if article_payload
+                        else item.payload
+                    ),
+                )
+            )
+
+        article_statuses = [payload.get("status") for payload in article_cache.values()]
+        attempted = len(article_cache)
+        available = sum(1 for status in article_statuses if status == "available")
+        failed = sum(1 for status in article_statuses if status == "error")
+
+        return replace(
+            result,
+            events=enriched_events,
+            evidence=enriched_evidence,
+            payload=result.payload
+            | {
+                "article_fetch": {
+                    "enabled": True,
+                    "attempted": attempted,
+                    "available": available,
+                    "failed": failed,
+                    "unavailable": attempted - available - failed,
+                }
+            },
+        )
+
+    def _fetch_article_payload(self, url: str) -> JsonDict:
+        """调用正文抓取器，并把异常也转换成可追踪 payload。"""
+
+        try:
+            result = self.article_fetcher.fetch(url)
+        except Exception as exc:
+            return {
+                "url": url,
+                "status": "error",
+                "source": "eastmoney:article_page",
+                "fetched_at": datetime.now(tz=UTC).isoformat(),
+                "title": None,
+                "full_text": None,
+                "text_length": 0,
+                "html_length": None,
+                "truncated": False,
+                "error_message": str(exc),
+            }
+        payload = result.to_payload()
+        if not isinstance(payload, dict):
+            return {
+                "url": url,
+                "status": "error",
+                "source": "eastmoney:article_page",
+                "fetched_at": datetime.now(tz=UTC).isoformat(),
+                "title": None,
+                "full_text": None,
+                "text_length": 0,
+                "html_length": None,
+                "truncated": False,
+                "error_message": "article_fetcher 返回了非字典 payload",
+            }
+        return payload
 
     def collect_notice_reports(
         self,

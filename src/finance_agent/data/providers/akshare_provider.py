@@ -12,12 +12,14 @@ from pandas import DataFrame
 
 from finance_agent.data.models import AssetListResult, MarketBarsResult
 from finance_agent.data.normalizers import (
+    normalize_ashare_code_name,
     normalize_ashare_hist,
     normalize_ashare_hist_tx,
     normalize_ashare_spot,
     normalize_ashare_spot_tx,
     with_ashare_exchange_prefix,
 )
+from finance_agent.data.providers.eastmoney_curl import eastmoney_headers
 
 
 class AkshareProvider:
@@ -38,32 +40,44 @@ class AkshareProvider:
         try:
             df = self._fetch_assets_eastmoney()
             assets = normalize_ashare_spot(df, limit=limit)
-            actual_source = "akshare:stock_zh_a_spot_em"
+            actual_source = df.attrs.get("actual_source", "akshare:stock_zh_a_spot_em")
         except Exception as exc:
             fallback_trace.append(
                 {"source": "akshare:stock_zh_a_spot_em", "error_message": str(exc)}
             )
             try:
-                df = self._fetch_assets_tencent()
-                assets = normalize_ashare_spot_tx(df, limit=limit)
-                actual_source = "akshare:stock_zh_a_spot_tx"
-            except Exception as fallback_exc:
+                df = self._fetch_assets_code_name()
+                assets = normalize_ashare_code_name(df, limit=limit)
+                fallback_trace.extend(df.attrs.get("source_errors", []))
+                actual_source = "akshare:stock_info_a_code_name"
+            except Exception as code_name_exc:
                 fallback_trace.append(
                     {
-                        "source": "akshare:stock_zh_a_spot_tx",
-                        "error_message": str(fallback_exc),
+                        "source": "akshare:stock_info_a_code_name",
+                        "error_message": str(code_name_exc),
                     }
                 )
-                return AssetListResult(
-                    provider_name=self.provider_name,
-                    status="error",
-                    collected_at=collected_at,
-                    error_message=str(fallback_exc),
-                    payload={
-                        "primary_source": "akshare:stock_zh_a_spot_em",
-                        "fallback_trace": fallback_trace,
-                    },
-                )
+                try:
+                    df = self._fetch_assets_tencent()
+                    assets = normalize_ashare_spot_tx(df, limit=limit)
+                    actual_source = "akshare:stock_zh_a_spot_tx"
+                except Exception as fallback_exc:
+                    fallback_trace.append(
+                        {
+                            "source": "akshare:stock_zh_a_spot_tx",
+                            "error_message": str(fallback_exc),
+                        }
+                    )
+                    return AssetListResult(
+                        provider_name=self.provider_name,
+                        status="error",
+                        collected_at=collected_at,
+                        error_message=str(fallback_exc),
+                        payload={
+                            "primary_source": "akshare:stock_zh_a_spot_em",
+                            "fallback_trace": fallback_trace,
+                        },
+                    )
         return AssetListResult(
             provider_name=self.provider_name,
             status="available" if assets else "unavailable",
@@ -202,7 +216,132 @@ class AkshareProvider:
     def _fetch_assets_eastmoney(self) -> DataFrame:
         """从东方财富接口获取 A 股实时行情。"""
 
-        return ak.stock_zh_a_spot_em()
+        try:
+            return ak.stock_zh_a_spot_em()
+        except Exception:
+            return self._fetch_assets_eastmoney_curl_cffi()
+
+    def _fetch_assets_eastmoney_curl_cffi(self) -> DataFrame:
+        """使用 curl_cffi 直连东方财富全 A 列表接口。"""
+
+        urls = [
+            "https://push2.eastmoney.com/api/qt/clist/get",
+            "https://82.push2.eastmoney.com/api/qt/clist/get",
+            "https://20.push2.eastmoney.com/api/qt/clist/get",
+            "https://29.push2.eastmoney.com/api/qt/clist/get",
+            "https://push2his.eastmoney.com/api/qt/clist/get",
+        ]
+        page_size = 200
+        max_pages = 80
+        rows: list[dict[str, Any]] = []
+        total: int | None = None
+        base_params = {
+            "po": "1",
+            "np": "1",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f3",
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+            "fields": "f12,f14,f2,f3",
+            "pz": str(page_size),
+        }
+        for page in range(1, max_pages + 1):
+            last_error: Exception | None = None
+            for url in urls:
+                try:
+                    response = curl_requests.get(
+                        url,
+                        params=base_params | {"pn": str(page)},
+                        timeout=self.request_timeout_seconds,
+                        impersonate="chrome120",
+                        headers=eastmoney_headers(),
+                    )
+                    break
+                except Exception as exc:
+                    last_error = exc
+            else:
+                if last_error is not None:
+                    raise last_error
+                raise RuntimeError("未配置可用的东方财富 A 股列表接口")
+            response.raise_for_status()
+            data = response.json().get("data") or {}
+            page_rows = data.get("diff") or []
+            if total is None:
+                total_value = data.get("total")
+                total = int(total_value) if total_value is not None else None
+            if not page_rows:
+                break
+            rows.extend(page_rows)
+            if total is not None and len(rows) >= total:
+                break
+        result = pd.DataFrame(rows)
+        if result.empty:
+            return result
+        result.rename(
+            columns={
+                "f12": "代码",
+                "f14": "名称",
+                "f2": "最新价",
+                "f3": "涨跌幅",
+            },
+            inplace=True,
+        )
+        result.attrs["actual_source"] = "eastmoney:curl_cffi:stock_zh_a_spot_em"
+        return result
+
+    def _fetch_assets_code_name(self) -> DataFrame:
+        """从 AKShare 全 A 代码名册获取资产基础列表。"""
+
+        frames: list[DataFrame] = []
+        source_errors: list[dict[str, str]] = []
+
+        def append_frame(source: str, df: DataFrame, code_column: str, name_column: str) -> None:
+            frame = df[[code_column, name_column]].copy()
+            frame.columns = ["code", "name"]
+            frame["source"] = source
+            frames.append(frame)
+
+        for source, loader, code_column, name_column in [
+            (
+                "akshare:stock_info_sz_name_code",
+                lambda: ak.stock_info_sz_name_code(symbol="A股列表"),
+                "A股代码",
+                "A股简称",
+            ),
+            (
+                "akshare:stock_info_sh_name_code:main",
+                lambda: ak.stock_info_sh_name_code(symbol="主板A股"),
+                "证券代码",
+                "证券简称",
+            ),
+            (
+                "akshare:stock_info_sh_name_code:kcb",
+                lambda: ak.stock_info_sh_name_code(symbol="科创板"),
+                "证券代码",
+                "证券简称",
+            ),
+            (
+                "akshare:stock_info_bj_name_code",
+                ak.stock_info_bj_name_code,
+                "证券代码",
+                "证券简称",
+            ),
+        ]:
+            try:
+                append_frame(source, loader(), code_column, name_column)
+            except Exception as exc:
+                source_errors.append({"source": source, "error_message": str(exc)})
+
+        if not frames:
+            return ak.stock_info_a_code_name()
+
+        result = pd.concat(frames, ignore_index=True)
+        result["code"] = (
+            result["code"].astype(str).str.split(".", expand=True).iloc[:, 0].str.zfill(6)
+        )
+        result = result.dropna(subset=["code"]).drop_duplicates(subset=["code"], keep="first")
+        result.attrs["source_errors"] = source_errors
+        return result
 
     def _fetch_assets_tencent(self) -> DataFrame:
         """从腾讯接口获取 A 股实时行情。"""
@@ -317,15 +456,9 @@ class AkshareProvider:
         response = curl_requests.get(
             url,
             params=params,
-            timeout=20,
+            timeout=self.request_timeout_seconds,
             impersonate="chrome120",
-            headers={
-                "Referer": "https://quote.eastmoney.com/",
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
-                ),
-            },
+            headers=eastmoney_headers(),
         )
         response.raise_for_status()
         data_json = response.json()

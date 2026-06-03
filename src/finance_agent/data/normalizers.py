@@ -97,6 +97,32 @@ def normalize_ashare_spot_tx(df: pd.DataFrame, *, limit: int | None = None) -> l
     return assets
 
 
+def normalize_ashare_code_name(df: pd.DataFrame, *, limit: int | None = None) -> list[AssetData]:
+    """归一化 AKShare 全 A 代码名册。"""
+
+    assets: list[AssetData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        symbol = normalize_ashare_symbol(str(row.get("code", "")).strip())
+        if not symbol:
+            continue
+        name = str(row.get("name", symbol)).strip() or symbol
+        assets.append(
+            AssetData(
+                asset_id=f"ashare:{symbol}",
+                symbol=symbol,
+                name=name,
+                market="ashare",
+                asset_type="stock",
+                exchange=infer_ashare_exchange(symbol),
+                currency="CNY",
+                tradable=True,
+                payload={"raw": row},
+            )
+        )
+    return assets
+
+
 def normalize_ashare_hist(
     df: pd.DataFrame,
     *,
@@ -269,8 +295,8 @@ def normalize_ashare_fund_flow_rank(
     rows = df.head(limit) if limit else df
     rank_total = len(rows.index)
     for index, row in enumerate(rows.to_dict("records"), start=1):
-        symbol = strip_ashare_exchange_prefix(str(_first_present(row, ["代码", "股票代码"]) or ""))
-        if not symbol:
+        symbol = normalize_ashare_symbol(str(_first_present(row, ["代码", "股票代码"]) or ""))
+        if not symbol or len(symbol) != 6 or not symbol.isdigit():
             continue
         main_net_inflow = _first_decimal(
             row,
@@ -1150,7 +1176,7 @@ def normalize_crypto_markets(
         selected = selected[:limit]
 
     for item in selected:
-        symbol = str(item.get("symbol") or "").replace("/", "")
+        symbol = compact_crypto_symbol(str(item.get("symbol") or ""))
         base_asset = item.get("base")
         quote_asset = item.get("quote")
         if not symbol or not base_asset or not quote_asset:
@@ -1186,7 +1212,7 @@ def normalize_crypto_ohlcv(
     """归一化 ccxt OHLCV。"""
 
     market_name = "crypto_future" if market_type in {"future", "swap"} else "crypto_spot"
-    compact_symbol = symbol.replace("/", "")
+    compact_symbol = compact_crypto_symbol(symbol)
     bars: list[MarketBarData] = []
     duration = timeframe_to_timedelta(timeframe)
     for timestamp_ms, open_price, high, low, close, volume in rows:
@@ -1223,7 +1249,7 @@ def normalize_binance_derivative_snapshot(
 ) -> CryptoDerivativeSnapshotData:
     """归一化 Binance U 本位合约衍生品快照。"""
 
-    compact_symbol = symbol.replace("/", "").upper()
+    compact_symbol = compact_crypto_symbol(symbol)
     premium_index = premium_index or {}
     open_interest = open_interest or {}
     long_short_ratio = long_short_ratio or {}
@@ -1272,6 +1298,19 @@ def normalize_binance_derivative_snapshot(
             "long_short_ratio": long_short_ratio,
         },
     )
+
+
+def compact_crypto_symbol(symbol: str) -> str:
+    """把 ccxt 的 BTC/USDT:USDT 等格式统一压缩为库内交易对 BTCUSDT。"""
+
+    normalized = str(symbol or "").strip().upper().replace("/", "")
+    if ":" in normalized:
+        base_quote, settlement = normalized.split(":", 1)
+        if "-" in settlement:
+            normalized = f"{base_quote}-{settlement.split('-', 1)[1]}"
+        else:
+            normalized = base_quote
+    return normalized
 
 
 def infer_ashare_exchange(symbol: str) -> str:

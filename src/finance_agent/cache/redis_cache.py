@@ -52,6 +52,48 @@ class RedisCacheClient:
 
         self.client.delete(self._key(key))
 
+    def append_json(
+        self,
+        key: str,
+        value: object,
+        *,
+        ttl_seconds: int | None = None,
+        max_length: int | None = None,
+    ) -> None:
+        """向 JSON 列表追加一个元素。"""
+
+        payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+        redis_key = self._key(key)
+        pipe = self.client.pipeline()
+        pipe.rpush(redis_key, payload)
+        if max_length is not None and max_length > 0:
+            pipe.ltrim(redis_key, -max_length, -1)
+        if ttl_seconds is not None:
+            pipe.expire(redis_key, ttl_seconds)
+        pipe.execute()
+
+    def list_json(self, key: str, *, limit: int | None = None) -> list[object]:
+        """读取 JSON 列表。"""
+
+        redis_key = self._key(key)
+        raw_items = (
+            self.client.lrange(redis_key, 0, -1)
+            if limit is None or limit <= 0
+            else self.client.lrange(redis_key, -limit, -1)
+        )
+        items: list[dict | list | str | int | float | bool] = []
+        for raw in raw_items:
+            try:
+                items.append(json.loads(raw))
+            except json.JSONDecodeError:
+                items.append(raw)
+        return items
+
+    def expire(self, key: str, ttl_seconds: int) -> None:
+        """刷新缓存键 TTL。"""
+
+        self.client.expire(self._key(key), ttl_seconds)
+
     def acquire_lock(self, key: str, *, ttl_seconds: int) -> bool:
         """使用 `SET NX EX` 获取锁。"""
 

@@ -14,7 +14,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Select, String, func, select
+from sqlalchemy import Select, String, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -175,15 +175,82 @@ class AssetRepository:
             "updated_at": datetime.now().astimezone(),
         }
         statement = insert(AssetORM).values(**values)
-        update_values = {
-            key: statement.excluded[key]
-            for key in values
-            if key not in {"asset_id"}
-        }
+        update_values = {key: statement.excluded[key] for key in values if key not in {"asset_id"}}
         self.session.execute(
             statement.on_conflict_do_update(
                 index_elements=[AssetORM.asset_id],
                 set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.get_asset(asset_id)
+
+    def upsert_asset_master(
+        self,
+        *,
+        asset_id: str,
+        symbol: str,
+        name: str,
+        market: str,
+        asset_type: str,
+        exchange: str | None = None,
+        currency: str | None = None,
+        sector: str | None = None,
+        base_asset: str | None = None,
+        quote_asset: str | None = None,
+        tradable: bool = True,
+        status: str = "available",
+        payload: JsonDict | None = None,
+    ) -> AssetORM:
+        """低频主数据刷新入口：只在稳定身份字段变化时修复 `assets` 主表。
+
+        高频行情、资金流、财务和新闻采集仍应使用 `ensure_asset`，避免并发任务
+        反复更新同一资产主表行。全市场资产池刷新属于低频权威来源，可以在
+        占位资产先写入后回填名称、交易所、币种等稳定字段。
+        """
+
+        values = {
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "name": name,
+            "market": market,
+            "asset_type": asset_type,
+            "exchange": exchange,
+            "currency": currency,
+            "sector": sector,
+            "base_asset": base_asset,
+            "quote_asset": quote_asset,
+            "tradable": tradable,
+            "status": status,
+            "payload": _json_safe(payload or {}),
+            "updated_at": datetime.now().astimezone(),
+        }
+        statement = insert(AssetORM).values(**values)
+        stable_fields = (
+            "symbol",
+            "name",
+            "market",
+            "asset_type",
+            "exchange",
+            "currency",
+            "sector",
+            "base_asset",
+            "quote_asset",
+            "tradable",
+            "status",
+        )
+        update_values = {key: statement.excluded[key] for key in stable_fields}
+        update_values["payload"] = statement.excluded.payload
+        update_values["updated_at"] = statement.excluded.updated_at
+        changed_conditions = [
+            getattr(AssetORM, key).is_distinct_from(statement.excluded[key])
+            for key in stable_fields
+        ]
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[AssetORM.asset_id],
+                set_=update_values,
+                where=or_(*changed_conditions),
             )
         )
         self.session.flush()
@@ -271,9 +338,7 @@ class AssetRepository:
         }
         statement = insert(AssetProfileORM).values(**values)
         update_values = {
-            key: statement.excluded[key]
-            for key in values
-            if key not in {"asset_id", "source"}
+            key: statement.excluded[key] for key in values if key not in {"asset_id", "source"}
         }
         self.session.execute(
             statement.on_conflict_do_update(
@@ -566,8 +631,8 @@ class RawRecordRepository:
     def count_by_provider(self, provider: str) -> int:
         """统计某个 Provider 已归档的原始记录数量。"""
 
-        statement = select(func.count()).select_from(RawRecordORM).where(
-            RawRecordORM.provider == provider
+        statement = (
+            select(func.count()).select_from(RawRecordORM).where(RawRecordORM.provider == provider)
         )
         return int(self.session.scalar(statement) or 0)
 
@@ -617,9 +682,7 @@ class UniverseRepository:
         }
         statement = insert(AssetUniverseORM).values(**values)
         update_values = {
-            key: statement.excluded[key]
-            for key in values
-            if key not in {"universe_id"}
+            key: statement.excluded[key] for key in values if key not in {"universe_id"}
         }
         self.session.execute(
             statement.on_conflict_do_update(
@@ -982,9 +1045,7 @@ class MarketDataRepository:
         if source:
             statement = statement.where(MarketBarORM.source == source)
         return list(
-            self.session.scalars(
-                statement.order_by(MarketBarORM.asset_id, MarketBarORM.timestamp)
-            )
+            self.session.scalars(statement.order_by(MarketBarORM.asset_id, MarketBarORM.timestamp))
         )
 
 
@@ -2467,10 +2528,14 @@ class AssistantTriggerRepository:
     ) -> bool:
         """判断冷却窗口内是否已有同类触发。"""
 
-        statement = select(func.count()).select_from(AssistantTriggerEventORM).where(
-            AssistantTriggerEventORM.dedup_key == dedup_key,
-            AssistantTriggerEventORM.triggered_at >= since,
-            AssistantTriggerEventORM.status.in_(statuses),
+        statement = (
+            select(func.count())
+            .select_from(AssistantTriggerEventORM)
+            .where(
+                AssistantTriggerEventORM.dedup_key == dedup_key,
+                AssistantTriggerEventORM.triggered_at >= since,
+                AssistantTriggerEventORM.status.in_(statuses),
+            )
         )
         return int(self.session.scalar(statement) or 0) > 0
 
@@ -2850,9 +2915,7 @@ class DecisionLogRepository:
         if asset_id:
             statement = statement.where(DecisionLogORM.asset_id == asset_id)
         return list(
-            self.session.scalars(
-                statement.order_by(DecisionLogORM.created_at.desc()).limit(limit)
-            )
+            self.session.scalars(statement.order_by(DecisionLogORM.created_at.desc()).limit(limit))
         )
 
 
@@ -2979,8 +3042,7 @@ class MemoryRepository:
         )
         if asset_id:
             statement = statement.where(
-                (AssistantMemoryORM.asset_id == asset_id)
-                | (AssistantMemoryORM.memory_id.is_(None))
+                (AssistantMemoryORM.asset_id == asset_id) | (AssistantMemoryORM.memory_id.is_(None))
             )
         if memory_type:
             statement = statement.where(
@@ -3082,9 +3144,7 @@ class MemoryRepository:
             "payload": _json_safe(payload or {}),
         }
         statement = insert(ReviewTaskORM).values(**values)
-        update_values = {
-            key: statement.excluded[key] for key in values if key != "review_task_id"
-        }
+        update_values = {key: statement.excluded[key] for key in values if key != "review_task_id"}
         self.session.execute(
             statement.on_conflict_do_update(
                 index_elements=[ReviewTaskORM.review_task_id],
@@ -3317,8 +3377,10 @@ class ChatMemoryRepository:
                 constraint="uq_chat_messages_session_seq",
             )
         )
-        count_statement = select(func.count()).select_from(AssistantChatMessageORM).where(
-            AssistantChatMessageORM.chat_session_id == chat_session_id
+        count_statement = (
+            select(func.count())
+            .select_from(AssistantChatMessageORM)
+            .where(AssistantChatMessageORM.chat_session_id == chat_session_id)
         )
         message_count = int(self.session.scalar(count_statement) or 0)
         session = self.session.get(AssistantChatSessionORM, chat_session_id)
@@ -3524,9 +3586,7 @@ class WorkflowAuditRepository:
             "payload": _json_safe(payload or {}),
         }
         statement = insert(AgentWorkflowRunORM).values(**values)
-        update_values = {
-            key: statement.excluded[key] for key in values if key != "workflow_run_id"
-        }
+        update_values = {key: statement.excluded[key] for key in values if key != "workflow_run_id"}
         self.session.execute(
             statement.on_conflict_do_update(
                 index_elements=[AgentWorkflowRunORM.workflow_run_id],
@@ -4303,8 +4363,7 @@ class ModelRuntimeConfigRepository:
         """返回启用供应商的 provider_key 映射。"""
 
         return {
-            provider.provider_key: provider
-            for provider in self.list_providers(enabled_only=True)
+            provider.provider_key: provider for provider in self.list_providers(enabled_only=True)
         }
 
     def find_route_model(

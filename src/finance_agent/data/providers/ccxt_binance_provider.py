@@ -28,7 +28,8 @@ class CcxtBinanceProvider:
         default_type: str = "spot",
     ) -> None:
         self.default_type = default_type
-        self.exchange = ccxt.binance(
+        exchange_factory = ccxt.binanceusdm if default_type in {"future", "swap"} else ccxt.binance
+        self.exchange = exchange_factory(
             {
                 "apiKey": api_key,
                 "secret": api_secret,
@@ -134,16 +135,23 @@ class CcxtBinanceProvider:
                 parsed = parsed.replace(tzinfo=UTC)
         return int(parsed.timestamp() * 1000)
 
-    @staticmethod
-    def _to_ccxt_symbol(symbol: str) -> str:
+    def _to_ccxt_symbol(self, symbol: str) -> str:
         """把 BTCUSDT 这类紧凑写法转换为 ccxt 常用写法。"""
 
         if "/" in symbol:
             return symbol
+        delivery_suffix = None
+        core_symbol = symbol
+        if "-" in symbol:
+            core_symbol, delivery_suffix = symbol.split("-", 1)
         common_quotes = ["USDT", "USDC", "BUSD", "BTC", "ETH", "USD"]
         for quote in common_quotes:
-            if symbol.endswith(quote) and len(symbol) > len(quote):
-                return f"{symbol[: -len(quote)]}/{quote}"
+            if core_symbol.endswith(quote) and len(core_symbol) > len(quote):
+                base = core_symbol[: -len(quote)]
+                if self.default_type in {"future", "swap"} and quote in {"USDT", "USDC", "USD"}:
+                    suffix = f"-{delivery_suffix}" if delivery_suffix else ""
+                    return f"{base}/{quote}:{quote}{suffix}"
+                return f"{base}/{quote}"
         return symbol
 
     def health_check(self) -> dict[str, Any]:
