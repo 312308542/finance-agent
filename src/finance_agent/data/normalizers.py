@@ -670,7 +670,7 @@ def normalize_ashare_stop_list(
     rows = df.head(limit) if limit else df
     for row in rows.to_dict("records"):
         symbol = normalize_ashare_symbol(str(_first_present(row, ["代码", "股票代码"]) or ""))
-        if not symbol:
+        if not symbol or not is_standard_ashare_stock_symbol(symbol):
             continue
         name = str(_first_present(row, ["名称", "股票简称", "股票名称"]) or symbol).strip()
         stop_at = parse_ashare_datetime(
@@ -1005,7 +1005,7 @@ def normalize_ashare_lhb_detail(
     rows = df.head(limit) if limit else df
     for row in rows.to_dict("records"):
         symbol = normalize_ashare_symbol(str(_first_present(row, ["代码", "股票代码"]) or ""))
-        if not symbol:
+        if not symbol or not is_standard_ashare_stock_symbol(symbol):
             continue
         name = str(_first_present(row, ["名称", "股票名称"]) or symbol).strip()
         as_of = parse_ashare_datetime(_first_present(row, ["上榜日", "日期"])) or collected_at
@@ -1396,6 +1396,30 @@ def normalize_ashare_symbol(symbol: str) -> str:
             normalized = normalized[: -len(suffix)]
             break
     return normalized.strip()
+
+
+def is_standard_ashare_stock_symbol(symbol: str) -> bool:
+    """判断是否为普通 A 股股票代码，过滤可转债、B 股等非股票标的。"""
+
+    normalized = normalize_ashare_symbol(symbol)
+    if len(normalized) != 6 or not normalized.isdigit():
+        return False
+    non_stock_prefixes = (
+        "110",
+        "111",
+        "113",
+        "118",
+        "123",
+        "127",
+        "128",
+        "200",
+        "201",
+        "202",
+        "900",
+    )
+    if normalized.startswith(non_stock_prefixes):
+        return False
+    return normalized.startswith(("0", "3", "4", "6", "8", "920"))
 
 
 def timeframe_to_timedelta(timeframe: str) -> timedelta | None:
