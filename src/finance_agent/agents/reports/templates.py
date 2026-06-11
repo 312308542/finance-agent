@@ -181,6 +181,12 @@ def build_roundtable_section(
             "asset_id": opinion.get("asset_id"),
             "stance": opinion.get("stance"),
             "summary": opinion.get("summary"),
+            "confidence": opinion.get("confidence"),
+            "key_points": normalize_text_list(opinion.get("key_points")),
+            "rebuttals": normalize_text_list(opinion.get("rebuttals")),
+            "data_gaps": normalize_text_list(opinion.get("data_gaps")),
+            "generated_by": opinion.get("generated_by") or "fallback",
+            "model_instance_id": opinion.get("model_instance_id"),
             "tool_calls": opinion.get("tool_calls", []),
             "evidence_ids": opinion.get("evidence_ids", []),
             "source_ids": opinion.get("source_ids", []),
@@ -314,10 +320,7 @@ def render_report_markdown(report: dict[str, Any]) -> str:
     else:
         lines.append("- 暂无可引用证据。")
     lines.extend(["", "## 圆桌观点"])
-    lines.extend(
-        f"- {item.get('role')}: {item.get('summary')}"
-        for item in report["roundtable_opinions"]
-    )
+    lines.extend(render_roundtable_markdown_lines(report["roundtable_opinions"]))
     lines.extend(
         [
             "",
@@ -337,3 +340,30 @@ def render_report_markdown(report: dict[str, Any]) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def render_roundtable_markdown_lines(
+    roundtable_opinions: list[dict[str, Any]],
+) -> list[str]:
+    """渲染圆桌观点 Markdown 行。"""
+
+    if not roundtable_opinions:
+        return ["- 暂无圆桌观点。"]
+    lines: list[str] = []
+    for item in roundtable_opinions:
+        generated_by = item.get("generated_by") or "fallback"
+        lines.append(
+            f"- {item.get('role')}（{generated_by}）: {item.get('summary')}"
+        )
+        lines.extend(f"  - 要点：{point}" for point in item.get("key_points", []))
+        lines.extend(f"  - 反方：{rebuttal}" for rebuttal in item.get("rebuttals", []))
+        lines.extend(f"  - 缺口：{gap}" for gap in item.get("data_gaps", []))
+    return lines
+
+
+def normalize_text_list(value: object) -> list[str]:
+    """把报告字段安全整理为字符串列表。"""
+
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
