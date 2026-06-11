@@ -111,7 +111,7 @@ python3 scripts/integration/smoke_hermes_skill_commands.py --mode wsl-bridge
 | --- | --- | --- |
 | T1 skill 副本入库 | 已完成 | `.\.venv\Scripts\python.exe scripts\integration\check_hermes_visibility.py --project-root D:\Code\aiAgents\finance-agent` 通过，确认项目根、`pyproject.toml`、venv Python、CLI 与 MCP 入口可见 |
 | T2 工具边界防回归测试 | 已完成 | 先新增 `tests/test_hermes_tool_boundary.py` 观察到缺少 `read_only` 元数据而失败；补 `FinanceTool.read_only=True` 与 `FinanceAgentInterface.list_tools()` 透出后，`.\.venv\Scripts\python.exe -m pytest tests\test_hermes_tool_boundary.py -q` 通过，`scripts\storage\smoke_agent_cli_interface.py` 通过 |
-| T3 冒烟 direct 模式 | 未开始 | - |
+| T3 冒烟 direct 模式 | 已完成 | `.\.venv\Scripts\python.exe -m pytest tests\test_hermes_smoke_commands.py -q` 通过；`.\.venv\Scripts\python.exe scripts\integration\smoke_hermes_skill_commands.py --mode direct` 通过，覆盖 Workflow/工具清单、模型配置脱敏、图谱健康、Agent 单轮消费、单标的分析和 Markdown 报告读取 |
 | T4 冒烟 wsl-bridge 模式 | 未开始 | - |
 | T5 MCP 模板与握手冒烟 | 未开始 | - |
 | T6 回归与文档同步 | 未开始 | - |
