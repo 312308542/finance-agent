@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -50,6 +50,25 @@ class MarketBarData:
     is_closed: bool = True
     raw_record_id: str | None = None
     status: str = "available"
+
+
+@dataclass(frozen=True)
+class FundNavSnapshotData:
+    """Provider 返回的开放式基金净值快照。"""
+
+    snapshot_id: str
+    asset_id: str
+    symbol: str
+    market: str
+    source: str
+    nav_date: date
+    unit_nav: Decimal | None = None
+    accumulated_nav: Decimal | None = None
+    daily_return: Decimal | None = None
+    purchase_status: str | None = None
+    redeem_status: str | None = None
+    status: str = "available"
+    payload: JsonDict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -208,6 +227,13 @@ class MarketBarsResult(ProviderResult):
     """K 线结果。"""
 
     bars: list[MarketBarData] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class FundNavSnapshotsResult(ProviderResult):
+    """开放式基金净值结果。"""
+
+    snapshots: list[FundNavSnapshotData] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

@@ -313,6 +313,48 @@ class RawRecordORM(Base):
     collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class DataSyncWatermarkORM(Base):
+    """数据采集水位表，记录每个资产在不同数据域的成功水位和失败重试状态。"""
+
+    __tablename__ = "data_sync_watermarks"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "asset_id",
+            "data_domain",
+            "timeframe",
+            "provider",
+            name="pk_data_sync_watermarks",
+        ),
+        Index("idx_data_sync_watermarks_market_domain", "market", "data_domain"),
+        Index("idx_data_sync_watermarks_next_retry", "next_retry_at"),
+        Index("idx_data_sync_watermarks_status", "status"),
+        Index("idx_data_sync_watermarks_watermark", "data_domain", "timeframe", "watermark_at"),
+    )
+
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    data_domain: Mapped[str] = mapped_column(String(64), nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(16), server_default=text("''"), nullable=False)
+    provider: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), server_default=text("'pending'"), nullable=False)
+    watermark_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    fail_count: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
+    last_error_message: Mapped[str | None] = mapped_column(Text)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class MarketBarORM(Base):
     """标准 OHLCV 行情表，迁移中会转换为 TimescaleDB hypertable。"""
 
@@ -346,6 +388,96 @@ class MarketBarORM(Base):
         String(32), server_default=text("'available'"), nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class MarketBarIntradayORM(Base):
+    """分钟/小时级盘中 K 线表，和长期日 K 使用独立生命周期策略。"""
+
+    __tablename__ = "market_bars_intraday"
+    __table_args__ = (
+        Index(
+            "idx_market_bars_intraday_asset_tf_time",
+            "asset_id",
+            "timeframe",
+            "timestamp",
+        ),
+        Index("idx_market_bars_intraday_market_symbol", "market", "symbol"),
+        Index("idx_market_bars_intraday_timestamp", "timestamp"),
+        Index(
+            "idx_market_bars_intraday_closed",
+            "asset_id",
+            "timeframe",
+            "is_closed",
+            "timestamp",
+        ),
+    )
+
+    asset_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(16), primary_key=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    end_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    open: Mapped[Decimal] = mapped_column(Numeric(30, 10), nullable=False)
+    high: Mapped[Decimal] = mapped_column(Numeric(30, 10), nullable=False)
+    low: Mapped[Decimal] = mapped_column(Numeric(30, 10), nullable=False)
+    close: Mapped[Decimal] = mapped_column(Numeric(30, 10), nullable=False)
+    volume: Mapped[Decimal] = mapped_column(Numeric(36, 10), nullable=False)
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    source: Mapped[str] = mapped_column(String(64), primary_key=True)
+    adjustment: Mapped[str] = mapped_column(
+        String(16), primary_key=True, server_default=text("''"), nullable=False
+    )
+    is_closed: Mapped[bool] = mapped_column(server_default=text("true"), nullable=False)
+    raw_record_id: Mapped[str | None] = mapped_column(String(192))
+    status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'available'"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class FundNavSnapshotORM(Base):
+    """开放式基金净值快照表。"""
+
+    __tablename__ = "fund_nav_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "source",
+            "asset_id",
+            "nav_date",
+            name="uq_fund_nav_snapshots_source_asset_nav_date",
+        ),
+        Index("idx_fund_nav_snapshots_asset_nav_date", "asset_id", "nav_date"),
+        Index("idx_fund_nav_snapshots_symbol_nav_date", "symbol", "nav_date"),
+        Index("idx_fund_nav_snapshots_status", "status"),
+        Index("idx_fund_nav_snapshots_source", "source"),
+    )
+
+    snapshot_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    nav_date: Mapped[date] = mapped_column(Date, nullable=False)
+    unit_nav: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    accumulated_nav: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    daily_return: Mapped[Decimal | None] = mapped_column(Numeric(18, 10))
+    purchase_status: Mapped[str | None] = mapped_column(String(64))
+    redeem_status: Mapped[str | None] = mapped_column(String(64))
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'available'"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
 

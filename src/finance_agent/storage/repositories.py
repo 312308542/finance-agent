@@ -10,11 +10,11 @@ import hashlib
 import json
 import math
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Select, String, func, or_, select
+from sqlalchemy import Select, String, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -37,11 +37,13 @@ from finance_agent.storage.orm import (
     CapitalFlowSnapshotORM,
     CryptoDerivativeSnapshotORM,
     DataQualitySnapshotORM,
+    DataSyncWatermarkORM,
     DecisionLogORM,
     EventRecordORM,
     EvidenceORM,
     FactorFrameORM,
     FinancialMemoryEdgeORM,
+    FundNavSnapshotORM,
     FundamentalSnapshotORM,
     IndicatorFrameORM,
     MarketBarORM,
@@ -71,6 +73,7 @@ from finance_agent.storage.orm import (
 )
 
 JsonDict = dict[str, Any]
+FINAL_MARKET_BAR_STATUSES = ("available", "revised")
 
 
 def _ensure_not_mixed_market(market: str, *, context: str) -> None:
@@ -131,6 +134,84 @@ def _stable_json_hash(value: Any) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha1(encoded).hexdigest()
+
+
+def _dedupe_rows(rows: Sequence[JsonDict], key_fields: Sequence[str]) -> list[JsonDict]:
+    """按唯一键对批量入库行去重，避免同一条 INSERT 命中同一冲突行两次。"""
+
+    deduped: dict[tuple[Any, ...], JsonDict] = {}
+    for row in rows:
+        deduped[tuple(row.get(field) for field in key_fields)] = row
+    return list(deduped.values())
+
+
+def _execute_chunked_upserts(
+    session: Session,
+    rows: Sequence[JsonDict],
+    *,
+    chunk_size: int,
+    build_statement: Any,
+) -> int:
+    """按固定大小分块执行批量 upsert，并只在整批完成后 flush 一次。"""
+
+    if chunk_size <= 0:
+        raise ValueError("chunk_size 必须大于 0")
+    if not rows:
+        return 0
+    total = 0
+    for index in range(0, len(rows), chunk_size):
+        chunk = rows[index : index + chunk_size]
+        session.execute(build_statement(chunk))
+        total += len(chunk)
+    session.flush()
+    return total
+
+
+def _article_payload_update_rows(updates: Sequence[JsonDict]) -> list[JsonDict]:
+    """标准化新闻正文回填行，并按事件 ID 去重。"""
+
+    return _dedupe_rows(
+        [
+            {
+                "event_id": item["event_id"],
+                "article_payload": _json_safe(item.get("article_payload") or {}),
+            }
+            for item in updates
+        ],
+        ("event_id",),
+    )
+
+
+def _article_payload_update_statement(
+    *,
+    table_name: str,
+    match_column: str,
+    rows: Sequence[JsonDict],
+) -> Any:
+    """构造正文 payload 批量 JSONB 回填语句。"""
+
+    params: dict[str, Any] = {}
+    values_sql: list[str] = []
+    for index, row in enumerate(rows):
+        event_param = f"event_id_{index}"
+        payload_param = f"article_payload_{index}"
+        params[event_param] = row["event_id"]
+        params[payload_param] = json.dumps(row["article_payload"], ensure_ascii=False)
+        values_sql.append(f"(:{event_param}, CAST(:{payload_param} AS jsonb))")
+    values_clause = ", ".join(values_sql)
+    return text(
+        f"""
+        UPDATE {table_name} AS target
+        SET payload = jsonb_set(
+            COALESCE(target.payload, '{{}}'::jsonb),
+            '{{article}}',
+            source.article_payload,
+            true
+        )
+        FROM (VALUES {values_clause}) AS source(event_id, article_payload)
+        WHERE target.{match_column} = source.event_id
+        """
+    ).bindparams(**params)
 
 
 class AssetRepository:
@@ -304,6 +385,322 @@ class AssetRepository:
         )
         self.session.flush()
         return self.get_asset(asset_id)
+
+    def upsert_asset_masters(
+        self,
+        assets: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """批量刷新低频权威资产主数据。"""
+
+        now = datetime.now().astimezone()
+        rows = _dedupe_rows(
+            [
+                {
+                    "asset_id": item["asset_id"],
+                    "symbol": item["symbol"],
+                    "name": item["name"],
+                    "market": item["market"],
+                    "asset_type": item["asset_type"],
+                    "exchange": item.get("exchange"),
+                    "currency": item.get("currency"),
+                    "sector": item.get("sector"),
+                    "base_asset": item.get("base_asset"),
+                    "quote_asset": item.get("quote_asset"),
+                    "tradable": item.get("tradable", True),
+                    "status": item.get("status", "available"),
+                    "payload": _json_safe(item.get("payload") or {}),
+                    "updated_at": now,
+                }
+                for item in assets
+            ],
+            ("asset_id",),
+        )
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(AssetORM).values(list(chunk))
+            stable_fields = (
+                "symbol",
+                "name",
+                "market",
+                "asset_type",
+                "exchange",
+                "currency",
+                "sector",
+                "base_asset",
+                "quote_asset",
+                "tradable",
+                "status",
+            )
+            update_values = {key: statement.excluded[key] for key in stable_fields}
+            update_values["payload"] = statement.excluded.payload
+            update_values["updated_at"] = statement.excluded.updated_at
+            changed_conditions = [
+                getattr(AssetORM, key).is_distinct_from(statement.excluded[key])
+                for key in stable_fields
+            ]
+            return statement.on_conflict_do_update(
+                index_elements=[AssetORM.asset_id],
+                set_=update_values,
+                where=or_(*changed_conditions),
+            )
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
+
+    def ensure_assets(
+        self,
+        assets: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """批量确保资产身份存在；已存在的主表行不做更新。"""
+
+        now = datetime.now().astimezone()
+        rows = _dedupe_rows(
+            [
+                {
+                    "asset_id": item["asset_id"],
+                    "symbol": item["symbol"],
+                    "name": item["name"],
+                    "market": item["market"],
+                    "asset_type": item["asset_type"],
+                    "exchange": item.get("exchange"),
+                    "currency": item.get("currency"),
+                    "sector": item.get("sector"),
+                    "base_asset": item.get("base_asset"),
+                    "quote_asset": item.get("quote_asset"),
+                    "tradable": item.get("tradable", True),
+                    "status": item.get("status", "available"),
+                    "payload": _json_safe(item.get("payload") or {}),
+                    "updated_at": now,
+                }
+                for item in assets
+            ],
+            ("asset_id",),
+        )
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(AssetORM).values(list(chunk))
+            return statement.on_conflict_do_nothing(index_elements=[AssetORM.asset_id])
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
+
+    def upsert_asset_profiles(
+        self,
+        profiles: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """批量写入资产画像附表。"""
+
+        now = datetime.now().astimezone()
+        rows = _dedupe_rows(
+            [
+                {
+                    "asset_id": item["asset_id"],
+                    "source": item["source"],
+                    "name": item["name"],
+                    "market": item["market"],
+                    "symbol": item["symbol"],
+                    "exchange": item.get("exchange"),
+                    "sector": item.get("sector"),
+                    "industry": item.get("industry"),
+                    "concept": item.get("concept"),
+                    "as_of": item["as_of"],
+                    "payload": _json_safe(item.get("payload") or {}),
+                    "updated_at": now,
+                }
+                for item in profiles
+            ],
+            ("asset_id", "source"),
+        )
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(AssetProfileORM).values(list(chunk))
+            update_values = {
+                key: statement.excluded[key]
+                for key in rows[0]
+                if key not in {"asset_id", "source"}
+            }
+            return statement.on_conflict_do_update(
+                index_elements=[AssetProfileORM.asset_id, AssetProfileORM.source],
+                set_=update_values,
+            )
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
+
+    def upsert_asset_provider_mappings(
+        self,
+        mappings: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """批量写入 Provider 代码映射。"""
+
+        now = datetime.now().astimezone()
+        rows = _dedupe_rows(
+            [
+                {
+                    "mapping_id": item.get("mapping_id")
+                    or f"asset_mapping:{item['provider']}:{item['market']}:{item['provider_symbol']}".replace(
+                        "/", "_"
+                    ),
+                    "asset_id": item["asset_id"],
+                    "market": item["market"],
+                    "symbol": item["symbol"],
+                    "provider": item["provider"],
+                    "provider_symbol": item["provider_symbol"],
+                    "provider_exchange": item.get("provider_exchange"),
+                    "source": item["source"],
+                    "status": item.get("status", "available"),
+                    "payload": _json_safe(item.get("payload") or {}),
+                    "updated_at": now,
+                }
+                for item in mappings
+            ],
+            ("provider", "provider_symbol", "market"),
+        )
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(AssetProviderMappingORM).values(list(chunk))
+            update_values = {
+                key: statement.excluded[key] for key in rows[0] if key != "mapping_id"
+            }
+            return statement.on_conflict_do_update(
+                constraint="uq_asset_provider_mappings_provider_symbol_market",
+                set_=update_values,
+            )
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
+
+    def upsert_asset_status_snapshots(
+        self,
+        snapshots: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """批量写入资产交易状态快照。"""
+
+        rows = _dedupe_rows(
+            [
+                {
+                    "asset_id": item["asset_id"],
+                    "as_of": item["as_of"],
+                    "source": item["source"],
+                    "symbol": item["symbol"],
+                    "market": item["market"],
+                    "tradable": item["tradable"],
+                    "trading_status": item["trading_status"],
+                    "reason": item.get("reason"),
+                    "payload": _json_safe(item.get("payload") or {}),
+                }
+                for item in snapshots
+            ],
+            ("asset_id", "as_of", "source"),
+        )
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(AssetStatusSnapshotORM).values(list(chunk))
+            update_values = {
+                key: statement.excluded[key]
+                for key in rows[0]
+                if key not in {"asset_id", "as_of", "source"}
+            }
+            return statement.on_conflict_do_update(
+                index_elements=[
+                    AssetStatusSnapshotORM.asset_id,
+                    AssetStatusSnapshotORM.as_of,
+                    AssetStatusSnapshotORM.source,
+                ],
+                set_=update_values,
+            )
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
+
+    def upsert_realtime_quote_snapshots(
+        self,
+        snapshots: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """批量写入实时行情快照。"""
+
+        rows = _dedupe_rows(
+            [
+                {
+                    "asset_id": item["asset_id"],
+                    "as_of": item["as_of"],
+                    "source": item["source"],
+                    "symbol": item["symbol"],
+                    "market": item["market"],
+                    "last_price": item.get("last_price"),
+                    "prev_close": item.get("prev_close"),
+                    "open": item.get("open", item.get("open_price")),
+                    "high": item.get("high"),
+                    "low": item.get("low"),
+                    "volume": item.get("volume"),
+                    "amount": item.get("amount"),
+                    "turnover_rate": item.get("turnover_rate"),
+                    "change_amount": item.get("change_amount"),
+                    "change_percent": item.get("change_percent"),
+                    "bid_price": item.get("bid_price"),
+                    "ask_price": item.get("ask_price"),
+                    "status": item.get("status", "available"),
+                    "payload": _json_safe(item.get("payload") or {}),
+                }
+                for item in snapshots
+            ],
+            ("asset_id", "as_of", "source"),
+        )
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(RealtimeQuoteSnapshotORM).values(list(chunk))
+            update_values = {
+                key: statement.excluded[key]
+                for key in rows[0]
+                if key not in {"asset_id", "as_of", "source"}
+            }
+            return statement.on_conflict_do_update(
+                index_elements=[
+                    RealtimeQuoteSnapshotORM.asset_id,
+                    RealtimeQuoteSnapshotORM.as_of,
+                    RealtimeQuoteSnapshotORM.source,
+                ],
+                set_=update_values,
+            )
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
 
     def upsert_asset_profile(
         self,
@@ -637,6 +1034,263 @@ class RawRecordRepository:
         return int(self.session.scalar(statement) or 0)
 
 
+class DataSyncWatermarkRepository:
+    """数据采集水位和失败重试状态仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def record_success(
+        self,
+        *,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        data_domain: str,
+        provider: str,
+        timeframe: str | None = None,
+        watermark_at: datetime | None = None,
+        occurred_at: datetime | None = None,
+        payload: JsonDict | None = None,
+    ) -> None:
+        """记录采集成功水位，并清空失败重试状态。"""
+
+        now = occurred_at or datetime.now().astimezone()
+        values = {
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "data_domain": data_domain,
+            "timeframe": timeframe or "",
+            "provider": provider,
+            "status": "available",
+            "watermark_at": watermark_at,
+            "last_success_at": now,
+            "last_failed_at": None,
+            "next_retry_at": None,
+            "fail_count": 0,
+            "last_error_message": None,
+            "payload": _json_safe(payload or {}),
+            "updated_at": now,
+        }
+        statement = insert(DataSyncWatermarkORM).values(**values)
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="pk_data_sync_watermarks",
+                set_={
+                    "symbol": statement.excluded.symbol,
+                    "market": statement.excluded.market,
+                    "status": statement.excluded.status,
+                    "watermark_at": statement.excluded.watermark_at,
+                    "last_success_at": statement.excluded.last_success_at,
+                    "last_failed_at": None,
+                    "next_retry_at": None,
+                    "fail_count": 0,
+                    "last_error_message": None,
+                    "payload": statement.excluded.payload,
+                    "updated_at": statement.excluded.updated_at,
+                },
+            )
+        )
+        self.session.flush()
+
+    def record_failure(
+        self,
+        *,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        data_domain: str,
+        provider: str,
+        timeframe: str | None = None,
+        occurred_at: datetime | None = None,
+        retry_after: timedelta | None = timedelta(minutes=15),
+        error_message: str | None = None,
+        payload: JsonDict | None = None,
+    ) -> None:
+        """记录采集失败，并设置下一次可重试时间。"""
+
+        now = occurred_at or datetime.now().astimezone()
+        next_retry_at = now + retry_after if retry_after is not None else None
+        values = {
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "data_domain": data_domain,
+            "timeframe": timeframe or "",
+            "provider": provider,
+            "status": "error",
+            "watermark_at": None,
+            "last_success_at": None,
+            "last_failed_at": now,
+            "next_retry_at": next_retry_at,
+            "fail_count": 1,
+            "last_error_message": error_message,
+            "payload": _json_safe(payload or {}),
+            "updated_at": now,
+        }
+        statement = insert(DataSyncWatermarkORM).values(**values)
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="pk_data_sync_watermarks",
+                set_={
+                    "symbol": statement.excluded.symbol,
+                    "market": statement.excluded.market,
+                    "status": statement.excluded.status,
+                    "last_failed_at": statement.excluded.last_failed_at,
+                    "next_retry_at": statement.excluded.next_retry_at,
+                    "fail_count": DataSyncWatermarkORM.fail_count + 1,
+                    "last_error_message": statement.excluded.last_error_message,
+                    "payload": statement.excluded.payload,
+                    "updated_at": statement.excluded.updated_at,
+                },
+            )
+        )
+        self.session.flush()
+
+    def get_next_retry_at(
+        self,
+        *,
+        asset_id: str,
+        data_domain: str,
+        provider: str,
+        timeframe: str | None = None,
+    ) -> datetime | None:
+        """读取指定资产和数据域的下一次可重试时间。"""
+
+        statement = select(DataSyncWatermarkORM.next_retry_at).where(
+            DataSyncWatermarkORM.asset_id == asset_id,
+            DataSyncWatermarkORM.data_domain == data_domain,
+            DataSyncWatermarkORM.provider == provider,
+            DataSyncWatermarkORM.timeframe == (timeframe or ""),
+        )
+        return self.session.execute(statement).scalar_one_or_none()
+
+
+class FundNavRepository:
+    """开放式基金净值仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_snapshot(
+        self,
+        *,
+        snapshot_id: str,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        nav_date: date,
+        source: str,
+        unit_nav: Decimal | None = None,
+        accumulated_nav: Decimal | None = None,
+        daily_return: Decimal | None = None,
+        purchase_status: str | None = None,
+        redeem_status: str | None = None,
+        status: str = "available",
+        payload: JsonDict | None = None,
+    ) -> FundNavSnapshotORM:
+        """按来源、资产和净值日期幂等写入净值快照。"""
+
+        values = {
+            "snapshot_id": snapshot_id,
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "nav_date": nav_date,
+            "unit_nav": unit_nav,
+            "accumulated_nav": accumulated_nav,
+            "daily_return": daily_return,
+            "purchase_status": purchase_status,
+            "redeem_status": redeem_status,
+            "source": source,
+            "status": status,
+            "payload": _json_safe(payload or {}),
+            "updated_at": datetime.now().astimezone(),
+        }
+        statement = insert(FundNavSnapshotORM).values(**values)
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="uq_fund_nav_snapshots_source_asset_nav_date",
+                set_={
+                    key: statement.excluded[key]
+                    for key in values
+                    if key not in {"snapshot_id", "asset_id", "nav_date", "source"}
+                },
+            )
+        )
+        self.session.flush()
+        return self.get_snapshot(snapshot_id)
+
+    def upsert_snapshots(
+        self,
+        snapshots: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """批量写入开放式基金净值快照。"""
+
+        now = datetime.now().astimezone()
+        rows = _dedupe_rows(
+            [
+                {
+                    "snapshot_id": item["snapshot_id"],
+                    "asset_id": item["asset_id"],
+                    "symbol": item["symbol"],
+                    "market": item["market"],
+                    "nav_date": item["nav_date"],
+                    "unit_nav": item.get("unit_nav"),
+                    "accumulated_nav": item.get("accumulated_nav"),
+                    "daily_return": item.get("daily_return"),
+                    "purchase_status": item.get("purchase_status"),
+                    "redeem_status": item.get("redeem_status"),
+                    "source": item["source"],
+                    "status": item.get("status", "available"),
+                    "payload": _json_safe(item.get("payload") or {}),
+                    "updated_at": now,
+                }
+                for item in snapshots
+            ],
+            ("source", "asset_id", "nav_date"),
+        )
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(FundNavSnapshotORM).values(list(chunk))
+            update_values = {
+                key: statement.excluded[key]
+                for key in rows[0]
+                if key not in {"snapshot_id", "asset_id", "nav_date", "source"}
+            }
+            return statement.on_conflict_do_update(
+                constraint="uq_fund_nav_snapshots_source_asset_nav_date",
+                set_=update_values,
+            )
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
+
+    def get_snapshot(self, snapshot_id: str) -> FundNavSnapshotORM:
+        """按快照 ID 读取净值快照。"""
+
+        return self.session.get_one(FundNavSnapshotORM, snapshot_id)
+
+    def list_recent_snapshots(self, *, asset_id: str, limit: int) -> list[FundNavSnapshotORM]:
+        """读取单只基金最近净值记录。"""
+
+        statement = (
+            select(FundNavSnapshotORM)
+            .where(FundNavSnapshotORM.asset_id == asset_id)
+            .order_by(FundNavSnapshotORM.nav_date.desc())
+            .limit(limit)
+        )
+        rows = list(self.session.scalars(statement))
+        return list(reversed(rows))
+
+
 class UniverseRepository:
     """候选池仓储。"""
 
@@ -756,10 +1410,56 @@ class UniverseRepository:
         可以改成批量 insert + on conflict。
         """
 
-        saved: list[AssetUniverseMemberORM] = []
+        if not members:
+            return []
+        universe = self.get_universe(universe_id)
+        rows: list[JsonDict] = []
         for member in members:
-            saved.append(self.upsert_member(universe_id=universe_id, **member))
-        return saved
+            market = member["market"]
+            _ensure_not_mixed_market(market, context="鍊欓€夋睜鎴愬憳")
+            _ensure_same_market(
+                expected=universe.market,
+                actual=market,
+                context=f"鍊欓€夋睜 {universe_id}",
+                subject=f"鎴愬憳 {member['asset_id']}",
+            )
+            rows.append(
+                {
+                    "id": member.get("id") or member["member_id"],
+                    "universe_id": universe_id,
+                    "asset_id": member["asset_id"],
+                    "symbol": member["symbol"],
+                    "market": market,
+                    "included": member.get("included", True),
+                    "removed_reason": member.get("removed_reason"),
+                    "rank_hint": member.get("rank_hint"),
+                    "as_of": member["as_of"],
+                    "payload": _json_safe(member.get("payload") or {}),
+                }
+            )
+        rows = _dedupe_rows(rows, ("universe_id", "asset_id"))
+        member_ids = [row["id"] for row in rows]
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(AssetUniverseMemberORM).values(list(chunk))
+            update_values = {
+                key: statement.excluded[key]
+                for key in rows[0]
+                if key not in {"id", "universe_id", "asset_id"}
+            }
+            return statement.on_conflict_do_update(
+                constraint="uq_universe_members_universe_asset",
+                set_=update_values,
+            )
+
+        _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=500,
+            build_statement=build_statement,
+        )
+        statement = select(AssetUniverseMemberORM).where(AssetUniverseMemberORM.id.in_(member_ids))
+        return list(self.session.scalars(statement))
 
     def get_universe(self, universe_id: str) -> AssetUniverseORM:
         """根据候选池 ID 查询候选池。"""
@@ -860,10 +1560,50 @@ class MarketCalendarRepository:
     ) -> list[MarketCalendarORM]:
         """批量幂等写入交易日历。"""
 
-        saved: list[MarketCalendarORM] = []
-        for entry in entries:
-            saved.append(self.upsert_calendar_entry(**entry))
-        return saved
+        rows = _dedupe_rows(
+            [
+                {
+                    "calendar_id": entry["calendar_id"],
+                    "market": entry["market"],
+                    "exchange": entry["exchange"],
+                    "trade_date": entry["trade_date"],
+                    "is_trading_day": entry["is_trading_day"],
+                    "open_at": entry.get("open_at"),
+                    "close_at": entry.get("close_at"),
+                    "session_type": entry["session_type"],
+                    "timezone": entry["timezone"],
+                    "status": entry.get("status", "available"),
+                    "source": entry["source"],
+                    "payload": _json_safe(entry.get("payload") or {}),
+                }
+                for entry in entries
+            ],
+            ("market", "exchange", "trade_date", "session_type"),
+        )
+        calendar_ids = [row["calendar_id"] for row in rows]
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(MarketCalendarORM).values(list(chunk))
+            update_values = {
+                key: statement.excluded[key]
+                for key in rows[0]
+                if key not in {"calendar_id", "market", "exchange", "trade_date", "session_type"}
+            }
+            return statement.on_conflict_do_update(
+                constraint="uq_market_calendars_session",
+                set_=update_values,
+            )
+
+        _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=500,
+            build_statement=build_statement,
+        )
+        if not calendar_ids:
+            return []
+        statement = select(MarketCalendarORM).where(MarketCalendarORM.calendar_id.in_(calendar_ids))
+        return list(self.session.scalars(statement))
 
     def get_calendar_entry(
         self,
@@ -932,44 +1672,29 @@ class MarketDataRepository:
     ) -> MarketBarORM:
         """按 K 线唯一键幂等写入行情。"""
 
-        values = {
-            "asset_id": asset_id,
-            "symbol": symbol,
-            "market": market,
-            "timeframe": timeframe,
-            "timestamp": timestamp,
-            "end_timestamp": end_timestamp,
-            "open": open_price,
-            "high": high,
-            "low": low,
-            "close": close,
-            "volume": volume,
-            "amount": amount,
-            "source": source,
-            "adjustment": adjustment,
-            "is_closed": is_closed,
-            "raw_record_id": raw_record_id,
-            "status": status,
-        }
-        statement = insert(MarketBarORM).values(**values)
-        update_values = {
-            key: statement.excluded[key]
-            for key in values
-            if key not in {"asset_id", "timeframe", "timestamp", "source", "adjustment"}
-        }
-        self.session.execute(
-            statement.on_conflict_do_update(
-                index_elements=[
-                    MarketBarORM.asset_id,
-                    MarketBarORM.timeframe,
-                    MarketBarORM.timestamp,
-                    MarketBarORM.source,
-                    MarketBarORM.adjustment,
-                ],
-                set_=update_values,
-            )
+        self.upsert_bars(
+            [
+                {
+                    "asset_id": asset_id,
+                    "symbol": symbol,
+                    "market": market,
+                    "timeframe": timeframe,
+                    "timestamp": timestamp,
+                    "end_timestamp": end_timestamp,
+                    "open": open_price,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "volume": volume,
+                    "amount": amount,
+                    "source": source,
+                    "adjustment": adjustment,
+                    "is_closed": is_closed,
+                    "raw_record_id": raw_record_id,
+                    "status": status,
+                }
+            ]
         )
-        self.session.flush()
         return self.get_bar(
             asset_id=asset_id,
             timeframe=timeframe,
@@ -977,6 +1702,47 @@ class MarketDataRepository:
             source=source,
             adjustment=adjustment,
         )
+
+    def upsert_bars(self, bars: Sequence[JsonDict], *, chunk_size: int = 500) -> int:
+        """按批次幂等写入 K 线，默认每批 500 条，降低大量历史 K 线入库的数据库往返。"""
+
+        if not bars:
+            return 0
+
+        conflict_keys = ("asset_id", "timeframe", "timestamp", "source", "adjustment")
+        deduplicated_rows: dict[tuple[Any, ...], JsonDict] = {}
+        ordered_keys: list[tuple[Any, ...]] = []
+        for row in bars:
+            row_values = dict(row)
+            conflict_key = tuple(row_values[key] for key in conflict_keys)
+            if conflict_key not in deduplicated_rows:
+                ordered_keys.append(conflict_key)
+            deduplicated_rows[conflict_key] = row_values
+
+        rows = [deduplicated_rows[key] for key in ordered_keys]
+        normalized_chunk_size = max(int(chunk_size), 1)
+        row_count = 0
+        for offset in range(0, len(rows), normalized_chunk_size):
+            chunk = rows[offset : offset + normalized_chunk_size]
+            statement = insert(MarketBarORM).values(chunk)
+            update_values = {
+                key: statement.excluded[key] for key in chunk[0] if key not in conflict_keys
+            }
+            self.session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=[
+                        MarketBarORM.asset_id,
+                        MarketBarORM.timeframe,
+                        MarketBarORM.timestamp,
+                        MarketBarORM.source,
+                        MarketBarORM.adjustment,
+                    ],
+                    set_=update_values,
+                )
+            )
+            row_count += len(chunk)
+        self.session.flush()
+        return row_count
 
     def get_bar(
         self,
@@ -1018,7 +1784,10 @@ class MarketDataRepository:
         if source:
             statement = statement.where(MarketBarORM.source == source)
         if closed_only:
-            statement = statement.where(MarketBarORM.is_closed.is_(True))
+            statement = statement.where(
+                MarketBarORM.is_closed.is_(True),
+                MarketBarORM.status.in_(FINAL_MARKET_BAR_STATUSES),
+            )
 
         rows = list(
             self.session.scalars(statement.order_by(MarketBarORM.timestamp.desc()).limit(limit))
@@ -1044,6 +1813,7 @@ class MarketDataRepository:
         )
         if source:
             statement = statement.where(MarketBarORM.source == source)
+        statement = statement.where(MarketBarORM.status.in_(FINAL_MARKET_BAR_STATUSES))
         return list(
             self.session.scalars(statement.order_by(MarketBarORM.asset_id, MarketBarORM.timestamp))
         )
@@ -1323,6 +2093,25 @@ class ScreeningRepository:
         """查询初筛汇总。"""
 
         return self.session.get_one(ScreeningResultORM, screening_id)
+
+    def get_latest_screening_result(
+        self,
+        *,
+        market: str,
+        strategy: str,
+    ) -> ScreeningResultORM | None:
+        """查询某市场某策略最近一次初筛汇总。"""
+
+        statement = (
+            select(ScreeningResultORM)
+            .where(
+                ScreeningResultORM.market == market,
+                ScreeningResultORM.strategy == strategy,
+            )
+            .order_by(ScreeningResultORM.as_of.desc())
+            .limit(1)
+        )
+        return self.session.scalars(statement).one_or_none()
 
     def get_screening_item(
         self,
@@ -1862,6 +2651,54 @@ class FundamentalDataRepository:
         )
         self.session.flush()
         return self.session.get_one(FundamentalSnapshotORM, snapshot_id)
+
+    def upsert_fundamental_snapshots(
+        self,
+        snapshots: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """批量写入财务和估值快照。"""
+
+        rows = _dedupe_rows(
+            [
+                {
+                    "snapshot_id": item["snapshot_id"],
+                    "asset_id": item["asset_id"],
+                    "symbol": item["symbol"],
+                    "report_period": item.get("report_period"),
+                    "pe_ttm": item.get("pe_ttm"),
+                    "pb": item.get("pb"),
+                    "roe": item.get("roe"),
+                    "revenue_growth_yoy": item.get("revenue_growth_yoy"),
+                    "net_profit_growth_yoy": item.get("net_profit_growth_yoy"),
+                    "debt_to_asset": item.get("debt_to_asset"),
+                    "operating_cashflow": item.get("operating_cashflow"),
+                    "source": item["source"],
+                    "status": item["status"],
+                    "missing_fields": item.get("missing_fields") or [],
+                    "as_of": item["as_of"],
+                    "payload": _json_safe(item.get("payload") or {}),
+                }
+                for item in snapshots
+            ],
+            ("snapshot_id",),
+        )
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(FundamentalSnapshotORM).values(list(chunk))
+            update_values = {key: statement.excluded[key] for key in rows[0] if key != "snapshot_id"}
+            return statement.on_conflict_do_update(
+                index_elements=[FundamentalSnapshotORM.snapshot_id],
+                set_=update_values,
+            )
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
 
     def get_latest_snapshot(self, *, asset_id: str) -> FundamentalSnapshotORM | None:
         """查询单标的最新财务估值快照。"""
@@ -3695,6 +4532,51 @@ class CapitalFlowRepository:
         self.session.flush()
         return self.session.get_one(CapitalFlowSnapshotORM, snapshot_id)
 
+    def upsert_capital_flow_snapshots(
+        self,
+        snapshots: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """批量写入资金流快照。"""
+
+        rows = _dedupe_rows(
+            [
+                {
+                    "snapshot_id": item["snapshot_id"],
+                    "asset_id": item["asset_id"],
+                    "symbol": item["symbol"],
+                    "market": item["market"],
+                    "main_net_inflow": item.get("main_net_inflow"),
+                    "northbound_net_inflow": item.get("northbound_net_inflow"),
+                    "turnover_rate": item.get("turnover_rate"),
+                    "amount": item.get("amount"),
+                    "window": item["window"],
+                    "source": item["source"],
+                    "status": item["status"],
+                    "as_of": item["as_of"],
+                    "payload": _json_safe(item.get("payload") or {}),
+                }
+                for item in snapshots
+            ],
+            ("snapshot_id",),
+        )
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(CapitalFlowSnapshotORM).values(list(chunk))
+            update_values = {key: statement.excluded[key] for key in rows[0] if key != "snapshot_id"}
+            return statement.on_conflict_do_update(
+                index_elements=[CapitalFlowSnapshotORM.snapshot_id],
+                set_=update_values,
+            )
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
+
     def get_latest_snapshot(
         self,
         *,
@@ -3833,6 +4715,163 @@ class EventRepository:
         self.session.flush()
         return self.session.get_one(EvidenceORM, evidence_id)
 
+    def upsert_events(
+        self,
+        events: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """批量写入事件记录。"""
+
+        rows = _dedupe_rows(
+            [
+                {
+                    "event_id": item["event_id"],
+                    "asset_id": item.get("asset_id"),
+                    "symbol": item.get("symbol"),
+                    "market": item["market"],
+                    "event_type": item["event_type"],
+                    "title": item["title"],
+                    "summary": item.get("summary"),
+                    "sentiment": item.get("sentiment", "unknown"),
+                    "importance": item.get("importance", "medium"),
+                    "source": item["source"],
+                    "url": item.get("url"),
+                    "published_at": item.get("published_at"),
+                    "collected_at": item["collected_at"],
+                    "payload": _json_safe(item.get("payload") or {}),
+                }
+                for item in events
+            ],
+            ("event_id",),
+        )
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(EventRecordORM).values(list(chunk))
+            update_values = {key: statement.excluded[key] for key in rows[0] if key != "event_id"}
+            return statement.on_conflict_do_update(
+                index_elements=[EventRecordORM.event_id],
+                set_=update_values,
+            )
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
+
+    def upsert_evidence_items(
+        self,
+        evidence: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """批量写入证据索引。"""
+
+        rows = _dedupe_rows(
+            [
+                {
+                    "evidence_id": item["evidence_id"],
+                    "evidence_type": item["evidence_type"],
+                    "asset_id": item.get("asset_id"),
+                    "source": item["source"],
+                    "title": item["title"],
+                    "summary": item.get("summary"),
+                    "data_ref": item.get("data_ref"),
+                    "url": item.get("url"),
+                    "reliability": item["reliability"],
+                    "as_of": item.get("as_of"),
+                    "collected_at": item["collected_at"],
+                    "payload": _json_safe(item.get("payload") or {}),
+                }
+                for item in evidence
+            ],
+            ("evidence_id",),
+        )
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(EvidenceORM).values(list(chunk))
+            update_values = {
+                key: statement.excluded[key] for key in rows[0] if key != "evidence_id"
+            }
+            return statement.on_conflict_do_update(
+                index_elements=[EvidenceORM.evidence_id],
+                set_=update_values,
+            )
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
+
+    def update_event_article_payload(
+        self,
+        *,
+        event_id: str,
+        article_payload: JsonDict,
+    ) -> EventRecordORM:
+        """回填新闻事件的正文抓取 payload。"""
+
+        self.update_event_article_payloads(
+            [{"event_id": event_id, "article_payload": article_payload}]
+        )
+        return self.session.get_one(EventRecordORM, event_id)
+
+    def update_event_article_payloads(
+        self,
+        updates: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """批量回填新闻事件的正文抓取 payload。"""
+
+        rows = _article_payload_update_rows(updates)
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=lambda chunk: _article_payload_update_statement(
+                table_name=EventRecordORM.__tablename__,
+                match_column="event_id",
+                rows=chunk,
+            ),
+        )
+
+    def update_evidence_article_payloads_by_event(
+        self,
+        *,
+        event_id: str,
+        article_payload: JsonDict,
+    ) -> int:
+        """按事件 ID 回填关联证据的正文抓取 payload。"""
+
+        return self.update_evidence_article_payloads_by_events(
+            [{"event_id": event_id, "article_payload": article_payload}]
+        )
+
+    def update_evidence_article_payloads_by_events(
+        self,
+        updates: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """按事件 ID 批量回填关联证据的正文抓取 payload。"""
+
+        rows = _article_payload_update_rows(updates)
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=lambda chunk: _article_payload_update_statement(
+                table_name=EvidenceORM.__tablename__,
+                match_column="data_ref",
+                rows=chunk,
+            ),
+        )
+
     def list_recent_events(self, *, asset_id: str, limit: int = 20) -> list[EventRecordORM]:
         """查询单标的最近事件。"""
 
@@ -3894,6 +4933,49 @@ class RiskRepository:
         )
         self.session.flush()
         return self.session.get_one(RiskFindingORM, risk_id)
+
+    def upsert_risk_findings(
+        self,
+        risks: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """批量写入风险发现。"""
+
+        rows = _dedupe_rows(
+            [
+                {
+                    "risk_id": item["risk_id"],
+                    "asset_id": item.get("asset_id"),
+                    "scope": item["scope"],
+                    "risk_type": item["risk_type"],
+                    "severity": item["severity"],
+                    "score": item.get("score"),
+                    "title": item["title"],
+                    "description": item.get("description"),
+                    "as_of": item["as_of"],
+                    "evidence_ids": item.get("evidence_ids") or [],
+                    "payload": _json_safe(item.get("payload") or {}),
+                }
+                for item in risks
+            ],
+            ("risk_id",),
+        )
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(RiskFindingORM).values(list(chunk))
+            update_values = {key: statement.excluded[key] for key in rows[0] if key != "risk_id"}
+            return statement.on_conflict_do_update(
+                index_elements=[RiskFindingORM.risk_id],
+                set_=update_values,
+            )
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
 
     def list_recent_risks(self, *, asset_id: str, limit: int = 20) -> list[RiskFindingORM]:
         """查询单标的最近风险发现。"""
@@ -3993,6 +5075,61 @@ class DerivativeDataRepository:
         )
         self.session.flush()
         return self.get_snapshot(asset_id=asset_id, as_of=as_of, source=source)
+
+    def upsert_crypto_derivative_snapshots(
+        self,
+        snapshots: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """批量写入数字货币衍生品快照。"""
+
+        rows = _dedupe_rows(
+            [
+                {
+                    "snapshot_id": item["snapshot_id"],
+                    "asset_id": item["asset_id"],
+                    "symbol": item["symbol"],
+                    "market": item["market"],
+                    "source": item["source"],
+                    "as_of": item["as_of"],
+                    "funding_rate": item.get("funding_rate"),
+                    "next_funding_time": item.get("next_funding_time"),
+                    "open_interest": item.get("open_interest"),
+                    "open_interest_value": item.get("open_interest_value"),
+                    "long_short_ratio": item.get("long_short_ratio"),
+                    "basis_rate": item.get("basis_rate"),
+                    "liquidation_risk_score": item.get("liquidation_risk_score"),
+                    "status": item.get("status", "available"),
+                    "payload": _json_safe(item.get("payload") or {}),
+                }
+                for item in snapshots
+            ],
+            ("asset_id", "as_of", "source"),
+        )
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(CryptoDerivativeSnapshotORM).values(list(chunk))
+            update_values = {
+                key: statement.excluded[key]
+                for key in rows[0]
+                if key not in {"asset_id", "as_of", "source"}
+            }
+            return statement.on_conflict_do_update(
+                index_elements=[
+                    CryptoDerivativeSnapshotORM.asset_id,
+                    CryptoDerivativeSnapshotORM.as_of,
+                    CryptoDerivativeSnapshotORM.source,
+                ],
+                set_=update_values,
+            )
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
 
     def get_snapshot(
         self,

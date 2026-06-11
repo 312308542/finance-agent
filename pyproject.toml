@@ -19,6 +19,7 @@ dependencies = [
   "neo4j>=5.25,<6.0",
   "numpy>=1.26,<3.0",
   "pandas>=2.2,<3.0",
+  "playwright>=1.49,<2.0",
   "psycopg[binary]>=3.2,<4.0",
   "redis>=5.2,<6.0",
   "requests>=2.32,<3.0",
