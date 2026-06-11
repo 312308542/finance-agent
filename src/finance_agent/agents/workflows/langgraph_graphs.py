@@ -14,7 +14,11 @@ from finance_agent.agents.reports import build_chinese_decision_report
 from finance_agent.agents.runtime import (
     build_workflow_context_envelope,
     HighRiskReviewPolicy,
+    load_model_registry,
+    ModelClient,
+    ModelEndpointConfig,
     ModelRoutingPolicy,
+    OpenAICompatibleModelClient,
     ReviewDecisionContext,
 )
 from finance_agent.agents.tools import FinanceToolRuntime
@@ -30,8 +34,22 @@ from finance_agent.agents.workflows.recommendation_decision import (
 from finance_agent.agents.workflows.watchlist_management import (
     WatchlistManagementWorkflow,
 )
+from finance_agent.agents.workflows.roundtable_model_nodes import (
+    build_fallback_opinion,
+    collect_evidence_ids,
+    generate_model_opinion,
+    RoundtableOpinionRequest,
+)
 
 WorkflowGraphState = dict[str, Any]
+ROUNDTABLE_MODEL_ROLES = (
+    "technical_analyst",
+    "factor_analyst",
+    "risk_rebuttal",
+    "portfolio_manager",
+    "memory_manager",
+)
+DAILY_REVIEW_DEFAULT_MODEL_ROLES = ("risk_rebuttal", "portfolio_manager")
 
 
 class LangGraphWorkflowUnavailable(RuntimeError):
@@ -96,24 +114,7 @@ def build_recommendation_context_envelope(state: WorkflowGraphState):
     """为推荐决策 workflow 构建共享上下文 envelope。"""
 
     workflow_input: RecommendationDecisionInput = state["workflow_input"]
-    asset_contexts = {
-        recommendation.asset_id: {
-            "profile": {
-                "asset_id": recommendation.asset_id,
-                "symbol": recommendation.symbol,
-                "market": recommendation.market,
-            },
-            "factor": state.get("factor_contexts", {}).get(recommendation.asset_id, {}),
-            "signal_risk": {
-                "signal": workflow_input.signals_by_asset.get(recommendation.asset_id),
-                "risks": workflow_input.risks_by_asset.get(recommendation.asset_id, ()),
-            },
-            "memory": {
-                "memories": workflow_input.memories_by_asset.get(recommendation.asset_id, ()),
-            },
-        }
-        for recommendation in workflow_input.recommendations
-    }
+    asset_contexts = build_recommendation_asset_contexts(state)
     return build_workflow_context_envelope(
         workflow_type="recommendation_decision",
         market_type=infer_market_type(state),
@@ -134,6 +135,33 @@ def build_recommendation_context_envelope(state: WorkflowGraphState):
         trigger_event=state.get("trigger_event"),
         available_tools=state.get("available_tools", []),
     )
+
+
+def build_recommendation_asset_contexts(
+    state: WorkflowGraphState,
+) -> dict[str, dict[str, Any]]:
+    """为推荐决策圆桌组装各标的上下文。"""
+
+    workflow_input: RecommendationDecisionInput = state["workflow_input"]
+    factor_contexts = state.get("factor_contexts", {})
+    return {
+        recommendation.asset_id: {
+            "profile": {
+                "asset_id": recommendation.asset_id,
+                "symbol": recommendation.symbol,
+                "market": recommendation.market,
+            },
+            "factor": factor_contexts.get(recommendation.asset_id, {}),
+            "signal_risk": {
+                "signal": workflow_input.signals_by_asset.get(recommendation.asset_id),
+                "risks": workflow_input.risks_by_asset.get(recommendation.asset_id, ()),
+            },
+            "memory": {
+                "memories": workflow_input.memories_by_asset.get(recommendation.asset_id, ()),
+            },
+        }
+        for recommendation in workflow_input.recommendations
+    }
 
 
 def _load_langgraph() -> tuple[Any, Any, Any]:
@@ -220,6 +248,16 @@ def build_operational_roundtable_graph(
             recommendation_context=None,
             source_asset_id=None,
             candidate_asset_id=None,
+        )
+        opinions = enrich_roundtable_opinions_with_model(
+            workflow_type=workflow_type,
+            fallback_opinions=opinions,
+            asset_contexts=state.get("asset_contexts", {}),
+            state=state,
+            model_routes=model_routes,
+            portfolio_context=state.get("portfolio_context"),
+            watchlist_context=state.get("watchlist_context"),
+            recommendation_context=None,
         )
         return {
             **state,
@@ -431,6 +469,16 @@ def build_roundtable_report_graph(
             source_asset_id=state.get("source_asset_id"),
             candidate_asset_id=state.get("candidate_asset_id"),
         )
+        opinions = enrich_roundtable_opinions_with_model(
+            workflow_type=workflow_type,
+            fallback_opinions=opinions,
+            asset_contexts=state.get("asset_contexts", {}),
+            state=state,
+            model_routes=model_routes,
+            portfolio_context=state.get("portfolio_context"),
+            watchlist_context=state.get("watchlist_context"),
+            recommendation_context=state.get("recommendation_context"),
+        )
         return {
             **state,
             "context_envelope": attach_context_envelope(state, workflow_type=workflow_type),
@@ -596,6 +644,7 @@ def build_recommendation_decision_graph() -> Any:
         model_policy = build_model_policy(state)
         workflow_input: RecommendationDecisionInput = state["workflow_input"]
         opinions: list[dict[str, Any]] = []
+        asset_contexts = build_recommendation_asset_contexts(state)
         model_routes = [
             model_policy.route_primary(
                 workflow_type="recommendation_decision",
@@ -620,6 +669,33 @@ def build_recommendation_decision_graph() -> Any:
                     positions=workflow_input.positions,
                 )
             )
+        opinions = enrich_roundtable_opinions_with_model(
+            workflow_type="recommendation_decision",
+            fallback_opinions=opinions,
+            asset_contexts=asset_contexts,
+            state=state,
+            model_routes=model_routes,
+            portfolio_context={
+                "portfolio_id": workflow_input.portfolio_id,
+                "positions": [
+                    position.position_id for position in workflow_input.positions
+                ],
+            },
+            watchlist_context={
+                "watchlist_id": workflow_input.watchlist.watchlist_id,
+                "items": [
+                    item.watchlist_item_id
+                    for item in workflow_input.watchlist_items
+                ],
+            },
+            recommendation_context={
+                "run_id": workflow_input.recommendation_run_id,
+                "recommendations": [
+                    recommendation.recommendation_id
+                    for recommendation in workflow_input.recommendations
+                ],
+            },
+        )
         return {
             **state,
             "context_envelope": build_recommendation_context_envelope(state).to_dict(),
@@ -761,6 +837,202 @@ def build_model_policy(state: WorkflowGraphState) -> ModelRoutingPolicy:
     if session is None:
         return ModelRoutingPolicy()
     return ModelRoutingPolicy(model_config_repository=ModelRuntimeConfigRepository(session))
+
+
+def resolve_roundtable_model_roles(
+    state: WorkflowGraphState,
+    *,
+    workflow_type: str,
+) -> list[str]:
+    """解析当前 Workflow 允许真实模型生成的圆桌角色。"""
+
+    raw_roles = state.get("roundtable_model_roles")
+    if raw_roles is None:
+        if workflow_type == "daily_review":
+            return list(DAILY_REVIEW_DEFAULT_MODEL_ROLES)
+        return list(ROUNDTABLE_MODEL_ROLES)
+    if isinstance(raw_roles, str):
+        requested = [raw_roles]
+    elif isinstance(raw_roles, (list, tuple, set)):
+        requested = [str(role) for role in raw_roles]
+    else:
+        return []
+    if any(role.lower() == "all" for role in requested):
+        return list(ROUNDTABLE_MODEL_ROLES)
+    requested_set = set(requested)
+    return [role for role in ROUNDTABLE_MODEL_ROLES if role in requested_set]
+
+
+def enrich_roundtable_opinions_with_model(
+    *,
+    workflow_type: str,
+    fallback_opinions: list[dict[str, Any]],
+    asset_contexts: dict[str, dict[str, Any]],
+    state: WorkflowGraphState,
+    model_routes: list[dict[str, Any]],
+    portfolio_context: dict[str, Any] | None = None,
+    watchlist_context: dict[str, Any] | None = None,
+    recommendation_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """在规则版圆桌观点外包一层真实模型增强。"""
+
+    if state.get("roundtable_model_enabled") is False:
+        return [
+            mark_roundtable_fallback(opinion=opinion)
+            for opinion in fallback_opinions
+        ]
+    enabled_roles = set(
+        resolve_roundtable_model_roles(state, workflow_type=workflow_type)
+    )
+    if not enabled_roles:
+        return [
+            mark_roundtable_fallback(opinion=opinion)
+            for opinion in fallback_opinions
+        ]
+    registry = resolve_roundtable_model_registry(state)
+    client = resolve_roundtable_model_client(state)
+    enriched: list[dict[str, Any]] = []
+    for opinion in fallback_opinions:
+        role = str(opinion.get("role") or "")
+        if role not in enabled_roles:
+            enriched.append(mark_roundtable_fallback(opinion=opinion))
+            continue
+        route = find_roundtable_model_route(opinion=opinion, model_routes=model_routes)
+        model_config = resolve_roundtable_model_config(registry=registry, route=route)
+        if model_config is None:
+            enriched.append(
+                mark_roundtable_fallback(
+                    opinion=opinion,
+                    data_gaps=["圆桌模型配置不可用，已使用规则版观点。"],
+                )
+            )
+            continue
+        request = RoundtableOpinionRequest(
+            role=role,
+            asset_id=str(opinion.get("asset_id") or route.get("asset_id") or ""),
+            workflow_type=workflow_type,
+            context=build_roundtable_model_context(
+                opinion=opinion,
+                asset_contexts=asset_contexts,
+                portfolio_context=portfolio_context,
+                watchlist_context=watchlist_context,
+                recommendation_context=recommendation_context,
+            ),
+            question=f"请以 {role} 身份输出该 Workflow 的圆桌观点。",
+            allowed_evidence_ids=build_roundtable_allowed_evidence_ids(
+                opinion=opinion,
+                asset_contexts=asset_contexts,
+            ),
+            fallback_opinion=opinion,
+        )
+        model_opinion = generate_model_opinion(
+            request=request,
+            model_client=client,
+            model_config=model_config,
+        )
+        model_opinion.setdefault("tool_calls", opinion.get("tool_calls", []))
+        model_opinion.setdefault("source_ids", opinion.get("source_ids", []))
+        enriched.append(model_opinion)
+    return enriched
+
+
+def resolve_roundtable_model_registry(state: WorkflowGraphState) -> Any:
+    """读取模型注册表；未注入时按项目默认配置加载。"""
+
+    registry = state.get("model_registry")
+    if hasattr(registry, "get"):
+        return registry
+    return load_model_registry()
+
+
+def resolve_roundtable_model_client(state: WorkflowGraphState) -> ModelClient:
+    """读取模型客户端；未注入时使用 OpenAI-compatible 客户端。"""
+
+    client = state.get("model_client")
+    if hasattr(client, "invoke_json"):
+        return client
+    return OpenAICompatibleModelClient()
+
+
+def resolve_roundtable_model_config(
+    *,
+    registry: Any,
+    route: dict[str, Any],
+) -> ModelEndpointConfig | None:
+    """按圆桌模型路由读取可调用配置。"""
+
+    model_key = str(route.get("model_key") or "")
+    if not model_key or not hasattr(registry, "get"):
+        return None
+    config = registry.get(model_key)
+    if not isinstance(config, ModelEndpointConfig) or not config.ready:
+        return None
+    return config
+
+
+def find_roundtable_model_route(
+    *,
+    opinion: dict[str, Any],
+    model_routes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """优先为同标的观点匹配模型路由。"""
+
+    asset_id = opinion.get("asset_id")
+    for route in model_routes:
+        if route.get("asset_id") == asset_id:
+            return route
+    return model_routes[0] if model_routes else {}
+
+
+def build_roundtable_model_context(
+    *,
+    opinion: dict[str, Any],
+    asset_contexts: dict[str, dict[str, Any]],
+    portfolio_context: dict[str, Any] | None,
+    watchlist_context: dict[str, Any] | None,
+    recommendation_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """为单条圆桌观点构造模型只读上下文。"""
+
+    asset_id = str(opinion.get("asset_id") or "")
+    return {
+        "asset_context": asset_contexts.get(asset_id, {}),
+        "portfolio_context": portfolio_context,
+        "watchlist_context": watchlist_context,
+        "recommendation_context": recommendation_context,
+        "fallback_opinion": opinion,
+    }
+
+
+def build_roundtable_allowed_evidence_ids(
+    *,
+    opinion: dict[str, Any],
+    asset_contexts: dict[str, dict[str, Any]],
+) -> list[str]:
+    """合并规则观点和工具上下文中的 evidence 白名单。"""
+
+    asset_id = str(opinion.get("asset_id") or "")
+    evidence_ids = unique_ids(opinion.get("evidence_ids", []))
+    context_ids = collect_evidence_ids(asset_contexts.get(asset_id, {}))
+    return unique_ids([*evidence_ids, *context_ids])
+
+
+def mark_roundtable_fallback(
+    *,
+    opinion: dict[str, Any],
+    data_gaps: list[str] | None = None,
+) -> dict[str, Any]:
+    """把规则版观点补齐为统一 fallback 结构。"""
+
+    request = RoundtableOpinionRequest(
+        role=str(opinion.get("role") or ""),
+        asset_id=str(opinion.get("asset_id") or ""),
+        workflow_type="fallback",
+        context={},
+        question="",
+        fallback_opinion=opinion,
+    )
+    return build_fallback_opinion(request=request, data_gaps=data_gaps)
 
 
 def serialize_recommendation_decision(decision: Any) -> dict[str, Any]:
@@ -1664,6 +1936,7 @@ def build_roundtable_opinions(
     return [
         {
             "role": "technical_analyst",
+            "asset_id": recommendation.asset_id,
             "stance": "support" if indicator else "insufficient",
             "summary": build_technical_summary(indicator=indicator, signal=signal),
             "tool_calls": [tool_call],
@@ -1672,6 +1945,7 @@ def build_roundtable_opinions(
         },
         {
             "role": "factor_analyst",
+            "asset_id": recommendation.asset_id,
             "stance": "support" if score and factor else "insufficient",
             "summary": build_factor_summary(score=score, factor=factor),
             "tool_calls": [tool_call],
@@ -1684,6 +1958,7 @@ def build_roundtable_opinions(
         },
         {
             "role": "risk_rebuttal",
+            "asset_id": recommendation.asset_id,
             "stance": "oppose" if high_risks else "caution",
             "summary": build_risk_summary(risks=risks),
             "tool_calls": [tool_call],
@@ -1694,6 +1969,7 @@ def build_roundtable_opinions(
         },
         {
             "role": "portfolio_manager",
+            "asset_id": recommendation.asset_id,
             "stance": "compare",
             "summary": (
                 f"当前组合持仓包含 {', '.join(position_symbols) or '无活跃持仓'}，"
@@ -1705,6 +1981,7 @@ def build_roundtable_opinions(
         },
         {
             "role": "memory_manager",
+            "asset_id": recommendation.asset_id,
             "stance": "recall" if memories else "no_memory",
             "summary": build_memory_summary(memories=memories),
             "tool_calls": [
