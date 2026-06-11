@@ -464,6 +464,136 @@ def test_scheduler_runs_technical_screening_without_collection() -> None:
     ]
 
 
+def test_scheduler_runs_trigger_evaluation_without_collection() -> None:
+    """触发评估任务应调用触发执行器，而不是误走基础采集入口。"""
+
+    calls: list[dict[str, Any]] = []
+
+    def run_trigger_evaluation(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "status": "available",
+            "created_count": 2,
+            "dispatched_count": 2,
+            "skipped_count": 1,
+            "cooldown_count": 0,
+        }
+
+    def collect_base_data(_: Any) -> dict[str, Any]:
+        raise AssertionError("触发评估任务不应调用基础采集入口")
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="analytics.triggers.evaluate.daily",
+                job_type="trigger_evaluation",
+                group="analytics",
+                interval_seconds=0,
+                schedule_type="after_success",
+                depends_on=("ashare.bars.1d.close_final",),
+                params={
+                    "sync_task_type": "analytics.triggers.evaluate",
+                    "owner_id": "default-owner",
+                    "dispatch": True,
+                    "max_events_per_run": 50,
+                    "trigger_groups": [
+                        "position",
+                        "signal",
+                        "watchlist",
+                        "recommendation",
+                        "risk",
+                        "data_quality",
+                    ],
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        run_trigger_evaluation_func=run_trigger_evaluation,
+    )
+
+    result = scheduler.run_once()
+
+    assert result["jobs"][0]["status"] == "executed"
+    assert result["jobs"][0]["summary"]["created_count"] == 2
+    assert calls == [
+        {
+            "owner_id": "default-owner",
+            "dispatch": True,
+            "max_events_per_run": 50,
+            "trigger_groups": [
+                "position",
+                "signal",
+                "watchlist",
+                "recommendation",
+                "risk",
+                "data_quality",
+            ],
+        }
+    ]
+
+
+def test_scheduler_runs_agent_loop_consume_without_collection() -> None:
+    """Agent 事件消费任务应调用 Agent Loop 执行器，而不是误走基础采集入口。"""
+
+    calls: list[dict[str, Any]] = []
+
+    def run_agent_loop_consume(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "status": "available",
+            "consumed": 3,
+            "succeeded": 2,
+            "failed": 1,
+            "fallback_used": True,
+        }
+
+    def collect_base_data(_: Any) -> dict[str, Any]:
+        raise AssertionError("Agent 事件消费任务不应调用基础采集入口")
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="agent.loop.consume.after_trigger",
+                job_type="agent_loop_consume",
+                group="agent",
+                interval_seconds=0,
+                schedule_type="after_success",
+                depends_on=("analytics.triggers.evaluate.daily",),
+                params={
+                    "sync_task_type": "agent.loop.consume",
+                    "owner_id": "default-owner",
+                    "limit": 10,
+                    "use_model_planner": "false",
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        run_agent_loop_consume_func=run_agent_loop_consume,
+    )
+
+    result = scheduler.run_once()
+
+    assert result["jobs"][0]["status"] == "executed"
+    assert result["jobs"][0]["summary"]["consumed"] == 3
+    assert calls == [
+        {
+            "owner_id": "default-owner",
+            "limit": 10,
+            "use_model_planner": False,
+        }
+    ]
+
+
 def test_recommendation_job_passes_watchlist_intake_options() -> None:
     """推荐任务的研究跟踪池入池选项应透传给执行器。"""
 

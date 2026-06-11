@@ -5,4 +5,5 @@
 | 日期 | 当前任务 | 差异项 | 处理方式 |
 | --- | --- | --- | --- |
 | 2026-06-12 | 批次 1 / 02-T1 | 总负责人已重新执行 `gitnexus analyze`，当前 `Indexed commit` 与 `Current commit` 均为 `d028988`，暂无索引差异 | 后续如提交后索引落后，不再中断开发；记录差异并在全部开发完成后统一更新 |
-| 2026-06-12 | 批次 1 / 02-T2 | 当前 Codex 可见工具中未暴露 GitNexus MCP 工具，`tool_search` 未检索到 `gitnexus` 相关工具，无法在编辑前通过 MCP 执行 `gitnexus_impact` | 不使用 `npx` 或 CLI 代替 MCP；沿用前序已完成的 `export_scheduler_payload` CRITICAL 影响分析结论，保持 `sync_config.py` 纯追加改动，并在全部开发完成后由总负责人统一更新索引 |
+| 2026-06-12 | 批次 1 / 02-T2 | `C:\Users\Administrator\.codex\config.toml` 已配置 `[mcp_servers.gitnexus]`，但当前 Codex 会话可调用工具列表未暴露 GitNexus MCP namespace，`tool_search` 未检索到 `gitnexus` 工具，`list_mcp_resources` 返回空，无法在编辑前通过 MCP 执行 `gitnexus_impact` | 不使用 `npx` 或 CLI 代替 MCP；沿用前序已完成的 `export_scheduler_payload` CRITICAL 影响分析结论，保持 `sync_config.py` 纯追加改动，并在全部开发完成后由总负责人统一更新索引 |
+| 2026-06-12 | 批次 1 / 02-T3/T4 | 修改 `BaseDataScheduler.__init__`、`run_job`、`execute_job`、新增 `build_trigger_evaluation_kwargs`、`build_agent_loop_consume_kwargs`、`run_trigger_evaluation`、`run_agent_loop_consume` 前，GitNexus MCP namespace 仍未暴露，无法通过 MCP 执行 `gitnexus_impact` / `gitnexus_detect_changes` | 使用 PyCharm MCP 和既有测试定位影响面；改动保持为调度器新增 job_type 分支和可注入执行器，不改已有 collection/recommendation/data_quality/technical_screening 分支；相关回归 `93 passed`，全部开发完成后由总负责人统一更新 GitNexus 索引 |

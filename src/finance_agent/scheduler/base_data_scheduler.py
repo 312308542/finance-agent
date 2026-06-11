@@ -611,6 +611,8 @@ class BaseDataScheduler:
         run_recommendation_pipeline_func: Callable[..., JsonDict] | None = None,
         run_data_quality_refresh_func: Callable[..., JsonDict] | None = None,
         run_technical_screening_refresh_func: Callable[..., JsonDict] | None = None,
+        run_trigger_evaluation_func: Callable[..., JsonDict] | None = None,
+        run_agent_loop_consume_func: Callable[..., JsonDict] | None = None,
         sleep_func: Callable[[float], None] = time.sleep,
         status_file: str | Path | None = None,
         event_log_file: str | Path | None = None,
@@ -623,6 +625,8 @@ class BaseDataScheduler:
         self._run_recommendation_pipeline = run_recommendation_pipeline_func
         self._run_data_quality_refresh = run_data_quality_refresh_func
         self._run_technical_screening_refresh = run_technical_screening_refresh_func
+        self._run_trigger_evaluation = run_trigger_evaluation_func
+        self._run_agent_loop_consume = run_agent_loop_consume_func
         self._uses_injected_collect_base_data = collect_base_data_func is not None
         self._sleep = sleep_func
         self.status_file = Path(status_file) if status_file else None
@@ -1003,6 +1007,10 @@ class BaseDataScheduler:
             planned["data_quality_args"] = self.build_data_quality_refresh_kwargs(job)
         elif job.job_type == "technical_screening_refresh":
             planned["technical_screening_args"] = self.build_technical_screening_refresh_kwargs(job)
+        elif job.job_type == "trigger_evaluation":
+            planned["trigger_evaluation_args"] = self.build_trigger_evaluation_kwargs(job)
+        elif job.job_type == "agent_loop_consume":
+            planned["agent_loop_consume_args"] = self.build_agent_loop_consume_kwargs(job)
         else:
             raise ValueError(f"不支持的调度任务类型：{job.job_type}")
 
@@ -1189,6 +1197,12 @@ class BaseDataScheduler:
         if job.job_type == "technical_screening_refresh":
             kwargs = self.build_technical_screening_refresh_kwargs(job)
             return self.run_technical_screening_refresh(**kwargs)
+        if job.job_type == "trigger_evaluation":
+            kwargs = self.build_trigger_evaluation_kwargs(job)
+            return self.run_trigger_evaluation(**kwargs)
+        if job.job_type == "agent_loop_consume":
+            kwargs = self.build_agent_loop_consume_kwargs(job)
+            return self.run_agent_loop_consume(**kwargs)
         raise ValueError(f"不支持的调度任务类型：{job.job_type}")
 
     def build_collection_args(self, job: BaseDataSchedulerJob) -> Any:
@@ -1340,6 +1354,59 @@ class BaseDataScheduler:
             params["source"] = str(value)
         return params
 
+    def build_trigger_evaluation_kwargs(self, job: BaseDataSchedulerJob) -> JsonDict:
+        """把触发评估任务配置转换为触发服务参数。"""
+
+        if job.job_type != "trigger_evaluation":
+            raise ValueError(f"{job.name} 不是触发评估任务")
+        groups = job.params.get("trigger_groups")
+        trigger_groups = (
+            [str(item) for item in groups if str(item).strip()]
+            if isinstance(groups, list | tuple)
+            else []
+        )
+        params: JsonDict = {
+            "owner_id": str(job.params.get("owner_id") or "default-owner"),
+            "dispatch": as_bool(
+                job.params.get("dispatch", True),
+                field_name=f"{job.name}.params.dispatch",
+            ),
+            "max_events_per_run": int(job.params.get("max_events_per_run") or job.limit or 50),
+        }
+        if trigger_groups:
+            params["trigger_groups"] = trigger_groups
+        for key in (
+            "portfolio_id",
+            "watchlist_id",
+            "recommendation_run_id",
+            "horizon",
+            "timeframe",
+            "intraday_sharp_drop_threshold",
+            "intraday_volume_surge_multiplier",
+        ):
+            value = job.params.get(key)
+            if value is not None:
+                params[key] = str(value)
+        for key in ("since_minutes", "cooldown_minutes", "recommendation_limit"):
+            value = job.params.get(key)
+            if value is not None:
+                params[key] = int(value)
+        return params
+
+    def build_agent_loop_consume_kwargs(self, job: BaseDataSchedulerJob) -> JsonDict:
+        """把 Agent 事件消费任务配置转换为内部 Agent Loop 参数。"""
+
+        if job.job_type != "agent_loop_consume":
+            raise ValueError(f"{job.name} 不是 Agent 事件消费任务")
+        return {
+            "owner_id": str(job.params.get("owner_id") or "default-owner"),
+            "limit": int(job.params.get("limit") or job.limit or 10),
+            "use_model_planner": as_bool(
+                job.params.get("use_model_planner", True),
+                field_name=f"{job.name}.params.use_model_planner",
+            ),
+        }
+
     def run_recommendation_pipeline(self, **kwargs: Any) -> JsonDict:
         """执行候选池推荐流水线。"""
 
@@ -1485,6 +1552,111 @@ class BaseDataScheduler:
             "rule_hits": result.rule_hits,
             "ttl_days": ttl_days,
         }
+
+    def run_trigger_evaluation(self, **kwargs: Any) -> JsonDict:
+        """执行触发评估并按需派发到 Agent 唤醒队列。"""
+
+        if self._run_trigger_evaluation is not None:
+            return self._run_trigger_evaluation(**kwargs)
+
+        from decimal import Decimal
+
+        from finance_agent.storage.db import create_session_factory, session_scope
+        from finance_agent.triggers import TriggerEvaluationRequest, TriggerService
+
+        owner_id = str(kwargs.pop("owner_id"))
+        dispatch = as_bool(kwargs.pop("dispatch", True), field_name="dispatch")
+        max_events_per_run = int(kwargs.pop("max_events_per_run", 50))
+        cooldown_minutes = int(kwargs.pop("cooldown_minutes", 15))
+        request = TriggerEvaluationRequest(
+            owner_id=owner_id,
+            as_of=datetime.now(tz=UTC),
+            portfolio_id=kwargs.pop("portfolio_id", None),
+            watchlist_id=kwargs.pop("watchlist_id", None),
+            recommendation_run_id=kwargs.pop("recommendation_run_id", None),
+            horizon=str(kwargs.pop("horizon", "swing")),
+            timeframe=str(kwargs.pop("timeframe", "1d")),
+            since_minutes=int(kwargs.pop("since_minutes", 60)),
+            cooldown_minutes=cooldown_minutes,
+            recommendation_limit=int(kwargs.pop("recommendation_limit", 20)),
+            drawdown_threshold=Decimal(str(kwargs.pop("drawdown_threshold", "0.050000"))),
+        )
+        trigger_groups = list(kwargs.pop("trigger_groups", []))
+        session_factory = create_session_factory()
+        with session_scope(session_factory) as session:
+            service = TriggerService(session)
+            evaluation = service.evaluate(request)
+            dispatch_result = (
+                service.dispatch_pending(
+                    owner_id=owner_id,
+                    limit=max(max_events_per_run, 1),
+                    as_of=request.as_of,
+                )
+                if dispatch
+                else None
+            )
+
+        created_count = len(evaluation.created_events)
+        suppressed_count = len(evaluation.suppressed_dedup_keys)
+        payload: JsonDict = {
+            "status": "available",
+            "owner_id": owner_id,
+            "created_count": created_count,
+            "suppressed_count": suppressed_count,
+            "skipped_count": 0,
+            "cooldown_count": suppressed_count,
+            "max_events_per_run": max_events_per_run,
+            "trigger_groups": trigger_groups,
+            "dispatch": dispatch,
+            "evaluation": evaluation.to_dict(),
+        }
+        if dispatch_result is not None:
+            payload["dispatched_count"] = len(dispatch_result.dispatched_events)
+            payload["skipped_count"] = len(dispatch_result.skipped_events)
+            payload["dispatch_result"] = dispatch_result.to_dict()
+        else:
+            payload["dispatched_count"] = 0
+        return payload
+
+    def run_agent_loop_consume(self, **kwargs: Any) -> JsonDict:
+        """消费已派发的 Agent 唤醒事件。"""
+
+        if self._run_agent_loop_consume is not None:
+            return self._run_agent_loop_consume(**kwargs)
+
+        from finance_agent.agents.loop import InternalFinanceAgentLoopRunner
+        from finance_agent.storage.db import create_session_factory, session_scope
+
+        owner_id = str(kwargs.get("owner_id") or "default-owner")
+        limit = int(kwargs.get("limit") or 10)
+        use_model_planner = as_bool(
+            kwargs.get("use_model_planner", True),
+            field_name="use_model_planner",
+        )
+        session_factory = create_session_factory()
+        with session_scope(session_factory) as session:
+            result = InternalFinanceAgentLoopRunner(session).run_once(
+                owner_id=owner_id,
+                limit=limit,
+                use_graph=use_model_planner,
+            )
+        payload = result.to_dict()
+        payload.update(
+            {
+                "status": "available",
+                "owner_id": owner_id,
+                "limit": limit,
+                "consumed": (
+                    payload["processed_count"]
+                    + payload["skipped_count"]
+                    + payload["failed_count"]
+                ),
+                "succeeded": payload["processed_count"],
+                "failed": payload["failed_count"],
+                "fallback_used": not use_model_planner,
+            }
+        )
+        return payload
 
     def collect_base_data(self, args: Any, *, job_name: str | None = None) -> JsonDict:
         """延迟导入采集入口，避免模块加载阶段触碰脚本依赖。"""
