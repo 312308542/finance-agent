@@ -693,6 +693,7 @@ def export_scheduler_payload(config: DataSyncConfig) -> JsonDict:
             *build_data_quality_scheduler_jobs(config),
             *build_technical_screening_scheduler_jobs(config),
             *build_recommendation_scheduler_jobs(config),
+            *build_trigger_scheduler_jobs(config),
         ],
         "processing": preview_data_processing_plan(config, tasks=tasks),
         "notes": [
@@ -948,6 +949,101 @@ def build_data_quality_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
             job["schedule_type"] = "after_success"
             job["depends_on"] = ["ashare.bars.1d.close_final"]
         jobs.append(job)
+    return jobs
+
+
+def build_trigger_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
+    """生成触发评估和 Agent 事件消费调度任务。"""
+
+    if not config.enabled:
+        return []
+
+    ashare_enabled = bool(config.markets.get("ashare") and config.markets["ashare"].enabled)
+    trigger_jobs: list[JsonDict] = []
+    if ashare_enabled:
+        trigger_jobs.extend(
+            [
+                {
+                    "name": "analytics.triggers.evaluate.daily",
+                    "job_type": "trigger_evaluation",
+                    "group": "analytics",
+                    "enabled": True,
+                    "interval_seconds": 0,
+                    "schedule_type": "after_success",
+                    "depends_on": ["ashare.bars.1d.close_final"],
+                    "params": {
+                        "sync_task_type": "analytics.triggers.evaluate",
+                        "owner_id": "default-owner",
+                        "dispatch": True,
+                        "max_events_per_run": 50,
+                        "trigger_groups": [
+                            "position",
+                            "signal",
+                            "watchlist",
+                            "recommendation",
+                            "risk",
+                            "data_quality",
+                        ],
+                    },
+                },
+                {
+                    "name": "analytics.triggers.evaluate.intraday",
+                    "job_type": "trigger_evaluation",
+                    "group": "analytics",
+                    "enabled": False,
+                    "interval_seconds": 15 * 60,
+                    "trading_day_policy": "ashare",
+                    "params": {
+                        "sync_task_type": "analytics.triggers.evaluate",
+                        "owner_id": "default-owner",
+                        "dispatch": True,
+                        "max_events_per_run": 50,
+                        "trigger_groups": ["intraday_volatility", "position"],
+                        "intraday_sharp_drop_threshold": "-0.04",
+                        "intraday_volume_surge_multiplier": "3",
+                        "cooldown_minutes": 120,
+                    },
+                },
+            ]
+        )
+
+    jobs: list[JsonDict] = [*trigger_jobs]
+    if trigger_jobs:
+        jobs.append(
+            {
+                "name": "agent.loop.consume.after_trigger",
+                "job_type": "agent_loop_consume",
+                "group": "agent",
+                "enabled": True,
+                "interval_seconds": 0,
+                "schedule_type": "after_success",
+                "depends_on": [
+                    "analytics.triggers.evaluate.daily",
+                    "analytics.triggers.evaluate.intraday",
+                ],
+                "params": {
+                    "sync_task_type": "agent.loop.consume",
+                    "owner_id": "default-owner",
+                    "limit": 10,
+                    "use_model_planner": True,
+                },
+            }
+        )
+    jobs.append(
+        {
+            "name": "agent.loop.consume.sweep",
+            "job_type": "agent_loop_consume",
+            "group": "agent",
+            "enabled": True,
+            "interval_seconds": 30 * 60,
+            "params": {
+                "sync_task_type": "agent.loop.consume",
+                "owner_id": "default-owner",
+                "limit": 10,
+                "use_model_planner": True,
+            },
+        }
+    )
     return jobs
 
 
