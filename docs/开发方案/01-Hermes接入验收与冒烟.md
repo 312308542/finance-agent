@@ -109,7 +109,7 @@ python3 scripts/integration/smoke_hermes_skill_commands.py --mode wsl-bridge
 
 | 任务 | 状态 | 验证记录 |
 | --- | --- | --- |
-| T1 skill 副本入库 | 未开始 | - |
+| T1 skill 副本入库 | 已完成 | `.\.venv\Scripts\python.exe scripts\integration\check_hermes_visibility.py --project-root D:\Code\aiAgents\finance-agent` 通过，确认项目根、`pyproject.toml`、venv Python、CLI 与 MCP 入口可见 |
 | T2 工具边界防回归测试 | 未开始 | - |
 | T3 冒烟 direct 模式 | 未开始 | - |
 | T4 冒烟 wsl-bridge 模式 | 未开始 | - |
