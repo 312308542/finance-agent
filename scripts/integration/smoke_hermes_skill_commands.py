@@ -94,6 +94,59 @@ def build_direct_cli_command(
     return [python_executable, "-m", "finance_agent.cli", *cli_args]
 
 
+def wsl_path_to_windows_path(path: str) -> str:
+    """把 WSL /mnt/<drive> 路径转换为 Windows 路径。"""
+
+    normalized = path.replace("\\", "/")
+    if len(normalized) >= 7 and normalized.startswith("/mnt/"):
+        drive = normalized[5].upper()
+        rest = normalized[7:].replace("/", "\\")
+        return f"{drive}:\\{rest}" if rest else f"{drive}:\\"
+    return path
+
+
+def quote_powershell_single(value: str) -> str:
+    """用 PowerShell 单引号安全包裹字符串。"""
+
+    return "'" + value.replace("'", "''") + "'"
+
+
+def quote_cli_arg_for_powershell(value: str) -> str:
+    """按需为 CLI 参数加 PowerShell 引号。"""
+
+    if not value:
+        return "''"
+    if re.search(r"\s|['\"`$;&|<>]", value):
+        return quote_powershell_single(value)
+    return value
+
+
+def build_wsl_bridge_command(
+    *,
+    windows_project_root: str,
+    windows_python_executable: str,
+    cli_args: Sequence[str],
+) -> list[str]:
+    """构造 WSL -> PowerShell -> Windows venv 的桥接命令。"""
+
+    cli_text = " ".join(quote_cli_arg_for_powershell(arg) for arg in cli_args)
+    powershell = (
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+        "$OutputEncoding=[Text.Encoding]::UTF8; "
+        "$env:PYTHONIOENCODING='utf-8'; "
+        f"cd {quote_powershell_single(windows_project_root)}; "
+        f"& {quote_powershell_single(windows_python_executable)} -m finance_agent.cli {cli_text}"
+    )
+    return [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        powershell,
+    ]
+
+
 def run_command(
     *,
     name: str,
@@ -311,19 +364,62 @@ def run_direct_smoke(args: argparse.Namespace) -> list[dict[str, Any]]:
 
     project_root = Path(args.project_root).resolve()
     python_executable = str(Path(args.python_executable).resolve())
-    summaries: list[dict[str, Any]] = []
-    workflow_run_id: str | None = None
-
-    for step in build_direct_steps(
+    return run_smoke_steps(
+        project_root=project_root,
+        command_builder=lambda cli_args: build_direct_cli_command(
+            python_executable=python_executable,
+            cli_args=cli_args,
+        ),
         owner_id=args.owner_id,
         asset_id=args.asset_id,
         portfolio_id=args.portfolio_id,
         watchlist_id=args.watchlist_id,
+    )
+
+
+def run_wsl_bridge_smoke(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """执行 WSL 桥接模式冒烟。"""
+
+    project_root = Path(args.project_root).resolve()
+    windows_project_root = args.windows_project_root or wsl_path_to_windows_path(str(project_root))
+    windows_python_executable = args.windows_python_executable or (
+        windows_project_root.rstrip("\\/") + r"\.venv\Scripts\python.exe"
+    )
+    return run_smoke_steps(
+        project_root=project_root,
+        command_builder=lambda cli_args: build_wsl_bridge_command(
+            windows_project_root=windows_project_root,
+            windows_python_executable=windows_python_executable,
+            cli_args=cli_args,
+        ),
+        owner_id=args.owner_id,
+        asset_id=args.asset_id,
+        portfolio_id=args.portfolio_id,
+        watchlist_id=args.watchlist_id,
+    )
+
+
+def run_smoke_steps(
+    *,
+    project_root: Path,
+    command_builder: Callable[[Sequence[str]], list[str]],
+    owner_id: str,
+    asset_id: str,
+    portfolio_id: str,
+    watchlist_id: str,
+) -> list[dict[str, Any]]:
+    """按固定步骤执行冒烟命令。"""
+
+    summaries: list[dict[str, Any]] = []
+    workflow_run_id: str | None = None
+
+    for step in build_direct_steps(
+        owner_id=owner_id,
+        asset_id=asset_id,
+        portfolio_id=portfolio_id,
+        watchlist_id=watchlist_id,
     ):
-        command = build_direct_cli_command(
-            python_executable=python_executable,
-            cli_args=step.cli_args,
-        )
+        command = command_builder(step.cli_args)
         result = run_command(
             name=step.name,
             command=command,
@@ -338,10 +434,7 @@ def run_direct_smoke(args: argparse.Namespace) -> list[dict[str, Any]]:
     if workflow_run_id:
         report_result = run_command(
             name="reports show markdown",
-            command=build_direct_cli_command(
-                python_executable=python_executable,
-                cli_args=("reports", "show", workflow_run_id, "--markdown"),
-            ),
+            command=command_builder(("reports", "show", workflow_run_id, "--markdown")),
             cwd=project_root,
             timeout_seconds=60,
         )
@@ -369,6 +462,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mode", choices=("direct", "wsl-bridge"), default="direct")
     parser.add_argument("--project-root", default=str(project_root))
     parser.add_argument("--python-executable", default=str(default_venv_python(project_root)))
+    parser.add_argument("--windows-project-root", default=None)
+    parser.add_argument("--windows-python-executable", default=None)
     parser.add_argument("--owner-id", default="owner:demo")
     parser.add_argument("--asset-id", default="asset:demo:600519")
     parser.add_argument("--portfolio-id", default="portfolio:demo")
@@ -380,11 +475,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     """脚本入口。"""
 
     args = parse_args(argv)
-    if args.mode != "direct":
-        raise NotImplementedError("wsl-bridge 模式将在方案 01-T4 中实现。")
 
     try:
-        summaries = run_direct_smoke(args)
+        summaries = run_direct_smoke(args) if args.mode == "direct" else run_wsl_bridge_smoke(args)
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 1

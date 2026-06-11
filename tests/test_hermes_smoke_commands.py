@@ -24,6 +24,38 @@ def test_build_direct_cli_command_uses_project_venv() -> None:
     ]
 
 
+def test_build_wsl_bridge_command_wraps_powershell_utf8_prefix() -> None:
+    """wsl-bridge 模式应通过 PowerShell 进入 Windows venv，并设置 UTF-8 输出。"""
+
+    command = smoke.build_wsl_bridge_command(
+        windows_project_root=r"D:\Code\aiAgents\finance-agent",
+        windows_python_executable=r"D:\Code\aiAgents\finance-agent\.venv\Scripts\python.exe",
+        cli_args=("workflows", "list"),
+    )
+
+    assert command[:5] == [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+    ]
+    powershell = command[5]
+    assert "[Console]::OutputEncoding=[Text.Encoding]::UTF8" in powershell
+    assert "cd 'D:\\Code\\aiAgents\\finance-agent'" in powershell
+    assert "& 'D:\\Code\\aiAgents\\finance-agent\\.venv\\Scripts\\python.exe'" in powershell
+    assert "-m finance_agent.cli workflows list" in powershell
+
+
+def test_wsl_path_to_windows_path_converts_mnt_drive() -> None:
+    r"""WSL /mnt/d 路径应转换为 PowerShell 可用的 D:\ 路径。"""
+
+    assert (
+        smoke.wsl_path_to_windows_path("/mnt/d/Code/aiAgents/finance-agent")
+        == r"D:\Code\aiAgents\finance-agent"
+    )
+
+
 def test_validate_workflows_requires_all_expected_workflows() -> None:
     """Workflow 清单必须固定包含 Hermes skill 允许的 6 个入口。"""
 
