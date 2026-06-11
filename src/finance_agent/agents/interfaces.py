@@ -69,6 +69,7 @@ class FinanceAgentInterface:
             {
                 "name": name,
                 "description": self.tool_runtime.get_tool(name).description,
+                "read_only": self.tool_runtime.get_tool(name).read_only,
             }
             for name in self.tool_runtime.list_tools()
         ]

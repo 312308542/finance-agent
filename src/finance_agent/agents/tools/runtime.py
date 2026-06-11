@@ -55,6 +55,7 @@ class FinanceTool:
     name: str
     description: str
     handler: ToolHandler
+    read_only: bool = True
 
 
 class FinanceToolRuntime:
