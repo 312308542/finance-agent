@@ -80,6 +80,22 @@ export type DataSchedulerStartPayload = {
   max_cycles?: number | null;
 };
 
+export type DataSchedulerJobUpdatePayload = {
+  enabled?: boolean | null;
+  interval_seconds?: number | null;
+  limit?: number | null;
+  batch_size?: number | null;
+  max_workers?: number | null;
+  schedule_type?: string | null;
+  run_at?: string[] | null;
+  timezone?: string | null;
+  trading_day_policy?: string | null;
+};
+
+export type DataSchedulerJobRunPayload = {
+  dry_run: boolean;
+};
+
 export type ChatStreamEvent = {
   event: string;
   data: Record<string, any>;
@@ -281,6 +297,81 @@ export async function loadDataSchedulerStatus(): Promise<Record<string, any>> {
   return getJson("/api/data/scheduler/status", { health: { status: "missing" }, process: { running: false } });
 }
 
+export async function loadDataSchedulerProgress(eventLimit = 120): Promise<Record<string, any>> {
+  const normalizedLimit = Math.min(200, Math.max(1, Math.round(eventLimit)));
+  return getJson(`/api/data/scheduler/progress?event_limit=${normalizedLimit}`, {
+    cache_backend: "null",
+    tasks: [],
+    waiting: [],
+    metrics: {},
+  });
+}
+
+export async function loadDataSchedulerJobs(): Promise<Record<string, any>> {
+  return getJson("/api/data/scheduler/jobs", {
+    config: {},
+    jobs: [],
+  });
+}
+
+export async function updateDataSchedulerJob(
+  jobName: string,
+  payload: DataSchedulerJobUpdatePayload,
+): Promise<Record<string, any>> {
+  return sendJson(`/api/data/scheduler/jobs/${encodeURIComponent(jobName)}`, payload);
+}
+
+export async function runDataSchedulerJob(
+  jobName: string,
+  payload: DataSchedulerJobRunPayload,
+): Promise<Record<string, any>> {
+  return requestJson(
+    "POST",
+    `/api/data/scheduler/jobs/${encodeURIComponent(jobName)}/run`,
+    payload,
+    45000,
+  );
+}
+
+export async function rerunFailedDataSchedulerJob(
+  jobName: string,
+  payload: DataSchedulerJobRunPayload,
+): Promise<Record<string, any>> {
+  return requestJson(
+    "POST",
+    `/api/data/scheduler/jobs/${encodeURIComponent(jobName)}/rerun-failed`,
+    payload,
+    45000,
+  );
+}
+
+export async function cancelDataSchedulerJob(jobName: string): Promise<Record<string, any>> {
+  return requestJson(
+    "POST",
+    `/api/data/scheduler/jobs/${encodeURIComponent(jobName)}/cancel`,
+    {},
+    45000,
+  );
+}
+
+export async function pauseDataSchedulerJob(jobName: string): Promise<Record<string, any>> {
+  return requestJson(
+    "POST",
+    `/api/data/scheduler/jobs/${encodeURIComponent(jobName)}/pause`,
+    {},
+    45000,
+  );
+}
+
+export async function resumeDataSchedulerJob(jobName: string): Promise<Record<string, any>> {
+  return requestJson(
+    "POST",
+    `/api/data/scheduler/jobs/${encodeURIComponent(jobName)}/resume`,
+    {},
+    45000,
+  );
+}
+
 export async function startDataScheduler(payload: DataSchedulerStartPayload): Promise<Record<string, any>> {
   return postJson("/api/data/scheduler/start", payload);
 }
@@ -423,6 +514,8 @@ const fallbackSummary: DashboardSummary = {
           market: "ashare",
           risk_level: "medium",
           source_type: "recommendation_run",
+          pool: "system_research_pool",
+          pool_label: "系统研究跟踪",
           reason: "资金流和行业景气度改善，等待放量确认。",
         },
         {
@@ -430,10 +523,32 @@ const fallbackSummary: DashboardSummary = {
           market: "crypto_spot",
           risk_level: "high",
           source_type: "signal_trigger",
+          pool: "manual_watchlist",
+          pool_label: "用户观察池",
           reason: "链上与衍生品拥挤度上升，适合持续观察而非追入。",
         },
       ],
-      metrics: { active_count: 2, high_risk_count: 1 },
+      pools: [
+        {
+          key: "system_research_pool",
+          label: "系统研究跟踪",
+          count: 1,
+          description: "系统推荐后自动跟踪，尚未代表用户确认关注。",
+        },
+        {
+          key: "manual_watchlist",
+          label: "用户观察池",
+          count: 1,
+          description: "用户手动加入或确认关注的资产。",
+        },
+        {
+          key: "other_watchlist",
+          label: "其他观察项",
+          count: 0,
+          description: "暂未归类到研究池或用户观察池的有效条目。",
+        },
+      ],
+      metrics: { active_count: 2, high_risk_count: 1, research_count: 1, manual_count: 1 },
     },
     recommendations: {
       status: "partial",

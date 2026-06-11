@@ -16,7 +16,7 @@ export type SchedulerQueueSummary = {
   queuedJobs: string[];
 };
 
-const marketOrder = ["ashare", "crypto_spot", "crypto_future"];
+const marketOrder = ["ashare", "fund", "crypto_spot", "crypto_future"];
 const processingStatusText: Record<string, string> = {
   active_with_collection: "随采集执行",
   implemented_not_scheduled: "已实现未调度",
