@@ -121,6 +121,47 @@ def test_parse_scheduler_config_accepts_technical_screening_job() -> None:
     assert config.jobs[0].depends_on == ("ashare.bars.1d.close_final",)
 
 
+def test_parse_scheduler_config_accepts_trigger_and_agent_loop_jobs() -> None:
+    """调度配置应能表达触发评估和 Agent 事件消费任务。"""
+
+    config = parse_scheduler_config(
+        {
+            "enabled": True,
+            "jobs": [
+                {
+                    "name": "analytics.triggers.evaluate.daily",
+                    "job_type": "trigger_evaluation",
+                    "group": "analytics",
+                    "enabled": True,
+                    "schedule_type": "after_success",
+                    "depends_on": ["ashare.bars.1d.close_final"],
+                    "params": {
+                        "sync_task_type": "analytics.triggers.evaluate",
+                        "owner_id": "default-owner",
+                    },
+                },
+                {
+                    "name": "agent.loop.consume.after_trigger",
+                    "job_type": "agent_loop_consume",
+                    "group": "agent",
+                    "enabled": True,
+                    "schedule_type": "after_success",
+                    "depends_on": ["analytics.triggers.evaluate.daily"],
+                    "params": {
+                        "sync_task_type": "agent.loop.consume",
+                        "owner_id": "default-owner",
+                    },
+                },
+            ],
+        }
+    )
+
+    assert config.jobs[0].job_type == "trigger_evaluation"
+    assert config.jobs[0].group == "analytics"
+    assert config.jobs[1].job_type == "agent_loop_consume"
+    assert config.jobs[1].group == "agent"
+
+
 def test_parse_scheduler_config_accepts_calendar_schedule_fields() -> None:
     """调度配置应能表达固定时间、手动和依赖成功触发的任务。"""
 

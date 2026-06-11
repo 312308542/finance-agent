@@ -43,10 +43,13 @@ JOB_TYPES = {
     "recommendation_pipeline",
     "data_quality_refresh",
     "technical_screening_refresh",
+    "trigger_evaluation",
+    "agent_loop_consume",
 }
 SCHEDULE_TYPES = {"interval", "daily_time", "trading_session", "manual", "after_success"}
 TRADING_DAY_POLICIES = {
     "any_day",
+    "ashare",
     "trading_day_only",
     "non_trading_day_only",
     "previous_trading_day_required",
@@ -228,7 +231,7 @@ def schedule_date_allowed(local_date: Any, trading_day_policy: str) -> bool:
     is_weekday = local_date.weekday() < 5
     if trading_day_policy in {"any_day", "previous_trading_day_required"}:
         return True
-    if trading_day_policy == "trading_day_only":
+    if trading_day_policy in {"ashare", "trading_day_only"}:
         return is_weekday
     if trading_day_policy == "non_trading_day_only":
         return not is_weekday
@@ -2153,8 +2156,15 @@ def as_job_group_choice(
 ) -> str | tuple[str, ...]:
     """按任务类型解析调度分组。"""
 
-    if job_type in {"recommendation_pipeline", "data_quality_refresh", "technical_screening_refresh"}:
+    if job_type in {
+        "recommendation_pipeline",
+        "data_quality_refresh",
+        "technical_screening_refresh",
+        "trigger_evaluation",
+    }:
         return as_choice(value, choices={"analytics"}, field_name=field_name)
+    if job_type == "agent_loop_consume":
+        return as_choice(value, choices={"agent"}, field_name=field_name)
     return as_group_choice(value, field_name=field_name)
 
 
