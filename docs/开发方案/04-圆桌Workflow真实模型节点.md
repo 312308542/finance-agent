@@ -117,8 +117,8 @@ def generate_model_opinion(role, context, model_client, routing) -> RoundtableOp
 
 | 任务 | 状态 | 验证记录 |
 | --- | --- | --- |
-| T1 节点测试 | 未开始 | - |
-| T2 骨架与 prompt | 未开始 | - |
+| T1 节点测试 | 已完成 | 2026-06-12：新增 `tests/test_roundtable_model_nodes.py`，覆盖合法观点、非法 JSON 纠错重试、虚构 evidence 剔除、模型不可用 fallback、`generated_by` 标记；红灯为缺少 `roundtable_model_nodes` 模块，随后转绿 |
+| T2 骨架与 prompt | 已完成 | 2026-06-12：新增 `roundtable_model_nodes.py` 与 `roundtable_prompts.py`，验证 `.\.venv\Scripts\python.exe -m pytest tests/test_roundtable_model_nodes.py -q`，结果 `5 passed` |
 | T3 六个 Workflow 接入 | 未开始 | - |
 | T4 报告渲染 | 未开始 | - |
 | T5 反馈 API | 未开始 | - |
