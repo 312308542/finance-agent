@@ -145,6 +145,11 @@ class HighRiskReviewService:
                 summary["unavailable_count"] += 1
         return summary
 
+    def list_pending_reviews(self, *, owner_id: str, limit: int = 10) -> list[JsonDict]:
+        """列出待复核事件，供 CLI dry-run 使用。"""
+
+        return self.review_store.list_pending_reviews(owner_id=owner_id, limit=limit)
+
     def execute_review(self, review_event: JsonDict) -> ReviewExecutionResult:
         """执行单条复核事件并回写审计链。"""
 

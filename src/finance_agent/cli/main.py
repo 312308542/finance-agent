@@ -21,6 +21,7 @@ from finance_agent.agents.runtime import (
     preview_model_routes,
     test_model_endpoint,
 )
+from finance_agent.agents.runtime.high_risk_review_service import HighRiskReviewService
 from finance_agent.agents.runtime.model_tui import render_model_tui
 from finance_agent.cli.data_sync import add_data_arguments, dispatch_data
 from finance_agent.scheduler import AssistantLoopScheduler, AssistantLoopSchedulerConfig
@@ -239,6 +240,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="最多轮询次数；本地测试建议传 1，常驻运行可不传。",
     )
     agent_run_loop.add_argument("--as-of", default=None, help="ISO 时间，默认每轮当前时间。")
+    agent_review_pending = agent_commands.add_parser(
+        "review-pending",
+        help="批量执行待处理的高风险模型复核事件。",
+    )
+    agent_review_pending.add_argument("--owner-id", required=True, help="用户/账户 ID。")
+    agent_review_pending.add_argument("--limit", type=int, default=10, help="本次最多处理复核事件数。")
+    agent_review_pending.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只列出待复核队列，不调用模型、不写回结果。",
+    )
 
     add_data_arguments(subparsers)
 
@@ -712,6 +724,29 @@ def dispatch_triggers(session: Any, args: argparse.Namespace) -> JsonDict:
 
 def dispatch_agent(session: Any, args: argparse.Namespace) -> JsonDict:
     """处理内部金融 Agent Loop 命令。"""
+
+    if args.command == "review-pending":
+        service = HighRiskReviewService(session=session)
+        if args.dry_run:
+            reviews = service.list_pending_reviews(
+                owner_id=args.owner_id,
+                limit=args.limit,
+            )
+            return {
+                "status": "ok",
+                "data": {
+                    "dry_run": True,
+                    "pending_count": len(reviews),
+                    "reviews": reviews,
+                },
+            }
+        return {
+            "status": "ok",
+            "data": service.run_pending_reviews(
+                owner_id=args.owner_id,
+                limit=args.limit,
+            ),
+        }
 
     runner = InternalFinanceAgentLoopRunner(session)
     if args.command == "run-once":

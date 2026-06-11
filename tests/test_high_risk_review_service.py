@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from finance_agent.cli import main as cli_main
 from finance_agent.agents.runtime.high_risk_review_service import HighRiskReviewService
 from finance_agent.agents.runtime.model_client import ModelClientResponse
 from finance_agent.agents.runtime.model_config import ModelEndpointConfig
@@ -254,6 +255,56 @@ def test_high_risk_review_service_keeps_retryable_when_model_unavailable() -> No
     assert store.decision_updates[0]["review_status"] == "review_unavailable"
     assert store.decision_updates[0]["confidence_multiplier"] == pytest.approx(0.7)
     assert store.decision_updates[0]["user_action"] is None
+
+
+def test_agent_review_pending_cli_dry_run_lists_queue(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeService:
+        def __init__(self, *, session: object) -> None:
+            self.session = session
+
+        def list_pending_reviews(self, *, owner_id: str, limit: int) -> list[dict[str, Any]]:
+            assert owner_id == "owner:demo"
+            assert limit == 5
+            return [{"workflow_event_id": "event:1"}]
+
+    monkeypatch.setattr(cli_main, "HighRiskReviewService", FakeService)
+
+    args = cli_main.build_parser().parse_args(
+        ["agent", "review-pending", "--owner-id", "owner:demo", "--limit", "5", "--dry-run"]
+    )
+    result = cli_main.dispatch_agent(object(), args)
+
+    assert result == {
+        "status": "ok",
+        "data": {
+            "dry_run": True,
+            "pending_count": 1,
+            "reviews": [{"workflow_event_id": "event:1"}],
+        },
+    }
+
+
+def test_agent_review_pending_cli_runs_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeService:
+        def __init__(self, *, session: object) -> None:
+            self.session = session
+
+        def run_pending_reviews(self, *, owner_id: str, limit: int) -> dict[str, Any]:
+            assert owner_id == "owner:demo"
+            assert limit == 3
+            return {"processed_count": 2, "approved_count": 1, "rejected_count": 1}
+
+    monkeypatch.setattr(cli_main, "HighRiskReviewService", FakeService)
+
+    args = cli_main.build_parser().parse_args(
+        ["agent", "review-pending", "--owner-id", "owner:demo", "--limit", "3"]
+    )
+    result = cli_main.dispatch_agent(object(), args)
+
+    assert result == {
+        "status": "ok",
+        "data": {"processed_count": 2, "approved_count": 1, "rejected_count": 1},
+    }
 
 
 def build_review_event(*, decision_id: str) -> dict[str, Any]:
