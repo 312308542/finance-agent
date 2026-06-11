@@ -9,10 +9,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from hashlib import sha1
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from finance_agent.agents.tools.runtime import json_value
@@ -22,6 +23,7 @@ from finance_agent.storage.orm import (
     DataQualitySnapshotORM,
     PositionORM,
     RecommendationRunORM,
+    RealtimeQuoteSnapshotORM,
     SignalSnapshotORM,
     WatchlistItemORM,
 )
@@ -55,6 +57,11 @@ class TriggerEvaluationRequest:
     cooldown_minutes: int = 15
     recommendation_limit: int = 20
     drawdown_threshold: Decimal = Decimal("0.050000")
+    trigger_groups: tuple[str, ...] = ()
+    intraday_quote_window_minutes: int = 30
+    intraday_sharp_drop_threshold: Decimal = Decimal("-0.040000")
+    intraday_volume_surge_multiplier: Decimal = Decimal("3.000000")
+    intraday_price_change_threshold: Decimal = Decimal("0.020000")
 
 
 @dataclass(frozen=True)
@@ -74,12 +81,21 @@ class TriggerEventDraft:
 
 
 @dataclass(frozen=True)
+class IntradayVolatilityDraftResult:
+    """盘中波动规则生成的草稿与跳过计数。"""
+
+    drafts: tuple[TriggerEventDraft, ...]
+    skipped_no_data_count: int = 0
+
+
+@dataclass(frozen=True)
 class TriggerEvaluationResult:
     """一次触发评估结果。"""
 
     owner_id: str
     created_events: tuple[AssistantTriggerEventORM, ...]
     suppressed_dedup_keys: tuple[str, ...]
+    skipped_no_data_count: int = 0
 
     def to_dict(self) -> JsonDict:
         """转换为 JSON 友好的字典。"""
@@ -88,6 +104,7 @@ class TriggerEvaluationResult:
             "owner_id": self.owner_id,
             "created_count": len(self.created_events),
             "suppressed_count": len(self.suppressed_dedup_keys),
+            "skipped_no_data_count": self.skipped_no_data_count,
             "created_events": [serialize_trigger_event(event) for event in self.created_events],
             "suppressed_dedup_keys": list(self.suppressed_dedup_keys),
         }
@@ -134,6 +151,7 @@ class TriggerService:
         """评估已入库事实并生成触发事件。"""
 
         drafts: list[TriggerEventDraft] = []
+        skipped_no_data_count = 0
         portfolio_snapshots = self._load_portfolio_snapshots(request)
         watchlist_items = tuple(
             self.watchlists.list_active_items(
@@ -141,34 +159,51 @@ class TriggerService:
                 watchlist_id=request.watchlist_id,
             )
         )
-        drafts.extend(
-            self._evaluate_position_triggers(
-                request=request,
-                portfolio_snapshots=portfolio_snapshots,
+        if trigger_group_enabled(request, "position", "signal"):
+            drafts.extend(
+                self._evaluate_position_triggers(
+                    request=request,
+                    portfolio_snapshots=portfolio_snapshots,
+                )
             )
-        )
-        drafts.extend(self._evaluate_watchlist_triggers(request=request, items=watchlist_items))
-        drafts.extend(
-            self._evaluate_recommendation_triggers(
-                request=request,
-                portfolio_snapshots=portfolio_snapshots,
+        if trigger_group_enabled(request, "watchlist"):
+            drafts.extend(self._evaluate_watchlist_triggers(request=request, items=watchlist_items))
+        if trigger_group_enabled(request, "recommendation"):
+            drafts.extend(
+                self._evaluate_recommendation_triggers(
+                    request=request,
+                    portfolio_snapshots=portfolio_snapshots,
+                )
             )
-        )
-        drafts.extend(
-            self._evaluate_risk_triggers(
+        if trigger_group_enabled(request, "risk"):
+            drafts.extend(
+                self._evaluate_risk_triggers(
+                    request=request,
+                    portfolio_snapshots=portfolio_snapshots,
+                    watchlist_items=watchlist_items,
+                )
+            )
+        if trigger_group_enabled(request, "data_quality"):
+            drafts.extend(
+                self._evaluate_data_quality_triggers(
+                    request=request,
+                    portfolio_snapshots=portfolio_snapshots,
+                    watchlist_items=watchlist_items,
+                )
+            )
+        if trigger_group_enabled(request, "intraday_volatility"):
+            intraday_result = self._evaluate_intraday_volatility_triggers(
                 request=request,
                 portfolio_snapshots=portfolio_snapshots,
                 watchlist_items=watchlist_items,
             )
+            drafts.extend(intraday_result.drafts)
+            skipped_no_data_count += intraday_result.skipped_no_data_count
+        return self._persist_drafts(
+            request=request,
+            drafts=drafts,
+            skipped_no_data_count=skipped_no_data_count,
         )
-        drafts.extend(
-            self._evaluate_data_quality_triggers(
-                request=request,
-                portfolio_snapshots=portfolio_snapshots,
-                watchlist_items=watchlist_items,
-            )
-        )
-        return self._persist_drafts(request=request, drafts=drafts)
 
     def dispatch_pending(
         self,
@@ -530,11 +565,160 @@ class TriggerService:
             )
         return drafts
 
+    def _evaluate_intraday_volatility_triggers(
+        self,
+        *,
+        request: TriggerEvaluationRequest,
+        portfolio_snapshots: tuple[Any, ...],
+        watchlist_items: tuple[WatchlistItemORM, ...],
+    ) -> IntradayVolatilityDraftResult:
+        """根据实时行情快照评估盘中急跌和放量异动。"""
+
+        held_assets: dict[str, Any] = {
+            position.asset_id: (snapshot.portfolio.portfolio_id, position)
+            for snapshot in portfolio_snapshots
+            for position in snapshot.positions
+        }
+        watched_assets = {item.asset_id: item for item in watchlist_items}
+        asset_ids = sorted({*held_assets, *watched_assets})
+        drafts: list[TriggerEventDraft] = []
+        skipped_no_data_count = 0
+        for asset_id in asset_ids:
+            draft_count_before = len(drafts)
+            snapshots = self._load_recent_realtime_quote_snapshots(
+                asset_id=asset_id,
+                since=request.as_of - timedelta(minutes=request.intraday_quote_window_minutes),
+            )
+            latest, previous = first_two_price_snapshots(snapshots)
+            if latest is None or previous is None:
+                skipped_no_data_count += 1
+                continue
+            latest_price = decimal_or_none(latest.last_price)
+            previous_price = decimal_or_none(previous.last_price)
+            if latest_price is None or previous_price is None or previous_price <= 0:
+                skipped_no_data_count += 1
+                continue
+
+            price_change_ratio = (latest_price - previous_price) / previous_price
+            portfolio_id, position = held_assets.get(asset_id, (None, None))
+            watchlist_item = watched_assets.get(asset_id)
+            requested_workflow_type = (
+                "portfolio_monitoring" if portfolio_id else "asset_deep_analysis"
+            )
+            scope_id = str(portfolio_id or getattr(watchlist_item, "watchlist_id", ""))
+            symbol = str(
+                getattr(position, "symbol", "")
+                or getattr(watchlist_item, "symbol", "")
+                or latest.symbol
+                or asset_id
+            )
+            trigger_ref = f"{asset_id}:{latest.as_of.isoformat()}"
+            if price_change_ratio <= request.intraday_sharp_drop_threshold:
+                drafts.append(
+                    TriggerEventDraft(
+                        trigger_type="intraday_sharp_drop",
+                        requested_workflow_type=requested_workflow_type,
+                        severity="high",
+                        trigger_ref=trigger_ref,
+                        dedup_key=build_dedup_key(
+                            owner_id=request.owner_id,
+                            trigger_type="intraday_sharp_drop",
+                            requested_workflow_type=requested_workflow_type,
+                            asset_id=asset_id,
+                            scope_id=scope_id,
+                        ),
+                        portfolio_id=portfolio_id,
+                        watchlist_id=getattr(watchlist_item, "watchlist_id", None),
+                        asset_id=asset_id,
+                        payload={
+                            "reason": f"{symbol} 盘中快速下跌，触发风险监控。",
+                            "symbol": symbol,
+                            "latest_price": json_value(latest_price),
+                            "previous_price": json_value(previous_price),
+                            "price_change_ratio": format_decimal_ratio(price_change_ratio),
+                            "latest_quote_at": json_value(latest.as_of),
+                            "previous_quote_at": json_value(previous.as_of),
+                            "rule": "intraday_sharp_drop",
+                        },
+                    )
+                )
+
+            volume_result = intraday_volume_surge_ratio(
+                latest=latest,
+                history=snapshots[1:21],
+            )
+            if volume_result is None:
+                if len(drafts) == draft_count_before:
+                    skipped_no_data_count += 1
+                continue
+            volume_surge_multiplier, baseline_volume = volume_result
+            if (
+                volume_surge_multiplier >= request.intraday_volume_surge_multiplier
+                and abs(price_change_ratio) >= request.intraday_price_change_threshold
+            ):
+                drafts.append(
+                    TriggerEventDraft(
+                        trigger_type="intraday_volume_surge",
+                        requested_workflow_type=requested_workflow_type,
+                        severity="medium",
+                        trigger_ref=trigger_ref,
+                        dedup_key=build_dedup_key(
+                            owner_id=request.owner_id,
+                            trigger_type="intraday_volume_surge",
+                            requested_workflow_type=requested_workflow_type,
+                            asset_id=asset_id,
+                            scope_id=scope_id,
+                        ),
+                        portfolio_id=portfolio_id,
+                        watchlist_id=getattr(watchlist_item, "watchlist_id", None),
+                        asset_id=asset_id,
+                        payload={
+                            "reason": f"{symbol} 盘中成交量显著放大，触发异动分析。",
+                            "symbol": symbol,
+                            "latest_price": json_value(latest_price),
+                            "previous_price": json_value(previous_price),
+                            "price_change_ratio": format_decimal_ratio(price_change_ratio),
+                            "latest_volume": json_value(decimal_or_none(latest.volume)),
+                            "baseline_volume": json_value(baseline_volume),
+                            "volume_surge_multiplier": format_decimal_ratio(
+                                volume_surge_multiplier
+                            ),
+                            "latest_quote_at": json_value(latest.as_of),
+                            "rule": "intraday_volume_surge",
+                        },
+                    )
+                )
+        return IntradayVolatilityDraftResult(
+            drafts=tuple(drafts),
+            skipped_no_data_count=skipped_no_data_count,
+        )
+
+    def _load_recent_realtime_quote_snapshots(
+        self,
+        *,
+        asset_id: str,
+        since: datetime,
+    ) -> list[RealtimeQuoteSnapshotORM]:
+        """读取单个标的最近实时行情快照。"""
+
+        statement = (
+            select(RealtimeQuoteSnapshotORM)
+            .where(
+                RealtimeQuoteSnapshotORM.asset_id == asset_id,
+                RealtimeQuoteSnapshotORM.as_of >= since,
+                RealtimeQuoteSnapshotORM.status == "available",
+            )
+            .order_by(RealtimeQuoteSnapshotORM.as_of.desc())
+            .limit(21)
+        )
+        return list(self.session.scalars(statement))
+
     def _persist_drafts(
         self,
         *,
         request: TriggerEvaluationRequest,
         drafts: list[TriggerEventDraft],
+        skipped_no_data_count: int = 0,
     ) -> TriggerEvaluationResult:
         created: list[AssistantTriggerEventORM] = []
         suppressed: list[str] = []
@@ -570,6 +754,7 @@ class TriggerService:
             owner_id=request.owner_id,
             created_events=tuple(created),
             suppressed_dedup_keys=tuple(suppressed),
+            skipped_no_data_count=skipped_no_data_count,
         )
 
 
@@ -675,6 +860,68 @@ def is_signal_flip_to_bearish(signals: list[SignalSnapshotORM]) -> bool:
         return False
     latest, previous = signals[0], signals[1]
     return latest.direction == "bearish" and previous.direction != "bearish"
+
+
+def trigger_group_enabled(request: TriggerEvaluationRequest, *groups: str) -> bool:
+    """判断当前请求是否启用了指定触发规则组。"""
+
+    if not request.trigger_groups:
+        return True
+    enabled_groups = {group for group in request.trigger_groups if group}
+    return any(group in enabled_groups for group in groups)
+
+
+def first_two_price_snapshots(
+    snapshots: list[RealtimeQuoteSnapshotORM],
+) -> tuple[RealtimeQuoteSnapshotORM | None, RealtimeQuoteSnapshotORM | None]:
+    """返回最近两个具备价格的实时快照。"""
+
+    price_snapshots = [
+        snapshot for snapshot in snapshots if decimal_or_none(snapshot.last_price) is not None
+    ]
+    if len(price_snapshots) < 2:
+        return None, None
+    return price_snapshots[0], price_snapshots[1]
+
+
+def intraday_volume_surge_ratio(
+    *,
+    latest: RealtimeQuoteSnapshotORM,
+    history: list[RealtimeQuoteSnapshotORM],
+) -> tuple[Decimal, Decimal] | None:
+    """计算当前成交量相对近 20 个快照的放量倍数。"""
+
+    latest_volume = decimal_or_none(latest.volume)
+    if latest_volume is None:
+        return None
+    history_volumes: list[Decimal] = []
+    for snapshot in history:
+        volume = decimal_or_none(snapshot.volume)
+        if volume is not None and volume > 0:
+            history_volumes.append(volume)
+    if len(history_volumes) < 20:
+        return None
+    baseline_volume = sum(history_volumes[:20], Decimal("0")) / Decimal("20")
+    if baseline_volume <= 0:
+        return None
+    return latest_volume / baseline_volume, baseline_volume
+
+
+def decimal_or_none(value: Any) -> Decimal | None:
+    """把数值安全转换为 Decimal。"""
+
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def format_decimal_ratio(value: Decimal) -> str:
+    """把比例格式化为固定 6 位小数字符串，便于前端和日志展示。"""
+
+    return str(value.quantize(Decimal("0.000001")))
 
 
 def validate_dispatch_requirements(event: AssistantTriggerEventORM) -> str | None:

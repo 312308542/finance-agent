@@ -1391,6 +1391,9 @@ class BaseDataScheduler:
             value = job.params.get(key)
             if value is not None:
                 params[key] = int(value)
+        value = job.params.get("intraday_quote_window_minutes")
+        if value is not None:
+            params["intraday_quote_window_minutes"] = int(value)
         return params
 
     def build_agent_loop_consume_kwargs(self, job: BaseDataSchedulerJob) -> JsonDict:
@@ -1568,6 +1571,7 @@ class BaseDataScheduler:
         dispatch = as_bool(kwargs.pop("dispatch", True), field_name="dispatch")
         max_events_per_run = int(kwargs.pop("max_events_per_run", 50))
         cooldown_minutes = int(kwargs.pop("cooldown_minutes", 15))
+        trigger_groups = tuple(str(item) for item in kwargs.pop("trigger_groups", []))
         request = TriggerEvaluationRequest(
             owner_id=owner_id,
             as_of=datetime.now(tz=UTC),
@@ -1580,8 +1584,18 @@ class BaseDataScheduler:
             cooldown_minutes=cooldown_minutes,
             recommendation_limit=int(kwargs.pop("recommendation_limit", 20)),
             drawdown_threshold=Decimal(str(kwargs.pop("drawdown_threshold", "0.050000"))),
+            trigger_groups=trigger_groups,
+            intraday_quote_window_minutes=int(kwargs.pop("intraday_quote_window_minutes", 30)),
+            intraday_sharp_drop_threshold=Decimal(
+                str(kwargs.pop("intraday_sharp_drop_threshold", "-0.040000"))
+            ),
+            intraday_volume_surge_multiplier=Decimal(
+                str(kwargs.pop("intraday_volume_surge_multiplier", "3.000000"))
+            ),
+            intraday_price_change_threshold=Decimal(
+                str(kwargs.pop("intraday_price_change_threshold", "0.020000"))
+            ),
         )
-        trigger_groups = list(kwargs.pop("trigger_groups", []))
         session_factory = create_session_factory()
         with session_scope(session_factory) as session:
             service = TriggerService(session)
@@ -1606,7 +1620,7 @@ class BaseDataScheduler:
             "skipped_count": 0,
             "cooldown_count": suppressed_count,
             "max_events_per_run": max_events_per_run,
-            "trigger_groups": trigger_groups,
+            "trigger_groups": list(trigger_groups),
             "dispatch": dispatch,
             "evaluation": evaluation.to_dict(),
         }
