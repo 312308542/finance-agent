@@ -46,6 +46,7 @@ AKShare 在本系统里应视为 **A 股数据 Provider 族**，不是单一 K �
 - 高频查询字段单独结构化，扩展字段放入 `payload`。
 - 不可靠接口必须有 `status`、`error_message` 和 fallback。
 - 东方财富接口优先使用 AKShare；若本机触发断连，可用 `curl_cffi` 或腾讯接口兜底。
+- 如果浏览器能打开东方财富 JSON、但后端 `requests` / 无 cookie 的 `curl_cffi` 被断开，仓库侧 `eastmoney:curl_cffi` fallback 会自动生成进程内匿名 Cookie；也可以用环境变量 `FINANCE_AGENT_EASTMONEY_COOKIE` 显式覆盖为浏览器 Cookie。Cookie 不写入代码或调度配置文件。
 - 腾讯接口可作为 A 股行情 fallback，尤其是实时行情和日线行情。
 - 腾讯实时行情 fallback 受分页和网络稳定性影响，第一版用于降级保底；完整全 A 主源仍优先使用东方财富或后续专门的股票列表接口。
 - 行业/概念成分优先使用东方财富全量接口；若 AKShare 和东财 `curl_cffi` 都断连，可用同花顺详情页首屏成分做轻量 fallback，并在 `raw_records.response_payload.source_coverage` 标记为 `first_page`。
