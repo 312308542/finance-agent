@@ -1029,6 +1029,22 @@ def build_trigger_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
                 },
             }
         )
+        jobs.append(
+            {
+                "name": "analytics.high_risk_reviews.after_agent",
+                "job_type": "high_risk_reviews",
+                "group": "analytics",
+                "enabled": True,
+                "interval_seconds": 0,
+                "schedule_type": "after_success",
+                "depends_on": ["agent.loop.consume.after_trigger"],
+                "params": {
+                    "sync_task_type": "analytics.high_risk_reviews",
+                    "owner_id": "default-owner",
+                    "limit": 10,
+                },
+            }
+        )
     jobs.append(
         {
             "name": "agent.loop.consume.sweep",
@@ -1041,6 +1057,20 @@ def build_trigger_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
                 "owner_id": "default-owner",
                 "limit": 10,
                 "use_model_planner": True,
+            },
+        }
+    )
+    jobs.append(
+        {
+            "name": "analytics.high_risk_reviews.sweep",
+            "job_type": "high_risk_reviews",
+            "group": "analytics",
+            "enabled": True,
+            "interval_seconds": 60 * 60,
+            "params": {
+                "sync_task_type": "analytics.high_risk_reviews",
+                "owner_id": "default-owner",
+                "limit": 10,
             },
         }
     )

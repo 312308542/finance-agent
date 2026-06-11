@@ -45,6 +45,7 @@ JOB_TYPES = {
     "technical_screening_refresh",
     "trigger_evaluation",
     "agent_loop_consume",
+    "high_risk_reviews",
 }
 SCHEDULE_TYPES = {"interval", "daily_time", "trading_session", "manual", "after_success"}
 TRADING_DAY_POLICIES = {
@@ -616,6 +617,7 @@ class BaseDataScheduler:
         run_technical_screening_refresh_func: Callable[..., JsonDict] | None = None,
         run_trigger_evaluation_func: Callable[..., JsonDict] | None = None,
         run_agent_loop_consume_func: Callable[..., JsonDict] | None = None,
+        run_high_risk_reviews_func: Callable[..., JsonDict] | None = None,
         sleep_func: Callable[[float], None] = time.sleep,
         status_file: str | Path | None = None,
         event_log_file: str | Path | None = None,
@@ -630,6 +632,7 @@ class BaseDataScheduler:
         self._run_technical_screening_refresh = run_technical_screening_refresh_func
         self._run_trigger_evaluation = run_trigger_evaluation_func
         self._run_agent_loop_consume = run_agent_loop_consume_func
+        self._run_high_risk_reviews = run_high_risk_reviews_func
         self._uses_injected_collect_base_data = collect_base_data_func is not None
         self._sleep = sleep_func
         self.status_file = Path(status_file) if status_file else None
@@ -1014,6 +1017,8 @@ class BaseDataScheduler:
             planned["trigger_evaluation_args"] = self.build_trigger_evaluation_kwargs(job)
         elif job.job_type == "agent_loop_consume":
             planned["agent_loop_consume_args"] = self.build_agent_loop_consume_kwargs(job)
+        elif job.job_type == "high_risk_reviews":
+            planned["high_risk_review_args"] = self.build_high_risk_review_kwargs(job)
         else:
             raise ValueError(f"不支持的调度任务类型：{job.job_type}")
 
@@ -1206,6 +1211,9 @@ class BaseDataScheduler:
         if job.job_type == "agent_loop_consume":
             kwargs = self.build_agent_loop_consume_kwargs(job)
             return self.run_agent_loop_consume(**kwargs)
+        if job.job_type == "high_risk_reviews":
+            kwargs = self.build_high_risk_review_kwargs(job)
+            return self.run_high_risk_reviews(**kwargs)
         raise ValueError(f"不支持的调度任务类型：{job.job_type}")
 
     def build_collection_args(self, job: BaseDataSchedulerJob) -> Any:
@@ -1411,6 +1419,16 @@ class BaseDataScheduler:
                 job.params.get("use_model_planner", True),
                 field_name=f"{job.name}.params.use_model_planner",
             ),
+        }
+
+    def build_high_risk_review_kwargs(self, job: BaseDataSchedulerJob) -> JsonDict:
+        """把高风险复核任务配置转换为复核服务参数。"""
+
+        if job.job_type != "high_risk_reviews":
+            raise ValueError(f"{job.name} 不是高风险复核任务")
+        return {
+            "owner_id": str(job.params.get("owner_id") or "default-owner"),
+            "limit": int(job.params.get("limit") or job.limit or 10),
         }
 
     def run_recommendation_pipeline(self, **kwargs: Any) -> JsonDict:
@@ -1671,6 +1689,32 @@ class BaseDataScheduler:
                 "succeeded": payload["processed_count"],
                 "failed": payload["failed_count"],
                 "fallback_used": not use_model_planner,
+            }
+        )
+        return payload
+
+    def run_high_risk_reviews(self, **kwargs: Any) -> JsonDict:
+        """执行待处理高风险模型复核事件。"""
+
+        if self._run_high_risk_reviews is not None:
+            return self._run_high_risk_reviews(**kwargs)
+
+        from finance_agent.agents.runtime.high_risk_review_service import HighRiskReviewService
+        from finance_agent.storage.db import create_session_factory, session_scope
+
+        owner_id = str(kwargs.get("owner_id") or "default-owner")
+        limit = int(kwargs.get("limit") or 10)
+        session_factory = create_session_factory()
+        with session_scope(session_factory) as session:
+            payload = HighRiskReviewService(session=session).run_pending_reviews(
+                owner_id=owner_id,
+                limit=limit,
+            )
+        payload.update(
+            {
+                "status": "available",
+                "owner_id": owner_id,
+                "limit": limit,
             }
         )
         return payload
@@ -2161,6 +2205,7 @@ def as_job_group_choice(
         "data_quality_refresh",
         "technical_screening_refresh",
         "trigger_evaluation",
+        "high_risk_reviews",
     }:
         return as_choice(value, choices={"analytics"}, field_name=field_name)
     if job_type == "agent_loop_consume":

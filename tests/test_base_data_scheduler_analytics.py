@@ -162,6 +162,35 @@ def test_parse_scheduler_config_accepts_trigger_and_agent_loop_jobs() -> None:
     assert config.jobs[1].group == "agent"
 
 
+def test_parse_scheduler_config_accepts_high_risk_reviews_job() -> None:
+    """调度配置应能表达高风险复核批处理任务。"""
+
+    config = parse_scheduler_config(
+        {
+            "enabled": True,
+            "jobs": [
+                {
+                    "name": "analytics.high_risk_reviews.after_agent",
+                    "job_type": "high_risk_reviews",
+                    "group": "analytics",
+                    "enabled": True,
+                    "schedule_type": "after_success",
+                    "depends_on": ["agent.loop.consume.after_trigger"],
+                    "params": {
+                        "sync_task_type": "analytics.high_risk_reviews",
+                        "owner_id": "default-owner",
+                        "limit": 10,
+                    },
+                }
+            ],
+        }
+    )
+
+    assert config.jobs[0].job_type == "high_risk_reviews"
+    assert config.jobs[0].group == "analytics"
+    assert config.jobs[0].depends_on == ("agent.loop.consume.after_trigger",)
+
+
 def test_parse_scheduler_config_accepts_calendar_schedule_fields() -> None:
     """调度配置应能表达固定时间、手动和依赖成功触发的任务。"""
 
@@ -631,6 +660,61 @@ def test_scheduler_runs_agent_loop_consume_without_collection() -> None:
             "owner_id": "default-owner",
             "limit": 10,
             "use_model_planner": False,
+        }
+    ]
+
+
+def test_scheduler_runs_high_risk_reviews_without_collection() -> None:
+    """高风险复核任务应调用复核执行器，而不是误走基础采集入口。"""
+
+    calls: list[dict[str, Any]] = []
+
+    def run_high_risk_reviews(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "status": "available",
+            "processed_count": 2,
+            "approved_count": 1,
+            "rejected_count": 1,
+            "unavailable_count": 0,
+        }
+
+    def collect_base_data(_: Any) -> dict[str, Any]:
+        raise AssertionError("高风险复核任务不应调用基础采集入口")
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="analytics.high_risk_reviews.after_agent",
+                job_type="high_risk_reviews",
+                group="analytics",
+                interval_seconds=0,
+                schedule_type="after_success",
+                depends_on=("agent.loop.consume.after_trigger",),
+                params={
+                    "sync_task_type": "analytics.high_risk_reviews",
+                    "owner_id": "default-owner",
+                    "limit": 10,
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        run_high_risk_reviews_func=run_high_risk_reviews,
+    )
+
+    result = scheduler.run_once()
+
+    assert result["jobs"][0]["status"] == "executed"
+    assert result["jobs"][0]["summary"]["processed_count"] == 2
+    assert calls == [
+        {
+            "owner_id": "default-owner",
+            "limit": 10,
         }
     ]
 

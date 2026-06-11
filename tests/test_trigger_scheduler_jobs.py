@@ -27,6 +27,8 @@ def test_build_trigger_scheduler_jobs_exports_evaluate_and_consume_jobs() -> Non
         "analytics.triggers.evaluate.intraday",
         "agent.loop.consume.after_trigger",
         "agent.loop.consume.sweep",
+        "analytics.high_risk_reviews.after_agent",
+        "analytics.high_risk_reviews.sweep",
     }
 
     daily = jobs["analytics.triggers.evaluate.daily"]
@@ -76,6 +78,23 @@ def test_build_trigger_scheduler_jobs_exports_evaluate_and_consume_jobs() -> Non
     assert sweep["interval_seconds"] == 30 * 60
     assert sweep["params"]["limit"] == 10
 
+    high_risk_after_agent = jobs["analytics.high_risk_reviews.after_agent"]
+    assert high_risk_after_agent["job_type"] == "high_risk_reviews"
+    assert high_risk_after_agent["group"] == "analytics"
+    assert high_risk_after_agent["schedule_type"] == "after_success"
+    assert high_risk_after_agent["depends_on"] == ["agent.loop.consume.after_trigger"]
+    assert high_risk_after_agent["params"]["sync_task_type"] == "analytics.high_risk_reviews"
+    assert high_risk_after_agent["params"]["owner_id"] == "default-owner"
+    assert high_risk_after_agent["params"]["limit"] == 10
+
+    high_risk_sweep = jobs["analytics.high_risk_reviews.sweep"]
+    assert high_risk_sweep["job_type"] == "high_risk_reviews"
+    assert high_risk_sweep["group"] == "analytics"
+    assert high_risk_sweep["interval_seconds"] == 60 * 60
+    assert high_risk_sweep["params"]["sync_task_type"] == "analytics.high_risk_reviews"
+    assert high_risk_sweep["params"]["owner_id"] == "default-owner"
+    assert high_risk_sweep["params"]["limit"] == 10
+
 
 def test_scheduler_payload_includes_trigger_jobs_with_intraday_disabled() -> None:
     """导出的调度计划应包含触发任务，且盘中任务默认禁用。"""
@@ -94,3 +113,7 @@ def test_scheduler_payload_includes_trigger_jobs_with_intraday_disabled() -> Non
         "analytics.triggers.evaluate.daily",
         "analytics.triggers.evaluate.intraday",
     ]
+    assert jobs["analytics.high_risk_reviews.after_agent"]["depends_on"] == [
+        "agent.loop.consume.after_trigger"
+    ]
+    assert jobs["analytics.high_risk_reviews.sweep"]["interval_seconds"] == 60 * 60
