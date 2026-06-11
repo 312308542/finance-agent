@@ -64,6 +64,7 @@ class RecommendationService:
         horizon: str = "swing",
         limit: int = 20,
         rule_version: str = RULE_VERSION,
+        audit_payload: JsonDict | None = None,
     ) -> RecommendationRunResult:
         """读取一次初筛的评分结果并生成推荐榜单。"""
 
@@ -139,6 +140,21 @@ class RecommendationService:
             market=screening.market,
             strategy=strategy,
         )
+        run_payload = {
+            "schema_version": "1.0",
+            "rule_version": rule_version,
+            "recommendation_ids": recommendation_ids,
+            "top_recommendations": recommendation_ids[: min(5, len(recommendation_ids))],
+            "watchlist": recommendation_ids,
+            "avoidlist": [],
+            "source": {
+                "screening_id": screening_id,
+                "universe_id": screening.universe_id,
+                "score_count": len(scores),
+            },
+        }
+        if audit_payload:
+            run_payload.update(audit_payload)
         self.recommendations.upsert_run(
             run_id=run_id,
             universe_id=screening.universe_id,
@@ -151,19 +167,7 @@ class RecommendationService:
             started_at=started_at,
             finished_at=finished_at,
             summary=summary,
-            payload={
-                "schema_version": "1.0",
-                "rule_version": rule_version,
-                "recommendation_ids": recommendation_ids,
-                "top_recommendations": recommendation_ids[: min(5, len(recommendation_ids))],
-                "watchlist": recommendation_ids,
-                "avoidlist": [],
-                "source": {
-                    "screening_id": screening_id,
-                    "universe_id": screening.universe_id,
-                    "score_count": len(scores),
-                },
-            },
+            payload=run_payload,
         )
 
         return RecommendationRunResult(

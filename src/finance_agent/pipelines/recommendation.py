@@ -82,12 +82,19 @@ class UniverseRecommendationPipeline:
         min_available_factor_groups: int = 1,
         candidate_source: str | None = None,
         technical_screening_strategy: str = TECHNICAL_SCREENING_STRATEGY,
+        avoid_universe_id: str | None = None,
     ) -> UniverseRecommendationRunResult:
         """执行一次候选池推荐流水线。"""
 
         universe = self.universes.get_universe(universe_id)
         members = self.universes.list_members(universe_id)
         ensure_single_market_universe(universe.market, members)
+        members, audit_payload = exclude_avoid_pool_members(
+            universes=self.universes,
+            candidate_universe=universe,
+            members=members,
+            avoid_universe_id=avoid_universe_id,
+        )
         members = prefer_technical_screening_members(
             members=members,
             market=universe.market,
@@ -232,6 +239,7 @@ class UniverseRecommendationPipeline:
             strategy=strategy,
             horizon=horizon,
             limit=limit,
+            audit_payload=audit_payload,
         )
         status = run_status(
             universe=universe,
@@ -421,6 +429,71 @@ def prefer_technical_screening_members(
         return members
     selected = [member for member in members if member.asset_id in passed_asset_ids]
     return selected or members
+
+
+def exclude_avoid_pool_members(
+    *,
+    universes: UniverseRepository,
+    candidate_universe: AssetUniverseORM,
+    members: list[AssetUniverseMemberORM],
+    avoid_universe_id: str | None,
+) -> tuple[list[AssetUniverseMemberORM], JsonDict]:
+    """根据回避池剔除候选成员，并返回推荐运行审计 payload。"""
+
+    if not avoid_universe_id:
+        return members, {}
+    avoid_universe = universes.get_universe(avoid_universe_id)
+    if avoid_universe.market != candidate_universe.market:
+        raise ValueError(
+            f"回避池 {avoid_universe_id} 市场为 {avoid_universe.market}，"
+            f"与候选池 {candidate_universe.universe_id} 市场 {candidate_universe.market} 不一致。"
+        )
+    avoid_members = universes.list_members(avoid_universe_id, included_only=False)
+    ensure_single_market_universe(avoid_universe.market, avoid_members)
+    avoid_by_asset_id = {member.asset_id: member for member in avoid_members if not member.included}
+    if not avoid_by_asset_id:
+        return members, {
+            "avoid_pool_excluded": {
+                "count": 0,
+                "assets": [],
+            }
+        }
+
+    kept_members: list[AssetUniverseMemberORM] = []
+    excluded_assets: list[JsonDict] = []
+    for member in members:
+        avoid_member = avoid_by_asset_id.get(member.asset_id)
+        if avoid_member is None:
+            kept_members.append(member)
+            continue
+        excluded_assets.append(
+            {
+                "asset_id": member.asset_id,
+                "symbol": member.symbol,
+                "reason": avoid_pool_reason(avoid_member),
+                "source_universe_id": avoid_universe_id,
+            }
+        )
+    return kept_members, {
+        "avoid_pool_excluded": {
+            "count": len(excluded_assets),
+            "assets": excluded_assets,
+        }
+    }
+
+
+def avoid_pool_reason(member: AssetUniverseMemberORM) -> str | None:
+    """从回避池成员 payload/removed_reason 中提取可审计剔除原因。"""
+
+    payload = member.payload or {}
+    avoid_reasons = payload.get("avoid_reasons")
+    if isinstance(avoid_reasons, list) and avoid_reasons:
+        return "；".join(str(item) for item in avoid_reasons if item)
+    for key in ("reason", "removed_reason", "avoid_reason"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return member.removed_reason
 
 
 def count_successful_signals(results: list[SignalComputationResult]) -> int:
