@@ -121,6 +121,6 @@ def generate_model_opinion(role, context, model_client, routing) -> RoundtableOp
 | T2 骨架与 prompt | 已完成 | 2026-06-12：新增 `roundtable_model_nodes.py` 与 `roundtable_prompts.py`，验证 `.\.venv\Scripts\python.exe -m pytest tests/test_roundtable_model_nodes.py -q`，结果 `5 passed` |
 | T3 六个 Workflow 接入 | 已完成 | 2026-06-12：推荐决策、持仓监控、观察池管理、单标的深度分析、换股/换币、每日复盘均接入“规则版观点 → 模型增强 → fallback”层；验证 `tests/test_roundtable_model_nodes.py tests/test_roundtable_workflow_model_integration.py -q` 结果 `8 passed`，并用禁用模型临时配置跑通 `smoke_portfolio_watchlist_roundtable_workflows.py` 与 `smoke_roundtable_report_workflows.py` |
 | T4 报告渲染 | 已完成 | 2026-06-12：圆桌报告结构透传 `generated_by`、`model_instance_id`、`confidence`、`key_points`、`rebuttals`、`data_gaps`，Markdown 展示模型/规则来源、要点、反方和缺口；验证 `tests/test_roundtable_model_nodes.py tests/test_roundtable_workflow_model_integration.py tests/test_roundtable_report_templates.py -q` 结果 `10 passed`，两个圆桌 smoke 均通过 |
-| T5 反馈 API | 未开始 | - |
+| T5 反馈 API | 已完成 | 2026-06-12：新增 `POST /api/decisions/{decision_id}/feedback` 与 `GET /api/decisions/pending-confirmation`，反馈复用 `MemoryService.record_user_feedback` 并写回原决策 `user_action/payload.user_feedback`；验证 `tests/test_roundtable_model_nodes.py tests/test_decision_feedback_api.py -q` 结果 `8 passed`，04 当前新增测试组合 `13 passed` |
 | T6 真实联调 | 未开始 | - |
 | T7 文档同步 | 未开始 | - |

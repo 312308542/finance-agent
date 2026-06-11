@@ -13,7 +13,7 @@ from typing import Any
 import requests
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm import Session
 
@@ -28,12 +28,14 @@ from finance_agent.api.schemas import (
     DataSchedulerJobUpdateRequest,
     DataSchedulerStartRequest,
     DataSyncConfigUpdateRequest,
+    DecisionFeedbackRequest,
     ModelInstanceUpdateRequest,
     ModelProviderConnectivityTestRequest,
     ModelProviderUpdateRequest,
     ModelRouteUpdateRequest,
     WorkflowRunRequest,
 )
+from finance_agent.application import MemoryService
 from finance_agent.application.dashboard_service import (
     DashboardService,
     serialize_model_instance,
@@ -47,6 +49,7 @@ from finance_agent.storage.db import (
     create_session_factory,
     session_scope,
 )
+from finance_agent.storage.orm import DecisionLogORM
 from finance_agent.storage.repositories import ChatMemoryRepository, ModelRuntimeConfigRepository
 
 JsonDict = dict[str, Any]
@@ -219,6 +222,178 @@ def report(
         return FinanceAgentInterface(session).get_report(workflow_run_id).to_dict()
     except Exception as exc:
         return {"status": "unavailable", "message": str(exc)[:240], "data": {}}
+
+
+@router.post("/decisions/{decision_id}/feedback")
+def submit_decision_feedback(
+    decision_id: str,
+    request: DecisionFeedbackRequest,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """记录用户对待确认决策的反馈。"""
+
+    decision = session.get(DecisionLogORM, decision_id)
+    if decision is None:
+        return {"status": "error", "message": "决策不存在", "data": {}}
+    user_action = resolve_feedback_user_action(request)
+    if user_action is None:
+        return {
+            "status": "error",
+            "message": "modified 反馈必须提供 modified_action。",
+            "data": {},
+        }
+    feedback_payload = build_decision_feedback_payload(
+        decision=decision,
+        request=request,
+        user_action=user_action,
+    )
+    update_decision_feedback_state(
+        decision=decision,
+        feedback_payload=feedback_payload,
+        user_action=user_action,
+    )
+    feedback_decision = MemoryService(session).record_user_feedback(
+        feedback_id=build_feedback_decision_id(decision_id=decision_id),
+        owner_id=decision.owner_id,
+        feedback_type="decision_feedback",
+        suggested_action=decision.suggested_action,
+        user_action=user_action,
+        summary=build_decision_feedback_summary(
+            decision=decision,
+            request=request,
+            user_action=user_action,
+        ),
+        as_of=datetime.now(UTC),
+        asset_id=decision.asset_id,
+        portfolio_id=decision.portfolio_id,
+        payload=feedback_payload,
+    )
+    session.flush()
+    return {
+        "status": "ok",
+        "data": {
+            "decision_id": decision_id,
+            "feedback_decision_id": feedback_decision.decision_id,
+            "user_action": user_action,
+        },
+    }
+
+
+@router.get("/decisions/pending-confirmation")
+def list_pending_confirmation_decisions(
+    owner_id: str,
+    limit: int = 20,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """列出等待用户确认的决策。"""
+
+    statement = (
+        select(DecisionLogORM)
+        .where(
+            DecisionLogORM.owner_id == owner_id,
+            DecisionLogORM.user_action == "pending_user_confirmation",
+        )
+        .order_by(DecisionLogORM.created_at.desc())
+        .limit(limit)
+    )
+    decisions = session.scalars(statement).all()
+    return {
+        "status": "ok",
+        "data": {
+            "items": [serialize_pending_decision(decision) for decision in decisions],
+        },
+    }
+
+
+def resolve_feedback_user_action(request: DecisionFeedbackRequest) -> str | None:
+    """把反馈类型转换为决策日志中的用户动作。"""
+
+    if request.feedback == "modified":
+        action = (request.modified_action or "").strip()
+        return action or None
+    return request.feedback
+
+
+def build_decision_feedback_payload(
+    *,
+    decision: DecisionLogORM,
+    request: DecisionFeedbackRequest,
+    user_action: str,
+) -> JsonDict:
+    """构造反馈落库 payload。"""
+
+    return {
+        "source_decision_id": decision.decision_id,
+        "feedback": request.feedback,
+        "comment": request.comment,
+        "modified_action": request.modified_action,
+        "resolved_user_action": user_action,
+        "original_user_action": decision.user_action,
+        "suggested_action": decision.suggested_action,
+        "workflow_run_id": decision.workflow_run_id,
+    }
+
+
+def update_decision_feedback_state(
+    *,
+    decision: DecisionLogORM,
+    feedback_payload: JsonDict,
+    user_action: str,
+) -> None:
+    """把用户反馈写回原决策日志。"""
+
+    payload = dict(decision.payload or {})
+    payload["user_feedback"] = feedback_payload
+    decision.payload = payload
+    decision.user_action = user_action
+
+
+def build_feedback_decision_id(*, decision_id: str) -> str:
+    """生成用户反馈决策日志 ID。"""
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
+    return f"feedback:{decision_id}:{timestamp}"
+
+
+def build_decision_feedback_summary(
+    *,
+    decision: DecisionLogORM,
+    request: DecisionFeedbackRequest,
+    user_action: str,
+) -> str:
+    """生成可沉淀为 Finance Memory 的用户反馈摘要。"""
+
+    comment = f"备注：{request.comment}" if request.comment else "无备注。"
+    return (
+        f"用户对决策 {decision.decision_id} 反馈为 {request.feedback}；"
+        f"系统建议动作 {decision.suggested_action}，用户最终动作 {user_action}。"
+        f"{comment}"
+    )
+
+
+def serialize_pending_decision(decision: DecisionLogORM) -> JsonDict:
+    """序列化待用户确认的决策。"""
+
+    payload = decision.payload or {}
+    return {
+        "decision_id": decision.decision_id,
+        "owner_id": decision.owner_id,
+        "portfolio_id": decision.portfolio_id,
+        "asset_id": decision.asset_id,
+        "decision_type": decision.decision_type,
+        "suggested_action": decision.suggested_action,
+        "user_action": decision.user_action,
+        "summary": decision.summary,
+        "workflow_run_id": decision.workflow_run_id,
+        "source_recommendation_id": decision.source_recommendation_id,
+        "source_alert_id": decision.source_alert_id,
+        "reason_ids": decision.reason_ids,
+        "risk_ids": decision.risk_ids,
+        "evidence_ids": decision.evidence_ids,
+        "created_at": decision.created_at.isoformat() if decision.created_at else None,
+        "review_status": payload.get("review_status") or decision.user_action,
+        "payload": payload,
+    }
 
 
 @router.get("/memory/assets/{asset_id}/timeline")

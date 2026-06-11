@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -34,6 +34,17 @@ class ChatRequest(BaseModel):
     message: str = Field(..., description="用户消息")
     session_id: str | None = None
     history_limit: int = 20
+
+
+class DecisionFeedbackRequest(BaseModel):
+    """用户对待确认决策的反馈请求。"""
+
+    feedback: Literal["accepted", "rejected", "modified", "deferred"] = Field(
+        ...,
+        description="用户反馈类型",
+    )
+    comment: str | None = Field(default=None, description="用户备注")
+    modified_action: str | None = Field(default=None, description="用户修改后的动作")
 
 
 class ModelProviderUpdateRequest(BaseModel):
