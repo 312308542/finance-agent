@@ -113,5 +113,5 @@ python3 scripts/integration/smoke_hermes_skill_commands.py --mode wsl-bridge
 | T2 工具边界防回归测试 | 已完成 | 先新增 `tests/test_hermes_tool_boundary.py` 观察到缺少 `read_only` 元数据而失败；补 `FinanceTool.read_only=True` 与 `FinanceAgentInterface.list_tools()` 透出后，`.\.venv\Scripts\python.exe -m pytest tests\test_hermes_tool_boundary.py -q` 通过，`scripts\storage\smoke_agent_cli_interface.py` 通过 |
 | T3 冒烟 direct 模式 | 已完成 | `.\.venv\Scripts\python.exe -m pytest tests\test_hermes_smoke_commands.py -q` 通过；`.\.venv\Scripts\python.exe scripts\integration\smoke_hermes_skill_commands.py --mode direct` 通过，覆盖 Workflow/工具清单、模型配置脱敏、图谱健康、Agent 单轮消费、单标的分析和 Markdown 报告读取 |
 | T4 冒烟 wsl-bridge 模式 | 已完成 | `wsl.exe -u root bash -lc "cd /mnt/d/Code/aiAgents/finance-agent && python3 scripts/integration/smoke_hermes_skill_commands.py --mode wsl-bridge"` 通过；PowerShell 桥接统一设置 UTF-8 输出，未发现 CLI 入口乱码问题，无需修改 `src/finance_agent/cli/main.py` |
-| T5 MCP 模板与握手冒烟 | 未开始 | - |
+| T5 MCP 模板与握手冒烟 | 已完成 | 新增 `docs/集成/MCP接入模板.md`；`.\.venv\Scripts\python.exe -m pytest tests\test_hermes_mcp_handshake.py -q` 通过；`.\.venv\Scripts\python.exe scripts\integration\smoke_mcp_handshake.py` 通过，initialize/list_tools 成功，MCP wrapper 工具 20 个，内部事实工具 15 个 |
 | T6 回归与文档同步 | 未开始 | - |
