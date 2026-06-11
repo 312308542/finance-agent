@@ -8,13 +8,16 @@ AKShare 某些东方财富接口在当前网络下会被上游断开普通 reque
 from __future__ import annotations
 
 import math
+import json
 import os
 import re
 import secrets
 import string
+import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from io import StringIO
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -31,7 +34,14 @@ EASTMONEY_HEADERS = {
     ),
 }
 EASTMONEY_COOKIE_ENV = "FINANCE_AGENT_EASTMONEY_COOKIE"
+EASTMONEY_COOKIE_FILE_ENV = "FINANCE_AGENT_EASTMONEY_COOKIE_FILE"
+EASTMONEY_COOKIE_AUTO_REFRESH_ENV = "FINANCE_AGENT_EASTMONEY_COOKIE_AUTO_REFRESH"
+EASTMONEY_COOKIE_MAX_AGE_SECONDS_ENV = "FINANCE_AGENT_EASTMONEY_COOKIE_MAX_AGE_SECONDS"
+DEFAULT_EASTMONEY_COOKIE_FILE = Path("runtime/secrets/eastmoney_cookie.json")
+DEFAULT_EASTMONEY_COOKIE_MAX_AGE_SECONDS = 12 * 60 * 60
 _SYNTHETIC_EASTMONEY_COOKIE: str | None = None
+_EASTMONEY_COOKIE_REFRESH_LOCK = threading.Lock()
+_EASTMONEY_COOKIE_REFRESH_GENERATION = 0
 
 
 def eastmoney_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -47,10 +57,211 @@ def eastmoney_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
 def _eastmoney_cookie() -> str:
     """读取用户配置的 Cookie；未配置时生成匿名浏览器 Cookie。"""
 
+    global _EASTMONEY_COOKIE_REFRESH_GENERATION
+
     configured_cookie = os.getenv(EASTMONEY_COOKIE_ENV, "").strip()
     if configured_cookie:
         return configured_cookie
+    ensure_eastmoney_cookie()
+    file_cookie = _eastmoney_cookie_from_file()
+    if file_cookie:
+        return file_cookie
     return _synthetic_eastmoney_cookie()
+
+
+def _eastmoney_cookie_from_file() -> str | None:
+    """从本地 secret 文件读取东方财富 Cookie。
+
+    文件可以是 JSON：{"cookie": "..."}，也可以是纯 Cookie 字符串。这个文件只用于本机
+    运行态，不应提交到版本库。
+    """
+
+    cookie_path = Path(os.getenv(EASTMONEY_COOKIE_FILE_ENV, "") or DEFAULT_EASTMONEY_COOKIE_FILE)
+    if not cookie_path.exists():
+        return None
+    raw_text = cookie_path.read_text(encoding="utf-8").strip()
+    if not raw_text:
+        return None
+    if raw_text.startswith("{"):
+        try:
+            payload = json.loads(raw_text)
+        except json.JSONDecodeError:
+            return None
+        cookie = str(payload.get("cookie") or "").strip()
+        return cookie or None
+    return raw_text
+
+
+def eastmoney_cookie_status() -> dict[str, Any]:
+    """返回东方财富 Cookie 的来源和可用性，供任务监控或诊断脚本展示。"""
+
+    configured_cookie = os.getenv(EASTMONEY_COOKIE_ENV, "").strip()
+    if configured_cookie:
+        return {"available": True, "source": "env", "cookie_length": len(configured_cookie)}
+    file_cookie = _eastmoney_cookie_from_file()
+    if file_cookie:
+        return {"available": True, "source": "file", "cookie_length": len(file_cookie)}
+    return {"available": True, "source": "synthetic", "cookie_length": len(_synthetic_eastmoney_cookie())}
+
+
+def ensure_eastmoney_cookie(*, force: bool = False) -> dict[str, Any]:
+    """确保本地有可复用的东方财富 Cookie。
+
+    环境变量 Cookie 永远优先，不会被自动刷新覆盖。未配置环境变量时，若本地 Cookie 文件
+    缺失或超过最大年龄，则尝试用 Playwright 自动刷新。刷新失败不会阻断采集，调用方仍可
+    退回合成 Cookie 或其他数据源。
+    """
+
+    configured_cookie = os.getenv(EASTMONEY_COOKIE_ENV, "").strip()
+    if configured_cookie:
+        return {"available": True, "source": "env", "refreshed": False}
+    cookie_path = _eastmoney_cookie_file_path()
+    max_age_seconds = _eastmoney_cookie_max_age_seconds()
+    if not force and cookie_path.exists() and _cookie_file_is_fresh(cookie_path, max_age_seconds):
+        return {"available": True, "source": "file", "refreshed": False}
+    if not _eastmoney_auto_refresh_enabled():
+        return {
+            "available": bool(_eastmoney_cookie_from_file()),
+            "source": "file" if _eastmoney_cookie_from_file() else "synthetic",
+            "refreshed": False,
+            "auto_refresh": False,
+        }
+    global _EASTMONEY_COOKIE_REFRESH_GENERATION
+
+    observed_refresh_generation = _EASTMONEY_COOKIE_REFRESH_GENERATION
+    with _EASTMONEY_COOKIE_REFRESH_LOCK:
+        if cookie_path.exists() and _cookie_file_is_fresh(cookie_path, max_age_seconds):
+            if not force or _EASTMONEY_COOKIE_REFRESH_GENERATION != observed_refresh_generation:
+                return {
+                    "available": True,
+                    "source": "file",
+                    "refreshed": False,
+                    "singleflight": force,
+                }
+        if force and _EASTMONEY_COOKIE_REFRESH_GENERATION != observed_refresh_generation:
+            if _eastmoney_cookie_from_file():
+                return {
+                    "available": True,
+                    "source": "file",
+                    "refreshed": False,
+                    "singleflight": True,
+                }
+        try:
+            payload = refresh_eastmoney_cookie_file(output_path=cookie_path)
+        except Exception as exc:  # noqa: BLE001 - 自动保活失败时不能阻断采集兜底
+            return {
+                "available": bool(_eastmoney_cookie_from_file()),
+                "source": "file" if _eastmoney_cookie_from_file() else "synthetic",
+                "refreshed": False,
+                "error_message": str(exc),
+            }
+        _EASTMONEY_COOKIE_REFRESH_GENERATION += 1
+        return {
+            "available": True,
+            "source": "file",
+            "refreshed": True,
+            "cookie_count": payload.get("cookie_count"),
+        }
+
+def refresh_eastmoney_cookie_file(
+    *,
+    output_path: Path | None = None,
+    headed: bool = False,
+    timeout_ms: int = 45_000,
+) -> dict[str, Any]:
+    """使用浏览器刷新东方财富 Cookie 并写入本地 secret 文件。"""
+
+    payload = collect_eastmoney_cookie(headed=headed, timeout_ms=timeout_ms)
+    target = output_path or _eastmoney_cookie_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def collect_eastmoney_cookie(*, headed: bool = False, timeout_ms: int = 45_000) -> dict[str, Any]:
+    """打开东方财富页面并导出匿名访问 Cookie。"""
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:  # pragma: no cover - 依赖由运行环境决定
+        raise RuntimeError("当前环境缺少 playwright，无法自动刷新东方财富 Cookie") from exc
+
+    with sync_playwright() as playwright:
+        browser = _launch_cookie_browser(playwright, headed=headed)
+        context = browser.new_context(
+            user_agent=EASTMONEY_HEADERS["User-Agent"],
+            locale="zh-CN",
+        )
+        page = context.new_page()
+        page.goto("https://quote.eastmoney.com/", wait_until="domcontentloaded", timeout=timeout_ms)
+        page.wait_for_timeout(1500)
+        page.goto(
+            "https://quote.eastmoney.com/sh603507.html",
+            wait_until="domcontentloaded",
+            timeout=timeout_ms,
+        )
+        page.wait_for_timeout(1500)
+        cookies = context.cookies(
+            [
+                "https://quote.eastmoney.com/",
+                "https://push2.eastmoney.com/",
+                "https://push2his.eastmoney.com/",
+            ]
+        )
+        browser.close()
+
+    cookie_items = [
+        f"{cookie['name']}={cookie['value']}"
+        for cookie in cookies
+        if "eastmoney.com" in str(cookie.get("domain", ""))
+    ]
+    cookie = "; ".join(dict.fromkeys(cookie_items))
+    if not cookie:
+        raise RuntimeError("未能从浏览器会话中提取东方财富 Cookie")
+    return {
+        "cookie": cookie,
+        "cookie_count": len(cookie_items),
+        "updated_at": datetime.now(tz=UTC).isoformat(),
+        "source": "playwright",
+        "domains": sorted({str(item.get("domain")) for item in cookies}),
+    }
+
+
+def _eastmoney_cookie_file_path() -> Path:
+    return Path(os.getenv(EASTMONEY_COOKIE_FILE_ENV, "") or DEFAULT_EASTMONEY_COOKIE_FILE)
+
+
+def _eastmoney_cookie_max_age_seconds() -> int:
+    raw_value = os.getenv(EASTMONEY_COOKIE_MAX_AGE_SECONDS_ENV, "").strip()
+    if not raw_value:
+        return DEFAULT_EASTMONEY_COOKIE_MAX_AGE_SECONDS
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        return DEFAULT_EASTMONEY_COOKIE_MAX_AGE_SECONDS
+
+
+def _cookie_file_is_fresh(cookie_path: Path, max_age_seconds: int) -> bool:
+    if max_age_seconds <= 0:
+        return False
+    age_seconds = time.time() - cookie_path.stat().st_mtime
+    return age_seconds <= max_age_seconds
+
+
+def _eastmoney_auto_refresh_enabled() -> bool:
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return False
+    value = os.getenv(EASTMONEY_COOKIE_AUTO_REFRESH_ENV, "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _launch_cookie_browser(playwright: Any, *, headed: bool) -> Any:
+    for channel in ["msedge", "chrome"]:
+        try:
+            return playwright.chromium.launch(channel=channel, headless=not headed)
+        except Exception:
+            continue
+    return playwright.chromium.launch(headless=not headed)
 
 
 def _synthetic_eastmoney_cookie() -> str:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from hashlib import sha1
 from typing import Any
@@ -15,6 +15,7 @@ from finance_agent.data.models import (
     CryptoDerivativeSnapshotData,
     EventRecordData,
     EvidenceData,
+    FundNavSnapshotData,
     FundamentalSnapshotData,
     MarketBarData,
     RiskFindingData,
@@ -130,6 +131,8 @@ def normalize_ashare_hist(
     timeframe: str,
     source: str,
     adjustment: str,
+    is_closed: bool = True,
+    status: str = "available",
 ) -> list[MarketBarData]:
     """归一化 AKShare A 股历史行情。"""
 
@@ -151,7 +154,8 @@ def normalize_ashare_hist(
                 amount=to_decimal(row.get("成交额")),
                 source=source,
                 adjustment=adjustment,
-                is_closed=True,
+                is_closed=is_closed,
+                status=status,
             )
         )
     return bars
@@ -164,6 +168,8 @@ def normalize_ashare_hist_tx(
     timeframe: str,
     source: str,
     adjustment: str,
+    is_closed: bool = True,
+    status: str = "available",
 ) -> list[MarketBarData]:
     """归一化腾讯 A 股历史行情。
 
@@ -192,11 +198,175 @@ def normalize_ashare_hist_tx(
                 amount=amount,
                 source=source,
                 adjustment=adjustment,
-                is_closed=True,
-                status="partial",
+                is_closed=is_closed,
+                status=status,
             )
         )
     return bars
+
+
+def normalize_fund_etf_spot_em(df: pd.DataFrame, *, limit: int | None = None) -> list[AssetData]:
+    """归一化东方财富 ETF 实时列表。"""
+
+    return _normalize_fund_spot_assets(df, asset_type="etf", limit=limit)
+
+
+def normalize_fund_lof_spot_em(df: pd.DataFrame, *, limit: int | None = None) -> list[AssetData]:
+    """归一化东方财富 LOF 实时列表。"""
+
+    return _normalize_fund_spot_assets(df, asset_type="lof", limit=limit)
+
+
+def _is_exchange_traded_fund_row(row: dict[str, Any]) -> bool:
+    """识别被开放式基金接口混入的场内 ETF/LOF 行。"""
+
+    name = str(_first_present(row, ["基金简称", "基金名称", "名称", "fund_name"]) or "").strip().upper()
+    purchase_status = str(_first_present(row, ["申购状态", "purchase_status"]) or "").strip()
+    redeem_status = str(_first_present(row, ["赎回状态", "redeem_status"]) or "").strip()
+    if "ETF" in name or "LOF" in name:
+        return True
+    return "场内交易" in purchase_status or "场内交易" in redeem_status
+
+
+def normalize_fund_open_fund_daily_em(
+    df: pd.DataFrame,
+    *,
+    limit: int | None = None,
+) -> list[AssetData]:
+    """归一化开放式基金日净值列表为资产身份。"""
+
+    assets: list[AssetData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        symbol = str(
+            _first_present(
+                row,
+                ["基金代码", "代码", "基金编号", "fund_code"],
+            )
+            or ""
+        ).strip()
+        if not symbol:
+            continue
+        if _is_exchange_traded_fund_row(row):
+            continue
+        name = str(
+            _first_present(
+                row,
+                ["基金简称", "基金名称", "名称", "fund_name"],
+            )
+            or symbol
+        ).strip()
+        assets.append(
+            AssetData(
+                asset_id=f"fund:open:{symbol}",
+                symbol=symbol,
+                name=name,
+                market="fund",
+                asset_type="open_fund",
+                exchange=None,
+                currency="CNY",
+                tradable=True,
+                payload={"raw": row},
+            )
+        )
+    return assets
+
+
+def normalize_fund_etf_hist_em(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    asset_type: str = "etf",
+    timeframe: str,
+    source: str,
+    is_closed: bool = True,
+    status: str = "available",
+) -> list[MarketBarData]:
+    """归一化 ETF 历史日 K。"""
+
+    return _normalize_fund_hist(
+        df,
+        symbol=symbol,
+        asset_type=asset_type,
+        timeframe=timeframe,
+        source=source,
+        is_closed=is_closed,
+        status=status,
+    )
+
+
+def normalize_fund_lof_hist_em(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    timeframe: str,
+    source: str,
+    is_closed: bool = True,
+    status: str = "available",
+) -> list[MarketBarData]:
+    """归一化 LOF 历史日 K。"""
+
+    return _normalize_fund_hist(
+        df,
+        symbol=symbol,
+        asset_type="lof",
+        timeframe=timeframe,
+        source=source,
+        is_closed=is_closed,
+        status=status,
+    )
+
+
+def normalize_fund_open_nav_em(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    source: str,
+    limit: int | None = None,
+) -> list[FundNavSnapshotData]:
+    """归一化开放式基金历史净值。"""
+
+    snapshots: list[FundNavSnapshotData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        nav_date = parse_fund_nav_date(
+            _first_present(
+                row,
+                ["净值日期", "日期", "净值时间", "trade_date"],
+            )
+        )
+        if nav_date is None:
+            continue
+        snapshots.append(
+            FundNavSnapshotData(
+                snapshot_id=stable_id("fund_nav", source, symbol, nav_date.isoformat()),
+                asset_id=f"fund:open:{symbol}",
+                symbol=symbol,
+                market="fund",
+                source=source,
+                nav_date=nav_date,
+                unit_nav=_first_decimal(
+                    row,
+                    ["单位净值", "最新净值", "净值"],
+                ),
+                accumulated_nav=_first_decimal(
+                    row,
+                    ["累计净值", "累计单位净值"],
+                ),
+                daily_return=_normalize_percent_decimal(
+                    _first_present(row, ["日增长率", "日涨跌幅", "涨跌幅"])
+                ),
+                purchase_status=_normalize_optional_text(
+                    _first_present(row, ["申购状态", "申购", "购买状态"])
+                ),
+                redeem_status=_normalize_optional_text(
+                    _first_present(row, ["赎回状态", "赎回", "卖出状态"])
+                ),
+                status="available",
+                payload={"raw": row},
+            )
+        )
+    return snapshots
 
 
 def normalize_ashare_board_members(
@@ -296,7 +466,7 @@ def normalize_ashare_fund_flow_rank(
     rank_total = len(rows.index)
     for index, row in enumerate(rows.to_dict("records"), start=1):
         symbol = normalize_ashare_symbol(str(_first_present(row, ["代码", "股票代码"]) or ""))
-        if not symbol or len(symbol) != 6 or not symbol.isdigit():
+        if not is_main_board_ashare_stock_symbol(symbol):
             continue
         main_net_inflow = _first_decimal(
             row,
@@ -1334,6 +1504,124 @@ def stable_id(*parts: Any) -> str:
     return f"{prefix}:{digest}"
 
 
+def _normalize_fund_spot_assets(
+    df: pd.DataFrame,
+    *,
+    asset_type: str,
+    limit: int | None = None,
+) -> list[AssetData]:
+    """归一化场内基金实时列表。"""
+
+    assets: list[AssetData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        symbol = str(_first_present(row, ["代码", "基金代码", "symbol"]) or "").strip()
+        if not symbol:
+            continue
+        name = str(_first_present(row, ["名称", "基金名称", "name"]) or symbol).strip()
+        assets.append(
+            AssetData(
+                asset_id=f"fund:{asset_type}:{symbol}",
+                symbol=symbol,
+                name=name,
+                market="fund",
+                asset_type=asset_type,
+                exchange=infer_fund_exchange(symbol),
+                currency="CNY",
+                tradable=True,
+                payload={"raw": row},
+            )
+        )
+    return assets
+
+
+def _normalize_fund_hist(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    asset_type: str,
+    timeframe: str,
+    source: str,
+    is_closed: bool,
+    status: str,
+) -> list[MarketBarData]:
+    """归一化场内基金历史 K 线。"""
+
+    bars: list[MarketBarData] = []
+    for row in df.to_dict("records"):
+        timestamp_value = _first_present(row, ["日期", "date", "净值日期"])
+        if timestamp_value is None:
+            continue
+        timestamp = pd.Timestamp(timestamp_value).to_pydatetime().replace(tzinfo=UTC)
+        bars.append(
+            MarketBarData(
+                asset_id=f"fund:{asset_type}:{symbol}",
+                symbol=symbol,
+                market="fund",
+                timeframe=timeframe,
+                timestamp=timestamp,
+                open_price=to_decimal(_first_present(row, ["开盘", "open"])),
+                high=to_decimal(_first_present(row, ["最高", "high"])),
+                low=to_decimal(_first_present(row, ["最低", "low"])),
+                close=to_decimal(_first_present(row, ["收盘", "close"])),
+                volume=to_decimal(_first_present(row, ["成交量", "volume"])),
+                amount=nullable_decimal(_first_present(row, ["成交额", "amount"])),
+                source=source,
+                adjustment="",
+                is_closed=is_closed,
+                status=status,
+            )
+        )
+    return bars
+
+
+def infer_fund_exchange(symbol: str) -> str:
+    """根据基金代码推断交易所。"""
+
+    if symbol.startswith(("5", "6")):
+        return "SSE"
+    if symbol.startswith(("0", "1", "3", "4")):
+        return "SZSE"
+    return "UNKNOWN"
+
+
+def parse_fund_nav_date(value: Any) -> date | None:
+    """把基金净值日期解析为 date。"""
+
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return pd.Timestamp(text).date()
+    except Exception:
+        return None
+
+
+def _normalize_percent_decimal(value: Any) -> Decimal | None:
+    """把 1.23% 或 1.23 转成 0.0123。"""
+
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip().replace("%", "")
+    if not text or text in {"-", "--"}:
+        return None
+    try:
+        return Decimal(text) / Decimal("100")
+    except Exception:
+        return None
+
+
+def _normalize_optional_text(value: Any) -> str | None:
+    """把可选文本字段转换为空或标准字符串。"""
+
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def parse_ashare_datetime(value: Any) -> datetime | None:
     """解析 AKShare 常见日期时间字段。"""
 
@@ -1420,6 +1708,15 @@ def is_standard_ashare_stock_symbol(symbol: str) -> bool:
     if normalized.startswith(non_stock_prefixes):
         return False
     return normalized.startswith(("0", "3", "4", "6", "8", "920"))
+
+
+def is_main_board_ashare_stock_symbol(symbol: str) -> bool:
+    """判断是否为用户可交易范围内的 A 股主板股票代码。"""
+
+    normalized = normalize_ashare_symbol(symbol)
+    if not is_standard_ashare_stock_symbol(normalized):
+        return False
+    return normalized.startswith(("000", "001", "002", "003", "600", "601", "603", "605"))
 
 
 def timeframe_to_timedelta(timeframe: str) -> timedelta | None:

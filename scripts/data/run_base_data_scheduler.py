@@ -87,6 +87,7 @@ def main() -> None:
         default_collection_args_func=default_collection_args,
         status_file=args.status_file,
         event_log_file=args.event_log_file,
+        scheduler_config_file=Path(args.config) if args.config else None,
     )
 
     if args.run_once:

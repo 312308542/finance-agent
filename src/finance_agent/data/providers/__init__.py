@@ -9,6 +9,7 @@ from finance_agent.data.providers.akshare_p2_provider import (
     AshareFundamentalProvider,
     AshareValuationProvider,
 )
+from finance_agent.data.providers.akshare_fund_provider import AkshareFundProvider
 from finance_agent.data.providers.akshare_provider import AkshareProvider
 from finance_agent.data.providers.akshare_risk_sentiment_provider import (
     AshareRiskProvider,
@@ -23,6 +24,7 @@ from finance_agent.data.providers.eastmoney_article_fetcher import (
 
 __all__ = [
     "AkshareProvider",
+    "AkshareFundProvider",
     "ArticleFetchResult",
     "AshareCapitalFlowProvider",
     "AshareEventProvider",

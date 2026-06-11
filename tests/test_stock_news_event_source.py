@@ -69,12 +69,40 @@ class _FakeEvents:
     def __init__(self) -> None:
         self.events: list[dict[str, object]] = []
         self.evidence: list[dict[str, object]] = []
+        self.event_article_updates: list[dict[str, object]] = []
+        self.evidence_article_updates: list[dict[str, object]] = []
+        self.event_article_batches: list[list[dict[str, object]]] = []
+        self.evidence_article_batches: list[list[dict[str, object]]] = []
 
     def upsert_event(self, **kwargs: object) -> None:
         self.events.append(kwargs)
 
     def upsert_evidence(self, **kwargs: object) -> None:
         self.evidence.append(kwargs)
+
+    def update_event_article_payload(self, *, event_id: str, article_payload: dict) -> None:
+        raise AssertionError("正文回填不应逐条 update event_records")
+
+    def update_evidence_article_payloads_by_event(
+        self,
+        *,
+        event_id: str,
+        article_payload: dict,
+    ) -> int:
+        raise AssertionError("正文回填不应逐条 update evidence")
+
+    def update_event_article_payloads(self, rows: list[dict[str, object]]) -> int:
+        self.event_article_batches.append(rows)
+        self.event_article_updates.extend(rows)
+        return len(rows)
+
+    def update_evidence_article_payloads_by_events(
+        self,
+        rows: list[dict[str, object]],
+    ) -> int:
+        self.evidence_article_batches.append(rows)
+        self.evidence_article_updates.extend(rows)
+        return len(rows)
 
 
 class _FakeArticleFetcher:
@@ -145,6 +173,26 @@ def test_collect_stock_news_enriches_article_full_text() -> None:
     assert raw_payload["events"][0]["payload"]["article"]["full_text"] == article.full_text
 
 
+def test_collect_stock_news_can_skip_inline_article_fetch() -> None:
+    """调度任务可跳过同步原文抓取，让新闻列表先快速入库。"""
+
+    fetcher = _FakeArticleFetcher(RuntimeError("should not fetch"))
+    collector = _build_collector(article_fetcher=fetcher)
+
+    AshareP1Collector.collect_stock_news(
+        collector,
+        symbol="000001",
+        asset_name="平安银行",
+        enrich_articles=False,
+    )
+
+    assert fetcher.urls == []
+    event_payload = collector.events.events[0]["payload"]
+    raw_payload = collector.raw_records.calls[0]["response_payload"]
+    assert "article" not in event_payload
+    assert "article_fetch" not in raw_payload
+
+
 def test_collect_stock_news_records_article_fetch_error() -> None:
     """二次抓取失败时，不影响新闻事件入库，并记录失败原因。"""
 
@@ -157,3 +205,42 @@ def test_collect_stock_news_records_article_fetch_error() -> None:
     assert event_payload["article"]["status"] == "error"
     assert event_payload["article"]["error_message"] == "timeout"
     assert evidence_payload["article"]["status"] == "error"
+
+
+def test_enrich_existing_stock_news_article_updates_event_and_evidence_payload() -> None:
+    """独立正文补抓任务应回填已入库事件和证据的 article payload。"""
+
+    fetched_at = datetime(2026, 6, 3, 1, 2, 3, tzinfo=UTC)
+    article = ArticleFetchResult(
+        url="http://finance.eastmoney.com/a/demo.html",
+        status="available",
+        fetched_at=fetched_at,
+        title="平安银行新闻",
+        full_text="完整正文，包含比 AKShare 摘要更长的事件背景和影响分析。",
+        text_length=30,
+        html_length=1024,
+    )
+    collector = _build_collector(article_fetcher=_FakeArticleFetcher(article))
+
+    result = AshareP1Collector.enrich_existing_stock_news_article(
+        collector,
+        event_id="event:news:000001:1",
+        url="http://finance.eastmoney.com/a/demo.html",
+        asset_id="ashare:000001",
+        symbol="000001",
+        title="平安银行新闻",
+        source_excerpt="接口摘要",
+    )
+
+    assert result.result.status == "available"
+    article_payload = collector.events.event_article_updates[0]["article_payload"]
+    assert article_payload["full_text"] == article.full_text
+    assert article_payload["source_excerpt"] == "接口摘要"
+    assert collector.events.evidence_article_updates == [
+        {
+            "event_id": "event:news:000001:1",
+            "article_payload": article_payload,
+        }
+    ]
+    raw_payload = collector.raw_records.calls[0]["response_payload"]
+    assert raw_payload["article_fetch"]["available"] == 1

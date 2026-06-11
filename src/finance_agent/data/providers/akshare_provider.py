@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from datetime import UTC, date, datetime
 from typing import Any
 
@@ -17,9 +19,14 @@ from finance_agent.data.normalizers import (
     normalize_ashare_hist_tx,
     normalize_ashare_spot,
     normalize_ashare_spot_tx,
-    with_ashare_exchange_prefix,
+)
+from finance_agent.data.providers.ashare_kline_sources import (
+    fetch_eastmoney_kline_direct,
+    fetch_tencent_kline_direct,
 )
 from finance_agent.data.providers.eastmoney_curl import eastmoney_headers
+
+KlineSourceGate = Callable[[str, Callable[[], DataFrame]], DataFrame]
 
 
 class AkshareProvider:
@@ -101,89 +108,136 @@ class AkshareProvider:
         end: str | None = None,
         limit: int | None = None,
         adjust: str = "qfq",
+        is_closed: bool = True,
+        status: str = "available",
+        source_gate: KlineSourceGate | None = None,
     ) -> MarketBarsResult:
         """获取 A 股历史 K 线。"""
 
         collected_at = datetime.now(tz=UTC)
-        primary_source = "akshare:stock_zh_a_hist_tx"
+        primary_source = "eastmoney:direct:kline"
         fallback_trace: list[dict[str, str]] = []
-        try:
-            df = self._fetch_ohlcv_tencent(symbol=symbol, start=start, end=end, adjust=adjust)
-            if limit:
-                df = df.tail(limit)
-            bars = normalize_ashare_hist_tx(
-                df,
-                symbol=symbol,
-                timeframe=timeframe,
-                source=primary_source,
-                adjustment=adjust,
-            )
-            actual_source = primary_source
-        except Exception as exc:
-            fallback_trace.append({"source": primary_source, "error_message": str(exc)})
-            try:
-                df = self._fetch_ohlcv_eastmoney(
+        source_attempts: list[dict[str, Any]] = []
+        bars = []
+        actual_source = primary_source
+        last_error_message: str | None = None
+        source_specs = [
+            {
+                "source": primary_source,
+                "rate_key": "eastmoney_kline",
+                "complexity": "direct-cookie",
+                "loader": lambda: self._fetch_ohlcv_eastmoney_curl_cffi(
                     symbol=symbol,
                     timeframe=timeframe,
                     start=start,
                     end=end,
                     adjust=adjust,
-                )
-                if limit:
-                    df = df.tail(limit)
-                bars = normalize_ashare_hist(
-                    df,
+                ),
+            },
+            {
+                "source": "tencent:direct:kline",
+                "rate_key": "tencent_kline",
+                "complexity": "direct-windowed",
+                "loader": lambda: self._fetch_ohlcv_tencent(symbol=symbol, start=start, end=end, adjust=adjust),
+            },
+            {
+                "source": "akshare:stock_zh_a_hist",
+                "rate_key": "stock_zh_a_hist",
+                "complexity": "akshare-wrapper",
+                "loader": lambda: self._fetch_ohlcv_eastmoney(
                     symbol=symbol,
                     timeframe=timeframe,
-                    source="akshare:stock_zh_a_hist",
-                    adjustment=adjust,
+                    start=start,
+                    end=end,
+                    adjust=adjust,
+                ),
+            },
+        ]
+
+        for spec in source_specs:
+            source = str(spec["source"])
+            rate_key = str(spec["rate_key"])
+            complexity = str(spec["complexity"])
+            loader = spec["loader"]
+            started = time.perf_counter()
+            try:
+                df = source_gate(rate_key, loader) if source_gate else loader()
+                row_count = len(df.index)
+                source_attempts.append(
+                    self._source_attempt(
+                        source=source,
+                        rate_key=rate_key,
+                        status="ok" if row_count else "empty",
+                        started=started,
+                        row_count=row_count,
+                        complexity=complexity,
+                    )
                 )
-                actual_source = "akshare:stock_zh_a_hist"
-            except Exception as fallback_exc:
-                fallback_trace.append(
-                    {
-                        "source": "akshare:stock_zh_a_hist",
-                        "error_message": str(fallback_exc),
-                    }
-                )
-                try:
-                    df = self._fetch_ohlcv_eastmoney_curl_cffi(
+                if row_count == 0:
+                    fallback_trace.append(
+                        {"source": source, "error_message": f"{source} returned 0 rows"}
+                    )
+                    actual_source = source
+                    continue
+                if limit:
+                    df = df.tail(limit)
+                if source == "tencent:direct:kline":
+                    bars = normalize_ashare_hist_tx(
+                        df,
                         symbol=symbol,
                         timeframe=timeframe,
-                        start=start,
-                        end=end,
-                        adjust=adjust,
+                        source=source,
+                        adjustment=adjust,
+                        is_closed=is_closed,
+                        status=status,
                     )
-                    if limit:
-                        df = df.tail(limit)
+                else:
                     bars = normalize_ashare_hist(
                         df,
                         symbol=symbol,
                         timeframe=timeframe,
-                        source="eastmoney:curl_cffi:kline",
+                        source=source,
                         adjustment=adjust,
+                        is_closed=is_closed,
+                        status=status,
                     )
-                    actual_source = "eastmoney:curl_cffi:kline"
-                except Exception as curl_exc:
-                    fallback_trace.append(
-                        {
-                            "source": "eastmoney:curl_cffi:kline",
-                            "error_message": str(curl_exc),
-                        }
-                    )
-                    return MarketBarsResult(
-                        provider_name=self.provider_name,
+                actual_source = source
+                break
+            except Exception as exc:
+                last_error_message = str(exc)
+                source_attempts.append(
+                    self._source_attempt(
+                        source=source,
+                        rate_key=rate_key,
                         status="error",
-                        collected_at=collected_at,
-                        error_message=str(curl_exc),
-                        payload={
-                            "symbol": symbol,
-                            "timeframe": timeframe,
-                            "adjust": adjust,
-                            "primary_source": primary_source,
-                            "fallback_trace": fallback_trace,
-                        },
+                        started=started,
+                        error_message=str(exc),
+                        complexity=complexity,
                     )
+                )
+                fallback_trace.append({"source": source, "error_message": str(exc)})
+
+        has_empty_attempt = any(item.get("status") == "empty" for item in source_attempts)
+        if (
+            not bars
+            and source_attempts
+            and source_attempts[-1]["status"] == "error"
+            and not has_empty_attempt
+        ):
+            return MarketBarsResult(
+                provider_name=self.provider_name,
+                status="error",
+                collected_at=collected_at,
+                error_message=last_error_message,
+                payload={
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "adjust": adjust,
+                    "primary_source": primary_source,
+                    "fallback_trace": fallback_trace,
+                    "source_attempts": source_attempts,
+                },
+            )
         return MarketBarsResult(
             provider_name=self.provider_name,
             status="available" if bars else "unavailable",
@@ -197,8 +251,34 @@ class AkshareProvider:
                 "actual_source": actual_source,
                 "fallback_used": actual_source != primary_source,
                 "fallback_trace": fallback_trace,
+                "source_attempts": source_attempts,
             },
         )
+
+    @staticmethod
+    def _source_attempt(
+        *,
+        source: str,
+        rate_key: str,
+        status: str,
+        started: float,
+        row_count: int = 0,
+        error_message: str | None = None,
+        complexity: str,
+    ) -> dict[str, Any]:
+        """记录单个 K 线源的尝试结果，用于后续稳定性和响应时间对比。"""
+
+        attempt: dict[str, Any] = {
+            "source": source,
+            "rate_key": rate_key,
+            "status": status,
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "row_count": row_count,
+            "complexity": complexity,
+        }
+        if error_message:
+            attempt["error_message"] = error_message
+        return attempt
 
     @staticmethod
     def _to_ak_period(timeframe: str) -> str:
@@ -414,10 +494,10 @@ class AkshareProvider:
     ) -> DataFrame:
         """从腾讯接口获取 A 股历史日线。"""
 
-        return ak.stock_zh_a_hist_tx(
-            symbol=with_ashare_exchange_prefix(symbol),
-            start_date=start or "20000101",
-            end_date=end or "20991231",
+        return fetch_tencent_kline_direct(
+            symbol=symbol,
+            start=start,
+            end=end,
             adjust=adjust,
             timeout=self.request_timeout_seconds,
         )
@@ -438,80 +518,14 @@ class AkshareProvider:
         不修改 `.venv` 里的 AKShare 源码。
         """
 
-        market_code = 1 if symbol.startswith(("6", "9")) else 0
-        adjust_dict = {"qfq": "1", "hfq": "2", "": "0"}
-        period_dict = {"daily": "101", "weekly": "102", "monthly": "103"}
-        period = self._to_ak_period(timeframe)
-        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-        params = {
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
-            "ut": "7eea3edcaed734bea9cbfc24409ed989",
-            "klt": period_dict[period],
-            "fqt": adjust_dict[adjust],
-            "secid": f"{market_code}.{symbol}",
-            "beg": start or "20000101",
-            "end": end or "20991231",
-        }
-        response = curl_requests.get(
-            url,
-            params=params,
+        return fetch_eastmoney_kline_direct(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+            adjust=adjust,
             timeout=self.request_timeout_seconds,
-            impersonate="chrome120",
-            headers=eastmoney_headers(),
         )
-        response.raise_for_status()
-        data_json = response.json()
-        klines = (data_json.get("data") or {}).get("klines") or []
-        if not klines:
-            return pd.DataFrame()
-        temp_df = pd.DataFrame([item.split(",") for item in klines])
-        temp_df["股票代码"] = symbol
-        temp_df.columns = [
-            "日期",
-            "开盘",
-            "收盘",
-            "最高",
-            "最低",
-            "成交量",
-            "成交额",
-            "振幅",
-            "涨跌幅",
-            "涨跌额",
-            "换手率",
-            "股票代码",
-        ]
-        numeric_columns = [
-            "开盘",
-            "收盘",
-            "最高",
-            "最低",
-            "成交量",
-            "成交额",
-            "振幅",
-            "涨跌幅",
-            "涨跌额",
-            "换手率",
-        ]
-        temp_df["日期"] = pd.to_datetime(temp_df["日期"], errors="coerce").dt.date
-        for column in numeric_columns:
-            temp_df[column] = pd.to_numeric(temp_df[column], errors="coerce")
-        return temp_df[
-            [
-                "日期",
-                "股票代码",
-                "开盘",
-                "收盘",
-                "最高",
-                "最低",
-                "成交量",
-                "成交额",
-                "振幅",
-                "涨跌幅",
-                "涨跌额",
-                "换手率",
-            ]
-        ]
 
     def fetch_trade_dates(self, *, start_date: date, end_date: date) -> list[date]:
         """获取 A 股交易日历，用于 K 线缺口补采和调度对齐。"""
