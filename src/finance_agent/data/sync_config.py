@@ -16,6 +16,10 @@ JsonDict = dict[str, Any]
 DEFAULT_SCHEDULER_JOB_TIMEOUT_SECONDS = 6 * 60 * 60
 DEFAULT_SCHEDULER_HEALTH_STALE_SECONDS = 300
 DEFAULT_SCHEDULER_MAX_CONCURRENT_JOBS = 4
+ASHARE_BOOTSTRAP_LOOKBACK = "10y"
+ASHARE_BOOTSTRAP_BATCH_SIZE = 50
+FUND_BOOTSTRAP_LOOKBACK = "10y"
+FUND_BOOTSTRAP_BATCH_SIZE = 50
 
 DataSyncPreset = Literal[
     "personal-comprehensive",
@@ -24,7 +28,7 @@ DataSyncPreset = Literal[
     "lightweight",
 ]
 
-MARKETS = {"ashare", "crypto_spot", "crypto_future"}
+MARKETS = {"ashare", "fund", "crypto_spot", "crypto_future"}
 PRESETS = {
     "personal-comprehensive",
     "ashare-comprehensive",
@@ -63,6 +67,15 @@ CRYPTO_DATA_PACKAGES = {
     "data_quality": "数据质量检查",
 }
 
+FUND_UNIVERSE_SOURCES = {
+    "all_funds": "基金全量列表",
+}
+
+FUND_DATA_PACKAGES = {
+    "market_bars": "场内基金日 K",
+    "fund_nav": "场外基金净值",
+}
+
 ASHARE_TIMELY_EVENT_INTERVAL_SECONDS = 5 * 60
 DEFAULT_SYMBOL_FETCH_MAX_WORKERS = 4
 
@@ -98,6 +111,7 @@ class DataSyncConfig:
     circuit_cooldown_seconds: int = 900
     loop_idle_seconds: int = 5
     max_concurrent_jobs: int = DEFAULT_SCHEDULER_MAX_CONCURRENT_JOBS
+    rate_policies: JsonDict = field(default_factory=dict)
 
     def to_dict(self) -> JsonDict:
         """转换为可写入 JSON 的字典。"""
@@ -115,13 +129,21 @@ class DataSyncTaskPreview:
     title: str
     interval_seconds: int
     mode: str
+    enabled: bool = True
+    schedule_type: str = "interval"
+    run_at: list[str] = field(default_factory=list)
+    timezone: str | None = None
+    trading_day_policy: str | None = None
+    depends_on: list[str] = field(default_factory=list)
     batch_size: int | None = None
     max_workers: int | None = None
+    max_retries: int | None = None
     lookback: str | None = None
     sources: list[str] = field(default_factory=list)
     data_packages: list[str] = field(default_factory=list)
     manual_symbol_required: bool = False
     notes: list[str] = field(default_factory=list)
+    extra_params: JsonDict = field(default_factory=dict)
 
     def to_dict(self) -> JsonDict:
         """转换为 JSON 字典。"""
@@ -158,6 +180,8 @@ def build_preset_config(
     for market in selected_markets:
         if market == "ashare":
             market_configs[market] = build_ashare_market_config(normalized_preset)
+        elif market == "fund":
+            market_configs[market] = build_fund_market_config(normalized_preset)
         elif market in {"crypto_spot", "crypto_future"}:
             market_configs[market] = build_crypto_market_config(
                 market=market,
@@ -171,6 +195,7 @@ def build_preset_config(
         cache_backend="redis",
         resource_profile="全面但限流友好",
         markets=market_configs,
+        rate_policies=default_source_rate_policies(),
     )
 
 
@@ -208,6 +233,12 @@ def parse_data_sync_config(payload: JsonDict) -> DataSyncConfig:
         market: parse_market_config(market, config)
         for market, config in markets_payload.items()
     }
+    raw_rate_policies = payload.get("rate_policies")
+    rate_policies = (
+        default_source_rate_policies()
+        if raw_rate_policies is None
+        else parse_json_object(raw_rate_policies, field_name="rate_policies")
+    )
     return DataSyncConfig(
         schema_version=str(payload.get("schema_version") or "1.0"),
         preset=str(payload.get("preset") or "custom"),
@@ -228,8 +259,105 @@ def parse_data_sync_config(payload: JsonDict) -> DataSyncConfig:
             payload.get("max_concurrent_jobs"),
             default=DEFAULT_SCHEDULER_MAX_CONCURRENT_JOBS,
         ),
+        rate_policies=rate_policies,
         markets=markets,
     )
+
+
+def default_source_rate_policies() -> JsonDict:
+    """返回基础数据采集的默认数据源限频策略。"""
+
+    return {
+        "stock_zh_a_spot_em": {
+            "max_concurrency": 1,
+            "min_interval_seconds": 30.0,
+            "timeout_seconds": 45,
+        },
+        "eastmoney_kline": {
+            "max_concurrency": 1,
+            "min_interval_seconds": 1.0,
+            "timeout_seconds": 45,
+            "backoff": {
+                "failure_rate_threshold": 0.1,
+                "cooldown_seconds": 900,
+                "max_interval_seconds": 12,
+            },
+        },
+        "tencent_kline": {
+            "max_concurrency": 2,
+            "min_interval_seconds": 0.5,
+            "timeout_seconds": 45,
+            "backoff": {
+                "failure_rate_threshold": 0.1,
+                "cooldown_seconds": 900,
+                "max_interval_seconds": 10,
+            },
+        },
+        "stock_zh_a_hist_tx": {
+            "max_concurrency": 2,
+            "min_interval_seconds": 0.5,
+            "timeout_seconds": 45,
+            "backoff": {
+                "failure_rate_threshold": 0.1,
+                "cooldown_seconds": 900,
+                "max_interval_seconds": 10,
+            },
+        },
+        "stock_zh_a_hist": {
+            "max_concurrency": 1,
+            "min_interval_seconds": 1.0,
+            "timeout_seconds": 60,
+            "backoff": {
+                "failure_rate_threshold": 0.1,
+                "cooldown_seconds": 900,
+                "max_interval_seconds": 12,
+            },
+        },
+        "stock_news_em": {
+            "max_concurrency": 2,
+            "min_interval_seconds": 2.0,
+            "timeout_seconds": 30,
+            "backoff": {
+                "failure_rate_threshold": 0.1,
+                "cooldown_seconds": 900,
+                "max_interval_seconds": 15,
+            },
+        },
+        "stock_news_article": {
+            "max_concurrency": 1,
+            "min_interval_seconds": 5.0,
+            "timeout_seconds": 30,
+            "backoff": {
+                "failure_rate_threshold": 0.1,
+                "cooldown_seconds": 900,
+                "max_interval_seconds": 30,
+            },
+        },
+        "stock_notice_report": {
+            "max_concurrency": 1,
+            "min_interval_seconds": 3.0,
+            "timeout_seconds": 30,
+        },
+        "fundamental_em": {
+            "max_concurrency": 1,
+            "min_interval_seconds": 1.0,
+            "timeout_seconds": 45,
+            "backoff": {
+                "failure_rate_threshold": 0.1,
+                "cooldown_seconds": 900,
+                "max_interval_seconds": 15,
+            },
+        },
+        "ccxt_binance_fetch_ohlcv": {
+            "max_concurrency": 3,
+            "min_interval_seconds": 0.05,
+            "timeout_seconds": 30,
+        },
+        "default": {
+            "max_concurrency": 4,
+            "min_interval_seconds": 0.0,
+        },
+    }
 
 
 def parse_market_config(market: str, payload: object) -> MarketSyncConfig:
@@ -328,6 +456,8 @@ def preview_data_sync_tasks(config: DataSyncConfig) -> list[DataSyncTaskPreview]
             continue
         if market == "ashare":
             tasks.extend(preview_ashare_tasks(market_config))
+        elif market == "fund":
+            tasks.extend(preview_fund_tasks(market_config))
         elif market in {"crypto_spot", "crypto_future"}:
             tasks.extend(preview_crypto_tasks(market, market_config))
     return tasks
@@ -527,6 +657,8 @@ def candidate_universe_patterns(markets: list[str]) -> list[str]:
                 "universe:base:ashare:p2:sentiment:zt_pool:<date>",
             ]
         )
+    if "fund" in markets:
+        patterns.append("universe:base:fund:all")
     if "crypto_spot" in markets:
         patterns.append("universe:base:crypto:spot:binance")
     if "crypto_future" in markets:
@@ -555,9 +687,11 @@ def export_scheduler_payload(config: DataSyncConfig) -> JsonDict:
         "job_timeout_seconds": DEFAULT_SCHEDULER_JOB_TIMEOUT_SECONDS,
         "health_stale_seconds": DEFAULT_SCHEDULER_HEALTH_STALE_SECONDS,
         "max_concurrent_jobs": config.max_concurrent_jobs,
+        "rate_policies": config.rate_policies,
         "jobs": [
             *[build_scheduler_job(task) for task in tasks],
             *build_data_quality_scheduler_jobs(config),
+            *build_technical_screening_scheduler_jobs(config),
             *build_recommendation_scheduler_jobs(config),
         ],
         "processing": preview_data_processing_plan(config, tasks=tasks),
@@ -575,8 +709,18 @@ def build_scheduler_job(task: DataSyncTaskPreview) -> JsonDict:
     """把逻辑数据同步任务映射为基础采集执行器可识别的 job。"""
 
     group = collection_group_for_task(task)
+    history_limit: int | None = task.batch_size
+    if task.market == "fund" and task.task_type in {
+        "market_bars_full_history_backfill",
+        "market_bars_close_final",
+        "fund_nav_full_history_backfill",
+        "fund_nav_daily",
+    }:
+        history_limit = None
     params = {
         "sync_task_type": task.task_type,
+        "title": task.title,
+        "notes": task.notes,
         "mode": task.mode,
         "sources": task.sources,
         "data_packages": task.data_packages,
@@ -588,19 +732,35 @@ def build_scheduler_job(task: DataSyncTaskPreview) -> JsonDict:
         params["max_workers"] = task.max_workers
     if task.market == "ashare":
         params.update(build_ashare_collection_params(task))
+    elif task.market == "fund":
+        params.update(build_fund_collection_params(task))
     elif task.market in {"crypto_spot", "crypto_future"}:
         params.update(build_crypto_collection_params(task))
+    params.update(task.extra_params)
 
-    return {
+    job = {
         "name": task.task_key,
         "job_type": "collection",
         "group": group,
-        "enabled": True,
+        "enabled": task.enabled,
         "interval_seconds": task.interval_seconds,
-        "limit": task.batch_size,
+        "limit": history_limit,
         "market": task.market,
         "params": params,
     }
+    if task.schedule_type != "interval":
+        job["schedule_type"] = task.schedule_type
+    if task.run_at:
+        job["run_at"] = task.run_at
+    if task.timezone:
+        job["timezone"] = task.timezone
+    if task.trading_day_policy:
+        job["trading_day_policy"] = task.trading_day_policy
+    if task.depends_on:
+        job["depends_on"] = task.depends_on
+    if task.max_retries is not None:
+        job["max_retries"] = task.max_retries
+    return job
 
 
 def build_recommendation_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
@@ -625,10 +785,13 @@ def build_recommendation_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict
                     min_indicator_coverage_ratio=0.7,
                     min_factor_coverage_ratio=0.5,
                     min_available_factor_groups=3,
+                    candidate_source="technical_screening_pool",
                     auto_sync_watchlist=True,
                     owner_id="default-owner",
-                    watchlist_id="watchlist:default-owner:ashare:recommendations",
+                    watchlist_id="watchlist:default-owner:ashare:research",
                     recommendation_intake_limit=20,
+                    schedule_type="after_success",
+                    depends_on=["analytics.technical_screening.ashare.main_board"],
                 )
             )
         elif market == "crypto_spot":
@@ -674,6 +837,65 @@ def build_recommendation_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict
     return jobs
 
 
+def build_technical_screening_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
+    """为已完成行情维护的市场生成技术初筛任务。"""
+
+    if not config.enabled:
+        return []
+    jobs: list[JsonDict] = []
+    for market, market_config in sorted(config.markets.items()):
+        if not market_config.enabled or "market_bars" not in market_config.data_packages:
+            continue
+        timeframe = (market_config.timeframes or ["1d"])[0]
+        if market == "ashare":
+            jobs.append(
+                {
+                    "name": "analytics.technical_screening.ashare.main_board",
+                    "job_type": "technical_screening_refresh",
+                    "group": "analytics",
+                    "enabled": True,
+                    "interval_seconds": 0,
+                    "limit": min(market_config.batch_size, 200),
+                    "market": "ashare",
+                    "schedule_type": "after_success",
+                    "depends_on": ["ashare.bars.1d.close_final"],
+                    "params": {
+                        "market": "ashare",
+                        "universe_id": "universe:technical:ashare:main_board",
+                        "strategy": "technical_screening_v1",
+                        "source_type": "technical_screening",
+                        "timeframe": timeframe,
+                        "min_bars": 250,
+                        "ttl_days": 3,
+                    },
+                }
+            )
+        elif market == "fund":
+            jobs.append(
+                {
+                    "name": "analytics.technical_screening.fund.exchange_traded",
+                    "job_type": "technical_screening_refresh",
+                    "group": "analytics",
+                    "enabled": True,
+                    "interval_seconds": 0,
+                    "limit": min(market_config.batch_size, 200),
+                    "market": "fund",
+                    "schedule_type": "after_success",
+                    "depends_on": ["fund.bars.1d.close_final"],
+                    "params": {
+                        "market": "fund",
+                        "universe_id": "universe:technical:fund:exchange_traded",
+                        "strategy": "technical_screening_v1",
+                        "source_type": "technical_screening",
+                        "timeframe": timeframe,
+                        "min_bars": 250,
+                        "ttl_days": 3,
+                    },
+                }
+            )
+    return jobs
+
+
 def build_data_quality_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
     """为启用 data_quality 的市场生成数据质量刷新任务。"""
 
@@ -705,25 +927,27 @@ def build_data_quality_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
             ]
             interval_seconds = market_config.interval_seconds.get("market_bars", 5 * 60)
             stale_after_seconds = 2 * 60 * 60
-        jobs.append(
-            {
-                "name": f"quality.{market}",
-                "job_type": "data_quality_refresh",
-                "group": "analytics",
-                "enabled": True,
-                "interval_seconds": interval_seconds,
-                "limit": market_config.batch_size,
+        job = {
+            "name": f"quality.{market}",
+            "job_type": "data_quality_refresh",
+            "group": "analytics",
+            "enabled": True,
+            "interval_seconds": interval_seconds,
+            "limit": market_config.batch_size,
+            "market": market,
+            "params": {
                 "market": market,
-                "params": {
-                    "market": market,
-                    "timeframe": timeframe,
-                    "horizon": "swing",
-                    "min_bars": min_bars,
-                    "stale_after_seconds": stale_after_seconds,
-                    "data_domains": domains,
-                },
-            }
-        )
+                "timeframe": timeframe,
+                "horizon": "swing",
+                "min_bars": min_bars,
+                "stale_after_seconds": stale_after_seconds,
+                "data_domains": domains,
+            },
+        }
+        if market == "ashare":
+            job["schedule_type"] = "after_success"
+            job["depends_on"] = ["ashare.bars.1d.close_final"]
+        jobs.append(job)
     return jobs
 
 
@@ -740,14 +964,17 @@ def build_recommendation_scheduler_job(
     min_indicator_coverage_ratio: float = 0.5,
     min_factor_coverage_ratio: float = 0.0,
     min_available_factor_groups: int = 1,
+    candidate_source: str | None = None,
     auto_sync_watchlist: bool = False,
     owner_id: str | None = None,
     watchlist_id: str | None = None,
     recommendation_intake_limit: int | None = None,
+    schedule_type: str = "interval",
+    depends_on: list[str] | None = None,
 ) -> JsonDict:
     """生成单个推荐流水线调度任务。"""
 
-    return {
+    job = {
         "name": name,
         "job_type": "recommendation_pipeline",
         "group": "analytics",
@@ -765,12 +992,18 @@ def build_recommendation_scheduler_job(
             "min_indicator_coverage_ratio": min_indicator_coverage_ratio,
             "min_factor_coverage_ratio": min_factor_coverage_ratio,
             "min_available_factor_groups": min_available_factor_groups,
+            "candidate_source": candidate_source,
             "auto_sync_watchlist": auto_sync_watchlist,
             "owner_id": owner_id,
             "watchlist_id": watchlist_id,
             "recommendation_intake_limit": recommendation_intake_limit or limit,
         },
     }
+    if schedule_type != "interval":
+        job["schedule_type"] = schedule_type
+    if depends_on:
+        job["depends_on"] = depends_on
+    return job
 
 
 def collection_group_for_task(task: DataSyncTaskPreview) -> str | tuple[str, ...]:
@@ -781,11 +1014,18 @@ def collection_group_for_task(task: DataSyncTaskPreview) -> str | tuple[str, ...
             "universe_refresh": ("ashare-p0", "ashare-p1", "ashare-risk"),
             "realtime_quote_refresh": "ashare-p0",
             "market_bars_backfill": "ashare-p0",
+            "market_bars_full_history_backfill": "ashare-p0",
+            "market_bars_midday_partial": "ashare-p0",
+            "market_bars_close_final": "ashare-p0",
+            "market_bars_revision": "ashare-p0",
             "fundamental_refresh": "ashare-p2",
             "capital_flow_refresh": "ashare-p1",
             "event_refresh": "ashare-p1",
+            "event_article_enrichment": "ashare-p1",
             "risk_sentiment_refresh": "ashare-risk",
         }[task.task_type]
+    if task.market == "fund":
+        return "fund"
     return "crypto"
 
 
@@ -799,7 +1039,13 @@ def build_ashare_collection_params(task: DataSyncTaskPreview) -> JsonDict:
         params["industry_catalog_limit"] = 0
         params["concept_catalog_limit"] = 0
         params["catalog_member_limit"] = 0
-    if task.task_type == "market_bars_backfill":
+    if task.task_type in {
+        "market_bars_backfill",
+        "market_bars_full_history_backfill",
+        "market_bars_midday_partial",
+        "market_bars_close_final",
+        "market_bars_revision",
+    }:
         params["group"] = ["ashare-p0"]
         params["ashare_timeframe"] = timeframe_from_task_key(task.task_key, default="1d")
     if task.task_type == "realtime_quote_refresh":
@@ -811,6 +1057,10 @@ def build_ashare_collection_params(task: DataSyncTaskPreview) -> JsonDict:
         params["group"] = ["ashare-p1"]
     if task.task_type == "event_refresh":
         params["group"] = ["ashare-p1"]
+        params["priority_symbol_limit"] = task.batch_size
+    if task.task_type == "event_article_enrichment":
+        params["group"] = ["ashare-p1"]
+        params["priority_symbol_limit"] = task.batch_size
     if task.task_type == "risk_sentiment_refresh":
         params["group"] = ["ashare-risk"]
     return params
@@ -834,9 +1084,33 @@ def build_crypto_collection_params(task: DataSyncTaskPreview) -> JsonDict:
     return params
 
 
+def build_fund_collection_params(task: DataSyncTaskPreview) -> JsonDict:
+    """生成基金采集入口参数。"""
+
+    params: JsonDict = {"group": ["fund"]}
+    if task.task_type == "universe_refresh":
+        params["symbol_source"] = "universe"
+    if task.task_type in {
+        "market_bars_full_history_backfill",
+        "market_bars_close_final",
+    }:
+        params["fund_timeframe"] = timeframe_from_task_key(task.task_key, default="1d")
+    if task.task_type in {
+        "fund_nav_full_history_backfill",
+        "fund_nav_daily",
+    }:
+        params["fund_asset_type"] = "open_fund"
+    return params
+
+
 def timeframe_from_task_key(task_key: str, *, default: str) -> str:
     """从任务 key 末尾提取周期。"""
 
+    parts = task_key.split(".")
+    if "bars" in parts:
+        index = parts.index("bars")
+        if len(parts) > index + 1:
+            return parts[index + 1]
     parts = task_key.rsplit(".", maxsplit=1)
     return parts[-1] if len(parts) == 2 else default
 
@@ -862,21 +1136,107 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
         )
     if "market_bars" in config.data_packages:
         for timeframe in config.timeframes or ["1d"]:
-            tasks.append(
-                DataSyncTaskPreview(
-                    task_key=f"ashare.bars.{timeframe}",
-                    market="ashare",
-                    task_type="market_bars_backfill",
-                    title=f"补采 A 股 {timeframe} K 线",
-                    interval_seconds=config.interval_seconds.get("market_bars", 60 * 60),
-                    mode="incremental_backfill",
-                    batch_size=config.batch_size,
-                    max_workers=config.max_workers,
-                    lookback=f"{config.lookback_days}d",
-                    sources=["market_bars"],
-                    data_packages=["market_bars"],
+            if timeframe == "1d":
+                tasks.extend(
+                    [
+                        DataSyncTaskPreview(
+                            task_key="ashare.bars.1d.bootstrap",
+                            market="ashare",
+                            task_type="market_bars_full_history_backfill",
+                            title="初始化 A 股主板 10 年历史日 K",
+                            interval_seconds=0,
+                            mode="full_history_backfill",
+                            enabled=False,
+                            schedule_type="manual",
+                            batch_size=min(config.batch_size, ASHARE_BOOTSTRAP_BATCH_SIZE),
+                            max_workers=min(config.max_workers, 2),
+                            max_retries=0,
+                            lookback=ASHARE_BOOTSTRAP_LOOKBACK,
+                            sources=["market_bars"],
+                            data_packages=["market_bars"],
+                            extra_params={"schedule_failure_retry": False},
+                            notes=["手动触发，只处理用户可交易的 A 股主板股票。"],
+                        ),
+                        DataSyncTaskPreview(
+                            task_key="ashare.bars.1d.midday_partial",
+                            market="ashare",
+                            task_type="market_bars_midday_partial",
+                            title="刷新 A 股午盘临时日 K",
+                            interval_seconds=24 * 60 * 60,
+                            mode="midday_partial",
+                            schedule_type="daily_time",
+                            run_at=["11:45"],
+                            timezone="Asia/Shanghai",
+                            trading_day_policy="trading_day_only",
+                            batch_size=config.batch_size,
+                            max_workers=config.max_workers,
+                            lookback="1d",
+                            sources=["market_bars"],
+                            data_packages=["market_bars"],
+                            notes=["只用于盘中观察，不触发正式推荐。"],
+                            extra_params={"is_closed": False, "status": "partial"},
+                        ),
+                        DataSyncTaskPreview(
+                            task_key="ashare.bars.1d.close_final",
+                            market="ashare",
+                            task_type="market_bars_close_final",
+                            title="刷新 A 股收盘最终日 K",
+                            interval_seconds=24 * 60 * 60,
+                            mode="close_final",
+                            schedule_type="daily_time",
+                            run_at=["15:50", "17:30"],
+                            timezone="Asia/Shanghai",
+                            trading_day_policy="trading_day_only",
+                            batch_size=config.batch_size,
+                            max_workers=config.max_workers,
+                            lookback=f"{config.lookback_days}d",
+                            sources=["market_bars"],
+                            data_packages=["market_bars"],
+                            notes=["收盘后闭合日 K，作为指标、因子和推荐输入。"],
+                            extra_params={"is_closed": True, "status": "available"},
+                        ),
+                        DataSyncTaskPreview(
+                            task_key="ashare.bars.1d.revision",
+                            market="ashare",
+                            task_type="market_bars_revision",
+                            title="凌晨修正 A 股日 K",
+                            interval_seconds=24 * 60 * 60,
+                            mode="revision",
+                            schedule_type="daily_time",
+                            run_at=["02:10"],
+                            timezone="Asia/Shanghai",
+                            trading_day_policy="any_day",
+                            batch_size=config.batch_size,
+                            max_workers=config.max_workers,
+                            lookback="7d",
+                            sources=["market_bars"],
+                            data_packages=["market_bars"],
+                            notes=["凌晨执行复权修正、失败重试和补漏。"],
+                            extra_params={
+                                "is_closed": True,
+                                "status": "available",
+                                "only_failed_or_stale": True,
+                                "include_adjustment_check": True,
+                            },
+                        ),
+                    ]
                 )
-            )
+            else:
+                tasks.append(
+                    DataSyncTaskPreview(
+                        task_key=f"ashare.bars.{timeframe}",
+                        market="ashare",
+                        task_type="market_bars_backfill",
+                        title=f"补采 A 股 {timeframe} K 线",
+                        interval_seconds=config.interval_seconds.get("market_bars", 60 * 60),
+                        mode="incremental_backfill",
+                        batch_size=config.batch_size,
+                        max_workers=config.max_workers,
+                        lookback=f"{config.lookback_days}d",
+                        sources=["market_bars"],
+                        data_packages=["market_bars"],
+                    )
+                )
     if "realtime_quotes" in config.data_packages:
         tasks.append(
             DataSyncTaskPreview(
@@ -910,6 +1270,7 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                     for package in ("fundamentals", "valuation")
                     if package in config.data_packages
                 ],
+                extra_params={"only_failed_or_stale": True},
             )
         )
     if "capital_flow" in config.data_packages:
@@ -943,6 +1304,26 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 max_workers=config.max_workers,
                 lookback=f"{config.lookback_days}d",
                 sources=["stock_news", "notice_report"],
+                data_packages=["events"],
+            )
+        )
+        tasks.append(
+            DataSyncTaskPreview(
+                task_key="ashare.news_articles",
+                market="ashare",
+                task_type="event_article_enrichment",
+                title="补抓 A 股新闻正文",
+                interval_seconds=config.interval_seconds.get(
+                    "events",
+                    ASHARE_TIMELY_EVENT_INTERVAL_SECONDS,
+                ),
+                mode="async_article_enrichment",
+                schedule_type="after_success",
+                depends_on=["ashare.events"],
+                batch_size=config.batch_size,
+                max_workers=1,
+                lookback=f"{config.lookback_days}d",
+                sources=["stock_news_article"],
                 data_packages=["events"],
             )
         )
@@ -1022,6 +1403,139 @@ def preview_crypto_tasks(market: str, config: MarketSyncConfig) -> list[DataSync
     return tasks
 
 
+def preview_fund_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
+    """生成基金市场任务预览。"""
+
+    tasks: list[DataSyncTaskPreview] = []
+    if config.universe_sources:
+        tasks.append(
+            DataSyncTaskPreview(
+                task_key="fund.universe.all",
+                market="fund",
+                task_type="universe_refresh",
+                title="刷新基金资产池",
+                interval_seconds=config.interval_seconds.get("universe_refresh", 24 * 60 * 60),
+                mode="full_universe_refresh",
+                batch_size=config.batch_size,
+                sources=["fund_etf_spot_em", "fund_lof_spot_em", "fund_open_fund_daily_em"],
+                data_packages=["assets", "asset_universes", "asset_universe_members"],
+                notes=["统一刷新 ETF、LOF 和开放式基金资产，不混入 A 股任务。"],
+            )
+        )
+    if "market_bars" in config.data_packages:
+        tasks.extend(
+            [
+                DataSyncTaskPreview(
+                    task_key="fund.etf.bars.1d.bootstrap",
+                    market="fund",
+                    task_type="market_bars_full_history_backfill",
+                    title="初始化 ETF 历史日 K",
+                    interval_seconds=0,
+                    mode="full_history_backfill",
+                    enabled=False,
+                    schedule_type="manual",
+                    batch_size=min(config.batch_size, FUND_BOOTSTRAP_BATCH_SIZE),
+                    max_workers=min(config.max_workers, 2),
+                    max_retries=0,
+                    lookback=FUND_BOOTSTRAP_LOOKBACK,
+                    sources=["fund_etf_hist_em"],
+                    data_packages=["market_bars"],
+                    extra_params={
+                        "fund_asset_type": "etf",
+                        "schedule_failure_retry": False,
+                    },
+                    notes=["手动触发，用于 ETF 首次建库或大缺口补齐。"],
+                ),
+                DataSyncTaskPreview(
+                    task_key="fund.lof.bars.1d.bootstrap",
+                    market="fund",
+                    task_type="market_bars_full_history_backfill",
+                    title="初始化 LOF 历史日 K",
+                    interval_seconds=0,
+                    mode="full_history_backfill",
+                    enabled=False,
+                    schedule_type="manual",
+                    batch_size=min(config.batch_size, FUND_BOOTSTRAP_BATCH_SIZE),
+                    max_workers=min(config.max_workers, 2),
+                    max_retries=0,
+                    lookback=FUND_BOOTSTRAP_LOOKBACK,
+                    sources=["fund_lof_hist_em"],
+                    data_packages=["market_bars"],
+                    extra_params={
+                        "fund_asset_type": "lof",
+                        "schedule_failure_retry": False,
+                    },
+                    notes=["手动触发，用于 LOF 首次建库或大缺口补齐。"],
+                ),
+                DataSyncTaskPreview(
+                    task_key="fund.bars.1d.close_final",
+                    market="fund",
+                    task_type="market_bars_close_final",
+                    title="刷新基金收盘最终日 K",
+                    interval_seconds=24 * 60 * 60,
+                    mode="close_final",
+                    schedule_type="daily_time",
+                    run_at=["16:30", "19:30"],
+                    timezone="Asia/Shanghai",
+                    trading_day_policy="trading_day_only",
+                    batch_size=config.batch_size,
+                    max_workers=config.max_workers,
+                    lookback=f"{config.lookback_days}d",
+                    sources=["fund_etf_hist_em", "fund_lof_hist_em"],
+                    data_packages=["market_bars"],
+                    extra_params={"is_closed": True, "status": "available"},
+                    notes=["收盘后补齐 ETF/LOF 最近窗口内的最终日 K。"],
+                ),
+            ]
+        )
+    if "fund_nav" in config.data_packages:
+        tasks.extend(
+            [
+                DataSyncTaskPreview(
+                    task_key="fund.open.nav.bootstrap",
+                    market="fund",
+                    task_type="fund_nav_full_history_backfill",
+                    title="初始化开放式基金净值",
+                    interval_seconds=0,
+                    mode="full_history_backfill",
+                    enabled=False,
+                    schedule_type="manual",
+                    batch_size=min(config.batch_size, FUND_BOOTSTRAP_BATCH_SIZE),
+                    max_workers=min(config.max_workers, 2),
+                    max_retries=0,
+                    lookback=FUND_BOOTSTRAP_LOOKBACK,
+                    sources=["fund_open_fund_info_em"],
+                    data_packages=["fund_nav"],
+                    extra_params={
+                        "fund_asset_type": "open_fund",
+                        "schedule_failure_retry": False,
+                    },
+                    notes=["手动触发，用于开放式基金 10 年净值初始化。"],
+                ),
+                DataSyncTaskPreview(
+                    task_key="fund.open.nav.daily",
+                    market="fund",
+                    task_type="fund_nav_daily",
+                    title="刷新开放式基金最新净值",
+                    interval_seconds=24 * 60 * 60,
+                    mode="incremental_snapshot",
+                    schedule_type="daily_time",
+                    run_at=["20:30", "02:30"],
+                    timezone="Asia/Shanghai",
+                    trading_day_policy="any_day",
+                    batch_size=config.batch_size,
+                    max_workers=config.max_workers,
+                    lookback=f"{config.lookback_days}d",
+                    sources=["fund_open_fund_daily_em", "fund_open_fund_info_em"],
+                    data_packages=["fund_nav"],
+                    extra_params={"fund_asset_type": "open_fund"},
+                    notes=["夜间刷新最新净值，并在次日凌晨补一次修正。"],
+                ),
+            ]
+        )
+    return tasks
+
+
 def validate_market_config(
     *,
     market: str,
@@ -1031,10 +1545,15 @@ def validate_market_config(
 ) -> None:
     """校验单市场配置。"""
 
-    allowed_sources = (
-        ASHARE_UNIVERSE_SOURCES if market == "ashare" else CRYPTO_UNIVERSE_SOURCES
-    )
-    allowed_packages = ASHARE_DATA_PACKAGES if market == "ashare" else CRYPTO_DATA_PACKAGES
+    if market == "ashare":
+        allowed_sources = ASHARE_UNIVERSE_SOURCES
+        allowed_packages = ASHARE_DATA_PACKAGES
+    elif market == "fund":
+        allowed_sources = FUND_UNIVERSE_SOURCES
+        allowed_packages = FUND_DATA_PACKAGES
+    else:
+        allowed_sources = CRYPTO_UNIVERSE_SOURCES
+        allowed_packages = CRYPTO_DATA_PACKAGES
     unknown_sources = sorted(set(market_config.universe_sources) - set(allowed_sources))
     if unknown_sources:
         errors.append(f"{market} 包含不支持的 Universe 来源：{', '.join(unknown_sources)}")
@@ -1053,6 +1572,8 @@ def validate_market_config(
         warnings.append(f"{market} max_workers 较大，可能触发上游限流。")
     if market == "ashare" and "all_ashare" not in market_config.universe_sources:
         warnings.append("A 股未启用全 A，推荐系统覆盖面会依赖其他种子池。")
+    if market == "fund" and "all_funds" not in market_config.universe_sources:
+        warnings.append("基金未启用全量基金列表，资产池可能不完整。")
 
 
 def validate_data_sync_config_without_preview_recursion(
@@ -1156,6 +1677,30 @@ def build_crypto_market_config(*, market: str, preset: str) -> MarketSyncConfig:
     )
 
 
+def build_fund_market_config(preset: str) -> MarketSyncConfig:
+    """生成基金默认配置。"""
+
+    batch_size = 50 if preset == "lightweight" else 100
+    return MarketSyncConfig(
+        enabled=True,
+        universe_sources=list(FUND_UNIVERSE_SOURCES),
+        data_packages=list(FUND_DATA_PACKAGES),
+        interval_seconds={
+            "universe_refresh": 24 * 60 * 60,
+            "market_bars": 24 * 60 * 60,
+            "fund_nav": 24 * 60 * 60,
+        },
+        batch_size=batch_size,
+        max_workers=2,
+        lookback_days=30,
+        timeframes=["1d"],
+        filters={
+            "include_exchange_traded": True,
+            "include_open_fund": True,
+        },
+    )
+
+
 def normalize_preset(preset: str) -> str:
     """规范化预设名称。"""
 
@@ -1201,8 +1746,8 @@ def preset_markets(preset: str) -> list[str]:
     if preset == "crypto-comprehensive":
         return ["crypto_spot", "crypto_future"]
     if preset == "lightweight":
-        return ["ashare", "crypto_spot"]
-    return ["ashare", "crypto_spot", "crypto_future"]
+        return ["ashare", "fund", "crypto_spot"]
+    return ["ashare", "fund", "crypto_spot", "crypto_future"]
 
 
 def preset_label(preset: str) -> str:
@@ -1253,6 +1798,16 @@ def string_list(value: object) -> list[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
     raise ValueError(f"配置值必须是字符串或数组：{value!r}")
+
+
+def parse_json_object(value: object, *, field_name: str) -> JsonDict:
+    """解析 JSON 对象配置。"""
+
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} 必须是对象。")
+    return dict(value)
 
 
 def parse_interval_seconds(value: object) -> dict[str, int]:

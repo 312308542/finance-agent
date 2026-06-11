@@ -1,22 +1,30 @@
+import json
 import logging
 import sys
 import threading
 import time
 from argparse import Namespace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 
+from finance_agent.agents.personal_assistant import PersonalFinanceAgentService
 from finance_agent.scheduler import (
     BaseDataScheduler,
     BaseDataSchedulerConfig,
     BaseDataSchedulerJob,
     parse_scheduler_config,
 )
+from finance_agent.scheduler import base_data_scheduler as scheduler_module
 from finance_agent.scheduler.base_data_scheduler import (
+    collect_base_data_with_timeout,
+    default_watchlist_name,
     import_collection_module,
+    next_run_at_for_job,
     replace_file_with_retry,
     seconds_until_next_run,
 )
@@ -79,6 +87,199 @@ def test_parse_scheduler_config_accepts_data_quality_refresh_job() -> None:
 
     assert config.jobs[0].job_type == "data_quality_refresh"
     assert config.jobs[0].group == "analytics"
+
+
+def test_parse_scheduler_config_accepts_technical_screening_job() -> None:
+    """调度配置应能表达技术初筛刷新任务。"""
+
+    config = parse_scheduler_config(
+        {
+            "enabled": True,
+            "jobs": [
+                {
+                    "name": "analytics.technical_screening.ashare.main_board",
+                    "job_type": "technical_screening_refresh",
+                    "group": "analytics",
+                    "enabled": True,
+                    "schedule_type": "after_success",
+                    "depends_on": ["ashare.bars.1d.close_final"],
+                    "market": "ashare",
+                    "limit": 200,
+                    "params": {
+                        "market": "ashare",
+                        "universe_id": "universe:technical:ashare:main_board",
+                        "min_bars": 250,
+                        "ttl_days": 3,
+                    },
+                }
+            ],
+        }
+    )
+
+    assert config.jobs[0].job_type == "technical_screening_refresh"
+    assert config.jobs[0].group == "analytics"
+    assert config.jobs[0].depends_on == ("ashare.bars.1d.close_final",)
+
+
+def test_parse_scheduler_config_accepts_calendar_schedule_fields() -> None:
+    """调度配置应能表达固定时间、手动和依赖成功触发的任务。"""
+
+    config = parse_scheduler_config(
+        {
+            "enabled": True,
+            "jobs": [
+                {
+                    "name": "ashare.bars.1d.revision",
+                    "job_type": "collection",
+                    "group": "ashare-p0",
+                    "enabled": True,
+                    "schedule_type": "daily_time",
+                    "run_at": ["02:10"],
+                    "timezone": "Asia/Shanghai",
+                    "trading_day_policy": "any_day",
+                    "market": "ashare",
+                    "params": {"sync_task_type": "market_bars_revision"},
+                },
+                {
+                    "name": "ashare.bars.1d.bootstrap",
+                    "job_type": "collection",
+                    "group": "ashare-p0",
+                    "enabled": False,
+                    "schedule_type": "manual",
+                    "market": "ashare",
+                    "params": {"sync_task_type": "market_bars_full_history_backfill"},
+                },
+                {
+                    "name": "quality.after.close",
+                    "job_type": "data_quality_refresh",
+                    "group": "analytics",
+                    "enabled": True,
+                    "schedule_type": "after_success",
+                    "depends_on": ["ashare.bars.1d.close_final"],
+                    "market": "ashare",
+                    "params": {"market": "ashare"},
+                },
+            ],
+        }
+    )
+
+    revision, bootstrap, quality = config.jobs
+    assert revision.schedule_type == "daily_time"
+    assert revision.run_at == ("02:10",)
+    assert revision.timezone == "Asia/Shanghai"
+    assert revision.trading_day_policy == "any_day"
+    assert revision.interval_seconds == 24 * 60 * 60
+    assert bootstrap.schedule_type == "manual"
+    assert bootstrap.interval_seconds == 0
+    assert quality.schedule_type == "after_success"
+    assert quality.depends_on == ("ashare.bars.1d.close_final",)
+
+
+def test_scheduler_passes_rate_policies_to_collection_args() -> None:
+    """调度器应把 top-level rate_policies 传给采集入口。"""
+
+    config = parse_scheduler_config(
+        {
+            "enabled": True,
+            "rate_policies": {
+                "stock_zh_a_hist_tx": {
+                    "max_concurrency": 1,
+                    "min_interval_seconds": 1.0,
+                }
+            },
+            "jobs": [
+                {
+                    "name": "ashare.bars.1d.close_final",
+                    "job_type": "collection",
+                    "group": "ashare-p0",
+                    "enabled": True,
+                    "interval_seconds": 3600,
+                    "market": "ashare",
+                    "params": {"sync_task_type": "market_bars_close_final"},
+                }
+            ],
+        }
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+    )
+
+    args = scheduler.build_collection_args(config.jobs[0])
+
+    assert args.rate_policies["stock_zh_a_hist_tx"]["min_interval_seconds"] == 1.0
+
+
+def test_next_run_at_for_daily_time_uses_configured_timezone() -> None:
+    """daily_time 应按配置时区计算下一次本地执行时间。"""
+
+    job = BaseDataSchedulerJob(
+        name="ashare.bars.1d.revision",
+        group="ashare-p0",
+        interval_seconds=24 * 60 * 60,
+        schedule_type="daily_time",
+        run_at=("02:10",),
+        timezone="Asia/Shanghai",
+    )
+
+    next_run = next_run_at_for_job(
+        job,
+        now=datetime(2026, 6, 3, 17, 0, tzinfo=UTC),
+    )
+
+    assert next_run == datetime(2026, 6, 3, 18, 10, tzinfo=UTC)
+    assert next_run_at_for_job(
+        job,
+        now=datetime(2026, 6, 3, 18, 20, tzinfo=UTC),
+    ) == datetime(2026, 6, 4, 18, 10, tzinfo=UTC)
+
+
+def test_next_run_at_for_trading_day_only_skips_weekend() -> None:
+    """交易日任务遇到周末应顺延到下一个工作日。"""
+
+    job = BaseDataSchedulerJob(
+        name="ashare.bars.1d.close_final",
+        group="ashare-p0",
+        interval_seconds=24 * 60 * 60,
+        schedule_type="daily_time",
+        run_at=("15:50",),
+        timezone="Asia/Shanghai",
+        trading_day_policy="trading_day_only",
+    )
+
+    next_run = next_run_at_for_job(
+        job,
+        now=datetime(2026, 6, 5, 10, 0, tzinfo=UTC),
+    )
+
+    assert next_run == datetime(2026, 6, 8, 7, 50, tzinfo=UTC)
+
+
+def test_next_run_at_for_manual_and_after_success_are_not_due_initially() -> None:
+    """手动任务和依赖成功任务不应在 loop 启动时自动到期。"""
+
+    now = datetime(2026, 6, 4, 1, 0, tzinfo=UTC)
+
+    assert next_run_at_for_job(
+        BaseDataSchedulerJob(
+            name="manual",
+            group="ashare-p0",
+            interval_seconds=0,
+            schedule_type="manual",
+        ),
+        now=now,
+    ) is None
+    assert next_run_at_for_job(
+        BaseDataSchedulerJob(
+            name="dependent",
+            group="analytics",
+            interval_seconds=0,
+            job_type="data_quality_refresh",
+            schedule_type="after_success",
+            depends_on=("source",),
+        ),
+        now=now,
+    ) is None
 
 
 def test_scheduler_executes_recommendation_pipeline_job_without_collection() -> None:
@@ -202,8 +403,69 @@ def test_scheduler_runs_data_quality_refresh_without_collection() -> None:
     ]
 
 
+def test_scheduler_runs_technical_screening_without_collection() -> None:
+    """技术初筛任务应调用 analytics 执行器，而不是误走基础采集入口。"""
+
+    calls: list[dict[str, Any]] = []
+
+    def run_technical_screening_refresh(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "status": "available",
+            "screening_id": "screen:technical:ashare:main_board:20260609T073000Z",
+            "accepted_count": 8,
+        }
+
+    def collect_base_data(_: Any) -> dict[str, Any]:
+        raise AssertionError("技术初筛任务不应调用基础采集入口")
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="analytics.technical_screening.ashare.main_board",
+                job_type="technical_screening_refresh",
+                group="analytics",
+                interval_seconds=0,
+                schedule_type="after_success",
+                depends_on=("ashare.bars.1d.close_final",),
+                limit=200,
+                market="ashare",
+                params={
+                    "market": "ashare",
+                    "universe_id": "universe:technical:ashare:main_board",
+                    "timeframe": "1d",
+                    "min_bars": 250,
+                    "ttl_days": 3,
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        run_technical_screening_refresh_func=run_technical_screening_refresh,
+    )
+
+    result = scheduler.run_once()
+
+    assert result["jobs"][0]["status"] == "executed"
+    assert result["jobs"][0]["summary"]["accepted_count"] == 8
+    assert calls == [
+        {
+            "market": "ashare",
+            "universe_id": "universe:technical:ashare:main_board",
+            "timeframe": "1d",
+            "limit": 200,
+            "min_bars": 250,
+            "ttl_days": 3,
+        }
+    ]
+
+
 def test_recommendation_job_passes_watchlist_intake_options() -> None:
-    """推荐任务的观察池入池选项应透传给执行器。"""
+    """推荐任务的研究跟踪池入池选项应透传给执行器。"""
 
     calls: list[dict[str, Any]] = []
 
@@ -225,7 +487,7 @@ def test_recommendation_job_passes_watchlist_intake_options() -> None:
                     "universe_id": "universe:base:ashare:p0:all_a",
                     "auto_sync_watchlist": True,
                     "owner_id": "default-owner",
-                    "watchlist_id": "watchlist:default-owner:ashare:recommendations",
+                    "watchlist_id": "watchlist:default-owner:ashare:research",
                     "recommendation_intake_limit": 20,
                 },
             ),
@@ -249,10 +511,241 @@ def test_recommendation_job_passes_watchlist_intake_options() -> None:
             "limit": 20,
             "auto_sync_watchlist": True,
             "owner_id": "default-owner",
-            "watchlist_id": "watchlist:default-owner:ashare:recommendations",
+            "watchlist_id": "watchlist:default-owner:ashare:research",
             "recommendation_intake_limit": 20,
         }
     ]
+
+
+def test_default_watchlist_name_uses_research_pool_wording() -> None:
+    """调度器自动同步目标应展示为系统研究跟踪池，不再叫推荐观察池。"""
+
+    assert default_watchlist_name("ashare") == "A 股系统研究跟踪池"
+
+
+def test_recommendation_intake_records_system_research_semantics() -> None:
+    """推荐同步入池应表达为系统研究跟踪，而不是用户观察确认。"""
+
+    class FakeRecommendations:
+        def __init__(self, recommendations: list[Namespace]) -> None:
+            self.recommendations = recommendations
+
+        def list_top_recommendations(self, *, run_id: str, limit: int) -> list[Namespace]:
+            assert run_id == "run:research"
+            assert limit == 3
+            return self.recommendations[:limit]
+
+    class FakeWatchlists:
+        def __init__(self) -> None:
+            self.items: list[dict[str, Any]] = []
+            self.events: list[dict[str, Any]] = []
+
+        def add_or_update_item(self, **kwargs: Any) -> Namespace:
+            self.items.append(kwargs)
+            return Namespace(
+                watchlist_item_id=kwargs["watchlist_item_id"],
+                status=kwargs["status"],
+            )
+
+        def record_event(self, **kwargs: Any) -> None:
+            self.events.append(kwargs)
+
+    class FakeMemory:
+        def record_alert(self, **kwargs: Any) -> Namespace:
+            return Namespace(alert_id=kwargs["alert_id"])
+
+        def record_decision(self, **kwargs: Any) -> Namespace:
+            return Namespace(decision_id=kwargs["decision_id"])
+
+        def upsert_memory(self, **kwargs: Any) -> Namespace:
+            return Namespace(memory_id=kwargs["memory_id"])
+
+        def link_memory_edge(self, **kwargs: Any) -> None:
+            return None
+
+        def schedule_review(self, **kwargs: Any) -> Namespace:
+            return Namespace(review_task_id=kwargs["review_task_id"])
+
+    class FakeWorkflowAudit:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        def start_run(self, **kwargs: Any) -> None:
+            return None
+
+        def record_event(self, **kwargs: Any) -> None:
+            self.events.append(kwargs)
+
+        def finish_run(self, **kwargs: Any) -> None:
+            return None
+
+    def recommendation(asset_id: str, symbol: str, action: str, rank: int) -> Namespace:
+        return Namespace(
+            recommendation_id=f"asset_rec:{asset_id}",
+            asset_id=asset_id,
+            symbol=symbol,
+            name=symbol,
+            market="ashare",
+            action=action,
+            rank=rank,
+            total_score=Decimal("88.120000"),
+            confidence=Decimal("0.760000"),
+            conviction="medium",
+            summary=f"{symbol} 进入系统研究跟踪。",
+            watch_conditions={"conditions": ["趋势保持"]},
+            invalid_if={"conditions": ["信号转弱"]},
+            score_id=f"score:{symbol}",
+            factor_frame_id=f"factor:{symbol}",
+            risk_ids=(),
+            evidence_ids=(),
+            signal_ids=(),
+        )
+
+    service = PersonalFinanceAgentService.__new__(PersonalFinanceAgentService)
+    service.recommendations = FakeRecommendations(
+        [
+            recommendation("ashare:600519", "600519", "watch", 1),
+            recommendation("ashare:000001", "000001", "avoid", 2),
+            recommendation("ashare:600036", "600036", "reject", 3),
+        ]
+    )
+    service.watchlists = FakeWatchlists()
+    service.memory = FakeMemory()
+    service.workflow_audit = FakeWorkflowAudit()
+    as_of = datetime(2026, 6, 9, 10, 30, tzinfo=UTC)
+
+    result = service.sync_recommendations_to_watchlist(
+        owner_id="default-owner",
+        recommendation_run_id="run:research",
+        watchlist_id="watchlist:default-owner:ashare:research",
+        as_of=as_of,
+        limit=3,
+        workflow_run_id="workflow:research",
+    )
+
+    assert result.watchlist_item_ids == (
+        "watchlist_item:watchlist:default-owner:ashare:research:ashare:600519",
+    )
+    assert len(service.watchlists.items) == 1
+    item_payload = service.watchlists.items[0]["payload"]
+    expires_at = as_of + timedelta(days=3)
+    assert service.watchlists.items[0]["next_review_at"] == expires_at
+    assert item_payload["promotion_status"] == "system_research"
+    assert item_payload["expires_at"] == expires_at.isoformat()
+    assert item_payload["recommendation_run_id"] == "run:research"
+    assert service.watchlists.events[0]["event_type"] == "research_intake"
+    skipped_actions = {
+        event["payload"]["action"]
+        for event in service.workflow_audit.events
+        if event["event_type"] == "recommendation_skipped"
+    }
+    assert skipped_actions == {"avoid", "reject"}
+
+
+def test_recommendation_intake_applies_score_and_confidence_thresholds() -> None:
+    """研究跟踪入池应支持分数和置信度阈值，低质量推荐不入池。"""
+
+    class FakeRecommendations:
+        def list_top_recommendations(self, *, run_id: str, limit: int) -> list[Namespace]:
+            return [
+                recommendation("ashare:600519", "600519", Decimal("88.00"), Decimal("0.80")),
+                recommendation("ashare:000001", "000001", Decimal("59.00"), Decimal("0.90")),
+                recommendation("ashare:600036", "600036", Decimal("90.00"), Decimal("0.30")),
+            ]
+
+    class FakeWatchlists:
+        def __init__(self) -> None:
+            self.items: list[dict[str, Any]] = []
+
+        def add_or_update_item(self, **kwargs: Any) -> Namespace:
+            self.items.append(kwargs)
+            return Namespace(watchlist_item_id=kwargs["watchlist_item_id"], status=kwargs["status"])
+
+        def record_event(self, **kwargs: Any) -> None:
+            return None
+
+    class FakeMemory:
+        def record_alert(self, **kwargs: Any) -> Namespace:
+            return Namespace(alert_id=kwargs["alert_id"])
+
+        def record_decision(self, **kwargs: Any) -> Namespace:
+            return Namespace(decision_id=kwargs["decision_id"])
+
+        def upsert_memory(self, **kwargs: Any) -> Namespace:
+            return Namespace(memory_id=kwargs["memory_id"])
+
+        def link_memory_edge(self, **kwargs: Any) -> None:
+            return None
+
+        def schedule_review(self, **kwargs: Any) -> Namespace:
+            return Namespace(review_task_id=kwargs["review_task_id"])
+
+    class FakeWorkflowAudit:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        def start_run(self, **kwargs: Any) -> None:
+            return None
+
+        def record_event(self, **kwargs: Any) -> None:
+            self.events.append(kwargs)
+
+        def finish_run(self, **kwargs: Any) -> None:
+            return None
+
+    def recommendation(
+        asset_id: str,
+        symbol: str,
+        total_score: Decimal,
+        confidence: Decimal,
+    ) -> Namespace:
+        return Namespace(
+            recommendation_id=f"asset_rec:{asset_id}",
+            asset_id=asset_id,
+            symbol=symbol,
+            name=symbol,
+            market="ashare",
+            action="watch",
+            rank=1,
+            total_score=total_score,
+            confidence=confidence,
+            conviction="medium",
+            summary=f"{symbol} 进入系统研究跟踪。",
+            watch_conditions={},
+            invalid_if={},
+            score_id=None,
+            factor_frame_id=None,
+            risk_ids=(),
+            evidence_ids=(),
+            signal_ids=(),
+        )
+
+    service = PersonalFinanceAgentService.__new__(PersonalFinanceAgentService)
+    service.recommendations = FakeRecommendations()
+    service.watchlists = FakeWatchlists()
+    service.memory = FakeMemory()
+    service.workflow_audit = FakeWorkflowAudit()
+
+    result = service.sync_recommendations_to_watchlist(
+        owner_id="default-owner",
+        recommendation_run_id="run:research",
+        watchlist_id="watchlist:default-owner:ashare:research",
+        as_of=datetime(2026, 6, 9, 10, 30, tzinfo=UTC),
+        limit=3,
+        workflow_run_id="workflow:research",
+        min_total_score=Decimal("60"),
+        min_confidence=Decimal("0.70"),
+    )
+
+    assert result.watchlist_item_ids == (
+        "watchlist_item:watchlist:default-owner:ashare:research:ashare:600519",
+    )
+    skipped_reasons = [
+        event["payload"]["reason"]
+        for event in service.workflow_audit.events
+        if event["event_type"] == "recommendation_skipped"
+    ]
+    assert skipped_reasons == ["below_min_total_score", "below_min_confidence"]
 
 
 def test_scheduler_logs_job_progress_to_standard_logging(caplog) -> None:
@@ -325,6 +818,237 @@ def test_scheduler_converts_ashare_market_bars_lookback_to_collection_dates() ->
     end_date = datetime.strptime(args.ashare_end, "%Y%m%d").replace(tzinfo=UTC)
     assert (end_date - start_date).days == 30
     assert args.symbol_source == "market_assets"
+
+
+def test_scheduler_sets_dynamic_end_for_ashare_full_history_without_lookback() -> None:
+    """A 股全量历史 K 线不使用 lookback 时，结束日期应动态取当前日期。"""
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="ashare.bars.1d.bootstrap",
+                job_type="collection",
+                group="ashare-p0",
+                interval_seconds=0,
+                limit=200,
+                market="ashare",
+                params={
+                    "sync_task_type": "market_bars_full_history_backfill",
+                    "lookback": None,
+                    "ashare_start": "19900101",
+                    "symbol_source": "market_assets",
+                    "ashare_timeframe": "1d",
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+    )
+
+    args = scheduler.build_collection_args(config.jobs[0])
+
+    assert args.ashare_start == "19900101"
+    assert args.ashare_end != "20260514"
+    assert int(args.ashare_end) >= int(datetime.now(tz=UTC).strftime("%Y%m%d"))
+
+
+def test_scheduler_converts_ashare_ten_year_bootstrap_lookback_to_collection_dates() -> None:
+    """A 股 10 年日 K 初始化任务应动态换算采集日期，避免继续拉上市以来全量。"""
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="ashare.bars.1d.bootstrap",
+                job_type="collection",
+                group="ashare-p0",
+                interval_seconds=0,
+                limit=200,
+                market="ashare",
+                params={
+                    "sync_task_type": "market_bars_full_history_backfill",
+                    "lookback": "10y",
+                    "symbol_source": "market_assets",
+                    "ashare_timeframe": "1d",
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+    )
+
+    args = scheduler.build_collection_args(config.jobs[0])
+
+    start_date = datetime.strptime(args.ashare_start, "%Y%m%d").replace(tzinfo=UTC)
+    end_date = datetime.strptime(args.ashare_end, "%Y%m%d").replace(tzinfo=UTC)
+    assert 3649 <= (end_date - start_date).days <= 3653
+    assert args.symbol_source == "market_assets"
+
+
+def test_scheduler_converts_fund_ten_year_bootstrap_lookback_to_collection_dates() -> None:
+    """基金 10 年初始化任务也应动态换算采集日期，避免落回脚本默认样例日期。"""
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="fund.etf.bars.1d.bootstrap",
+                job_type="collection",
+                group="fund",
+                interval_seconds=0,
+                limit=None,
+                market="fund",
+                params={
+                    "sync_task_type": "market_bars_full_history_backfill",
+                    "lookback": "10y",
+                    "symbol_source": "market_assets",
+                    "fund_timeframe": "1d",
+                    "fund_asset_type": "etf",
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+    )
+
+    args = scheduler.build_collection_args(config.jobs[0])
+
+    start_date = datetime.strptime(args.ashare_start, "%Y%m%d").replace(tzinfo=UTC)
+    end_date = datetime.strptime(args.ashare_end, "%Y%m%d").replace(tzinfo=UTC)
+    assert 3649 <= (end_date - start_date).days <= 3653
+    assert args.symbol_source == "market_assets"
+
+
+def test_scheduler_job_max_retries_overrides_global_retry_count() -> None:
+    """单任务 max_retries=0 时，任务级失败只记录一次，不走全局自动重试。"""
+
+    attempts = 0
+
+    def failing_collect_base_data(_: Any) -> dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("bootstrap failed")
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        max_job_retries=2,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="ashare.bars.1d.bootstrap",
+                group="ashare-p0",
+                interval_seconds=0,
+                market="ashare",
+                schedule_type="manual",
+                max_retries=0,
+                params={"sync_task_type": "market_bars_full_history_backfill"},
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=failing_collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        sleep_func=lambda _: None,
+    )
+
+    result = scheduler.run_job(config.jobs[0])
+
+    assert attempts == 1
+    assert result["status"] == "failed"
+    assert result["attempt_count"] == 1
+
+
+def test_scheduler_uses_global_retry_count_when_job_max_retries_is_unset() -> None:
+    """未设置单任务 max_retries 时，其他任务继续沿用全局重试逻辑。"""
+
+    attempts = 0
+
+    def failing_collect_base_data(_: Any) -> dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("normal job failed")
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        max_job_retries=2,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="ashare.bars.1d.close_final",
+                group="ashare-p0",
+                interval_seconds=3600,
+                market="ashare",
+                params={"sync_task_type": "market_bars_close_final"},
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=failing_collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        sleep_func=lambda _: None,
+    )
+
+    result = scheduler.run_job(config.jobs[0])
+
+    assert attempts == 3
+    assert result["status"] == "failed"
+    assert result["attempt_count"] == 3
+
+
+def test_collection_progress_uses_symbol_worker_concurrency() -> None:
+    """任务监控里的并发数应展示按标的采集并发，而不是调度器任务槽位数。"""
+
+    captured_progress: dict[str, Any] = {}
+
+    class FakeProgressRecorder:
+        cache_backend = "redis"
+
+        def job_started(self, **kwargs: Any) -> str:
+            captured_progress.update(kwargs)
+            return "run-progress"
+
+        def job_completed(self, **_: Any) -> None:
+            return None
+
+        def job_failed(self, **_: Any) -> None:
+            return None
+
+    config = BaseDataSchedulerConfig(
+        cache_backend="null",
+        max_concurrent_jobs=1,
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="ashare.bars.1d.bootstrap",
+                group="ashare-p0",
+                interval_seconds=0,
+                market="ashare",
+                schedule_type="manual",
+                params={
+                    "sync_task_type": "market_bars_full_history_backfill",
+                    "max_workers": 3,
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=lambda args: {"status": "ok", "max_workers": args.max_workers},
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+    )
+    scheduler._progress = FakeProgressRecorder()  # type: ignore[assignment]
+
+    result = scheduler.run_job(config.jobs[0])
+
+    assert result["status"] == "executed"
+    assert captured_progress["max_workers"] == 3
 
 
 def test_scheduler_loop_runs_due_jobs_concurrently() -> None:
@@ -431,6 +1155,139 @@ def test_scheduler_loop_runs_market_universe_before_asset_dependents() -> None:
     assert started == ["ashare.universe.all"]
 
 
+def test_scheduler_loop_triggers_after_success_dependents() -> None:
+    """上游任务成功后，after_success 依赖任务应进入下一轮调度。"""
+
+    started: list[str] = []
+
+    def collect_base_data(args: Namespace) -> dict[str, Any]:
+        started.append(args.name)
+        return {"status": "ok", "name": args.name}
+
+    def run_data_quality_refresh(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs["market"] == "ashare"
+        started.append("quality.ashare.after_close")
+        return {"status": "available", "snapshot_count": 1}
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        max_concurrent_jobs=1,
+        loop_idle_seconds=0.01,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="ashare.bars.1d.close_final",
+                group="ashare-p0",
+                interval_seconds=3600,
+                market="ashare",
+                params={
+                    "name": "ashare.bars.1d.close_final",
+                    "sync_task_type": "market_bars_close_final",
+                },
+            ),
+            BaseDataSchedulerJob(
+                name="quality.ashare.after_close",
+                job_type="data_quality_refresh",
+                group="analytics",
+                interval_seconds=0,
+                schedule_type="after_success",
+                depends_on=("ashare.bars.1d.close_final",),
+                market="ashare",
+                params={"name": "quality.ashare.after_close", "market": "ashare"},
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        run_data_quality_refresh_func=run_data_quality_refresh,
+        sleep_func=lambda _: None,
+    )
+
+    result = scheduler.run_loop(max_cycles=2)
+
+    assert result["cycles"] == 2
+    assert started == ["ashare.bars.1d.close_final", "quality.ashare.after_close"]
+
+
+def test_scheduler_loop_triggers_chained_after_success_dependents() -> None:
+    """after_success 应支持收盘 K 线、质量刷新、推荐流水线的串联触发。"""
+
+    started: list[str] = []
+
+    def collect_base_data(args: Namespace) -> dict[str, Any]:
+        started.append(args.name)
+        return {"status": "ok", "name": args.name}
+
+    def run_data_quality_refresh(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs["market"] == "ashare"
+        started.append("quality.ashare")
+        return {"status": "available", "snapshot_count": 1}
+
+    def run_recommendation_pipeline(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs["universe_id"] == "universe:base:ashare:p0:all_a"
+        started.append("analytics.recommendations.ashare.all_a")
+        return {"status": "available", "recommendation_count": 3}
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        max_concurrent_jobs=1,
+        loop_idle_seconds=0.01,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="ashare.bars.1d.close_final",
+                group="ashare-p0",
+                interval_seconds=3600,
+                market="ashare",
+                params={
+                    "name": "ashare.bars.1d.close_final",
+                    "sync_task_type": "market_bars_close_final",
+                },
+            ),
+            BaseDataSchedulerJob(
+                name="quality.ashare",
+                job_type="data_quality_refresh",
+                group="analytics",
+                interval_seconds=0,
+                schedule_type="after_success",
+                depends_on=("ashare.bars.1d.close_final",),
+                market="ashare",
+                params={"name": "quality.ashare", "market": "ashare"},
+            ),
+            BaseDataSchedulerJob(
+                name="analytics.recommendations.ashare.all_a",
+                job_type="recommendation_pipeline",
+                group="analytics",
+                interval_seconds=0,
+                schedule_type="after_success",
+                depends_on=("quality.ashare",),
+                market="ashare",
+                params={
+                    "name": "analytics.recommendations.ashare.all_a",
+                    "universe_id": "universe:base:ashare:p0:all_a",
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        run_data_quality_refresh_func=run_data_quality_refresh,
+        run_recommendation_pipeline_func=run_recommendation_pipeline,
+        sleep_func=lambda _: None,
+    )
+
+    result = scheduler.run_loop(max_cycles=3)
+
+    assert result["cycles"] == 3
+    assert started == [
+        "ashare.bars.1d.close_final",
+        "quality.ashare",
+        "analytics.recommendations.ashare.all_a",
+    ]
+
+
 def test_status_writes_from_multiple_scheduler_instances_do_not_share_temp_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -509,6 +1366,127 @@ def test_seconds_until_next_run_handles_empty_waiting_states() -> None:
     assert seconds_until_next_run([], idle_seconds=5) == 5.0
 
 
+def test_collect_base_data_with_timeout_sets_spawn_executable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """采集 payload 子进程应显式继承当前解释器，避免 Windows spawn 跑到其他 Python。"""
+
+    configured_executables: list[str] = []
+
+    class FakeQueue:
+        def __init__(self, maxsize: int) -> None:
+            self.maxsize = maxsize
+
+        def get_nowait(self) -> dict[str, Any]:
+            return {"ok": True, "result": {"status": "ok"}}
+
+    class FakeProcess:
+        exitcode = 0
+
+        def __init__(self, *, target: Any, args: tuple[Any, ...]) -> None:
+            self.target = target
+            self.args = args
+
+        def start(self) -> None:
+            return None
+
+        def is_alive(self) -> bool:
+            return False
+
+        def join(self, timeout: float | None = None) -> None:
+            return None
+
+    class FakeContext:
+        def Queue(self, maxsize: int) -> FakeQueue:  # noqa: N802 - 模拟 multiprocessing API
+            return FakeQueue(maxsize=maxsize)
+
+        def Process(self, *, target: Any, args: tuple[Any, ...]) -> FakeProcess:  # noqa: N802
+            return FakeProcess(target=target, args=args)
+
+    monkeypatch.setattr(scheduler_module.multiprocessing, "get_context", lambda method: FakeContext())
+    monkeypatch.setattr(
+        scheduler_module.multiprocessing,
+        "set_executable",
+        lambda executable: configured_executables.append(str(executable)),
+    )
+
+    result = collect_base_data_with_timeout(
+        Namespace(),
+        timeout_seconds=5,
+        collect_base_data_func=lambda args: {"status": "ok"},
+    )
+
+    assert result == {"status": "ok"}
+    assert configured_executables == [sys.executable]
+
+
+def test_collect_base_data_with_timeout_reads_queue_before_join_when_child_is_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """子进程已写入大结果但尚未退出时，父进程应先读队列再 join，避免 Windows Queue flush 死锁。"""
+
+    events: list[str] = []
+
+    class FakeQueue:
+        def __init__(self, maxsize: int) -> None:
+            self.maxsize = maxsize
+
+        def get(self, timeout: float | None = None) -> dict[str, Any]:
+            events.append("queue.get")
+            return {"ok": True, "result": {"status": "ok", "rows": 872}}
+
+        def get_nowait(self) -> dict[str, Any]:
+            events.append("queue.get_nowait")
+            return {"ok": True, "result": {"status": "fallback"}}
+
+    class FakeProcess:
+        exitcode = None
+
+        def __init__(self, *, target: Any, args: tuple[Any, ...]) -> None:
+            self.target = target
+            self.args = args
+            self.alive = True
+
+        def start(self) -> None:
+            events.append("process.start")
+
+        def is_alive(self) -> bool:
+            events.append("process.is_alive")
+            return self.alive
+
+        def join(self, timeout: float | None = None) -> None:
+            events.append("process.join")
+            self.alive = False
+            self.exitcode = 0
+
+        def terminate(self) -> None:
+            events.append("process.terminate")
+            self.alive = False
+
+        def kill(self) -> None:
+            events.append("process.kill")
+            self.alive = False
+
+    class FakeContext:
+        def Queue(self, maxsize: int) -> FakeQueue:  # noqa: N802 - 模拟 multiprocessing API
+            return FakeQueue(maxsize=maxsize)
+
+        def Process(self, *, target: Any, args: tuple[Any, ...]) -> FakeProcess:  # noqa: N802
+            return FakeProcess(target=target, args=args)
+
+    monkeypatch.setattr(scheduler_module.multiprocessing, "get_context", lambda method: FakeContext())
+    monkeypatch.setattr(scheduler_module.multiprocessing, "set_executable", lambda executable: None)
+
+    result = collect_base_data_with_timeout(
+        Namespace(),
+        timeout_seconds=5,
+        collect_base_data_func=lambda args: {"status": "ok"},
+    )
+
+    assert result == {"status": "ok", "rows": 872}
+    assert events.index("queue.get") < events.index("process.join")
+    assert "process.terminate" not in events
+    assert "process.kill" not in events
+
+
 def test_ashare_market_bars_backfill_registers_one_task_per_market_asset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -548,7 +1526,7 @@ def test_ashare_market_bars_backfill_registers_one_task_per_market_asset(
     monkeypatch.setattr(
         collect_base_data,
         "batch_ashare_symbols",
-        lambda session, limit, fallback_symbol: ["000001", "600519"],
+        lambda session, limit, fallback_symbol, **kwargs: ["000001", "600519"],
     )
 
     args = collect_base_data.default_collection_args(
@@ -568,6 +1546,627 @@ def test_ashare_market_bars_backfill_registers_one_task_per_market_asset(
         "stock_zh_a_hist_tx:000001",
         "stock_zh_a_hist_tx:600519",
     ]
+
+
+def test_ashare_market_bars_reload_batch_size_between_batches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A 股 K 线长任务应在批次边界读取最新批大小，让页面保存的配置热生效。"""
+
+    collect_base_data = import_collection_module()
+    scheduler_config_file = tmp_path / "base_data_scheduler.json"
+    job_name = "ashare.bars.1d.bootstrap"
+
+    def write_scheduler_batch_size(batch_size: int) -> None:
+        scheduler_config_file.write_text(
+            json.dumps(
+                {
+                    "schema_version": "data-sync-scheduler-v1",
+                    "enabled": True,
+                    "jobs": [
+                        {
+                            "name": job_name,
+                            "group": "ashare-p0",
+                            "enabled": True,
+                            "interval_seconds": 3600,
+                            "market": "ashare",
+                            "params": {
+                                "sync_task_type": "market_bars_full_history_backfill",
+                                "batch_size": batch_size,
+                            },
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    write_scheduler_batch_size(2)
+    executed_batches: list[list[str]] = []
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            return Namespace(
+                task=task,
+                status="planned",
+                raw_record_id=None,
+                item_count=0,
+                error_message=None,
+                payload={},
+            )
+
+    def fake_run_symbol_task_batch(symbols: list[str], **kwargs: Any) -> list[Any]:
+        executed_batches.append(list(symbols))
+        collect_symbol = kwargs["collect_symbol"]
+        on_symbol_result = kwargs.get("on_symbol_result")
+        results = []
+        for index, symbol in enumerate(symbols):
+            result = collect_symbol(symbol)
+            if on_symbol_result is not None:
+                on_symbol_result(symbol, result, index)
+            results.append(result)
+        if len(executed_batches) == 1:
+            write_scheduler_batch_size(1)
+        return results
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "batch_ashare_symbols",
+        lambda session, limit, fallback_symbol, **kwargs: [
+            "000001",
+            "000002",
+            "000003",
+            "000004",
+            "000005",
+        ],
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "should_refresh_asset_universe_before_incremental",
+        lambda session, market: False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_ashare_market_bar_watermark",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(collect_base_data, "run_symbol_task_batch", fake_run_symbol_task_batch)
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p0"],
+        sync_task_type="market_bars_full_history_backfill",
+        symbol_source="market_assets",
+        limit=5,
+        batch_size=2,
+    )
+    args.progress_job_name = job_name
+    args.runtime_scheduler_config_file = str(scheduler_config_file)
+
+    collect_base_data.run_ashare_p0(object(), args, RecordingRuntime())
+
+    assert executed_batches == [
+        ["000001", "000002"],
+        ["000003"],
+        ["000004"],
+        ["000005"],
+    ]
+
+
+def test_symbol_task_batch_logs_worker_start_and_finish(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """批量标的执行器应输出 worker 级开始和完成日志，便于定位卡住的股票。"""
+
+    collect_base_data = import_collection_module()
+    caplog.set_level(logging.INFO, logger=collect_base_data.__name__)
+
+    results = collect_base_data.run_symbol_task_batch(
+        ["000001"],
+        max_workers=1,
+        collect_symbol=lambda symbol: Namespace(
+            task="ashare_p0_ohlcv",
+            status="available",
+            raw_record_id=None,
+            item_count=1,
+            error_message=None,
+            payload={},
+        ),
+        stage_key="ashare_p0_ohlcv",
+        batch_index=1,
+        batch_count=1,
+        batch_size=1,
+        total_items=1,
+    )
+
+    assert len(results) == 1
+    assert "标的采集开始 stage=ashare_p0_ohlcv symbol=000001" in caplog.text
+    assert "标的采集完成 stage=ashare_p0_ohlcv symbol=000001" in caplog.text
+
+
+def test_ashare_market_bars_reload_max_workers_between_batches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A 股 K 线长任务应在批次边界读取最新并发数，让当前运行任务可热调速。"""
+
+    collect_base_data = import_collection_module()
+    scheduler_config_file = tmp_path / "base_data_scheduler.json"
+    job_name = "ashare.bars.1d.bootstrap"
+
+    def write_scheduler_max_workers(max_workers: int) -> None:
+        scheduler_config_file.write_text(
+            json.dumps(
+                {
+                    "schema_version": "data-sync-scheduler-v1",
+                    "enabled": True,
+                    "jobs": [
+                        {
+                            "name": job_name,
+                            "group": "ashare-p0",
+                            "enabled": True,
+                            "interval_seconds": 3600,
+                            "market": "ashare",
+                            "params": {
+                                "sync_task_type": "market_bars_full_history_backfill",
+                                "batch_size": 2,
+                                "max_workers": max_workers,
+                            },
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    write_scheduler_max_workers(2)
+    observed_max_workers: list[int] = []
+
+    def fake_run_symbol_task_batch(symbols: list[str], **kwargs: Any) -> list[Any]:
+        observed_max_workers.append(kwargs["max_workers"])
+        if len(observed_max_workers) == 1:
+            write_scheduler_max_workers(4)
+        return [
+            Namespace(
+                task=f"ashare_p0_ohlcv:{symbol}",
+                status="planned",
+                raw_record_id=None,
+                item_count=0,
+                error_message=None,
+                payload={},
+            )
+            for symbol in symbols
+        ]
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "batch_ashare_symbols",
+        lambda session, limit, fallback_symbol, **kwargs: [
+            "000001",
+            "000002",
+            "000003",
+            "000004",
+        ],
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "should_refresh_asset_universe_before_incremental",
+        lambda session, market: False,
+    )
+    monkeypatch.setattr(collect_base_data, "run_symbol_task_batch", fake_run_symbol_task_batch)
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p0"],
+        sync_task_type="market_bars_full_history_backfill",
+        symbol_source="market_assets",
+        limit=4,
+        batch_size=2,
+        max_workers=2,
+    )
+    args.progress_job_name = job_name
+    args.runtime_scheduler_config_file = str(scheduler_config_file)
+
+    collect_base_data.run_ashare_p0(
+        object(),
+        args,
+        Namespace(run_task=lambda **kwargs: None),
+        session_factory=object(),
+    )
+
+    assert observed_max_workers == [2, 4]
+
+
+def test_rate_limited_collection_hot_reloads_runtime_rate_policies(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """源级限频策略应在取源令牌前热读取运行期配置，让页面保存后当前任务生效。"""
+
+    collect_base_data = import_collection_module()
+    scheduler_config_file = tmp_path / "base_data_scheduler.json"
+    job_name = "ashare.bars.1d.bootstrap"
+    scheduler_config_file.write_text(
+        json.dumps(
+            {
+                "schema_version": "data-sync-scheduler-v1",
+                "enabled": True,
+                "rate_policies": {
+                    "eastmoney_kline": {
+                        "max_concurrency": 1,
+                        "min_interval_seconds": 1.5,
+                    }
+                },
+                "jobs": [
+                    {
+                        "name": job_name,
+                        "group": "ashare-p0",
+                        "enabled": True,
+                        "interval_seconds": 3600,
+                        "market": "ashare",
+                        "params": {
+                            "sync_task_type": "market_bars_full_history_backfill",
+                            "max_workers": 8,
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    updates: list[dict[str, Any]] = []
+
+    class FakeLimiter:
+        def update_policies(self, payload: dict[str, Any]) -> None:
+            updates.append(payload)
+
+        def acquire(self, source_key: str) -> Any:
+            class _Context:
+                def __enter__(self) -> None:
+                    return None
+
+                def __exit__(self, *_args: object) -> None:
+                    return None
+
+            return _Context()
+
+        def record_success(self, source_key: str) -> None:
+            return None
+
+        def record_failure(self, source_key: str, error_message: str | None = None) -> None:
+            return None
+
+        def adaptive_snapshot(self, source_key: str) -> None:
+            return None
+
+    args = Namespace(
+        runtime_scheduler_config_file=str(scheduler_config_file),
+        progress_job_name=job_name,
+        rate_policies={
+            "eastmoney_kline": {
+                "max_concurrency": 2,
+                "min_interval_seconds": 0.5,
+            }
+        },
+    )
+    monkeypatch.setattr(collect_base_data, "SOURCE_RATE_LIMITER", FakeLimiter())
+    monkeypatch.setattr(collect_base_data, "COLLECTION_RUNTIME_ARGS", args, raising=False)
+
+    result = collect_base_data.run_rate_limited_collection("eastmoney_kline", lambda: "ok")
+
+    assert result == "ok"
+    assert updates == [
+        {
+            "eastmoney_kline": {
+                "max_concurrency": 1,
+                "min_interval_seconds": 1.5,
+            }
+        }
+    ]
+
+
+def test_ashare_market_bars_reload_limit_before_each_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A 股 K 线长任务应在提交每只股票前读取最新单次上限，避免整轮任务固定旧 limit。"""
+
+    collect_base_data = import_collection_module()
+    scheduler_config_file = tmp_path / "base_data_scheduler.json"
+    job_name = "ashare.bars.1d"
+
+    def write_scheduler_limit(limit: int) -> None:
+        scheduler_config_file.write_text(
+            json.dumps(
+                {
+                    "schema_version": "data-sync-scheduler-v1",
+                    "enabled": True,
+                    "jobs": [
+                        {
+                            "name": job_name,
+                            "group": "ashare-p0",
+                            "enabled": True,
+                            "interval_seconds": 3600,
+                            "limit": limit,
+                            "market": "ashare",
+                            "params": {
+                                "sync_task_type": "market_bars_backfill",
+                                "batch_size": 3,
+                                "max_workers": 1,
+                            },
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    write_scheduler_limit(2)
+    observed_limits: list[int | None] = []
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            if task == "ashare_p0_ohlcv":
+                observed_limits.append(parameters["limit"])
+                if len(observed_limits) == 1:
+                    write_scheduler_limit(9)
+            return Namespace(
+                task=task,
+                status="planned",
+                raw_record_id=None,
+                item_count=0,
+                error_message=None,
+                payload={},
+            )
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "batch_ashare_symbols",
+        lambda session, limit, fallback_symbol, **kwargs: ["000001", "000002", "000003"],
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "should_refresh_asset_universe_before_incremental",
+        lambda session, market: False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_ashare_market_bar_watermark",
+        lambda *args, **kwargs: None,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p0"],
+        sync_task_type="market_bars_backfill",
+        symbol_source="market_assets",
+        limit=2,
+        batch_size=3,
+        max_workers=1,
+    )
+    args.progress_job_name = job_name
+    args.runtime_scheduler_config_file = str(scheduler_config_file)
+
+    collect_base_data.run_ashare_p0(object(), args, RecordingRuntime())
+
+    assert observed_limits == [2, 9, 9]
+
+
+def test_ashare_market_bars_recuts_sequential_batch_when_batch_size_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """顺序 K 线任务执行中修改批次大小时，应提前结束当前批次并用新批次大小继续。"""
+
+    collect_base_data = import_collection_module()
+    scheduler_config_file = tmp_path / "base_data_scheduler.json"
+    job_name = "ashare.bars.1d"
+
+    def write_scheduler_batch_size(batch_size: int) -> None:
+        scheduler_config_file.write_text(
+            json.dumps(
+                {
+                    "schema_version": "data-sync-scheduler-v1",
+                    "enabled": True,
+                    "jobs": [
+                        {
+                            "name": job_name,
+                            "group": "ashare-p0",
+                            "enabled": True,
+                            "interval_seconds": 3600,
+                            "limit": 2,
+                            "market": "ashare",
+                            "params": {
+                                "sync_task_type": "market_bars_backfill",
+                                "batch_size": batch_size,
+                                "max_workers": 1,
+                            },
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    write_scheduler_batch_size(3)
+    observed_symbols: list[str] = []
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            if task == "ashare_p0_ohlcv":
+                observed_symbols.append(parameters["symbol"])
+                if len(observed_symbols) == 1:
+                    write_scheduler_batch_size(1)
+            return Namespace(
+                task=task,
+                status="planned",
+                raw_record_id=None,
+                item_count=0,
+                error_message=None,
+                payload={},
+            )
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "batch_ashare_symbols",
+        lambda session, limit, fallback_symbol, **kwargs: ["000001", "000002", "000003"],
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "should_refresh_asset_universe_before_incremental",
+        lambda session, market: False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_ashare_market_bar_watermark",
+        lambda *args, **kwargs: None,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p0"],
+        sync_task_type="market_bars_backfill",
+        symbol_source="market_assets",
+        limit=2,
+        batch_size=3,
+        max_workers=1,
+    )
+    args.progress_job_name = job_name
+    args.runtime_scheduler_config_file = str(scheduler_config_file)
+
+    results = collect_base_data.run_ashare_p0(object(), args, RecordingRuntime())
+    ohlcv_payloads = [item.payload for item in results if item.task == "ashare_p0_ohlcv"]
+
+    assert observed_symbols == ["000001", "000002", "000003"]
+    assert [payload["batch_size"] for payload in ohlcv_payloads] == [3, 1, 1]
+
+
+def test_ashare_market_bars_waits_while_runtime_control_paused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A 股 K 线长任务遇到暂停控制时，应在下一只股票提交前等待继续。"""
+
+    collect_base_data = import_collection_module()
+    scheduler_config_file = tmp_path / "base_data_scheduler.json"
+    job_name = "ashare.bars.1d"
+
+    def write_control(paused: bool) -> None:
+        scheduler_config_file.write_text(
+            json.dumps(
+                {
+                    "schema_version": "data-sync-scheduler-v1",
+                    "enabled": True,
+                    "jobs": [
+                        {
+                            "name": job_name,
+                            "group": "ashare-p0",
+                            "enabled": True,
+                            "interval_seconds": 3600,
+                            "market": "ashare",
+                            "control": {"paused": paused},
+                            "params": {
+                                "sync_task_type": "market_bars_backfill",
+                                "batch_size": 2,
+                                "max_workers": 1,
+                            },
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    write_control(False)
+    submitted_symbols: list[str] = []
+    sleep_calls: list[float] = []
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            if task == "ashare_p0_ohlcv":
+                submitted_symbols.append(parameters["symbol"])
+                if len(submitted_symbols) == 1:
+                    write_control(True)
+            return Namespace(
+                task=task,
+                status="planned",
+                raw_record_id=None,
+                item_count=0,
+                error_message=None,
+                payload={},
+            )
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        write_control(False)
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "batch_ashare_symbols",
+        lambda session, limit, fallback_symbol, **kwargs: ["000001", "000002"],
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "should_refresh_asset_universe_before_incremental",
+        lambda session, market: False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_ashare_market_bar_watermark",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(collect_base_data, "time_sleep", fake_sleep)
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p0"],
+        sync_task_type="market_bars_backfill",
+        symbol_source="market_assets",
+        limit=2,
+        batch_size=2,
+        max_workers=1,
+    )
+    args.progress_job_name = job_name
+    args.runtime_scheduler_config_file = str(scheduler_config_file)
+
+    collect_base_data.run_ashare_p0(object(), args, RecordingRuntime())
+
+    assert submitted_symbols == ["000001", "000002"]
+    assert sleep_calls == [1.0]
 
 
 def test_ashare_universe_refresh_fetches_complete_asset_list(
@@ -756,8 +2355,13 @@ def test_ashare_p1_list_refreshes_use_unbounded_source_limits(
     monkeypatch.setattr(
         collect_base_data.AshareP1Collector,
         "collect_stock_news",
-        lambda self, symbol, asset_name, limit: calls.append(
-            {"task": "collect_stock_news", "symbol": symbol, "limit": limit}
+        lambda self, symbol, asset_name, limit, enrich_articles=True: calls.append(
+            {
+                "task": "collect_stock_news",
+                "symbol": symbol,
+                "limit": limit,
+                "enrich_articles": enrich_articles,
+            }
         ),
     )
     monkeypatch.setattr(
@@ -812,10 +2416,95 @@ def test_ashare_p1_list_refreshes_use_unbounded_source_limits(
     assert flow_task["parameters"]["limit"] is None
 
 
-def test_ashare_event_refresh_runs_stock_news_for_all_market_assets_in_batches(
+def test_ashare_capital_flow_records_rank_watermark(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A 股新闻增量应从完整资产池展开并按批跑完，而不是只采样例股票。"""
+    """资金流榜单刷新完成后应写入榜单级水位，支持失败补跑和冷却判断。"""
+
+    collect_base_data = import_collection_module()
+    watermark_calls: list[dict[str, Any]] = []
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            return Namespace(
+                task=task,
+                status="available",
+                raw_record_id="raw:flow",
+                item_count=2,
+                error_message=None,
+                payload={"actual_source": "eastmoney"},
+            )
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_ashare_capital_flow_watermark",
+        lambda session, **kwargs: watermark_calls.append(kwargs),
+        raising=False,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p1"],
+        sync_task_type="capital_flow_refresh",
+        flow_window="今日",
+    )
+
+    collect_base_data.run_ashare_p1(object(), args, RecordingRuntime())
+
+    assert len(watermark_calls) == 1
+    assert watermark_calls[0]["indicator"] == "今日"
+    assert watermark_calls[0]["result"].status == "available"
+
+
+def test_ashare_capital_flow_skips_when_failure_watermark_in_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """资金流榜单失败冷却未到时应跳过本轮请求，避免反复打不稳定来源。"""
+
+    collect_base_data = import_collection_module()
+    run_calls: list[str] = []
+    next_retry_at = datetime.now(tz=UTC) + timedelta(minutes=10)
+
+    class RecordingRuntime:
+        def run_task(self, **kwargs: Any) -> Any:
+            run_calls.append(kwargs["task"])
+            raise AssertionError("失败冷却期内不应继续请求资金流数据源")
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_data_sync_watermarks",
+        lambda session, asset_ids, data_domain, provider, timeframe: {
+            collect_base_data.ashare_capital_flow_watermark_asset_id("今日"): Namespace(
+                status="error",
+                next_retry_at=next_retry_at,
+            )
+        },
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p1"],
+        sync_task_type="capital_flow_refresh",
+        flow_window="今日",
+    )
+
+    results = collect_base_data.run_ashare_p1(object(), args, RecordingRuntime())
+
+    assert run_calls == []
+    assert results[0].status == "skipped"
+    assert "失败冷却期" in results[0].error_message
+
+
+def test_ashare_event_refresh_runs_stock_news_for_priority_assets_in_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 股逐股新闻只覆盖重点资产，避免全市场逐股新闻拖慢事件主链路。"""
 
     collect_base_data = import_collection_module()
 
@@ -850,8 +2539,8 @@ def test_ashare_event_refresh_runs_stock_news_for_all_market_assets_in_batches(
 
     monkeypatch.setattr(
         collect_base_data,
-        "batch_ashare_symbols",
-        lambda session, limit, fallback_symbol: ["000001", "000002", "000003"],
+        "resolve_ashare_priority_news_symbols",
+        lambda session, args: ["000001", "600519", "002594"],
     )
     monkeypatch.setattr(
         collect_base_data,
@@ -870,8 +2559,9 @@ def test_ashare_event_refresh_runs_stock_news_for_all_market_assets_in_batches(
     results = collect_base_data.run_ashare_p1(object(), args, RecordingRuntime())
 
     news_calls = [item for item in calls if item["task"] == "ashare_p1_stock_news"]
-    assert [item["parameters"]["symbol"] for item in news_calls] == ["000001", "000002", "000003"]
+    assert [item["parameters"]["symbol"] for item in news_calls] == ["000001", "600519", "002594"]
     assert [item["parameters"]["limit"] for item in news_calls] == [None, None, None]
+    assert [item["parameters"]["enrich_articles"] for item in news_calls] == [False, False, False]
     assert [
         item.payload.get("batch_index")
         for item in results
@@ -883,6 +2573,34 @@ def test_ashare_event_refresh_runs_stock_news_for_all_market_assets_in_batches(
     ]
     notice_call = next(item for item in calls if item["task"] == "ashare_p1_notice_reports")
     assert notice_call["parameters"]["limit"] is None
+
+
+def test_ashare_priority_news_symbols_use_event_priority_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """逐股新闻重点名单应优先来自事件重点池解析器。"""
+
+    collect_base_data = import_collection_module()
+    session = object()
+    calls: list[dict[str, Any]] = []
+
+    class FakeEventPriorityResolver:
+        def __init__(self, resolver_session: Any) -> None:
+            calls.append({"session": resolver_session})
+
+        def resolve_ashare_symbols(self, *, limit: int) -> list[str]:
+            calls.append({"limit": limit})
+            return ["600519", "300750", "000001"]
+
+    monkeypatch.setattr(collect_base_data, "EventPriorityResolver", FakeEventPriorityResolver)
+
+    args = Namespace(priority_symbol_limit=2, ashare_symbol="002594")
+
+    assert collect_base_data.resolve_ashare_priority_news_symbols(session, args) == [
+        "600519",
+        "000001",
+    ]
+    assert calls == [{"session": session}, {"limit": 2}]
 
 
 def test_ashare_risk_sentiment_refreshes_use_unbounded_source_limits(
@@ -956,6 +2674,181 @@ def test_ashare_risk_sentiment_refreshes_use_unbounded_source_limits(
     }
     assert all(limit is None for limit in collected_limits.values())
     assert all(result.payload.get("limit") is None for result in results)
+
+
+def test_ashare_risk_sentiment_records_independent_source_watermarks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """风险情绪每个子源都应独立写水位，避免一个源失败污染整组任务。"""
+
+    collect_base_data = import_collection_module()
+    watermark_calls: list[dict[str, Any]] = []
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            status = "error" if provider_key == "stock_hot_rank_em" else "available"
+            return Namespace(
+                task=task,
+                status=status,
+                raw_record_id=f"raw:{provider_key}" if status == "available" else None,
+                item_count=3 if status == "available" else 0,
+                error_message="hot rank timeout" if status == "error" else None,
+                payload={"actual_source": f"akshare:{provider_key}"},
+            )
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_ashare_risk_sentiment_watermark",
+        lambda session, **kwargs: watermark_calls.append(kwargs),
+        raising=False,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-risk"],
+        sync_task_type="risk_sentiment_refresh",
+        limit=2,
+        batch_size=2,
+    )
+
+    collect_base_data.run_ashare_risk(object(), args, RecordingRuntime())
+
+    assert [
+        (call["task"], call["provider"], call["result"].status)
+        for call in watermark_calls
+    ] == [
+        ("ashare_risk_stop_list", "stock_zh_a_stop_em", "available"),
+        ("ashare_sentiment_hot_rank", "stock_hot_rank_em", "error"),
+        ("ashare_sentiment_zt_pool", "stock_zt_pool_em", "available"),
+        ("ashare_risk_lhb_detail", "stock_lhb_detail_em", "available"),
+        ("ashare_risk_block_trades", "stock_dzjy_mrmx", "available"),
+        ("ashare_risk_margin_sse", "stock_margin_sse", "available"),
+        ("ashare_risk_margin_szse", "stock_margin_szse", "available"),
+    ]
+
+
+def test_ashare_risk_sentiment_skips_only_source_in_failure_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单个风险源失败冷却未到时，只跳过该源，其他子阶段仍应继续执行。"""
+
+    collect_base_data = import_collection_module()
+    run_calls: list[str] = []
+    watermark_calls: list[dict[str, Any]] = []
+    next_retry_at = datetime.now(tz=UTC) + timedelta(minutes=10)
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            run_calls.append(provider_key)
+            return Namespace(
+                task=task,
+                status="available",
+                raw_record_id=f"raw:{provider_key}",
+                item_count=1,
+                error_message=None,
+                payload={},
+            )
+
+    def fake_watermarks(
+        session: Any,
+        asset_ids: list[str],
+        *,
+        data_domain: str,
+        provider: str,
+        timeframe: str,
+    ) -> dict[str, Any]:
+        assert data_domain == collect_base_data.ASHARE_RISK_SENTIMENT_DATA_DOMAIN
+        if provider == "stock_hot_rank_em":
+            return {
+                collect_base_data.ashare_risk_sentiment_watermark_asset_id(
+                    "stock_hot_rank_em",
+                    timeframe="hot_rank",
+                ): Namespace(status="error", next_retry_at=next_retry_at)
+            }
+        return {}
+
+    monkeypatch.setattr(collect_base_data, "_fetch_data_sync_watermarks", fake_watermarks)
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_ashare_risk_sentiment_watermark",
+        lambda session, **kwargs: watermark_calls.append(kwargs),
+        raising=False,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-risk"],
+        sync_task_type="risk_sentiment_refresh",
+        risk_end="20260514",
+    )
+
+    results = collect_base_data.run_ashare_risk(object(), args, RecordingRuntime())
+
+    assert "stock_hot_rank_em" not in run_calls
+    assert len(run_calls) == 6
+    hot_rank = next(result for result in results if result.task == "ashare_sentiment_hot_rank")
+    assert hot_rank.status == "skipped"
+    assert "失败冷却期" in hot_rank.error_message
+    assert [call["provider"] for call in watermark_calls] == run_calls
+
+
+def test_record_ashare_risk_sentiment_watermark_records_success_and_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """风险情绪源水位应记录成功和失败摘要，便于后续断点和手工重跑。"""
+
+    collect_base_data = import_collection_module()
+    calls: list[dict[str, Any]] = []
+
+    class FakeWatermarkRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def record_success(self, **kwargs: Any) -> None:
+            calls.append({"kind": "success", **kwargs})
+
+        def record_failure(self, **kwargs: Any) -> None:
+            calls.append({"kind": "failure", **kwargs})
+
+    monkeypatch.setattr(collect_base_data, "DataSyncWatermarkRepository", FakeWatermarkRepository)
+
+    collect_base_data.record_ashare_risk_sentiment_watermark(
+        object(),
+        task="ashare_risk_stop_list",
+        provider="stock_zh_a_stop_em",
+        timeframe="stop_list",
+        result=Namespace(status="available", item_count=2, payload={"actual_source": "akshare"}),
+    )
+    collect_base_data.record_ashare_risk_sentiment_watermark(
+        object(),
+        task="ashare_sentiment_hot_rank",
+        provider="stock_hot_rank_em",
+        timeframe="hot_rank",
+        result=Namespace(status="error", item_count=0, error_message="timeout", payload={}),
+    )
+
+    assert calls[0]["kind"] == "success"
+    assert calls[0]["asset_id"] == "ashare:risk_sentiment:stock_zh_a_stop_em:stop_list"
+    assert calls[0]["data_domain"] == collect_base_data.ASHARE_RISK_SENTIMENT_DATA_DOMAIN
+    assert calls[0]["payload"]["item_count"] == 2
+    assert calls[1]["kind"] == "failure"
+    assert calls[1]["asset_id"] == "ashare:risk_sentiment:stock_hot_rank_em:hot_rank"
+    assert calls[1]["error_message"] == "timeout"
+    assert calls[1]["retry_after"] == timedelta(minutes=15)
 
 
 def test_ashare_market_bars_backfill_refreshes_complete_universe_when_pool_empty(
@@ -1058,7 +2951,7 @@ def test_ashare_market_bars_backfill_runs_all_market_assets_in_batches(
     monkeypatch.setattr(
         collect_base_data,
         "batch_ashare_symbols",
-        lambda session, limit, fallback_symbol: [
+        lambda session, limit, fallback_symbol, **kwargs: [
             "000001",
             "000002",
             "000003",
@@ -1112,6 +3005,66 @@ def test_ashare_market_bars_backfill_runs_all_market_assets_in_batches(
     ]
 
 
+def test_ashare_full_history_backfill_does_not_cap_single_symbol_bars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """10 年历史 K 线初始化任务不应把批次 limit 误传成单股 K 线条数上限。"""
+
+    collect_base_data = import_collection_module()
+
+    calls: list[dict[str, Any]] = []
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            calls.append(
+                {
+                    "task": task,
+                    "provider_key": provider_key,
+                    "parameters": parameters,
+                    "force": force,
+                }
+            )
+            return Namespace(
+                task=task,
+                status="planned",
+                raw_record_id=None,
+                item_count=0,
+                error_message=None,
+                payload={},
+            )
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "batch_ashare_symbols",
+        lambda session, limit, fallback_symbol, **kwargs: ["000001", "600519"],
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p0"],
+        sync_task_type="market_bars_full_history_backfill",
+        symbol_source="market_assets",
+        limit=2,
+        batch_size=2,
+        max_workers=1,
+        ashare_start="20160605",
+        ashare_end="20260605",
+    )
+
+    collect_base_data.run_ashare_p0(object(), args, RecordingRuntime())
+
+    ohlcv_calls = [item for item in calls if item["task"] == "ashare_p0_ohlcv"]
+    assert [item["parameters"]["symbol"] for item in ohlcv_calls] == ["000001", "600519"]
+    assert [item["parameters"]["limit"] for item in ohlcv_calls] == [None, None]
+
+
 def test_ashare_market_bars_uses_symbol_scoped_provider_circuit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1151,7 +3104,7 @@ def test_ashare_market_bars_uses_symbol_scoped_provider_circuit(
     monkeypatch.setattr(
         collect_base_data,
         "batch_ashare_symbols",
-        lambda session, limit, fallback_symbol: ["000001", "600519"],
+        lambda session, limit, fallback_symbol, **kwargs: ["000001", "600519"],
     )
 
     args = collect_base_data.default_collection_args(
@@ -1186,7 +3139,10 @@ def test_batch_ashare_symbols_prefers_assets_with_less_market_bar_coverage(
             assert only_tradable is True
             return [
                 Namespace(asset_id="ashare:000001", symbol="000001"),
+                Namespace(asset_id="ashare:002594", symbol="002594"),
                 Namespace(asset_id="ashare:300750", symbol="300750"),
+                Namespace(asset_id="ashare:688363", symbol="688363"),
+                Namespace(asset_id="ashare:873124", symbol="873124"),
                 Namespace(asset_id="ashare:600519", symbol="600519"),
             ]
 
@@ -1196,6 +3152,7 @@ def test_batch_ashare_symbols_prefers_assets_with_less_market_bar_coverage(
         "_fetch_ashare_bar_coverage",
         lambda session, asset_ids, timeframe: {
             "ashare:000001": (40, None),
+            "ashare:002594": (8, None),
             "ashare:300750": (8, None),
         },
         raising=False,
@@ -1207,7 +3164,818 @@ def test_batch_ashare_symbols_prefers_assets_with_less_market_bar_coverage(
         fallback_symbol="000001",
     )
 
-    assert symbols == ["600519", "300750"]
+    assert symbols == ["600519", "002594"]
+
+
+def test_batch_ashare_symbols_skips_failed_assets_until_retry_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 股 K 线补采应跳过仍处于失败冷却期的标的，避免本轮反复请求同一不稳定源。"""
+
+    collect_base_data = import_collection_module()
+    now = datetime(2026, 6, 4, 10, 0, tzinfo=UTC)
+
+    class FakeAssetRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def find_by_market(self, market: str, *, only_tradable: bool = True) -> list[Any]:
+            assert market == "ashare"
+            return [
+                Namespace(asset_id="ashare:000001", symbol="000001"),
+                Namespace(asset_id="ashare:002594", symbol="002594"),
+                Namespace(asset_id="ashare:300750", symbol="300750"),
+                Namespace(asset_id="ashare:600519", symbol="600519"),
+            ]
+
+    monkeypatch.setattr(collect_base_data, "AssetRepository", FakeAssetRepository)
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_ashare_bar_coverage",
+        lambda session, asset_ids, timeframe: {
+            "ashare:000001": (0, None),
+            "ashare:002594": (0, None),
+            "ashare:300750": (0, None),
+            "ashare:600519": (0, None),
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_data_sync_watermarks",
+        lambda session, asset_ids, data_domain, provider, timeframe: {
+            "ashare:000001": Namespace(status="error", next_retry_at=now + timedelta(minutes=10)),
+            "ashare:002594": Namespace(status="error", next_retry_at=now - timedelta(minutes=1)),
+        },
+        raising=False,
+    )
+
+    symbols = collect_base_data.batch_ashare_symbols(
+        object(),
+        limit=None,
+        fallback_symbol="000001",
+        now=now,
+    )
+
+    assert symbols == ["002594", "600519"]
+
+
+def test_batch_ashare_symbols_skips_assets_with_covered_requested_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """全量历史 K 线任务应跳过数据库中已覆盖本次请求区间的标的，避免断点续跑时重跑。"""
+
+    collect_base_data = import_collection_module()
+    request_start = datetime(2016, 6, 1, tzinfo=UTC)
+    request_end = datetime(2026, 6, 5, tzinfo=UTC)
+
+    class FakeAssetRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def find_by_market(self, market: str, *, only_tradable: bool = True) -> list[Any]:
+            assert market == "ashare"
+            return [
+                Namespace(asset_id="ashare:000001", symbol="000001"),
+                Namespace(asset_id="ashare:002594", symbol="002594"),
+                Namespace(asset_id="ashare:600519", symbol="600519"),
+            ]
+
+    monkeypatch.setattr(collect_base_data, "AssetRepository", FakeAssetRepository)
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_ashare_bar_coverage",
+        lambda session, asset_ids, timeframe: {
+            "ashare:000001": (2426, request_start, request_end),
+            "ashare:002594": (0, None, None),
+            "ashare:600519": (1800, datetime(2018, 1, 1, tzinfo=UTC), request_end),
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_data_sync_watermarks",
+        lambda session, asset_ids, data_domain, provider, timeframe: {},
+        raising=False,
+    )
+
+    symbols = collect_base_data.batch_ashare_symbols(
+        object(),
+        fallback_symbol="000001",
+        only_failed_or_stale=True,
+        required_start_at=request_start,
+        required_end_at=request_end,
+    )
+
+    assert symbols == ["002594", "600519"]
+
+
+def test_fetch_ashare_bar_coverage_returns_earliest_and_latest() -> None:
+    """A 股 K 线覆盖度查询必须返回最早和最新时间，断点续跑才能判断完整窗口。"""
+
+    collect_base_data = import_collection_module()
+    earliest = datetime(2016, 6, 8, tzinfo=UTC)
+    latest = datetime(2026, 6, 5, tzinfo=UTC)
+
+    class FakeSession:
+        def execute(self, statement: Any) -> list[tuple[Any, ...]]:
+            return [("ashare:000001", 2420, earliest, latest)]
+
+    assert collect_base_data._fetch_ashare_bar_coverage(
+        FakeSession(),
+        ["ashare:000001"],
+        timeframe="1d",
+    ) == {"ashare:000001": (2420, earliest, latest)}
+
+
+def test_fetch_ashare_bar_coverage_chunks_large_asset_sets() -> None:
+    """A 股 K 线覆盖率查询应按资产分块，避免单条超大 IN 查询耗尽 PostgreSQL 共享内存。"""
+
+    collect_base_data = import_collection_module()
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.execute_count = 0
+
+        def execute(self, statement: Any) -> list[tuple[Any, ...]]:
+            self.execute_count += 1
+            return [(f"ashare:chunk:{self.execute_count}", self.execute_count, None, None)]
+
+    session = FakeSession()
+
+    coverage = collect_base_data._fetch_ashare_bar_coverage(
+        session,
+        [f"ashare:{index:06d}" for index in range(1201)],
+        timeframe="1d",
+    )
+
+    assert session.execute_count == 3
+    assert coverage["ashare:chunk:1"] == (1, None, None)
+    assert coverage["ashare:chunk:3"] == (3, None, None)
+
+
+def test_batch_ashare_symbols_does_not_fallback_single_symbol_when_full_history_selection_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """全量历史 K 线筛选失败时应让任务失败，而不是降级为单只 000001 后误报完成。"""
+
+    collect_base_data = import_collection_module()
+
+    class FakeAssetRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def find_by_market(self, market: str, *, only_tradable: bool = True) -> list[Any]:
+            assert market == "ashare"
+            assert only_tradable is True
+            return [
+                Namespace(asset_id="ashare:000001", symbol="000001"),
+                Namespace(asset_id="ashare:600519", symbol="600519"),
+            ]
+
+    monkeypatch.setattr(collect_base_data, "AssetRepository", FakeAssetRepository)
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_ashare_bar_coverage",
+        lambda session, asset_ids, timeframe: (_ for _ in ()).throw(RuntimeError("coverage boom")),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="A 股 K 线补采标的筛选失败"):
+        collect_base_data.batch_ashare_symbols(
+            object(),
+            fallback_symbol="000001",
+            only_failed_or_stale=True,
+        )
+
+
+def test_batch_ashare_symbols_skips_assets_with_matching_success_watermark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """成功水位已覆盖本次请求区间时，即使上市日晚于起始日也应视为可断点跳过。"""
+
+    collect_base_data = import_collection_module()
+    request_start = datetime(2016, 6, 1, tzinfo=UTC)
+    request_end = datetime(2026, 6, 5, tzinfo=UTC)
+
+    class FakeAssetRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def find_by_market(self, market: str, *, only_tradable: bool = True) -> list[Any]:
+            assert market == "ashare"
+            return [Namespace(asset_id="ashare:603507", symbol="603507")]
+
+    monkeypatch.setattr(collect_base_data, "AssetRepository", FakeAssetRepository)
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_ashare_bar_coverage",
+        lambda session, asset_ids, timeframe: {
+            "ashare:603507": (1600, datetime(2017, 1, 3, tzinfo=UTC), request_end)
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_data_sync_watermarks",
+        lambda session, asset_ids, data_domain, provider, timeframe: {
+            "ashare:603507": Namespace(
+                status="available",
+                next_retry_at=None,
+                payload={
+                    "sync_task_type": "market_bars_full_history_backfill",
+                    "requested_start": "20160601",
+                    "requested_end": "20260605",
+                },
+            )
+        },
+        raising=False,
+    )
+
+    symbols = collect_base_data.batch_ashare_symbols(
+        object(),
+        fallback_symbol="000001",
+        only_failed_or_stale=True,
+        required_start_at=request_start,
+        required_end_at=request_end,
+    )
+
+    assert symbols == []
+
+
+def test_resolve_ashare_collection_symbols_uses_resume_filter_for_full_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """全量历史 K 线初始化应自动启用断点筛选，并把请求区间传给标的选择器。"""
+
+    collect_base_data = import_collection_module()
+    captured: dict[str, Any] = {}
+
+    def fake_batch_ashare_symbols(session: Any, **kwargs: Any) -> list[str]:
+        captured.update(kwargs)
+        return ["000001"]
+
+    monkeypatch.setattr(collect_base_data, "batch_ashare_symbols", fake_batch_ashare_symbols)
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p0"],
+        sync_task_type="market_bars_full_history_backfill",
+        symbol_source="market_assets",
+        ashare_start="20160601",
+        ashare_end="20260605",
+    )
+
+    assert collect_base_data.resolve_ashare_collection_symbols(object(), args) == ["000001"]
+    assert captured["only_failed_or_stale"] is True
+    assert captured["required_start_at"] == datetime(2016, 6, 1, tzinfo=UTC)
+    assert captured["required_end_at"] == datetime(2026, 6, 5, tzinfo=UTC)
+
+
+def test_resolve_ashare_collection_symbols_uses_last_trading_day_for_full_history_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """全量历史 K 线断点筛选应把自然日结束日校准到最后交易日，避免周末当天永远缺 K 线。"""
+
+    collect_base_data = import_collection_module()
+    captured: dict[str, Any] = {}
+
+    def fake_batch_ashare_symbols(session: Any, **kwargs: Any) -> list[str]:
+        captured.update(kwargs)
+        return ["000001"]
+
+    monkeypatch.setattr(collect_base_data, "batch_ashare_symbols", fake_batch_ashare_symbols)
+    monkeypatch.setattr(
+        collect_base_data,
+        "latest_ashare_trading_datetime",
+        lambda session, end_at: datetime(2026, 6, 5, tzinfo=UTC),
+        raising=False,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p0"],
+        sync_task_type="market_bars_full_history_backfill",
+        symbol_source="market_assets",
+        ashare_start="20160608",
+        ashare_end="20260606",
+    )
+
+    assert collect_base_data.resolve_ashare_collection_symbols(object(), args) == ["000001"]
+    assert captured["required_end_at"] == datetime(2026, 6, 5, tzinfo=UTC)
+
+
+def test_ashare_kline_source_gate_uses_queue_workers_without_source_limiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 股 K 线有效并发由任务队列 worker 控制，源优先级和降级保留在 provider 内部。"""
+
+    collect_base_data = import_collection_module()
+
+    def fail_if_called(source_key: str, collect: Any) -> Any:
+        raise AssertionError(f"source limiter should not gate A-share K-line: {source_key}")
+
+    monkeypatch.setattr(collect_base_data, "run_rate_limited_collection", fail_if_called)
+
+    assert collect_base_data.ashare_kline_source_gate("eastmoney_kline", lambda: "ok") == "ok"
+
+
+def test_record_ashare_market_bar_watermark_records_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 股 K 线采集成功后应以库内最新 K 线时间更新采集水位。"""
+
+    collect_base_data = import_collection_module()
+    now = datetime(2026, 6, 4, 10, 0, tzinfo=UTC)
+    latest_bar_at = datetime(2026, 6, 3, 15, 0, tzinfo=UTC)
+    calls: list[dict[str, Any]] = []
+
+    class FakeWatermarkRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def record_success(self, **kwargs: Any) -> None:
+            calls.append({"method": "success", **kwargs})
+
+        def record_failure(self, **kwargs: Any) -> None:
+            calls.append({"method": "failure", **kwargs})
+
+    monkeypatch.setattr(collect_base_data, "DataSyncWatermarkRepository", FakeWatermarkRepository)
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_ashare_bar_coverage",
+        lambda session, asset_ids, timeframe: {"ashare:600519": (117, latest_bar_at)},
+        raising=False,
+    )
+
+    collect_base_data.record_ashare_market_bar_watermark(
+        object(),
+        symbol="600519",
+        timeframe="1d",
+        result=Namespace(status="available", item_count=117, error_message=None, payload={}),
+        occurred_at=now,
+    )
+
+    assert calls == [
+        {
+            "method": "success",
+            "asset_id": "ashare:600519",
+            "symbol": "600519",
+            "market": "ashare",
+            "data_domain": "market_bars",
+            "provider": "akshare:stock_zh_a_hist_tx",
+            "timeframe": "1d",
+            "watermark_at": latest_bar_at,
+            "occurred_at": now,
+            "payload": {"item_count": 117, "latest_bar_count": 117},
+        }
+    ]
+
+
+def test_record_ashare_market_bar_watermark_keeps_requested_window_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """成功水位应保留本次请求窗口，供新股等实际起始日晚于 10 年起点的标的断点跳过。"""
+
+    collect_base_data = import_collection_module()
+    now = datetime(2026, 6, 4, 10, 0, tzinfo=UTC)
+    earliest_bar_at = datetime(2018, 1, 3, tzinfo=UTC)
+    latest_bar_at = datetime(2026, 6, 3, 15, 0, tzinfo=UTC)
+    calls: list[dict[str, Any]] = []
+
+    class FakeWatermarkRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def record_success(self, **kwargs: Any) -> None:
+            calls.append({"method": "success", **kwargs})
+
+        def record_failure(self, **kwargs: Any) -> None:
+            calls.append({"method": "failure", **kwargs})
+
+    monkeypatch.setattr(collect_base_data, "DataSyncWatermarkRepository", FakeWatermarkRepository)
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_ashare_bar_coverage",
+        lambda session, asset_ids, timeframe: {
+            "ashare:603507": (1600, earliest_bar_at, latest_bar_at)
+        },
+        raising=False,
+    )
+
+    collect_base_data.record_ashare_market_bar_watermark(
+        object(),
+        symbol="603507",
+        timeframe="1d",
+        result=Namespace(
+            status="available",
+            item_count=1600,
+            error_message=None,
+            payload={
+                "sync_task_type": "market_bars_full_history_backfill",
+                "requested_start": "20160601",
+                "requested_end": "20260605",
+            },
+        ),
+        occurred_at=now,
+    )
+
+    assert calls[0]["payload"] == {
+        "item_count": 1600,
+        "latest_bar_count": 1600,
+        "sync_task_type": "market_bars_full_history_backfill",
+        "requested_start": "20160601",
+        "requested_end": "20260605",
+    }
+
+
+def test_record_ashare_market_bar_watermark_records_network_failure_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 股 K 线网络失败应写入失败水位和下次重试时间，而不是反复打同一源。"""
+
+    collect_base_data = import_collection_module()
+    now = datetime(2026, 6, 4, 10, 0, tzinfo=UTC)
+    calls: list[dict[str, Any]] = []
+
+    class FakeWatermarkRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def record_success(self, **kwargs: Any) -> None:
+            calls.append({"method": "success", **kwargs})
+
+        def record_failure(self, **kwargs: Any) -> None:
+            calls.append({"method": "failure", **kwargs})
+
+    monkeypatch.setattr(collect_base_data, "DataSyncWatermarkRepository", FakeWatermarkRepository)
+
+    collect_base_data.record_ashare_market_bar_watermark(
+        object(),
+        symbol="301611",
+        timeframe="1d",
+        result=Namespace(
+            status="error",
+            item_count=0,
+            error_message="Failed to perform, curl: (56) Connection closed abruptly",
+            payload={},
+        ),
+        occurred_at=now,
+    )
+
+    assert calls == [
+        {
+            "method": "failure",
+            "asset_id": "ashare:301611",
+            "symbol": "301611",
+            "market": "ashare",
+            "data_domain": "market_bars",
+            "provider": "akshare:stock_zh_a_hist_tx",
+            "timeframe": "1d",
+            "occurred_at": now,
+            "retry_after": timedelta(minutes=15),
+            "error_message": "Failed to perform, curl: (56) Connection closed abruptly",
+            "payload": {"status": "error", "item_count": 0},
+        }
+    ]
+
+
+def test_record_ashare_market_bar_watermark_can_skip_failure_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """全量历史 K 线初始化失败只记录失败，不自动安排待重试时间。"""
+
+    collect_base_data = import_collection_module()
+    now = datetime(2026, 6, 4, 10, 0, tzinfo=UTC)
+    calls: list[dict[str, Any]] = []
+
+    class FakeWatermarkRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def record_success(self, **kwargs: Any) -> None:
+            calls.append({"method": "success", **kwargs})
+
+        def record_failure(self, **kwargs: Any) -> None:
+            calls.append({"method": "failure", **kwargs})
+
+    monkeypatch.setattr(collect_base_data, "DataSyncWatermarkRepository", FakeWatermarkRepository)
+
+    collect_base_data.record_ashare_market_bar_watermark(
+        object(),
+        symbol="301611",
+        timeframe="1d",
+        result=Namespace(
+            status="error",
+            item_count=0,
+            error_message="Failed to perform, curl: (56) Connection closed abruptly",
+            payload={},
+        ),
+        occurred_at=now,
+        schedule_retry=False,
+    )
+
+    assert calls == [
+        {
+            "method": "failure",
+            "asset_id": "ashare:301611",
+            "symbol": "301611",
+            "market": "ashare",
+            "data_domain": "market_bars",
+            "provider": "akshare:stock_zh_a_hist_tx",
+            "timeframe": "1d",
+            "occurred_at": now,
+            "retry_after": None,
+            "error_message": "Failed to perform, curl: (56) Connection closed abruptly",
+            "payload": {"status": "error", "item_count": 0},
+        }
+    ]
+
+
+def test_attach_ashare_market_bar_retry_payload_can_skip_retry_metadata() -> None:
+    """全量历史 K 线初始化失败日志保留分类，但不展示待重试倒计时。"""
+
+    collect_base_data = import_collection_module()
+    now = datetime(2026, 6, 4, 10, 0, tzinfo=UTC)
+
+    result = collect_base_data.attach_ashare_market_bar_retry_payload(
+        Namespace(
+            status="error",
+            item_count=0,
+            error_message="Failed to perform, curl: (56) Connection closed abruptly",
+            payload={},
+        ),
+        occurred_at=now,
+        schedule_retry=False,
+    )
+
+    assert result.payload["provider_key"] == "akshare:stock_zh_a_hist_tx"
+    assert result.payload["error_category"] == "network"
+    assert "retry_after_seconds" not in result.payload
+    assert "next_retry_at" not in result.payload
+
+
+def test_record_ashare_market_bar_watermark_rolls_back_aborted_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """水位写入遇到数据库事务异常时，应回滚并跳过，不能继续打挂整轮 K 线任务。"""
+
+    collect_base_data = import_collection_module()
+    now = datetime(2026, 6, 4, 10, 0, tzinfo=UTC)
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.rolled_back = False
+
+        def rollback(self) -> None:
+            self.rolled_back = True
+
+    class FailingWatermarkRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def record_failure(self, **kwargs: Any) -> None:
+            raise SQLAlchemyError("current transaction is aborted")
+
+    session = FakeSession()
+    monkeypatch.setattr(collect_base_data, "DataSyncWatermarkRepository", FailingWatermarkRepository)
+
+    collect_base_data.record_ashare_market_bar_watermark(
+        session,
+        symbol="001208",
+        timeframe="1d",
+        result=Namespace(
+            status="error",
+            item_count=0,
+            error_message="curl: (56) Connection closed abruptly",
+            payload={},
+        ),
+        occurred_at=now,
+    )
+
+    assert session.rolled_back is True
+
+
+def test_record_ashare_market_bar_watermark_uses_isolated_session_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """调度提供 session_factory 时，K 线水位应使用独立短事务写入，避免污染主批次事务。"""
+
+    collect_base_data = import_collection_module()
+    now = datetime(2026, 6, 4, 10, 0, tzinfo=UTC)
+    calls: list[dict[str, Any]] = []
+
+    class MainSession:
+        pass
+
+    class WatermarkSession:
+        def __init__(self) -> None:
+            self.committed = False
+            self.closed = False
+
+        def commit(self) -> None:
+            self.committed = True
+
+        def rollback(self) -> None:
+            raise AssertionError("成功路径不应回滚独立水位事务")
+
+        def close(self) -> None:
+            self.closed = True
+
+    watermark_session = WatermarkSession()
+
+    class FakeWatermarkRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def record_failure(self, **kwargs: Any) -> None:
+            calls.append({"session": self.session, **kwargs})
+
+    monkeypatch.setattr(collect_base_data, "DataSyncWatermarkRepository", FakeWatermarkRepository)
+
+    collect_base_data.record_ashare_market_bar_watermark(
+        MainSession(),
+        symbol="001208",
+        timeframe="1d",
+        result=Namespace(
+            status="error",
+            item_count=0,
+            error_message="curl: (56) Connection closed abruptly",
+            payload={},
+        ),
+        occurred_at=now,
+        session_factory=lambda: watermark_session,
+    )
+
+    assert calls[0]["session"] is watermark_session
+    assert calls[0]["asset_id"] == "ashare:001208"
+    assert watermark_session.committed is True
+    assert watermark_session.closed is True
+
+
+def test_ashare_market_bars_backfill_updates_watermarks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 股 K 线批量补采应在每个标的完成后同步更新采集水位。"""
+
+    collect_base_data = import_collection_module()
+    latest_bar_at = datetime(2026, 6, 3, 15, 0, tzinfo=UTC)
+    calls: list[dict[str, Any]] = []
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            if task != "ashare_p0_ohlcv":
+                return Namespace(
+                    task=task,
+                    status="planned",
+                    raw_record_id=None,
+                    item_count=0,
+                    error_message=None,
+                    payload={},
+                )
+            if parameters["symbol"] == "600519":
+                return Namespace(
+                    task=task,
+                    status="available",
+                    raw_record_id="raw:600519",
+                    item_count=117,
+                    error_message=None,
+                    payload={},
+                )
+            return Namespace(
+                task=task,
+                status="error",
+                raw_record_id="raw:301611",
+                item_count=0,
+                error_message="curl: (56) Connection closed abruptly",
+                payload={},
+            )
+
+    class FakeWatermarkRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def record_success(self, **kwargs: Any) -> None:
+            calls.append({"method": "success", **kwargs})
+
+        def record_failure(self, **kwargs: Any) -> None:
+            calls.append({"method": "failure", **kwargs})
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "batch_ashare_symbols",
+        lambda session, limit, fallback_symbol, **kwargs: ["600519", "301611"],
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "should_refresh_asset_universe_before_incremental",
+        lambda session, market: False,
+    )
+    monkeypatch.setattr(collect_base_data, "DataSyncWatermarkRepository", FakeWatermarkRepository)
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_ashare_bar_coverage",
+        lambda session, asset_ids, timeframe: {"ashare:600519": (117, latest_bar_at)},
+        raising=False,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p0"],
+        sync_task_type="market_bars_backfill",
+        symbol_source="market_assets",
+        limit=2,
+        batch_size=2,
+    )
+
+    collect_base_data.run_ashare_p0(object(), args, RecordingRuntime())
+
+    assert [call["method"] for call in calls] == ["success", "failure"]
+    assert calls[0]["asset_id"] == "ashare:600519"
+    assert calls[0]["watermark_at"] == latest_bar_at
+    assert calls[1]["asset_id"] == "ashare:301611"
+    assert calls[1]["retry_after"] == timedelta(minutes=15)
+
+
+def test_ashare_market_bars_backfill_uses_current_session_for_single_worker_watermark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单 worker 写入仍在当前事务中，水位记录应复用当前 session 才能读到最新 K 线。"""
+
+    collect_base_data = import_collection_module()
+    watermark_calls: list[dict[str, Any]] = []
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            if task != "ashare_p0_ohlcv":
+                return Namespace(
+                    task=task,
+                    status="planned",
+                    raw_record_id=None,
+                    item_count=0,
+                    error_message=None,
+                    payload={},
+                )
+            return Namespace(
+                task=task,
+                status="available",
+                raw_record_id="raw:600519",
+                item_count=117,
+                error_message=None,
+                payload={},
+            )
+
+    def fake_record_watermark(session: Any, **kwargs: Any) -> None:
+        watermark_calls.append({"session": session, **kwargs})
+
+    main_session = object()
+    monkeypatch.setattr(
+        collect_base_data,
+        "batch_ashare_symbols",
+        lambda session, limit, fallback_symbol, **kwargs: ["600519"],
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "should_refresh_asset_universe_before_incremental",
+        lambda session, market: False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_ashare_market_bar_watermark",
+        fake_record_watermark,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p0"],
+        sync_task_type="market_bars_backfill",
+        symbol_source="market_assets",
+        limit=1,
+        batch_size=1,
+        max_workers=1,
+    )
+
+    collect_base_data.run_ashare_p0(
+        main_session,
+        args,
+        RecordingRuntime(),
+        session_factory=lambda: object(),
+    )
+
+    assert watermark_calls[0]["session"] is main_session
+    assert watermark_calls[0]["session_factory"] is None
 
 
 def test_resolve_ashare_collection_symbols_keeps_full_backfill_universe(
@@ -1224,6 +3992,10 @@ def test_resolve_ashare_collection_symbols_keeps_full_backfill_universe(
         def find_by_market(self, market: str, *, only_tradable: bool = True) -> list[Any]:
             assert market == "ashare"
             return [
+                Namespace(asset_id="ashare:110067", symbol="110067"),
+                Namespace(asset_id="ashare:900001", symbol="900001"),
+                Namespace(asset_id="ashare:159001", symbol="159001"),
+            ] + [
                 Namespace(asset_id=f"ashare:00000{index}", symbol=f"00000{index}")
                 for index in range(1, 6)
             ]
@@ -1282,7 +4054,7 @@ def test_ashare_market_bars_backfill_commits_after_each_symbol_batch(
     monkeypatch.setattr(
         collect_base_data,
         "batch_ashare_symbols",
-        lambda session, limit, fallback_symbol: [
+        lambda session, limit, fallback_symbol, **kwargs: [
             "000001",
             "000002",
             "000003",
@@ -1341,8 +4113,8 @@ def test_ashare_fundamentals_run_all_market_assets_in_batches(
 
     monkeypatch.setattr(
         collect_base_data,
-        "batch_ashare_symbols",
-        lambda session, limit, fallback_symbol: [
+        "batch_ashare_fundamental_symbols",
+        lambda session, limit, fallback_symbol, **kwargs: [
             "000001",
             "000002",
             "000003",
@@ -1391,6 +4163,160 @@ def test_ashare_fundamentals_run_all_market_assets_in_batches(
     ]
 
 
+def test_batch_ashare_fundamental_symbols_uses_watermarks_for_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """基本面增量刷新应跳过财务和估值都已成功且未过期的标的。"""
+
+    collect_base_data = import_collection_module()
+    stale_before = datetime(2026, 6, 1, tzinfo=UTC)
+
+    class FakeAssetRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def find_by_market(self, market: str, *, only_tradable: bool = True) -> list[Any]:
+            assert market == "ashare"
+            return [
+                Namespace(asset_id="ashare:000001", symbol="000001"),
+                Namespace(asset_id="ashare:600519", symbol="600519"),
+                Namespace(asset_id="ashare:002594", symbol="002594"),
+            ]
+
+    def fake_watermarks(
+        session: Any,
+        asset_ids: list[str],
+        data_domain: str,
+        provider: str,
+        timeframe: str,
+    ) -> dict[str, Any]:
+        if data_domain == "fundamentals":
+            return {
+                "ashare:000001": Namespace(status="available", watermark_at=datetime(2026, 6, 4, tzinfo=UTC)),
+                "ashare:600519": Namespace(status="available", watermark_at=datetime(2026, 6, 4, tzinfo=UTC)),
+            }
+        if data_domain == "valuation":
+            return {
+                "ashare:000001": Namespace(status="available", watermark_at=datetime(2026, 6, 4, tzinfo=UTC)),
+                "ashare:600519": Namespace(status="error", next_retry_at=datetime(2026, 5, 31, tzinfo=UTC)),
+            }
+        return {}
+
+    monkeypatch.setattr(collect_base_data, "AssetRepository", FakeAssetRepository)
+    monkeypatch.setattr(collect_base_data, "_fetch_data_sync_watermarks", fake_watermarks)
+
+    symbols = collect_base_data.batch_ashare_fundamental_symbols(
+        object(),
+        fallback_symbol="000001",
+        only_failed_or_stale=True,
+        stale_before=stale_before,
+    )
+
+    assert symbols == ["002594", "600519"]
+
+
+def test_record_ashare_fundamental_watermark_records_success_and_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单股票财务/估值结果应写入独立水位，支持后续断点续跑和失败补跑。"""
+
+    collect_base_data = import_collection_module()
+    calls: list[dict[str, Any]] = []
+
+    class FakeWatermarkRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def record_success(self, **kwargs: Any) -> None:
+            calls.append({"kind": "success", **kwargs})
+
+        def record_failure(self, **kwargs: Any) -> None:
+            calls.append({"kind": "failure", **kwargs})
+
+    monkeypatch.setattr(collect_base_data, "DataSyncWatermarkRepository", FakeWatermarkRepository)
+
+    collect_base_data.record_ashare_fundamental_watermark(
+        object(),
+        symbol="000001",
+        data_domain="fundamentals",
+        provider="stock_financial_analysis_indicator_em",
+        result=Namespace(status="available", item_count=3, payload={"actual_source": "akshare"}),
+    )
+    collect_base_data.record_ashare_fundamental_watermark(
+        object(),
+        symbol="000001",
+        data_domain="valuation",
+        provider="stock_value_em",
+        result=Namespace(status="error", item_count=0, error_message="timeout", payload={}),
+    )
+
+    assert calls[0]["kind"] == "success"
+    assert calls[0]["asset_id"] == "ashare:000001"
+    assert calls[0]["data_domain"] == "fundamentals"
+    assert calls[0]["payload"]["item_count"] == 3
+    assert calls[1]["kind"] == "failure"
+    assert calls[1]["data_domain"] == "valuation"
+    assert calls[1]["error_message"] == "timeout"
+    assert calls[1]["retry_after"] == timedelta(minutes=15)
+
+
+def test_ashare_fundamentals_records_symbol_watermarks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """基本面批量任务应在单股票财务和估值完成后分别写入水位。"""
+
+    collect_base_data = import_collection_module()
+    watermark_calls: list[dict[str, Any]] = []
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            status = "error" if task == "ashare_p2_valuation" else "available"
+            return Namespace(
+                task=task,
+                status=status,
+                raw_record_id=None,
+                item_count=1 if status == "available" else 0,
+                error_message="valuation timeout" if status == "error" else None,
+                payload={},
+            )
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "batch_ashare_fundamental_symbols",
+        lambda session, limit, fallback_symbol, **kwargs: ["000001"],
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_ashare_fundamental_watermark",
+        lambda session, **kwargs: watermark_calls.append(kwargs),
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p2"],
+        sync_task_type="fundamental_refresh",
+        symbol_source="market_assets",
+        batch_size=1,
+    )
+
+    collect_base_data.run_ashare_p2(object(), args, RecordingRuntime())
+
+    assert [
+        (call["symbol"], call["data_domain"], call["provider"], call["result"].status)
+        for call in watermark_calls
+    ] == [
+        ("000001", "fundamentals", "stock_financial_analysis_indicator_em", "available"),
+        ("000001", "valuation", "stock_value_em", "error"),
+    ]
+
+
 def test_ashare_fundamentals_does_not_fallback_to_single_symbol_when_universe_locked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1430,7 +4356,7 @@ def test_ashare_fundamentals_does_not_fallback_to_single_symbol_when_universe_lo
     monkeypatch.setattr(
         collect_base_data,
         "batch_ashare_symbols",
-        lambda session, limit, fallback_symbol: [fallback_symbol],
+        lambda session, limit, fallback_symbol, **kwargs: [fallback_symbol],
     )
 
     args = collect_base_data.default_collection_args(
@@ -1672,6 +4598,209 @@ def test_crypto_market_bars_backfill_runs_all_market_assets_in_batches(
         2,
         2,
     ]
+
+
+def test_crypto_market_bars_records_symbol_watermarks_and_skips_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Crypto K 线应按交易对写水位，并只跳过仍在失败冷却期的交易对。"""
+
+    collect_base_data = import_collection_module()
+    run_calls: list[str] = []
+    watermark_calls: list[dict[str, Any]] = []
+    next_retry_at = datetime.now(tz=UTC) + timedelta(minutes=10)
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            if task == "crypto_ohlcv":
+                run_calls.append(parameters["symbol"])
+            return Namespace(
+                task=task,
+                status="available",
+                raw_record_id=f"raw:{parameters.get('symbol', task)}",
+                item_count=2,
+                error_message=None,
+                payload={},
+            )
+
+    def fake_watermarks(
+        session: Any,
+        asset_ids: list[str],
+        *,
+        data_domain: str,
+        provider: str,
+        timeframe: str,
+    ) -> dict[str, Any]:
+        assert data_domain == collect_base_data.CRYPTO_MARKET_BAR_DATA_DOMAIN
+        assert provider == collect_base_data.CRYPTO_MARKET_BAR_PROVIDER
+        assert timeframe == "1h"
+        return {
+            "crypto_spot:ETHUSDT": Namespace(status="error", next_retry_at=next_retry_at),
+        }
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "batch_crypto_symbols",
+        lambda session, market, timeframe, limit, fallback_symbol: ["BTCUSDT", "ETHUSDT"],
+        raising=False,
+    )
+    monkeypatch.setattr(collect_base_data, "_fetch_data_sync_watermarks", fake_watermarks)
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_crypto_symbol_watermark",
+        lambda session, **kwargs: watermark_calls.append(kwargs),
+        raising=False,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["crypto"],
+        sync_task_type="market_bars_backfill",
+        symbol_source="market_assets",
+        crypto_market_type="spot",
+        crypto_timeframe="1h",
+        batch_size=2,
+    )
+
+    results = collect_base_data.run_crypto(object(), args, RecordingRuntime())
+
+    assert run_calls == ["BTCUSDT"]
+    skipped = next(item for item in results if item.task == "crypto_ohlcv" and item.status == "skipped")
+    assert skipped.payload["symbol"] == "ETHUSDT"
+    assert "失败冷却期" in skipped.error_message
+    assert [(call["symbol"], call["data_domain"], call["provider"]) for call in watermark_calls] == [
+        ("BTCUSDT", collect_base_data.CRYPTO_MARKET_BAR_DATA_DOMAIN, collect_base_data.CRYPTO_MARKET_BAR_PROVIDER)
+    ]
+
+
+def test_crypto_derivatives_records_symbol_watermarks_and_uses_source_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Crypto 衍生品快照应按交易对写水位，并通过 Binance native 源限流。"""
+
+    collect_base_data = import_collection_module()
+    source_gate_calls: list[str] = []
+    watermark_calls: list[dict[str, Any]] = []
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            if task == "crypto_derivative_snapshot":
+                collect()
+            return Namespace(
+                task=task,
+                status="available",
+                raw_record_id=f"raw:{parameters.get('symbol', task)}",
+                item_count=1,
+                error_message=None,
+                payload={},
+            )
+
+    class FakeCollector:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def collect_derivative_snapshot(self, *, symbol: str) -> Any:
+            return Namespace()
+
+    monkeypatch.setattr(collect_base_data, "CryptoDataCollector", FakeCollector)
+    monkeypatch.setattr(
+        collect_base_data,
+        "batch_crypto_derivative_symbols",
+        lambda session, market, limit, fallback_symbol: ["BTCUSDT"],
+        raising=False,
+    )
+
+    def fake_rate_limited(source_key: str, collect: Any) -> Any:
+        source_gate_calls.append(source_key)
+        return collect()
+
+    monkeypatch.setattr(collect_base_data, "run_rate_limited_collection", fake_rate_limited)
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_crypto_symbol_watermark",
+        lambda session, **kwargs: watermark_calls.append(kwargs),
+        raising=False,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["crypto"],
+        sync_task_type="derivative_refresh",
+        symbol_source="market_assets",
+        crypto_market_type="future",
+        batch_size=1,
+    )
+
+    collect_base_data.run_crypto(object(), args, RecordingRuntime())
+
+    assert source_gate_calls == ["binance_derivative_snapshot"]
+    assert watermark_calls[0]["symbol"] == "BTCUSDT"
+    assert watermark_calls[0]["market"] == "crypto_future"
+    assert watermark_calls[0]["data_domain"] == collect_base_data.CRYPTO_DERIVATIVE_DATA_DOMAIN
+    assert watermark_calls[0]["provider"] == collect_base_data.CRYPTO_DERIVATIVE_PROVIDER
+
+
+def test_record_crypto_symbol_watermark_records_success_and_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Crypto 交易对水位应记录成功和失败，供 7x24 任务断点续跑。"""
+
+    collect_base_data = import_collection_module()
+    calls: list[dict[str, Any]] = []
+
+    class FakeWatermarkRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def record_success(self, **kwargs: Any) -> None:
+            calls.append({"kind": "success", **kwargs})
+
+        def record_failure(self, **kwargs: Any) -> None:
+            calls.append({"kind": "failure", **kwargs})
+
+    monkeypatch.setattr(collect_base_data, "DataSyncWatermarkRepository", FakeWatermarkRepository)
+
+    collect_base_data.record_crypto_symbol_watermark(
+        object(),
+        symbol="BTC/USDT",
+        market="crypto_spot",
+        data_domain="market_bars",
+        provider="ccxt_binance_fetch_ohlcv",
+        timeframe="1h",
+        result=Namespace(status="available", item_count=2, payload={"actual_source": "ccxt"}),
+    )
+    collect_base_data.record_crypto_symbol_watermark(
+        object(),
+        symbol="ETHUSDT",
+        market="crypto_future",
+        data_domain="derivatives",
+        provider="binance_derivative_snapshot",
+        timeframe="future",
+        result=Namespace(status="error", item_count=0, error_message="timeout", payload={}),
+    )
+
+    assert calls[0]["kind"] == "success"
+    assert calls[0]["asset_id"] == "crypto_spot:BTCUSDT"
+    assert calls[0]["timeframe"] == "1h"
+    assert calls[0]["payload"]["item_count"] == 2
+    assert calls[1]["kind"] == "failure"
+    assert calls[1]["asset_id"] == "crypto_future:ETHUSDT"
+    assert calls[1]["data_domain"] == "derivatives"
+    assert calls[1]["retry_after"] == timedelta(minutes=15)
 
 
 def test_crypto_derivative_refresh_runs_all_future_assets_in_batches(

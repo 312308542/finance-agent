@@ -1,6 +1,7 @@
 from finance_agent.data.sync_config import (
     build_preset_config,
     export_scheduler_payload,
+    parse_data_sync_config,
     preview_data_sync_config,
 )
 
@@ -79,6 +80,9 @@ def test_scheduler_payload_registers_real_universe_recommendation_jobs() -> None
         ]
         == 3
     )
+    assert jobs["analytics.recommendations.ashare.all_a"]["params"]["candidate_source"] == (
+        "technical_screening_pool"
+    )
     assert jobs["analytics.recommendations.crypto_spot.binance"]["params"]["universe_id"] == (
         "universe:base:crypto:spot:binance"
     )
@@ -108,9 +112,71 @@ def test_scheduler_payload_uses_long_enough_bar_lookback_for_analytics() -> None
     scheduler_payload = export_scheduler_payload(config)
     jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
 
-    assert jobs["ashare.bars.1d"]["params"]["lookback"] == "180d"
+    assert jobs["ashare.bars.1d.bootstrap"]["params"]["lookback"] == "10y"
+    assert "ashare_start" not in jobs["ashare.bars.1d.bootstrap"]["params"]
+    assert jobs["ashare.bars.1d.bootstrap"]["params"]["schedule_failure_retry"] is False
+    assert jobs["ashare.bars.1d.bootstrap"]["max_retries"] == 0
+    assert jobs["ashare.bars.1d.close_final"]["params"]["lookback"] == "180d"
+    assert jobs["ashare.bars.1d.revision"]["params"]["lookback"] == "7d"
     assert jobs["crypto_spot.bars.1h"]["params"]["lookback"] == "168h"
     assert jobs["crypto_future.bars.1h"]["params"]["lookback"] == "168h"
+
+
+def test_scheduler_payload_documents_historical_bootstrap_boundaries() -> None:
+    """历史初始化任务应按资产类型拆分，并在中文说明中表达清楚边界。"""
+
+    config = build_preset_config("personal-comprehensive", markets=["ashare", "fund"])
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+
+    ashare_bootstrap = jobs["ashare.bars.1d.bootstrap"]
+    assert ashare_bootstrap["params"]["sync_task_type"] == "market_bars_full_history_backfill"
+    assert ashare_bootstrap["params"]["lookback"] == "10y"
+    assert "A 股主板" in ashare_bootstrap["params"]["title"]
+    assert "主板股票" in "；".join(ashare_bootstrap["params"]["notes"])
+
+    assert jobs["fund.etf.bars.1d.bootstrap"]["params"]["fund_asset_type"] == "etf"
+    assert jobs["fund.etf.bars.1d.bootstrap"]["params"]["data_packages"] == ["market_bars"]
+    assert jobs["fund.lof.bars.1d.bootstrap"]["params"]["fund_asset_type"] == "lof"
+    assert jobs["fund.lof.bars.1d.bootstrap"]["params"]["data_packages"] == ["market_bars"]
+    assert jobs["fund.open.nav.bootstrap"]["params"]["fund_asset_type"] == "open_fund"
+    assert jobs["fund.open.nav.bootstrap"]["params"]["sync_task_type"] == (
+        "fund_nav_full_history_backfill"
+    )
+    assert jobs["fund.open.nav.bootstrap"]["params"]["data_packages"] == ["fund_nav"]
+
+
+def test_scheduler_payload_splits_ashare_daily_bar_lifecycle_jobs() -> None:
+    """A 股日 K 应拆分为初始化、午盘、收盘和凌晨修正，而不是每小时全量扫。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+
+    assert "ashare.bars.1d" not in jobs
+    assert jobs["ashare.bars.1d.bootstrap"]["schedule_type"] == "manual"
+    assert jobs["ashare.bars.1d.bootstrap"]["enabled"] is False
+    assert jobs["ashare.bars.1d.bootstrap"]["params"]["sync_task_type"] == (
+        "market_bars_full_history_backfill"
+    )
+    assert jobs["ashare.bars.1d.midday_partial"]["schedule_type"] == "daily_time"
+    assert jobs["ashare.bars.1d.midday_partial"]["run_at"] == ["11:45"]
+    assert jobs["ashare.bars.1d.midday_partial"]["trading_day_policy"] == (
+        "trading_day_only"
+    )
+    assert jobs["ashare.bars.1d.midday_partial"]["params"]["is_closed"] is False
+    assert jobs["ashare.bars.1d.midday_partial"]["params"]["status"] == "partial"
+    assert jobs["ashare.bars.1d.close_final"]["run_at"] == ["15:50", "17:30"]
+    assert jobs["ashare.bars.1d.close_final"]["params"]["is_closed"] is True
+    assert jobs["ashare.bars.1d.close_final"]["params"]["status"] == "available"
+    assert jobs["ashare.bars.1d.revision"]["run_at"] == ["02:10"]
+    assert jobs["ashare.bars.1d.revision"]["trading_day_policy"] == "any_day"
+    assert jobs["ashare.bars.1d.revision"]["params"]["sync_task_type"] == (
+        "market_bars_revision"
+    )
+    assert jobs["ashare.bars.1d.revision"]["params"]["lookback"] == "7d"
 
 
 def test_scheduler_payload_marks_market_bar_batch_size_as_symbol_batch_size() -> None:
@@ -121,8 +187,12 @@ def test_scheduler_payload_marks_market_bar_batch_size_as_symbol_batch_size() ->
     scheduler_payload = export_scheduler_payload(config)
     jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
 
-    assert jobs["ashare.bars.1d"]["limit"] == 200
-    assert jobs["ashare.bars.1d"]["params"]["batch_size"] == 200
+    assert jobs["ashare.bars.1d.bootstrap"]["limit"] == 50
+    assert jobs["ashare.bars.1d.bootstrap"]["params"]["batch_size"] == 50
+    assert jobs["ashare.bars.1d.close_final"]["limit"] == 200
+    assert jobs["ashare.bars.1d.close_final"]["params"]["batch_size"] == 200
+    assert jobs["ashare.bars.1d.revision"]["limit"] == 200
+    assert jobs["ashare.bars.1d.revision"]["params"]["batch_size"] == 200
     assert jobs["crypto_spot.bars.1h"]["limit"] == 150
     assert jobs["crypto_spot.bars.1h"]["params"]["batch_size"] == 150
     assert jobs["crypto_future.bars.1h"]["limit"] == 150
@@ -137,11 +207,59 @@ def test_scheduler_payload_exports_low_symbol_fetch_concurrency() -> None:
     scheduler_payload = export_scheduler_payload(config)
     jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
 
-    assert jobs["ashare.bars.1d"]["params"]["max_workers"] == 4
+    assert jobs["ashare.bars.1d.bootstrap"]["params"]["max_workers"] == 2
+    assert jobs["ashare.bars.1d.close_final"]["params"]["max_workers"] == 4
+    assert jobs["ashare.bars.1d.revision"]["params"]["max_workers"] == 4
     assert jobs["ashare.events"]["params"]["max_workers"] == 4
     assert jobs["ashare.fundamentals"]["params"]["max_workers"] == 4
     assert jobs["crypto_spot.bars.1h"]["params"]["max_workers"] == 4
     assert jobs["crypto_future.bars.1h"]["params"]["max_workers"] == 4
+
+
+def test_scheduler_payload_marks_ashare_fundamentals_as_incremental_resume() -> None:
+    """基本面/估值定时任务应默认按水位增量补齐，避免每轮重复扫完整资产池。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+
+    assert jobs["ashare.fundamentals"]["params"]["only_failed_or_stale"] is True
+
+
+def test_scheduler_payload_exports_source_rate_policies() -> None:
+    """调度计划应携带数据源限频策略，便于采集进程按配置执行。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    policies = scheduler_payload["rate_policies"]
+
+    assert policies["eastmoney_kline"]["max_concurrency"] == 1
+    assert policies["eastmoney_kline"]["backoff"]["cooldown_seconds"] == 900
+    assert policies["tencent_kline"]["max_concurrency"] == 2
+    assert policies["tencent_kline"]["min_interval_seconds"] >= 0.5
+    assert policies["stock_zh_a_hist_tx"]["max_concurrency"] == 2
+    assert policies["stock_zh_a_hist_tx"]["min_interval_seconds"] >= 0.5
+    assert policies["stock_news_em"]["min_interval_seconds"] >= 2.0
+    assert policies["stock_zh_a_hist_tx"]["backoff"]["cooldown_seconds"] == 900
+
+
+def test_parse_data_sync_config_backfills_default_source_rate_policies() -> None:
+    """旧版运行时配置缺少 rate_policies 时，应自动补齐默认源级限频策略。"""
+
+    config = build_preset_config("personal-comprehensive")
+    payload = config.to_dict()
+    payload.pop("rate_policies", None)
+
+    parsed_config = parse_data_sync_config(payload)
+    scheduler_payload = export_scheduler_payload(parsed_config)
+    policies = scheduler_payload["rate_policies"]
+
+    assert policies["eastmoney_kline"]["max_concurrency"] == 1
+    assert policies["tencent_kline"]["max_concurrency"] == 2
+    assert policies["stock_zh_a_hist_tx"]["max_concurrency"] == 2
+    assert policies["stock_zh_a_hist_tx"]["backoff"]["cooldown_seconds"] == 900
 
 
 def test_scheduler_payload_does_not_cap_universe_refresh_by_batch_size() -> None:
@@ -176,6 +294,49 @@ def test_scheduler_payload_does_not_cap_list_sources_by_batch_size() -> None:
         assert "source_limit" not in jobs[job_name]["params"]
 
 
+def test_fund_market_preview_and_scheduler_jobs_are_exported() -> None:
+    """基金市场启用后，应导出资产池、ETF/LOF 日 K 和开放式基金净值任务。"""
+
+    config = build_preset_config("personal-comprehensive", markets=["fund"])
+
+    preview = preview_data_sync_config(config)
+    scheduler_payload = export_scheduler_payload(config)
+    task_keys = {task["task_key"] for task in preview["tasks"]}
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+
+    assert preview["enabled_markets"] == ["fund"]
+    assert {
+        "fund.universe.all",
+        "fund.etf.bars.1d.bootstrap",
+        "fund.lof.bars.1d.bootstrap",
+        "fund.bars.1d.close_final",
+        "fund.open.nav.bootstrap",
+        "fund.open.nav.daily",
+    }.issubset(task_keys)
+    assert jobs["fund.etf.bars.1d.bootstrap"]["schedule_type"] == "manual"
+    assert jobs["fund.etf.bars.1d.bootstrap"]["limit"] is None
+    assert jobs["fund.etf.bars.1d.bootstrap"]["params"]["fund_asset_type"] == "etf"
+    assert jobs["fund.lof.bars.1d.bootstrap"]["params"]["fund_asset_type"] == "lof"
+    assert jobs["fund.lof.bars.1d.bootstrap"]["limit"] is None
+    assert jobs["fund.open.nav.bootstrap"]["params"]["fund_asset_type"] == "open_fund"
+    assert jobs["fund.open.nav.bootstrap"]["limit"] is None
+    assert jobs["fund.open.nav.daily"]["params"]["sync_task_type"] == "fund_nav_daily"
+    assert jobs["fund.open.nav.daily"]["limit"] is None
+
+
+def test_scheduler_payload_limits_priority_stock_news_symbols() -> None:
+    """逐股新闻应只覆盖重点标的，数量上限独立于列表型公告来源。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+    event_params = jobs["ashare.events"]["params"]
+
+    assert event_params["priority_symbol_limit"] == 200
+    assert "source_limit" not in event_params
+
+
 def test_scheduler_payload_uses_timeout_long_enough_for_full_market_bar_batches() -> None:
     """默认调度超时应允许全市场 K 线在一次任务中按批跑完。"""
 
@@ -202,8 +363,79 @@ def test_scheduler_payload_registers_data_quality_jobs() -> None:
     assert jobs["quality.crypto_spot"]["params"]["min_bars"] == 120
 
 
+def test_ashare_analytics_jobs_run_after_close_final_not_midday_partial() -> None:
+    """A 股正式分析链路应由收盘最终日 K 触发，午盘 partial 只用于观察。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+
+    assert jobs["quality.ashare"]["schedule_type"] == "after_success"
+    assert jobs["quality.ashare"]["depends_on"] == ["ashare.bars.1d.close_final"]
+    assert jobs["analytics.technical_screening.ashare.main_board"]["schedule_type"] == (
+        "after_success"
+    )
+    assert jobs["analytics.technical_screening.ashare.main_board"]["depends_on"] == [
+        "ashare.bars.1d.close_final"
+    ]
+    ashare_recommendation = jobs["analytics.recommendations.ashare.all_a"]
+    assert ashare_recommendation["schedule_type"] == "after_success"
+    assert ashare_recommendation["depends_on"] == [
+        "analytics.technical_screening.ashare.main_board"
+    ]
+    assert not [
+        job
+        for job in jobs.values()
+        if "ashare.bars.1d.midday_partial" in job.get("depends_on", [])
+    ]
+
+
+def test_scheduler_payload_registers_technical_screening_jobs() -> None:
+    """技术初筛应作为收盘行情后的独立 analytics 任务进入调度计划。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+    ashare_job = jobs["analytics.technical_screening.ashare.main_board"]
+
+    assert ashare_job["job_type"] == "technical_screening_refresh"
+    assert ashare_job["group"] == "analytics"
+    assert ashare_job["schedule_type"] == "after_success"
+    assert ashare_job["depends_on"] == ["ashare.bars.1d.close_final"]
+    assert ashare_job["params"]["market"] == "ashare"
+    assert ashare_job["params"]["universe_id"] == "universe:technical:ashare:main_board"
+    assert ashare_job["params"]["source_type"] == "technical_screening"
+    assert ashare_job["params"]["min_bars"] == 250
+    assert ashare_job["params"]["ttl_days"] == 3
+
+    recommendation_job = jobs["analytics.recommendations.ashare.all_a"]
+    assert recommendation_job["depends_on"] == [
+        "analytics.technical_screening.ashare.main_board"
+    ]
+
+
+def test_scheduler_payload_splits_stock_news_article_enrichment_task() -> None:
+    """新闻正文二次抓取应是独立低并发任务，不阻塞新闻列表入库。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+
+    article_job = jobs["ashare.news_articles"]
+    assert article_job["job_type"] == "collection"
+    assert article_job["group"] == "ashare-p1"
+    assert article_job["schedule_type"] == "after_success"
+    assert article_job["depends_on"] == ["ashare.events"]
+    assert article_job["params"]["sync_task_type"] == "event_article_enrichment"
+    assert article_job["params"]["sources"] == ["stock_news_article"]
+    assert article_job["params"]["max_workers"] == 1
+
+
 def test_recommendation_jobs_enable_default_watchlist_intake() -> None:
-    """推荐流水线默认应把非回避结果同步到私人观察池。"""
+    """推荐流水线默认应把非回避结果同步到系统研究跟踪池。"""
 
     config = build_preset_config("personal-comprehensive")
 
@@ -213,5 +445,5 @@ def test_recommendation_jobs_enable_default_watchlist_intake() -> None:
 
     assert ashare_params["auto_sync_watchlist"] is True
     assert ashare_params["owner_id"] == "default-owner"
-    assert ashare_params["watchlist_id"] == "watchlist:default-owner:ashare:recommendations"
+    assert ashare_params["watchlist_id"] == "watchlist:default-owner:ashare:research"
     assert ashare_params["recommendation_intake_limit"] == 20

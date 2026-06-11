@@ -13,6 +13,7 @@ import logging
 import multiprocessing
 import os
 import queue
+import sys
 import threading
 import time
 import traceback
@@ -23,6 +24,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from finance_agent.cache import create_cache_client
 from finance_agent.data.sync_config import (
@@ -35,8 +37,20 @@ from finance_agent.scheduler.base_data_progress import BaseDataTaskProgressRecor
 JsonDict = dict[str, Any]
 logger = logging.getLogger(__name__)
 
-COLLECTION_GROUPS = {"all", "ashare-p0", "ashare-p1", "ashare-p2", "ashare-risk", "crypto"}
-JOB_TYPES = {"collection", "recommendation_pipeline", "data_quality_refresh"}
+COLLECTION_GROUPS = {"all", "ashare-p0", "ashare-p1", "ashare-p2", "ashare-risk", "fund", "crypto"}
+JOB_TYPES = {
+    "collection",
+    "recommendation_pipeline",
+    "data_quality_refresh",
+    "technical_screening_refresh",
+}
+SCHEDULE_TYPES = {"interval", "daily_time", "trading_session", "manual", "after_success"}
+TRADING_DAY_POLICIES = {
+    "any_day",
+    "trading_day_only",
+    "non_trading_day_only",
+    "previous_trading_day_required",
+}
 DEFAULT_JOB_TIMEOUT_SECONDS = 6 * 60 * 60
 DEFAULT_HEALTH_STALE_SECONDS = 300
 DEFAULT_MAX_CONCURRENT_JOBS = 4
@@ -56,6 +70,12 @@ class BaseDataSchedulerJob:
     limit: int | None = None
     market: str | None = None
     params: JsonDict = field(default_factory=dict)
+    schedule_type: str = "interval"
+    run_at: tuple[str, ...] = ()
+    timezone: str = "UTC"
+    trading_day_policy: str = "any_day"
+    depends_on: tuple[str, ...] = ()
+    max_retries: int | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +94,7 @@ class BaseDataSchedulerConfig:
     job_timeout_seconds: int = DEFAULT_JOB_TIMEOUT_SECONDS
     health_stale_seconds: int = DEFAULT_HEALTH_STALE_SECONDS
     max_concurrent_jobs: int = DEFAULT_MAX_CONCURRENT_JOBS
+    rate_policies: JsonDict = field(default_factory=dict)
     jobs: tuple[BaseDataSchedulerJob, ...] = ()
 
 
@@ -82,7 +103,7 @@ class ScheduledJobState:
     """运行期任务状态。"""
 
     job: BaseDataSchedulerJob
-    next_run_at: datetime
+    next_run_at: datetime | None
     last_run_at: datetime | None = None
     last_summary: JsonDict | None = None
     running: bool = False
@@ -129,6 +150,107 @@ def filter_due_states_by_market_universe(
         else:
             runnable.append(state)
     return runnable, blocked
+
+
+def next_run_at_for_job(job: BaseDataSchedulerJob, *, now: datetime) -> datetime | None:
+    """根据任务调度类型计算下一次运行时间。"""
+
+    normalized_now = now if now.tzinfo else now.replace(tzinfo=UTC)
+    if job.schedule_type == "manual":
+        return None
+    if job.schedule_type == "after_success":
+        return None
+    if job.schedule_type == "interval":
+        return normalized_now
+    if job.schedule_type in {"daily_time", "trading_session"}:
+        return next_calendar_run_at(
+            job.run_at,
+            now=normalized_now,
+            timezone=job.timezone,
+            trading_day_policy=job.trading_day_policy,
+        )
+    return normalized_now
+
+
+def next_run_after_completion(job: BaseDataSchedulerJob, *, completed_at: datetime) -> datetime | None:
+    """任务完成后计算后续运行时间。"""
+
+    normalized_completed_at = completed_at if completed_at.tzinfo else completed_at.replace(tzinfo=UTC)
+    if job.schedule_type == "interval":
+        return normalized_completed_at + timedelta(seconds=job.interval_seconds)
+    if job.schedule_type in {"daily_time", "trading_session"}:
+        return next_run_at_for_job(job, now=normalized_completed_at)
+    return None
+
+
+def next_calendar_run_at(
+    run_at: tuple[str, ...],
+    *,
+    now: datetime,
+    timezone: str,
+    trading_day_policy: str,
+) -> datetime | None:
+    """按本地时间列表计算下一次日历触发时间。"""
+
+    try:
+        zone = ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"未知时区：{timezone}") from exc
+    local_now = now.astimezone(zone)
+    times = sorted(parse_local_time(value) for value in run_at)
+    for day_offset in range(0, 15):
+        local_date = local_now.date() + timedelta(days=day_offset)
+        if not schedule_date_allowed(local_date, trading_day_policy):
+            continue
+        for local_time in times:
+            candidate = datetime.combine(local_date, local_time, tzinfo=zone)
+            if candidate > local_now:
+                return candidate.astimezone(UTC)
+    return None
+
+
+def parse_local_time(value: str) -> Any:
+    """解析 HH:MM 或 HH:MM:SS 本地时间。"""
+
+    parts = str(value).strip().split(":")
+    if len(parts) not in {2, 3}:
+        raise ValueError(f"run_at 时间格式应为 HH:MM 或 HH:MM:SS：{value}")
+    hour, minute = int(parts[0]), int(parts[1])
+    second = int(parts[2]) if len(parts) == 3 else 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+        raise ValueError(f"run_at 时间超出范围：{value}")
+    return datetime(2000, 1, 1, hour, minute, second).time()
+
+
+def schedule_date_allowed(local_date: Any, trading_day_policy: str) -> bool:
+    """按交易日策略判断日期是否允许执行。"""
+
+    is_weekday = local_date.weekday() < 5
+    if trading_day_policy in {"any_day", "previous_trading_day_required"}:
+        return True
+    if trading_day_policy == "trading_day_only":
+        return is_weekday
+    if trading_day_policy == "non_trading_day_only":
+        return not is_weekday
+    return True
+
+
+def trigger_after_success_dependents(
+    states: list[ScheduledJobState],
+    *,
+    completed_job_name: str,
+    triggered_at: datetime,
+) -> None:
+    """上游任务成功后唤醒声明 after_success 的依赖任务。"""
+
+    for state in states:
+        if state.job.schedule_type != "after_success":
+            continue
+        if completed_job_name not in state.job.depends_on:
+            continue
+        if state.running or state.queued:
+            continue
+        state.next_run_at = triggered_at
 
 
 def default_scheduler_payload() -> JsonDict:
@@ -383,6 +505,7 @@ def parse_scheduler_config(payload: Mapping[str, Any]) -> BaseDataSchedulerConfi
             payload.get("max_concurrent_jobs", DEFAULT_MAX_CONCURRENT_JOBS),
             field_name="max_concurrent_jobs",
         ),
+        rate_policies=parse_json_object(payload.get("rate_policies"), field_name="rate_policies"),
         jobs=jobs,
     )
 
@@ -402,15 +525,39 @@ def parse_scheduler_job(payload: Any, *, index: int) -> BaseDataSchedulerJob:
         choices=JOB_TYPES,
         field_name=f"{name}.job_type",
     )
+    schedule_type = as_choice(
+        payload.get("schedule_type", "interval"),
+        choices=SCHEDULE_TYPES,
+        field_name=f"{name}.schedule_type",
+    )
     group = as_job_group_choice(
         payload.get("group"),
         job_type=job_type,
         field_name=f"{name}.group",
     )
-    interval_seconds = as_positive_int(
-        payload.get("interval_seconds"),
-        field_name=f"{name}.interval_seconds",
+    if schedule_type == "interval":
+        interval_seconds = as_positive_int(
+            payload.get("interval_seconds"),
+            field_name=f"{name}.interval_seconds",
+        )
+    else:
+        default_interval = 24 * 60 * 60 if schedule_type in {"daily_time", "trading_session"} else 0
+        interval_seconds = as_non_negative_int(
+            payload.get("interval_seconds", default_interval),
+            field_name=f"{name}.interval_seconds",
+        )
+    run_at = as_string_tuple(payload.get("run_at", ()), field_name=f"{name}.run_at")
+    if schedule_type in {"daily_time", "trading_session"} and not run_at:
+        raise ValueError(f"{name}.run_at 不能为空")
+    timezone = str(payload.get("timezone") or "UTC").strip() or "UTC"
+    trading_day_policy = as_choice(
+        payload.get("trading_day_policy", "any_day"),
+        choices=TRADING_DAY_POLICIES,
+        field_name=f"{name}.trading_day_policy",
     )
+    depends_on = as_string_tuple(payload.get("depends_on", ()), field_name=f"{name}.depends_on")
+    if schedule_type == "after_success" and not depends_on:
+        raise ValueError(f"{name}.depends_on 不能为空")
     limit = payload.get("limit")
     if limit is not None:
         limit = as_positive_int(limit, field_name=f"{name}.limit")
@@ -439,6 +586,16 @@ def parse_scheduler_job(payload: Any, *, index: int) -> BaseDataSchedulerJob:
         limit=limit,
         market=str(market) if market is not None else None,
         params=dict(params),
+        schedule_type=schedule_type,
+        run_at=run_at,
+        timezone=timezone,
+        trading_day_policy=trading_day_policy,
+        depends_on=depends_on,
+        max_retries=(
+            as_non_negative_int(payload.get("max_retries"), field_name=f"{name}.max_retries")
+            if payload.get("max_retries") is not None
+            else None
+        ),
     )
 
 
@@ -453,9 +610,11 @@ class BaseDataScheduler:
         default_collection_args_func: Callable[..., Any] | None = None,
         run_recommendation_pipeline_func: Callable[..., JsonDict] | None = None,
         run_data_quality_refresh_func: Callable[..., JsonDict] | None = None,
+        run_technical_screening_refresh_func: Callable[..., JsonDict] | None = None,
         sleep_func: Callable[[float], None] = time.sleep,
         status_file: str | Path | None = None,
         event_log_file: str | Path | None = None,
+        scheduler_config_file: str | Path | None = None,
         service_name: str = "base_data_scheduler",
     ) -> None:
         self.config = config
@@ -463,10 +622,12 @@ class BaseDataScheduler:
         self._default_collection_args = default_collection_args_func
         self._run_recommendation_pipeline = run_recommendation_pipeline_func
         self._run_data_quality_refresh = run_data_quality_refresh_func
+        self._run_technical_screening_refresh = run_technical_screening_refresh_func
         self._uses_injected_collect_base_data = collect_base_data_func is not None
         self._sleep = sleep_func
         self.status_file = Path(status_file) if status_file else None
         self.event_log_file = Path(event_log_file) if event_log_file else None
+        self.scheduler_config_file = Path(scheduler_config_file) if scheduler_config_file else None
         self.service_name = service_name
         self.started_at: datetime | None = None
         self._status_lock = threading.Lock()
@@ -599,7 +760,10 @@ class BaseDataScheduler:
             logger.info("基础数据调度器已禁用 mode=loop")
             return result
 
-        states = [ScheduledJobState(job=job, next_run_at=started_at) for job in self.enabled_jobs()]
+        states = [
+            ScheduledJobState(job=job, next_run_at=next_run_at_for_job(job, now=started_at))
+            for job in self.enabled_jobs()
+        ]
         cycles = 0
         executed: list[JsonDict] = []
         running: dict[Future[JsonDict], ScheduledJobState] = {}
@@ -657,14 +821,25 @@ class BaseDataScheduler:
                             }
                         state.last_run_at = datetime.now(tz=UTC)
                         state.last_summary = summary
-                        state.next_run_at = state.last_run_at + timedelta(
-                            seconds=state.job.interval_seconds,
+                        state.next_run_at = next_run_after_completion(
+                            state.job,
+                            completed_at=state.last_run_at,
                         )
+                        if summary.get("status") == "executed":
+                            trigger_after_success_dependents(
+                                states,
+                                completed_job_name=state.job.name,
+                                triggered_at=state.last_run_at,
+                            )
                         executed.append(
                             summary
                             | {
                                 "last_run_at": state.last_run_at.isoformat(),
-                                "next_run_at": state.next_run_at.isoformat(),
+                                "next_run_at": (
+                                    state.next_run_at.isoformat()
+                                    if state.next_run_at is not None
+                                    else None
+                                ),
                             }
                         )
 
@@ -691,7 +866,12 @@ class BaseDataScheduler:
                     due_states = [
                         state
                         for state in states
-                        if not state.running and not state.queued and state.next_run_at <= now
+                        if (
+                            not state.running
+                            and not state.queued
+                            and state.next_run_at is not None
+                            and state.next_run_at <= now
+                        )
                     ]
                     due_states, blocked_due_states = filter_due_states_by_market_universe(
                         due_states,
@@ -821,6 +1001,8 @@ class BaseDataScheduler:
             planned["recommendation_args"] = self.build_recommendation_pipeline_kwargs(job)
         elif job.job_type == "data_quality_refresh":
             planned["data_quality_args"] = self.build_data_quality_refresh_kwargs(job)
+        elif job.job_type == "technical_screening_refresh":
+            planned["technical_screening_args"] = self.build_technical_screening_refresh_kwargs(job)
         else:
             raise ValueError(f"不支持的调度任务类型：{job.job_type}")
 
@@ -850,7 +1032,10 @@ class BaseDataScheduler:
                     market=job.market,
                     task_type=str(job.params.get("sync_task_type") or job.job_type),
                     interval_seconds=job.interval_seconds,
-                    max_workers=self.config.max_concurrent_jobs,
+                    max_workers=collection_progress_max_workers(
+                        args,
+                        fallback=self.config.max_concurrent_jobs,
+                    ),
                 )
                 args.progress_job_name = job.name
                 args.progress_run_id = progress_run_id
@@ -861,7 +1046,8 @@ class BaseDataScheduler:
                 progress_run_id = None
                 logger.warning("初始化调度任务进度失败 job=%s error=%s", job.name, exc)
 
-        max_attempts = self.config.max_job_retries + 1
+        max_retries = self.config.max_job_retries if job.max_retries is None else job.max_retries
+        max_attempts = max_retries + 1
         self.emit_event("job_start", job=job.name, market=job.market, max_attempts=max_attempts)
         self.write_status(
             state="running",
@@ -1000,6 +1186,9 @@ class BaseDataScheduler:
         if job.job_type == "data_quality_refresh":
             kwargs = self.build_data_quality_refresh_kwargs(job)
             return self.run_data_quality_refresh(**kwargs)
+        if job.job_type == "technical_screening_refresh":
+            kwargs = self.build_technical_screening_refresh_kwargs(job)
+            return self.run_technical_screening_refresh(**kwargs)
         raise ValueError(f"不支持的调度任务类型：{job.job_type}")
 
     def build_collection_args(self, job: BaseDataSchedulerJob) -> Any:
@@ -1018,16 +1207,43 @@ class BaseDataScheduler:
             "circuit_failure_threshold": self.config.circuit_failure_threshold,
             "circuit_cooldown_seconds": self.config.circuit_cooldown_seconds,
             "force_provider": self.config.force_provider,
+            "rate_policies": self.config.rate_policies,
         }
+        if self.scheduler_config_file is not None:
+            overrides["runtime_scheduler_config_file"] = str(self.scheduler_config_file)
         if job.limit is not None:
             overrides["limit"] = job.limit
         overrides.update(job.params)
         if (
             job.market == "ashare"
-            and str(overrides.get("sync_task_type") or "") == "market_bars_backfill"
+            and str(overrides.get("sync_task_type") or "")
+            in {
+                "market_bars_backfill",
+                "market_bars_full_history_backfill",
+                "market_bars_midday_partial",
+                "market_bars_close_final",
+                "market_bars_revision",
+            }
             and overrides.get("lookback")
         ):
             overrides.update(build_ashare_lookback_date_overrides(str(overrides["lookback"])))
+        elif (
+            job.market == "fund"
+            and str(overrides.get("sync_task_type") or "")
+            in {
+                "market_bars_full_history_backfill",
+                "market_bars_close_final",
+            }
+            and overrides.get("lookback")
+        ):
+            overrides.update(build_fund_lookback_date_overrides(str(overrides["lookback"])))
+        elif (
+            job.market == "ashare"
+            and str(overrides.get("sync_task_type") or "")
+            == "market_bars_full_history_backfill"
+            and not overrides.get("ashare_end")
+        ):
+            overrides["ashare_end"] = datetime.now(tz=UTC).strftime("%Y%m%d")
         return self.default_collection_args(**overrides)
 
     def build_recommendation_pipeline_kwargs(self, job: BaseDataSchedulerJob) -> JsonDict:
@@ -1044,7 +1260,7 @@ class BaseDataScheduler:
             "horizon": str(job.params.get("horizon") or "swing"),
             "limit": job.limit or int(job.params.get("limit") or 20),
         }
-        for key in ("timeframe", "source"):
+        for key in ("timeframe", "source", "candidate_source", "technical_screening_strategy"):
             value = job.params.get(key)
             if value is not None:
                 params[key] = value
@@ -1096,6 +1312,34 @@ class BaseDataScheduler:
             params["horizon"] = str(value)
         return params
 
+    def build_technical_screening_refresh_kwargs(self, job: BaseDataSchedulerJob) -> JsonDict:
+        """把技术初筛任务配置转换为刷新服务参数。"""
+
+        if job.job_type != "technical_screening_refresh":
+            raise ValueError(f"{job.name} 不是技术初筛刷新任务")
+        market = str(job.params.get("market") or job.market or "").strip()
+        if not market:
+            raise ValueError(f"{job.name}.params.market 不能为空")
+        params: JsonDict = {
+            "market": market,
+            "universe_id": str(
+                job.params.get("universe_id")
+                or (
+                    "universe:technical:ashare:main_board"
+                    if market == "ashare"
+                    else f"universe:technical:{market}"
+                )
+            ),
+            "timeframe": str(job.params.get("timeframe") or "1d"),
+            "limit": job.limit or int(job.params.get("limit") or 200),
+            "min_bars": int(job.params.get("min_bars") or 250),
+            "ttl_days": int(job.params.get("ttl_days") or 3),
+        }
+        value = job.params.get("source")
+        if value is not None:
+            params["source"] = str(value)
+        return params
+
     def run_recommendation_pipeline(self, **kwargs: Any) -> JsonDict:
         """执行候选池推荐流水线。"""
 
@@ -1138,7 +1382,7 @@ class BaseDataScheduler:
         recommendation_status: str,
         limit: int,
     ) -> JsonDict:
-        """推荐流水线成功后，把非回避推荐同步进默认观察池。"""
+        """推荐流水线成功后，把非回避推荐同步进系统研究跟踪池。"""
 
         if recommendation_status != "available" or not recommendation_run_id:
             return {
@@ -1158,11 +1402,12 @@ class BaseDataScheduler:
             owner_id=owner_id,
             name=default_watchlist_name(market),
             market=market,
-            purpose="接收调度器推荐流水线产生的非回避候选，供后续 Agent 复核。",
+            purpose="system_research_pool",
             status="active",
             payload={
                 "source": "base_data_scheduler",
                 "recommendation_run_id": recommendation_run_id,
+                "description": "接收调度器推荐流水线产生的非回避候选，供后续 Agent 复核。",
             },
         )
         summary = agent.sync_recommendations_to_watchlist(
@@ -1186,6 +1431,60 @@ class BaseDataScheduler:
         session_factory = create_session_factory()
         with session_scope(session_factory) as session:
             return DataQualityService(session).refresh_quality_snapshots(**kwargs)
+
+    def run_technical_screening_refresh(self, **kwargs: Any) -> JsonDict:
+        """刷新技术初筛池。"""
+
+        if self._run_technical_screening_refresh is not None:
+            return self._run_technical_screening_refresh(**kwargs)
+
+        from finance_agent.application.technical_screening_service import (
+            TechnicalScreeningService,
+        )
+        from finance_agent.storage.db import create_session_factory, session_scope
+
+        market = str(kwargs.pop("market"))
+        universe_id = str(kwargs.pop("universe_id"))
+        timeframe = str(kwargs.pop("timeframe", "1d"))
+        limit = int(kwargs.pop("limit", 200))
+        min_bars = int(kwargs.pop("min_bars", 250))
+        ttl_days = int(kwargs.pop("ttl_days", 3))
+        source = kwargs.pop("source", None)
+        session_factory = create_session_factory()
+        with session_scope(session_factory) as session:
+            service = TechnicalScreeningService(session)
+            if market == "ashare":
+                result = service.screen_ashare(
+                    limit=limit,
+                    timeframe=timeframe,
+                    source=source,
+                    min_bars=min_bars,
+                    persist=True,
+                )
+            elif market == "fund":
+                result = service.screen_funds(
+                    limit=limit,
+                    timeframe=timeframe,
+                    source=source,
+                    min_bars=min_bars,
+                    persist=True,
+                )
+            else:
+                raise ValueError(f"暂不支持 {market} 技术初筛刷新")
+
+        return {
+            "status": result.status,
+            "screening_id": result.screening_id,
+            "universe_id": universe_id or result.universe_id,
+            "market": result.market,
+            "strategy": result.strategy,
+            "candidate_count": result.candidate_count,
+            "accepted_count": result.accepted_count,
+            "rejected_count": result.rejected_count,
+            "skipped_count": result.skipped_count,
+            "rule_hits": result.rule_hits,
+            "ttl_days": ttl_days,
+        }
 
     def collect_base_data(self, args: Any, *, job_name: str | None = None) -> JsonDict:
         """延迟导入采集入口，避免模块加载阶段触碰脚本依赖。"""
@@ -1357,6 +1656,18 @@ def build_ashare_lookback_date_overrides(lookback: str, *, now: datetime | None 
     }
 
 
+def build_fund_lookback_date_overrides(lookback: str, *, now: datetime | None = None) -> JsonDict:
+    """把基金 lookback 配置转换为采集脚本复用的 YYYYMMDD 起止日期。"""
+
+    current = now or datetime.now(tz=UTC)
+    end_date = current.date()
+    start_date = end_date - timedelta(days=parse_lookback_days(lookback, default_days=30))
+    return {
+        "ashare_start": start_date.strftime("%Y%m%d"),
+        "ashare_end": end_date.strftime("%Y%m%d"),
+    }
+
+
 def parse_lookback_days(value: str | None, *, default_days: int) -> int:
     """把 30d / 72h 这类 lookback 字符串转换为天数。"""
 
@@ -1364,6 +1675,8 @@ def parse_lookback_days(value: str | None, *, default_days: int) -> int:
         return default_days
     text = str(value).strip().lower()
     try:
+        if text.endswith("y"):
+            return max(1, int(text[:-1]) * 365)
         if text.endswith("h"):
             return max(1, int(text[:-1]) // 24)
         if text.endswith("d"):
@@ -1387,6 +1700,8 @@ def collect_base_data_with_timeout(
 ) -> JsonDict:
     """在子进程中执行采集，超时后终止子进程。"""
 
+    # Windows spawn 有可能继承到系统 Python，这里显式固定为当前调度进程解释器。
+    multiprocessing.set_executable(sys.executable)
     context = multiprocessing.get_context("spawn")
     result_queue: multiprocessing.Queue[JsonDict] = context.Queue(maxsize=1)
     if collect_base_data_func is None:
@@ -1400,15 +1715,29 @@ def collect_base_data_with_timeout(
     process.start()
     deadline = time.monotonic() + timeout_seconds
     next_heartbeat_at = time.monotonic() + max(1, heartbeat_interval_seconds)
+    message: JsonDict | None = None
     while process.is_alive():
         remaining_seconds = deadline - time.monotonic()
         if remaining_seconds <= 0:
             break
         wait_seconds = min(1.0, remaining_seconds)
-        process.join(wait_seconds)
+        try:
+            message = result_queue.get(timeout=wait_seconds)
+            break
+        except queue.Empty:
+            pass
         if heartbeat is not None and time.monotonic() >= next_heartbeat_at:
             heartbeat()
             next_heartbeat_at = time.monotonic() + max(1, heartbeat_interval_seconds)
+    if message is not None:
+        # 先读取结果再等待子进程退出，避免 Windows 队列写大结果时互等。
+        process.join(5)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+            if process.is_alive():
+                process.kill()
+                process.join(5)
     if process.is_alive():
         process.terminate()
         process.join(5)
@@ -1417,10 +1746,11 @@ def collect_base_data_with_timeout(
             process.join(5)
         raise JobTimeoutError(f"采集任务超过 {timeout_seconds} 秒未完成，已终止子进程")
 
-    try:
-        message = result_queue.get_nowait()
-    except queue.Empty as exc:
-        raise RuntimeError(f"采集子进程未返回结果，exitcode={process.exitcode}") from exc
+    if message is None:
+        try:
+            message = result_queue.get_nowait()
+        except queue.Empty as exc:
+            raise RuntimeError(f"采集子进程未返回结果，exitcode={process.exitcode}") from exc
 
     if message.get("ok"):
         result = message.get("result")
@@ -1529,10 +1859,11 @@ def replace_file_with_retry(
 def seconds_until_next_run(states: list[ScheduledJobState], idle_seconds: int) -> float:
     """计算下一次循环休眠秒数。"""
 
-    if not states:
+    next_run_values = [state.next_run_at for state in states if state.next_run_at is not None]
+    if not next_run_values:
         return float(idle_seconds)
     now = datetime.now(tz=UTC)
-    next_run_at = min(state.next_run_at for state in states)
+    next_run_at = min(next_run_values)
     wait_seconds = max(0.0, (next_run_at - now).total_seconds())
     return min(float(idle_seconds), wait_seconds) if wait_seconds else 0.0
 
@@ -1589,6 +1920,32 @@ def as_choice(value: Any, *, choices: set[str], field_name: str) -> str:
     return parsed
 
 
+def as_string_tuple(value: Any, *, field_name: str) -> tuple[str, ...]:
+    """解析字符串或字符串数组。"""
+
+    if value is None or value == "":
+        return ()
+    if isinstance(value, str):
+        parsed = (value.strip(),)
+    elif isinstance(value, list | tuple):
+        parsed = tuple(str(item).strip() for item in value if str(item).strip())
+    else:
+        raise ValueError(f"{field_name} 必须是字符串或字符串数组")
+    if any(not item for item in parsed):
+        raise ValueError(f"{field_name} 不能为空字符串")
+    return parsed
+
+
+def parse_json_object(value: Any, *, field_name: str) -> JsonDict:
+    """解析 JSON 对象配置。"""
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} 必须是对象")
+    return dict(value)
+
+
 def as_group_choice(value: Any, *, field_name: str) -> str | tuple[str, ...]:
     """解析采集分组，支持单分组和多分组。"""
 
@@ -1610,7 +1967,7 @@ def as_job_group_choice(
 ) -> str | tuple[str, ...]:
     """按任务类型解析调度分组。"""
 
-    if job_type in {"recommendation_pipeline", "data_quality_refresh"}:
+    if job_type in {"recommendation_pipeline", "data_quality_refresh", "technical_screening_refresh"}:
         return as_choice(value, choices={"analytics"}, field_name=field_name)
     return as_group_choice(value, field_name=field_name)
 
@@ -1619,7 +1976,7 @@ def default_watchlist_name(market: str) -> str:
     """返回调度器默认观察池名称。"""
 
     return {
-        "ashare": "A 股推荐观察池",
+        "ashare": "A 股系统研究跟踪池",
         "crypto_spot": "数字货币现货推荐观察池",
         "crypto_future": "数字货币合约推荐观察池",
     }.get(market, f"{market} 推荐观察池")
@@ -1669,3 +2026,15 @@ def compact_collection_summary(summary: JsonDict) -> JsonDict:
         "mode",
     )
     return {key: summary.get(key) for key in keys if key in summary}
+
+
+def collection_progress_max_workers(args: Any, *, fallback: int) -> int:
+    """读取采集任务内部的按标的并发数，用于任务监控进度展示。"""
+
+    raw_value = getattr(args, "max_workers", None)
+    if raw_value in {None, ""}:
+        raw_value = fallback
+    try:
+        return max(1, int(raw_value))
+    except (TypeError, ValueError):
+        return max(1, int(fallback))

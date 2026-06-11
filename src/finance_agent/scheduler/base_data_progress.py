@@ -15,6 +15,8 @@ CURRENT_KEY_PREFIX = "base_data:task:{job_name}:current"
 SNAPSHOT_KEY_PREFIX = "base_data:task:{job_name}:run:{run_id}:snapshot"
 EVENTS_KEY_PREFIX = "base_data:task:{job_name}:run:{run_id}:events"
 ACTIVE_KEY = "base_data:task:active"
+SOURCE_RATE_KEY_PREFIX = "base_data:source_rate:{source_key}:snapshot"
+SOURCE_RATE_ACTIVE_KEY = "base_data:source_rate:active"
 EVENT_LIMIT_DEFAULT = 80
 EVENT_LIMIT_MAX = 200
 PROGRESS_TTL_GRACE_SECONDS = 1800
@@ -155,6 +157,7 @@ class BaseDataTaskProgressRecorder:
         batch_index: int,
         batch_count: int,
         batch_size: int,
+        max_workers: int | None = None,
     ) -> None:
         """记录批次开始。"""
 
@@ -190,8 +193,11 @@ class BaseDataTaskProgressRecorder:
         snapshot["batch_index"] = batch_index
         snapshot["batch_count"] = batch_count
         snapshot["batch_size"] = batch_size
+        if max_workers is not None:
+            snapshot["max_workers"] = max(int(max_workers), 1)
         stage["running_items"] = running_items
         snapshot["stages"] = self._replace_stage(snapshot.get("stages"), stage)
+        self._refresh_metrics(snapshot, now=now)
         self._save_snapshot(job_name, run_id, snapshot, ttl_seconds=ttl_seconds)
         self._append_event(
             job_name=job_name,
@@ -205,6 +211,7 @@ class BaseDataTaskProgressRecorder:
                 "batch_index": batch_index,
                 "batch_count": batch_count,
                 "batch_size": batch_size,
+                "max_workers": max_workers,
             },
         )
 
@@ -277,6 +284,10 @@ class BaseDataTaskProgressRecorder:
         batch_count: int,
         error_message: str | None = None,
         retry_count: int | None = None,
+        retry_after_seconds: int | float | None = None,
+        next_retry_at: str | None = None,
+        provider_key: str | None = None,
+        error_category: str | None = None,
     ) -> None:
         """记录单个标的完成或失败。"""
 
@@ -289,6 +300,7 @@ class BaseDataTaskProgressRecorder:
         ttl_seconds = self._snapshot_ttl(snapshot)
         completed = int(snapshot.get("completed_items") or 0)
         failed = int(snapshot.get("failed_items") or 0)
+        retry_items = int(snapshot.get("retry_items") or 0)
         running = max(0, int(snapshot.get("running_items") or 0) - 1)
         if status in {"completed", "available", "skipped", "locked"}:
             completed += 1
@@ -298,6 +310,8 @@ class BaseDataTaskProgressRecorder:
             failed += 1
             event_type = "symbol_failed"
             stage_status = "failed"
+            if retry_after_seconds is not None or next_retry_at or (retry_count or 0) > 0:
+                retry_items += 1
         total_items = int(snapshot.get("total_items") or 0)
         current_items = [
             item
@@ -307,6 +321,7 @@ class BaseDataTaskProgressRecorder:
         snapshot["current_items"] = current_items
         snapshot["completed_items"] = completed
         snapshot["failed_items"] = failed
+        snapshot["retry_items"] = retry_items
         snapshot["running_items"] = running
         snapshot["remaining_items"] = max(total_items - completed - failed, 0) if total_items else 0
         snapshot["progress_ratio"] = self._progress_ratio(total_items, completed, failed)
@@ -339,6 +354,10 @@ class BaseDataTaskProgressRecorder:
                 "batch_count": batch_count,
                 "error_message": error_message,
                 "retry_count": retry_count,
+                "retry_after_seconds": retry_after_seconds,
+                "next_retry_at": next_retry_at,
+                "provider_key": provider_key,
+                "error_category": error_category,
             },
         )
 
@@ -421,6 +440,70 @@ class BaseDataTaskProgressRecorder:
             error_message=error_message,
         )
 
+    def job_cancelled(self, *, job_name: str, error_message: str) -> None:
+        """把当前运行中的任务标记为用户取消，避免任务监控页长期停留在 running。"""
+
+        if self._disabled:
+            return
+        run_id = self._read_current_run_id(job_name) or self._read_active_run_id(job_name)
+        self.job_completed(
+            job_name=job_name,
+            run_id=run_id,
+            status="cancelled",
+            summary={},
+            error_message=error_message,
+        )
+
+    def job_paused(self, *, job_name: str, message: str) -> None:
+        """把当前任务标记为暂停，但不写 finished_at，便于后续断点继续。"""
+
+        self._set_current_job_runtime_status(
+            job_name=job_name,
+            status="paused",
+            event_type="job_paused",
+            message=message,
+        )
+
+    def job_resumed(self, *, job_name: str, message: str) -> None:
+        """把暂停任务恢复为运行中，并追加继续事件。"""
+
+        self._set_current_job_runtime_status(
+            job_name=job_name,
+            status="running",
+            event_type="job_resumed",
+            message=message,
+        )
+
+    def source_rate_updated(
+        self,
+        *,
+        source_key: str,
+        snapshot: JsonDict,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        """记录数据源运行期限频和退避状态。"""
+
+        if self._disabled:
+            return
+        normalized_source = str(source_key or "default").strip() or "default"
+        now = self._now()
+        payload = {"source_key": normalized_source, **dict(snapshot), "updated_at": now.isoformat()}
+        ttl = ttl_seconds or PROGRESS_TTL_MIN_SECONDS
+        self._set_json(source_rate_key(normalized_source), payload, ttl_seconds=ttl)
+        active_payload = self._safe_get_json(SOURCE_RATE_ACTIVE_KEY)
+        active_items = [
+            item
+            for item in active_items_from_payload(active_payload)
+            if str(item.get("source_key") or "") != normalized_source
+        ]
+        active_items.append(
+            {
+                "source_key": normalized_source,
+                "updated_at": now.isoformat(),
+            }
+        )
+        self._set_json(SOURCE_RATE_ACTIVE_KEY, active_items, ttl_seconds=ttl)
+
     def build_snapshot_task_view(
         self,
         *,
@@ -436,6 +519,7 @@ class BaseDataTaskProgressRecorder:
             "completed_items": int(snapshot.get("completed_items") or 0),
             "running_items": int(snapshot.get("running_items") or 0),
             "failed_items": int(snapshot.get("failed_items") or 0),
+            "retry_items": int(snapshot.get("retry_items") or 0),
             "remaining_items": int(snapshot.get("remaining_items") or 0),
             "progress_ratio": float(snapshot.get("progress_ratio") or 0.0),
         }
@@ -450,11 +534,32 @@ class BaseDataTaskProgressRecorder:
             "started_at": snapshot.get("started_at"),
             "updated_at": snapshot.get("updated_at"),
             "finished_at": snapshot.get("finished_at"),
+            "batch_index": snapshot.get("batch_index"),
+            "batch_count": snapshot.get("batch_count"),
+            "batch_size": snapshot.get("batch_size"),
+            "max_workers": int(snapshot.get("max_workers") or 0),
+            "throughput_per_minute": float(
+                (snapshot.get("metrics") or {}).get("throughput_per_minute") or 0.0
+            ),
             "summary": summary,
             "stages": list(snapshot.get("stages") or []),
             "recent_events": events[-self._event_limit_for_read():],
             "metrics": snapshot.get("metrics") or {},
         }
+
+    def read_source_rate_states(self) -> list[JsonDict]:
+        """读取当前数据源限频和退避状态。"""
+
+        active_payload = self._safe_get_json(SOURCE_RATE_ACTIVE_KEY)
+        states: list[JsonDict] = []
+        for item in active_items_from_payload(active_payload):
+            source_key = str(item.get("source_key") or "").strip()
+            if not source_key:
+                continue
+            snapshot = self._safe_get_json(source_rate_key(source_key))
+            if isinstance(snapshot, dict):
+                states.append(dict(snapshot))
+        return states
 
     def read_scheduler_progress(
         self,
@@ -519,6 +624,7 @@ class BaseDataTaskProgressRecorder:
                 "generated_at": now.isoformat(),
                 "tasks": tasks,
                 "waiting": waiting,
+                "source_rate_states": self.read_source_rate_states(),
                 "metrics": metrics,
             },
         }
@@ -531,7 +637,9 @@ class BaseDataTaskProgressRecorder:
     ) -> list[JsonDict]:
         waiting: list[JsonDict] = []
         for job in scheduler_jobs:
-            if not getattr(job, "enabled", True):
+            schedule_type = str(getattr(job, "schedule_type", "interval") or "interval")
+            is_manual = schedule_type == "manual"
+            if not getattr(job, "enabled", True) and not is_manual:
                 continue
             job_name = str(getattr(job, "name", "") or "").strip()
             if not job_name or job_name in running_job_names:
@@ -561,6 +669,17 @@ class BaseDataTaskProgressRecorder:
         current = self._safe_get_json(current_task_key(job_name))
         return current if isinstance(current, str) and current else None
 
+    def _read_active_run_id(self, job_name: str) -> str | None:
+        active_payload = self._safe_get_json(ACTIVE_KEY)
+        active_items = active_items_from_payload(active_payload)
+        for item in reversed(active_items):
+            if str(item.get("job_name") or "").strip() != job_name:
+                continue
+            run_id = item.get("run_id")
+            if isinstance(run_id, str) and run_id:
+                return run_id
+        return None
+
     def _delete_run(self, *, job_name: str, run_id: str) -> None:
         self._safe_delete(snapshot_task_key(job_name, run_id))
         self._safe_delete(events_task_key(job_name, run_id))
@@ -580,6 +699,40 @@ class BaseDataTaskProgressRecorder:
             status=str(snapshot.get("status") or "unknown"),
             ttl_seconds=ttl_seconds,
             updated_at=parse_iso_datetime(snapshot.get("updated_at")),
+        )
+
+    def _set_current_job_runtime_status(
+        self,
+        *,
+        job_name: str,
+        status: str,
+        event_type: str,
+        message: str,
+    ) -> None:
+        """更新当前任务的运行期状态；暂停/继续不改变完成时间。"""
+
+        if self._disabled:
+            return
+        run_id = self._read_current_run_id(job_name) or self._read_active_run_id(job_name)
+        if not run_id:
+            return
+        snapshot = self._load_snapshot(job_name, run_id)
+        if not snapshot:
+            return
+        now = self._now()
+        ttl_seconds = self._snapshot_ttl(snapshot)
+        snapshot["status"] = status
+        snapshot["updated_at"] = now.isoformat()
+        snapshot["error_message"] = message if status == "paused" else None
+        self._refresh_metrics(snapshot, now=now)
+        self._save_snapshot(job_name, run_id, snapshot, ttl_seconds=ttl_seconds)
+        self._append_event(
+            job_name=job_name,
+            run_id=run_id,
+            event_type=event_type,
+            created_at=now,
+            ttl_seconds=ttl_seconds,
+            payload={"status": status, "message": message},
         )
 
     def _append_event(
@@ -669,6 +822,7 @@ class BaseDataTaskProgressRecorder:
             "completed_items": completed_items,
             "running_items": running_items,
             "failed_items": failed_items,
+            "retry_items": 0,
             "remaining_items": remaining_items,
             "progress_ratio": self._progress_ratio(total_items, completed_items, failed_items),
             "batch_index": None,
@@ -680,6 +834,8 @@ class BaseDataTaskProgressRecorder:
             "metrics": {
                 "duration_seconds": 0,
                 "error_rate": 0.0,
+                "max_workers": max_workers or 0,
+                "throughput_per_minute": 0.0,
                 "node": "local",
                 "cache_backend": self.cache_backend,
             },
@@ -747,11 +903,16 @@ class BaseDataTaskProgressRecorder:
         started_at = parse_iso_datetime(snapshot.get("started_at")) or now
         duration_seconds = max(0, int((now - started_at).total_seconds()))
         total = max(int(snapshot.get("total_items") or 0), 0)
+        completed = max(int(snapshot.get("completed_items") or 0), 0)
         failed = max(int(snapshot.get("failed_items") or 0), 0)
+        processed = completed + failed
         error_rate = round(failed / total, 6) if total else 0.0
+        throughput_per_minute = round((processed / duration_seconds) * 60, 3) if duration_seconds else 0.0
         snapshot["metrics"] = {
             "duration_seconds": duration_seconds,
             "error_rate": error_rate,
+            "max_workers": int(snapshot.get("max_workers") or 0),
+            "throughput_per_minute": throughput_per_minute,
             "node": "local",
             "cache_backend": self.cache_backend,
         }
@@ -851,6 +1012,12 @@ def events_task_key(job_name: str, run_id: str) -> str:
     """生成 events 键。"""
 
     return EVENTS_KEY_PREFIX.format(job_name=job_name, run_id=run_id)
+
+
+def source_rate_key(source_key: str) -> str:
+    """生成数据源限频状态键。"""
+
+    return SOURCE_RATE_KEY_PREFIX.format(source_key=source_key)
 
 
 def active_items_from_payload(payload: Any) -> list[JsonDict]:

@@ -91,7 +91,9 @@ class DataSyncConfigUpdateRequest(BaseModel):
     """数据同步配置保存请求。"""
 
     preset: str = "personal-comprehensive"
-    markets: list[str] = Field(default_factory=lambda: ["ashare", "crypto_spot", "crypto_future"])
+    markets: list[str] = Field(
+        default_factory=lambda: ["ashare", "fund", "crypto_spot", "crypto_future"]
+    )
     enabled: bool = True
     cache_backend: str = "redis"
     max_concurrent_jobs: int = Field(4, ge=1, le=16)
@@ -103,3 +105,29 @@ class DataSchedulerStartRequest(BaseModel):
 
     dry_run: bool = False
     max_cycles: int | None = None
+
+
+class DataSchedulerJobUpdateRequest(BaseModel):
+    """单个基础数据调度任务配置更新请求。"""
+
+    enabled: bool | None = None
+    interval_seconds: int | None = Field(default=None, ge=0)
+    limit: int | None = Field(default=None, ge=1)
+    batch_size: int | None = Field(default=None, ge=1)
+    max_workers: int | None = Field(default=None, ge=1)
+    schedule_type: str | None = None
+    run_at: list[str] | None = None
+    timezone: str | None = None
+    trading_day_policy: str | None = None
+
+
+class DataSchedulerJobRunRequest(BaseModel):
+    """单个基础数据调度任务立即执行请求。"""
+
+    dry_run: bool = False
+
+
+class DataSchedulerFailedRerunRequest(BaseModel):
+    """单个基础数据调度任务失败项重跑请求。"""
+
+    dry_run: bool = False

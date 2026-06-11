@@ -23,6 +23,9 @@ from finance_agent.agents.runtime import load_model_registry, preview_model_rout
 from finance_agent.api.deps import get_session
 from finance_agent.api.schemas import (
     ChatRequest,
+    DataSchedulerFailedRerunRequest,
+    DataSchedulerJobRunRequest,
+    DataSchedulerJobUpdateRequest,
     DataSchedulerStartRequest,
     DataSyncConfigUpdateRequest,
     ModelInstanceUpdateRequest,
@@ -515,6 +518,135 @@ def data_scheduler_status(
         status_file=status_file,
         max_age_seconds=max_age_seconds,
     )
+
+
+@router.get("/data/scheduler/progress")
+def data_scheduler_progress(
+    event_limit: int = 80,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """读取基础数据调度器运行态进度。"""
+
+    _ = session
+    try:
+        return DataSyncControlService().read_scheduler_progress(event_limit=event_limit)
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400], "data": {}}
+
+
+@router.get("/data/scheduler/jobs")
+def data_scheduler_jobs(session: Session = SESSION_DEPENDENCY) -> JsonDict:
+    """读取基础数据调度任务目录，供前端选择执行和编辑配置。"""
+
+    _ = session
+    try:
+        return DataSyncControlService().read_scheduler_jobs()
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400], "data": {"jobs": []}}
+
+
+@router.put("/data/scheduler/jobs/{job_name}")
+def update_data_scheduler_job(
+    job_name: str,
+    request: DataSchedulerJobUpdateRequest,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """保存单个基础数据调度任务的运行时配置。"""
+
+    _ = session
+    try:
+        return DataSyncControlService().update_scheduler_job(
+            job_name=job_name,
+            enabled=request.enabled,
+            interval_seconds=request.interval_seconds,
+            limit=request.limit,
+            batch_size=request.batch_size,
+            max_workers=request.max_workers,
+            schedule_type=request.schedule_type,
+            run_at=request.run_at,
+            timezone=request.timezone,
+            trading_day_policy=request.trading_day_policy,
+        )
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400], "data": {}}
+
+
+@router.post("/data/scheduler/jobs/{job_name}/run")
+def run_data_scheduler_job(
+    job_name: str,
+    request: DataSchedulerJobRunRequest,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """使用单任务 run-once 配置立即执行选中的调度任务。"""
+
+    _ = session
+    try:
+        return DataSyncControlService().run_scheduler_job(
+            job_name=job_name,
+            dry_run=request.dry_run,
+        )
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400], "data": {}}
+
+
+@router.post("/data/scheduler/jobs/{job_name}/rerun-failed")
+def rerun_failed_data_scheduler_job(
+    job_name: str,
+    request: DataSchedulerFailedRerunRequest,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """把选中任务的失败项重跑加入后台串行队列。"""
+
+    _ = session
+    try:
+        return DataSyncControlService().rerun_failed_scheduler_job(
+            job_name=job_name,
+            dry_run=request.dry_run,
+        )
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400], "data": {}}
+
+
+@router.post("/data/scheduler/jobs/{job_name}/cancel")
+def cancel_data_scheduler_job(
+    job_name: str,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """取消由 Web 页面启动的单个基础数据调度任务。"""
+
+    _ = session
+    try:
+        return DataSyncControlService().cancel_scheduler_job(job_name=job_name)
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400], "data": {}}
+
+
+@router.post("/data/scheduler/jobs/{job_name}/pause")
+def pause_data_scheduler_job(
+    job_name: str,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """暂停单个基础数据调度任务；采集进程会在下一只标的前等待。"""
+
+    _ = session
+    try:
+        return DataSyncControlService().pause_scheduler_job(job_name=job_name)
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400], "data": {}}
+
+
+@router.post("/data/scheduler/jobs/{job_name}/resume")
+def resume_data_scheduler_job(
+    job_name: str,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """继续已暂停的基础数据调度任务。"""
+
+    _ = session
+    try:
+        return DataSyncControlService().resume_scheduler_job(job_name=job_name)
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400], "data": {}}
 
 
 @router.get("/data/sync/config")
