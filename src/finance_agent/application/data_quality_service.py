@@ -273,6 +273,8 @@ def market_bar_coverage(
         select(func.count(MarketBarORM.timestamp), func.max(MarketBarORM.timestamp)).where(
             MarketBarORM.asset_id == asset_id,
             MarketBarORM.timeframe == timeframe,
+            MarketBarORM.is_closed.is_(True),
+            MarketBarORM.status.in_(("available", "revised")),
         )
     ).one()
     return int(row[0] or 0), row[1]

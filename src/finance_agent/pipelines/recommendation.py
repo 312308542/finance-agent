@@ -24,8 +24,11 @@ from finance_agent.screening.service import ensure_single_market_universe
 from finance_agent.signals import SignalComputationResult, SignalService
 from finance_agent.storage.orm import AssetUniverseMemberORM, AssetUniverseORM
 from finance_agent.storage.repositories import UniverseRepository
+from finance_agent.storage.repositories import ScreeningRepository
 
 JsonDict = dict[str, Any]
+TECHNICAL_SCREENING_POOL_SOURCE = "technical_screening_pool"
+TECHNICAL_SCREENING_STRATEGY = "technical_screening_v1"
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,7 @@ class UniverseRecommendationPipeline:
         self.indicators = IndicatorService(session)
         self.factors = FactorService(session)
         self.screenings = ScreeningService(session)
+        self.screening_repository = ScreeningRepository(session)
         self.scoring = ScoringService(session)
         self.signals = SignalService(session)
         self.recommendations = RecommendationService(session)
@@ -76,12 +80,21 @@ class UniverseRecommendationPipeline:
         min_indicator_coverage_ratio: float | None = None,
         min_factor_coverage_ratio: float | None = None,
         min_available_factor_groups: int = 1,
+        candidate_source: str | None = None,
+        technical_screening_strategy: str = TECHNICAL_SCREENING_STRATEGY,
     ) -> UniverseRecommendationRunResult:
         """执行一次候选池推荐流水线。"""
 
         universe = self.universes.get_universe(universe_id)
         members = self.universes.list_members(universe_id)
         ensure_single_market_universe(universe.market, members)
+        members = prefer_technical_screening_members(
+            members=members,
+            market=universe.market,
+            candidate_source=candidate_source,
+            screening_repository=getattr(self, "screening_repository", None),
+            strategy=technical_screening_strategy,
+        )
         effective_timeframe = timeframe or default_timeframe(universe.market)
         required_indicator_coverage = normalize_indicator_coverage_ratio(
             market=universe.market,
@@ -379,6 +392,35 @@ def members_with_successful_indicators(
         item.asset_id for item in indicator_results if item.indicator_frame_id is not None
     }
     return [member for member in members if member.asset_id in available_asset_ids]
+
+
+def prefer_technical_screening_members(
+    *,
+    members: list[AssetUniverseMemberORM],
+    market: str,
+    candidate_source: str | None,
+    screening_repository: Any,
+    strategy: str,
+) -> list[AssetUniverseMemberORM]:
+    """配置技术初筛来源时，优先使用最近技术初筛通过项。"""
+
+    if candidate_source != TECHNICAL_SCREENING_POOL_SOURCE or screening_repository is None:
+        return members
+    latest = screening_repository.get_latest_screening_result(
+        market=market,
+        strategy=strategy or TECHNICAL_SCREENING_STRATEGY,
+    )
+    if latest is None:
+        return members
+    passed_items = screening_repository.list_items(
+        screening_id=latest.screening_id,
+        passed_only=True,
+    )
+    passed_asset_ids = {item.asset_id for item in passed_items}
+    if not passed_asset_ids:
+        return members
+    selected = [member for member in members if member.asset_id in passed_asset_ids]
+    return selected or members
 
 
 def count_successful_signals(results: list[SignalComputationResult]) -> int:

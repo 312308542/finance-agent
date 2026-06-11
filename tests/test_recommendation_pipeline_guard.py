@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 from finance_agent.pipelines.recommendation import UniverseRecommendationPipeline
@@ -64,6 +65,47 @@ class _Factors:
         asset_id = str(kwargs["asset_id"])
         self.calls.append(asset_id)
         return _FactorResult(asset_id=asset_id)
+
+
+class _TechnicalScreeningRepository:
+    def get_latest_screening_result(self, *, market: str, strategy: str) -> SimpleNamespace:
+        assert market == "ashare"
+        assert strategy == "technical_screening_v1"
+        return SimpleNamespace(screening_id="screen:technical:ashare:main_board:latest")
+
+    def list_items(self, *, screening_id: str, passed_only: bool = False) -> list[SimpleNamespace]:
+        assert screening_id == "screen:technical:ashare:main_board:latest"
+        assert passed_only is True
+        return [SimpleNamespace(asset_id="ashare:000001", passed=True)]
+
+
+class _Screenings:
+    def apply_rules(self, **kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            status="available",
+            screening_id="screen:balanced",
+            passed_count=1,
+            removed_count=0,
+        )
+
+
+class _Scoring:
+    def score_screening(self, **kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(scored_count=1)
+
+
+class _Signals:
+    def compute_for_asset(self, **kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(signal_id=f"signal:{kwargs['asset_id']}")
+
+
+class _Recommendations:
+    def rank_from_screening(self, **kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            recommendation_count=0,
+            run_id=None,
+            top_recommendation_id=None,
+        )
 
 
 class _ForbiddenStage:
@@ -152,4 +194,37 @@ def test_recommendation_pipeline_only_computes_factors_for_indicator_backed_memb
         min_factor_coverage_ratio=2.0,
     )
 
+    assert factors.calls == ["ashare:000001"]
+
+
+def test_recommendation_pipeline_prefers_latest_technical_screening_pool() -> None:
+    """推荐流水线配置技术初筛来源后，应优先处理技术初筛通过项。"""
+
+    pipeline = UniverseRecommendationPipeline.__new__(UniverseRecommendationPipeline)
+    pipeline.universes = _Universes(
+        [
+            _Member(asset_id="ashare:000001", symbol="000001"),
+            _Member(asset_id="ashare:600519", symbol="600519"),
+        ]
+    )
+    factors = _Factors()
+    pipeline.indicators = _Indicators(available_asset_ids={"ashare:000001", "ashare:600519"})
+    pipeline.factors = factors
+    pipeline.screening_repository = _TechnicalScreeningRepository()
+    pipeline.screenings = _Screenings()
+    pipeline.scoring = _Scoring()
+    pipeline.signals = _Signals()
+    pipeline.recommendations = _Recommendations()
+
+    result = pipeline.run_for_universe(
+        universe_id="universe:test:ashare",
+        horizon="swing",
+        timeframe="1d",
+        candidate_source="technical_screening_pool",
+        min_indicator_coverage_ratio=0.5,
+        min_factor_coverage_ratio=0.0,
+    )
+
+    assert result.member_count == 1
+    assert result.indicator_count == 1
     assert factors.calls == ["ashare:000001"]

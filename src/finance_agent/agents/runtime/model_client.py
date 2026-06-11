@@ -7,6 +7,8 @@ Workflow 白名单和 fallback 策略仍由 Agent Loop / Workflow 层负责。
 from __future__ import annotations
 
 import json
+import os
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -15,6 +17,14 @@ import requests
 from finance_agent.agents.runtime.model_config import ModelEndpointConfig
 
 JsonDict = dict[str, Any]
+TRANSIENT_MODEL_HTTP_ERRORS = (
+    requests.exceptions.ConnectTimeout,
+    requests.exceptions.ReadTimeout,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+)
+DEFAULT_MODEL_HTTP_RETRIES = 2
+DEFAULT_MODEL_HTTP_RETRY_BACKOFF_SECONDS = 0.5
 
 
 class ModelClient(Protocol):
@@ -207,11 +217,11 @@ class OpenAICompatibleModelClient:
             tool_choice=tool_choice,
             temperature=temperature,
         )
-        response = requests.post(
-            url,
+        response = self._post_chat_completion_with_retry(
+            url=url,
             headers={"Authorization": f"Bearer {config.api_key}"},
-            json=request_payload,
-            timeout=config.timeout_seconds,
+            payload=request_payload,
+            timeout_seconds=config.timeout_seconds,
         )
         if not response.ok:
             raise RuntimeError(
@@ -233,6 +243,63 @@ class OpenAICompatibleModelClient:
             tool_calls=tool_calls,
             finish_reason=extract_finish_reason(payload),
         )
+
+    def _post_chat_completion_with_retry(
+        self,
+        *,
+        url: str,
+        headers: JsonDict,
+        payload: JsonDict,
+        timeout_seconds: float,
+    ) -> requests.Response:
+        """对模型端点的瞬时网络错误做有限重试。"""
+
+        retries = read_model_http_retry_count()
+        backoff_seconds = read_model_http_retry_backoff_seconds()
+        attempts = retries + 1
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return requests.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=timeout_seconds,
+                )
+            except TRANSIENT_MODEL_HTTP_ERRORS as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    break
+                if backoff_seconds > 0:
+                    time.sleep(backoff_seconds * attempt)
+
+        raise RuntimeError(
+            f"模型接口连接超时或网络不可用，已重试 {retries} 次：{last_error}"
+        ) from last_error
+
+
+def read_model_http_retry_count() -> int:
+    """读取模型 HTTP 瞬时错误重试次数。"""
+
+    raw_value = os.getenv("FINANCE_AGENT_MODEL_HTTP_RETRIES")
+    if raw_value is None:
+        return DEFAULT_MODEL_HTTP_RETRIES
+    try:
+        return max(0, min(int(raw_value), 10))
+    except ValueError:
+        return DEFAULT_MODEL_HTTP_RETRIES
+
+
+def read_model_http_retry_backoff_seconds() -> float:
+    """读取模型 HTTP 重试退避秒数。"""
+
+    raw_value = os.getenv("FINANCE_AGENT_MODEL_HTTP_RETRY_BACKOFF_SECONDS")
+    if raw_value is None:
+        return DEFAULT_MODEL_HTTP_RETRY_BACKOFF_SECONDS
+    try:
+        return max(0.0, min(float(raw_value), 30.0))
+    except ValueError:
+        return DEFAULT_MODEL_HTTP_RETRY_BACKOFF_SECONDS
 
 
 def extract_chat_message(payload: JsonDict) -> JsonDict | None:

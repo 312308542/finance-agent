@@ -143,6 +143,7 @@ class AgentContextBuilder:
                 MarketBarORM.asset_id == asset_id,
                 MarketBarORM.timeframe == timeframe,
                 MarketBarORM.is_closed.is_(True),
+                MarketBarORM.status.in_(("available", "revised")),
             )
             .order_by(MarketBarORM.timestamp.desc())
             .limit(limit)

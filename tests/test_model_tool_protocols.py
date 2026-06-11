@@ -1,5 +1,8 @@
+import requests
+
 from finance_agent.agents.runtime.model_client import (
     DeepSeekToolCallProtocolStrategy,
+    OpenAICompatibleModelClient,
     OpenAIToolCallProtocolStrategy,
     resolve_tool_call_protocol_strategy,
 )
@@ -79,3 +82,51 @@ def test_resolve_tool_call_protocol_strategy_uses_provider() -> None:
         resolve_tool_call_protocol_strategy(openai_config),
         OpenAIToolCallProtocolStrategy,
     )
+
+
+def test_openai_compatible_model_client_retries_transient_http_errors(
+    monkeypatch,
+) -> None:
+    """模型端点临时连接超时时会重试，而不是立即终止 Agent 工具循环。"""
+
+    calls: list[dict[str, object]] = []
+
+    class _FakeResponse:
+        ok = True
+        status_code = 200
+        text = '{"choices":[{"message":{"content":"完成"}}]}'
+
+        def json(self) -> dict[str, object]:
+            return {"choices": [{"message": {"content": "完成"}, "finish_reason": "stop"}]}
+
+    def fake_post(url: str, **kwargs: object) -> _FakeResponse:
+        calls.append({"url": url, **kwargs})
+        if len(calls) == 1:
+            raise requests.exceptions.ConnectTimeout("connect timed out")
+        return _FakeResponse()
+
+    monkeypatch.setenv("FINANCE_AGENT_MODEL_HTTP_RETRIES", "1")
+    monkeypatch.setenv("FINANCE_AGENT_MODEL_HTTP_RETRY_BACKOFF_SECONDS", "0")
+    monkeypatch.setattr(
+        "finance_agent.agents.runtime.model_client.requests.post",
+        fake_post,
+    )
+
+    config = ModelEndpointConfig(
+        model_key="deepseek-chat",
+        provider="deepseek",
+        model_name="deepseek-chat",
+        base_url="https://api.deepseek.com",
+        api_key="test-api-key",
+        timeout_seconds=12,
+    )
+
+    response = OpenAICompatibleModelClient().invoke_json(
+        config=config,
+        messages=[{"role": "user", "content": "ping"}],
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["timeout"] == 12
+    assert calls[1]["url"] == "https://api.deepseek.com/chat/completions"
+    assert response.content == "完成"

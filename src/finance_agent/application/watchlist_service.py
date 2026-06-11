@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -16,6 +16,11 @@ from finance_agent.storage.orm import (
 from finance_agent.storage.repositories import WatchlistRepository
 
 JsonDict = dict[str, Any]
+DEFAULT_OWNER_ID = "default-owner"
+DEFAULT_ASHARE_RESEARCH_WATCHLIST_ID = "watchlist:default-owner:ashare:research"
+LEGACY_ASHARE_RECOMMENDATION_WATCHLIST_ID = (
+    "watchlist:default-owner:ashare:recommendations"
+)
 
 
 class WatchlistService:
@@ -172,6 +177,141 @@ class WatchlistService:
             self.repository.list_active_items(owner_id=owner_id, watchlist_id=watchlist_id)
         )
 
+    def migrate_recommendation_watchlist_to_research_pool(
+        self,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+        market: str = "ashare",
+        source_watchlist_id: str | None = None,
+        target_watchlist_id: str | None = None,
+        as_of: datetime | None = None,
+    ) -> JsonDict:
+        """将旧推荐观察池 active 条目迁移到系统研究跟踪池。"""
+
+        migrated_at = as_of or datetime.now(UTC)
+        source_id = source_watchlist_id or default_legacy_recommendation_watchlist_id(
+            owner_id=owner_id,
+            market=market,
+        )
+        target_id = target_watchlist_id or default_research_watchlist_id(
+            owner_id=owner_id,
+            market=market,
+        )
+        self.upsert_watchlist(
+            watchlist_id=target_id,
+            owner_id=owner_id,
+            name=default_research_watchlist_name(market),
+            market=market,
+            purpose="system_research_pool",
+            status="active",
+            payload={
+                "source": "watchlist_migration",
+                "migrated_from_watchlist_id": source_id,
+                "migrated_at": migrated_at.isoformat(),
+            },
+        )
+
+        migrated_count = 0
+        for item in self.list_active_items(owner_id=owner_id, watchlist_id=source_id):
+            payload = dict(item.payload or {})
+            payload.update(
+                {
+                    "promotion_status": "system_research",
+                    "migrated_from_watchlist_id": source_id,
+                    "migrated_from_watchlist_item_id": item.watchlist_item_id,
+                    "migrated_at": migrated_at.isoformat(),
+                }
+            )
+            new_item_id = build_watchlist_item_id(
+                watchlist_id=target_id,
+                asset_id=item.asset_id,
+            )
+            migrated_item = self.add_or_update_item(
+                watchlist_item_id=new_item_id,
+                watchlist_id=target_id,
+                asset_id=item.asset_id,
+                symbol=item.symbol,
+                market=item.market,
+                source_type=item.source_type,
+                source_id=item.source_id,
+                reason=item.reason,
+                watch_conditions=item.watch_conditions,
+                trigger_conditions=item.trigger_conditions,
+                invalid_conditions=item.invalid_conditions,
+                risk_level=item.risk_level,
+                status=item.status,
+                next_review_at=item.next_review_at,
+                removed_at=item.removed_at,
+                removed_reason=item.removed_reason,
+                payload=payload,
+            )
+            self.record_event(
+                event_id=build_watchlist_event_id(
+                    watchlist_item_id=migrated_item.watchlist_item_id,
+                    event_type="migrated_to_research_pool",
+                    created_at=migrated_at,
+                ),
+                owner_id=owner_id,
+                watchlist_id=target_id,
+                watchlist_item_id=migrated_item.watchlist_item_id,
+                asset_id=item.asset_id,
+                event_type="migrated_to_research_pool",
+                from_status=None,
+                to_status=migrated_item.status,
+                reason="旧推荐观察池条目迁移到系统研究跟踪池。",
+                created_at=migrated_at,
+                payload={
+                    "source_watchlist_id": source_id,
+                    "source_watchlist_item_id": item.watchlist_item_id,
+                    "target_watchlist_id": target_id,
+                },
+            )
+            migrated_count += 1
+
+        return {
+            "status": "executed",
+            "migrated_count": migrated_count,
+            "source_watchlist_id": source_id,
+            "target_watchlist_id": target_id,
+        }
+
+    def expire_research_pool_items(
+        self,
+        *,
+        owner_id: str = DEFAULT_OWNER_ID,
+        watchlist_id: str = DEFAULT_ASHARE_RESEARCH_WATCHLIST_ID,
+        as_of: datetime | None = None,
+    ) -> JsonDict:
+        """将系统研究跟踪池中已到期的 active 条目标记为 expired。"""
+
+        expired_at = as_of or datetime.now(UTC)
+        expired_count = 0
+        removed_reason = "系统研究跟踪有效期已到期。"
+        for item in self.list_active_items(owner_id=owner_id, watchlist_id=watchlist_id):
+            expires_at = parse_payload_datetime((item.payload or {}).get("expires_at"))
+            if expires_at is None or normalize_datetime(expires_at) > normalize_datetime(expired_at):
+                continue
+
+            payload = {
+                "expired_at": expired_at.isoformat(),
+                "expires_at": expires_at.isoformat(),
+            }
+            self.transition_item(
+                item=item,
+                status="expired",
+                next_review_at=None,
+                removed_at=expired_at,
+                removed_reason=removed_reason,
+                owner_id=owner_id,
+                event_type="research_expired",
+                reason=removed_reason,
+                event_at=expired_at,
+                payload=payload,
+            )
+            expired_count += 1
+
+        return {"status": "executed", "expired_count": expired_count}
+
     def list_asset_theses(
         self,
         *,
@@ -275,3 +415,54 @@ def build_watchlist_event_id(
     """生成观察池事件 ID。"""
 
     return f"watchlist_event:{watchlist_item_id}:{event_type}:{created_at:%Y%m%d%H%M%S}"
+
+
+def parse_payload_datetime(value: Any) -> datetime | None:
+    """从 payload 字段解析 ISO 时间，解析失败时返回 None。"""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def normalize_datetime(value: datetime) -> datetime:
+    """统一时间比较口径，缺少时区时按 UTC 处理。"""
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def build_watchlist_item_id(*, watchlist_id: str, asset_id: str) -> str:
+    """生成观察池条目 ID。"""
+
+    return f"watchlist_item:{watchlist_id}:{asset_id}"
+
+
+def default_research_watchlist_id(*, owner_id: str, market: str) -> str:
+    """返回系统研究跟踪池 ID。"""
+
+    if owner_id == DEFAULT_OWNER_ID and market == "ashare":
+        return DEFAULT_ASHARE_RESEARCH_WATCHLIST_ID
+    return f"watchlist:{owner_id}:{market}:research"
+
+
+def default_legacy_recommendation_watchlist_id(*, owner_id: str, market: str) -> str:
+    """返回旧推荐观察池 ID。"""
+
+    if owner_id == DEFAULT_OWNER_ID and market == "ashare":
+        return LEGACY_ASHARE_RECOMMENDATION_WATCHLIST_ID
+    return f"watchlist:{owner_id}:{market}:recommendations"
+
+
+def default_research_watchlist_name(market: str) -> str:
+    """返回系统研究跟踪池名称。"""
+
+    return {
+        "ashare": "A 股系统研究跟踪池",
+        "crypto_spot": "数字货币现货系统研究跟踪池",
+        "crypto_future": "数字货币合约系统研究跟踪池",
+    }.get(market, f"{market} 系统研究跟踪池")

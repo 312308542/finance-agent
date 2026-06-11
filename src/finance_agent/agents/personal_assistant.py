@@ -611,6 +611,8 @@ class PersonalFinanceAgentService:
         as_of: datetime,
         limit: int = 10,
         workflow_run_id: str | None = None,
+        min_total_score: Decimal | None = None,
+        min_confidence: Decimal | None = None,
     ) -> RecommendationIntakeRunSummary:
         """把一次推荐运行的 Top N 同步到私人观察池。"""
 
@@ -653,7 +655,8 @@ class PersonalFinanceAgentService:
         review_task_ids: list[str] = []
 
         for recommendation in recommendations:
-            if recommendation.action == "avoid":
+            recommendation_action = str(recommendation.action or "").strip().lower()
+            if recommendation_action in {"avoid", "reject"}:
                 self.workflow_audit.record_event(
                     workflow_event_id=(
                         f"{run_id}:event:skip:{recommendation.asset_id}"
@@ -661,12 +664,37 @@ class PersonalFinanceAgentService:
                     workflow_run_id=run_id,
                     event_type="recommendation_skipped",
                     agent_name="recommendation_intake",
-                    message="推荐动作为 avoid，已跳过入池。",
+                    message=f"推荐动作为 {recommendation.action}，已跳过系统研究跟踪入池。",
                     evidence_ids=list(recommendation.evidence_ids),
                     created_at=as_of,
                     payload={
                         "recommendation_id": recommendation.recommendation_id,
                         "action": recommendation.action,
+                    },
+                )
+                continue
+            skip_reason = research_intake_skip_reason(
+                recommendation,
+                min_total_score=min_total_score,
+                min_confidence=min_confidence,
+            )
+            if skip_reason is not None:
+                self.workflow_audit.record_event(
+                    workflow_event_id=(
+                        f"{run_id}:event:skip:{recommendation.asset_id}"
+                    ),
+                    workflow_run_id=run_id,
+                    event_type="recommendation_skipped",
+                    agent_name="recommendation_intake",
+                    message=f"推荐未达到系统研究跟踪入池阈值，已跳过：{skip_reason}。",
+                    evidence_ids=list(recommendation.evidence_ids),
+                    created_at=as_of,
+                    payload={
+                        "recommendation_id": recommendation.recommendation_id,
+                        "action": recommendation.action,
+                        "reason": skip_reason,
+                        "total_score": str(recommendation.total_score),
+                        "confidence": str(recommendation.confidence),
                     },
                 )
                 continue
@@ -679,6 +707,7 @@ class PersonalFinanceAgentService:
                 f"{recommendation.name} 推荐排名第 {recommendation.rank}，"
                 f"评分 {recommendation.total_score}，适合进入观察池。"
             )
+            expires_at = as_of + timedelta(days=3)
             item = self.watchlists.add_or_update_item(
                 watchlist_item_id=watchlist_item_id,
                 watchlist_id=watchlist_id,
@@ -696,10 +725,13 @@ class PersonalFinanceAgentService:
                     conviction=recommendation.conviction,
                 ),
                 status="active",
-                next_review_at=as_of + timedelta(days=2),
+                next_review_at=expires_at,
                 payload={
                     "workflow_run_id": run_id,
                     "recommendation_run_id": recommendation_run_id,
+                    "recommendation_id": recommendation.recommendation_id,
+                    "promotion_status": "system_research",
+                    "expires_at": expires_at.isoformat(),
                     "rank": recommendation.rank,
                     "total_score": str(recommendation.total_score),
                     "confidence": str(recommendation.confidence),
@@ -716,7 +748,7 @@ class PersonalFinanceAgentService:
                 watchlist_id=watchlist_id,
                 watchlist_item_id=item.watchlist_item_id,
                 asset_id=recommendation.asset_id,
-                event_type="recommendation_intake",
+                event_type="research_intake",
                 from_status=None,
                 to_status=item.status,
                 reason=reason,
@@ -725,6 +757,8 @@ class PersonalFinanceAgentService:
                     "workflow_run_id": run_id,
                     "recommendation_run_id": recommendation_run_id,
                     "recommendation_id": recommendation.recommendation_id,
+                    "promotion_status": "system_research",
+                    "expires_at": expires_at.isoformat(),
                 },
             )
             alert = self.memory.record_alert(
@@ -826,7 +860,7 @@ class PersonalFinanceAgentService:
                 asset_id=recommendation.asset_id,
                 source_decision_id=decision_log.decision_id,
                 review_type="recommendation_intake_followup",
-                due_at=as_of + timedelta(days=2),
+                due_at=expires_at,
                 review_questions=[
                     {"question": "推荐入池后是否触发买入条件？"},
                     {"question": "观察条件和失效条件是否仍然成立？"},
@@ -1584,6 +1618,21 @@ def map_recommendation_severity(*, action: str, conviction: str) -> str:
     if action in {"sell_candidate", "reduce_candidate"} or conviction == "high":
         return "medium"
     return "low"
+
+
+def research_intake_skip_reason(
+    recommendation: Any,
+    *,
+    min_total_score: Decimal | None,
+    min_confidence: Decimal | None,
+) -> str | None:
+    """判断推荐是否未达到系统研究跟踪入池阈值。"""
+
+    if min_total_score is not None and Decimal(str(recommendation.total_score)) < min_total_score:
+        return "below_min_total_score"
+    if min_confidence is not None and Decimal(str(recommendation.confidence)) < min_confidence:
+        return "below_min_confidence"
+    return None
 
 
 def build_alert_id(*, run_id: str, asset_id: str) -> str:

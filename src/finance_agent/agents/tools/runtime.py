@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm import Session
 
 from finance_agent.application import MemoryService, PortfolioService, WatchlistService
@@ -209,7 +210,16 @@ class FinanceToolRuntime:
     def get_portfolio_snapshot(self, *, portfolio_id: str) -> JsonDict:
         """读取组合和持仓快照。"""
 
-        snapshot = self.portfolios.load_portfolio_snapshot(portfolio_id)
+        try:
+            snapshot = self.portfolios.load_portfolio_snapshot(portfolio_id)
+        except NoResultFound:
+            return {
+                "portfolio": None,
+                "positions": [],
+                "status": "missing",
+                "message": "组合未配置或不存在。",
+                "portfolio_id": portfolio_id,
+            }
         return {
             "portfolio": serialize_portfolio(snapshot.portfolio),
             "positions": [serialize_position(position) for position in snapshot.positions],

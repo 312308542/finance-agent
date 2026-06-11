@@ -120,12 +120,31 @@ class DashboardService:
         """读取活跃观察项。"""
 
         items = self.watchlists.list_active_items(owner_id=owner_id)[:limit]
+        serialized_items: list[JsonDict] = []
+        pool_counts = {str(pool["key"]): 0 for pool in watchlist_pool_definitions()}
+        for item in items:
+            pool = classify_watchlist_pool(item)
+            pool_counts[pool] = pool_counts.get(pool, 0) + 1
+            serialized = serialize_watchlist_item(item)
+            serialized["pool"] = pool
+            serialized["pool_label"] = watchlist_pool_label(pool)
+            serialized_items.append(serialized)
+
         return {
             "status": "ok" if items else "empty",
-            "items": [serialize_watchlist_item(item) for item in items],
+            "items": serialized_items,
+            "pools": [
+                {
+                    **pool,
+                    "count": pool_counts.get(str(pool["key"]), 0),
+                }
+                for pool in watchlist_pool_definitions()
+            ],
             "metrics": {
                 "active_count": len(items),
                 "high_risk_count": sum(1 for item in items if item.risk_level == "high"),
+                "research_count": pool_counts.get("system_research_pool", 0),
+                "manual_count": pool_counts.get("manual_watchlist", 0),
                 "markets": sorted({item.market for item in items}),
             },
         }
@@ -560,6 +579,62 @@ def mask_secret(value: str | None) -> str | None:
     if len(value) <= 8:
         return "***"
     return f"{value[:4]}***{value[-4:]}"
+
+
+def classify_watchlist_pool(item: Any) -> str:
+    """将观察项归类到前端展示用的池子。"""
+
+    payload = item.payload or {}
+    watchlist_id = str(getattr(item, "watchlist_id", "") or "")
+    source_type = str(getattr(item, "source_type", "") or "")
+    payload_source_type = str(payload.get("source_type") or "")
+    if (
+        watchlist_id.endswith(":technical")
+        or source_type == "technical_screening"
+        or payload_source_type == "technical_screening"
+    ):
+        return "technical_screening_pool"
+    if watchlist_id.endswith(":research") or payload.get("promotion_status") == "system_research":
+        return "system_research_pool"
+    if source_type in {"manual", "agent_confirmed", "portfolio", "fund"}:
+        return "manual_watchlist"
+    return "other_watchlist"
+
+
+def watchlist_pool_definitions() -> list[JsonDict]:
+    """返回观察池前端分组定义。"""
+
+    return [
+        {
+            "key": "technical_screening_pool",
+            "label": "技术初筛池",
+            "description": "历史行情完成后的技术粗筛结果，只表示后续优先补齐，不代表买入建议。",
+        },
+        {
+            "key": "system_research_pool",
+            "label": "系统研究跟踪",
+            "description": "系统推荐后自动跟踪，尚未代表用户确认关注。",
+        },
+        {
+            "key": "manual_watchlist",
+            "label": "用户观察池",
+            "description": "用户手动加入或确认关注的资产。",
+        },
+        {
+            "key": "other_watchlist",
+            "label": "其他观察项",
+            "description": "暂未归类到研究池或用户观察池的有效条目。",
+        },
+    ]
+
+
+def watchlist_pool_label(pool: str) -> str:
+    """返回观察池分组中文名。"""
+
+    return {
+        str(item["key"]): str(item["label"])
+        for item in watchlist_pool_definitions()
+    }.get(pool, "其他观察项")
 
 
 def count_rows(session: Session, model: Any) -> int:
