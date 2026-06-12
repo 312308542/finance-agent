@@ -1218,6 +1218,69 @@ def normalize_ashare_restricted_release_detail(
     return risks, events
 
 
+def normalize_ashare_pledge_ratio(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    collected_at: datetime,
+    limit: int | None = None,
+    risk_ratio_threshold: Decimal = Decimal("0.30"),
+) -> list[RiskFindingData]:
+    """归一化上市公司股权质押比例为资产级风险。"""
+
+    risks: list[RiskFindingData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        symbol = normalize_ashare_symbol(
+            str(_first_present(row, ["股票代码", "证券代码", "代码"]) or "")
+        )
+        if not symbol or not is_main_board_ashare_stock_symbol(symbol):
+            continue
+        name = str(_first_present(row, ["股票简称", "证券简称", "名称"]) or symbol).strip()
+        pledge_ratio = _normalize_percent_ratio(
+            _first_decimal(row, ["质押比例", "质押总比例", "股权质押比例"])
+        )
+        if pledge_ratio is None or pledge_ratio < risk_ratio_threshold:
+            continue
+        as_of = (
+            parse_ashare_datetime(_first_present(row, ["交易日期", "统计日期", "日期"]))
+            or collected_at
+        )
+        pledge_count = _first_decimal(row, ["质押笔数", "质押次数"])
+        pledged_shares = _first_decimal(row, ["质押股数", "质押数量"])
+        pledge_value = _first_decimal(row, ["质押市值", "质押金额"])
+        industry = str(_first_present(row, ["所属行业", "行业"]) or "").strip() or None
+        severity = "critical" if pledge_ratio >= Decimal("0.50") else "high"
+        score = min(Decimal("1.0"), pledge_ratio * Decimal("2"))
+        description = (
+            f"股权质押比例 {pledge_ratio:.2%}，质押笔数 {pledge_count}，"
+            f"质押市值 {pledge_value}。"
+        )
+        risks.append(
+            RiskFindingData(
+                risk_id=stable_id("risk", source, "pledge_ratio", symbol, as_of.isoformat()),
+                asset_id=f"ashare:{symbol}",
+                scope="asset",
+                risk_type="pledge_ratio",
+                severity=severity,
+                score=score.quantize(Decimal("0.001")),
+                title=f"{name}({symbol}) 股权质押比例偏高",
+                description=description,
+                as_of=as_of,
+                payload={
+                    "raw": row,
+                    "pledge_ratio": str(pledge_ratio),
+                    "pledge_count": str(pledge_count) if pledge_count is not None else None,
+                    "pledged_shares": str(pledged_shares) if pledged_shares is not None else None,
+                    "pledge_value": str(pledge_value) if pledge_value is not None else None,
+                    "industry": industry,
+                    "risk_ratio_threshold": str(risk_ratio_threshold),
+                },
+            )
+        )
+    return risks
+
+
 def normalize_ashare_hot_rank(
     df: pd.DataFrame,
     *,
@@ -1918,6 +1981,14 @@ def is_main_board_ashare_stock_symbol(symbol: str) -> bool:
     if not is_standard_ashare_stock_symbol(normalized):
         return False
     return normalized.startswith(("000", "001", "002", "003", "600", "601", "603", "605"))
+
+
+def _normalize_percent_ratio(value: Decimal | None) -> Decimal | None:
+    """把第三方百分数或小数比例统一成 0~1 口径。"""
+
+    if value is None:
+        return None
+    return value / Decimal("100") if value > Decimal("1") else value
 
 
 def timeframe_to_timedelta(timeframe: str) -> timedelta | None:

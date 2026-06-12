@@ -6,7 +6,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Any
 
 import akshare as ak
@@ -18,6 +19,7 @@ from finance_agent.data.normalizers import (
     normalize_ashare_hot_rank,
     normalize_ashare_lhb_detail,
     normalize_ashare_margin_summary,
+    normalize_ashare_pledge_ratio,
     normalize_ashare_restricted_release_detail,
     normalize_ashare_st_list,
     normalize_ashare_stop_list,
@@ -381,6 +383,83 @@ class AshareRiskProvider:
             },
         )
 
+    def fetch_pledge_ratio(
+        self,
+        *,
+        date: str | None = None,
+        limit: int | None = None,
+        risk_ratio_threshold: Any = "0.30",
+    ) -> RiskFindingsResult:
+        """获取上市公司股权质押比例，用于风险反驳和回避池。"""
+
+        collected_at = datetime.now(tz=UTC)
+        endpoint = "stock_gpzy_pledge_ratio_em"
+        source = f"akshare:{endpoint}"
+        try:
+            requested_date = compact_akshare_date(date or collected_at.strftime("%Y%m%d"))
+            query_date = requested_date
+            fallback_trace: list[dict[str, str]] = []
+            try:
+                df = ak.stock_gpzy_pledge_ratio_em(date=query_date)
+                fallback_used = False
+            except Exception as primary_exc:
+                fallback_trace.append(
+                    {"date": query_date, "error_message": str(primary_exc)}
+                )
+                fallback_date = self._latest_pledge_ratio_date(requested_date)
+                if not fallback_date or fallback_date == requested_date:
+                    raise
+                query_date = fallback_date
+                df = ak.stock_gpzy_pledge_ratio_em(date=query_date)
+                fallback_used = True
+            risks = normalize_ashare_pledge_ratio(
+                df,
+                source=source,
+                collected_at=collected_at,
+                limit=limit,
+                risk_ratio_threshold=Decimal(str(risk_ratio_threshold)),
+            )
+        except Exception as exc:
+            return RiskFindingsResult(
+                provider_name=self.provider_name,
+                status="error",
+                collected_at=collected_at,
+                error_message=str(exc),
+                payload={"endpoint": endpoint, "date": date},
+            )
+        return RiskFindingsResult(
+            provider_name=self.provider_name,
+            status="available" if risks else "unavailable",
+            collected_at=collected_at,
+            risks=risks,
+            payload={
+                "endpoint": endpoint,
+                "requested_date": requested_date,
+                "date": query_date,
+                "row_count": len(risks),
+                "actual_source": source,
+                "risk_ratio_threshold": str(risk_ratio_threshold),
+                "fallback_used": fallback_used,
+                "fallback_trace": fallback_trace,
+            },
+        )
+
+    def _latest_pledge_ratio_date(self, requested_date: str) -> str | None:
+        """从股权质押概览中选择不晚于请求日的最近可用交易日。"""
+
+        profile_df = ak.stock_gpzy_profile_em()
+        requested = parse_compact_akshare_date(requested_date)
+        candidates: list[date] = []
+        for row in profile_df.to_dict("records"):
+            trade_date = parse_compact_akshare_date(row.get("交易日期"))
+            if trade_date is None:
+                continue
+            if requested is None or trade_date <= requested:
+                candidates.append(trade_date)
+        if not candidates:
+            return None
+        return max(candidates).strftime("%Y%m%d")
+
 
 class AshareSentimentProvider:
     """A 股短线情绪数据 Provider。"""
@@ -496,3 +575,36 @@ class AshareSentimentProvider:
                 "actual_source": source,
             },
         )
+
+
+def compact_akshare_date(value: Any) -> str:
+    """把日期值压缩为 AKShare 常用的 YYYYMMDD 字符串。"""
+
+    parsed = parse_compact_akshare_date(value)
+    if parsed is not None:
+        return parsed.strftime("%Y%m%d")
+    digits = "".join(char for char in str(value or "") if char.isdigit())
+    return digits[:8] if len(digits) >= 8 else str(value or "").strip()
+
+
+def parse_compact_akshare_date(value: Any) -> date | None:
+    """解析 AKShare/东方财富返回的日期字段。"""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    digits = "".join(char for char in text if char.isdigit())
+    for candidate, fmt in ((digits[:8], "%Y%m%d"), (text[:10], "%Y-%m-%d")):
+        if not candidate:
+            continue
+        try:
+            return datetime.strptime(candidate, fmt).date()
+        except ValueError:
+            continue
+    return None

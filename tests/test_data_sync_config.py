@@ -257,6 +257,22 @@ def test_scheduler_payload_exports_ashare_restricted_release_job() -> None:
     assert "stock_restricted_release_detail_em" in jobs["ashare.restricted_release"]["params"]["sources"]
 
 
+def test_scheduler_payload_exports_ashare_pledge_job() -> None:
+    """A 股风险包应包含股权质押任务，供风险反驳和回避池消费。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+
+    assert jobs["ashare.pledge"]["job_type"] == "collection"
+    assert jobs["ashare.pledge"]["group"] == "ashare-risk"
+    assert jobs["ashare.pledge"]["params"]["sync_task_type"] == "pledge_risk_refresh"
+    assert jobs["ashare.pledge"]["params"]["group"] == ["ashare-risk"]
+    assert jobs["ashare.pledge"]["params"]["source_limit"] == jobs["ashare.pledge"]["limit"]
+    assert "stock_gpzy_pledge_ratio_em" in jobs["ashare.pledge"]["params"]["sources"]
+
+
 def test_scheduler_payload_marks_ashare_fundamentals_as_incremental_resume() -> None:
     """基本面/估值定时任务应默认按水位增量补齐，避免每轮重复扫完整资产池。"""
 

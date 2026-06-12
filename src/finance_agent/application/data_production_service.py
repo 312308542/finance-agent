@@ -587,6 +587,7 @@ class AvoidPoolPolicy:
         "st_risk",
         "suspension",
         "regulatory_risk",
+        "pledge_ratio",
     }
 
     def build_avoid_members(

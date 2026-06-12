@@ -96,7 +96,7 @@ AKShare 在本系统里应视为 **A 股数据 Provider 族**，不是单一 K �
 | 盈利预测 | `stock_profit_forecast_em`、`stock_profit_forecast_ths` | 预期差、机构一致预期 | P2 |
 | 股东/高管 | 十大股东、流通股东、高管持股、股东户数 | 筹码稳定性、治理风险 | P2 |
 | 限售解禁 | `stock_restricted_release_detail_em`、`stock_restricted_release_queue_em` | 解禁事件、临近高占比解禁风险、风险反驳；字段重点为股票代码、股票简称、解禁时间、限售股类型、实际解禁数量、实际解禁市值、占解禁前流通市值比例；日级低频刷新，失败常见模式为东财连接断开、窗口内无数据或低比例解禁仅落事件不落风险 | P2 |
-| 股权质押 | 股票质押、上市公司质押比例、质押明细 | 质押风险、风险扣分 | P2 |
+| 股权质押 | `stock_gpzy_pledge_ratio_em`、`stock_gpzy_pledge_ratio_detail_em`、`stock_gpzy_individual_pledge_ratio_detail_em` | 上市公司质押比例风险、风险扣分、回避池剔除；当前优先接入 `stock_gpzy_pledge_ratio_em(date)`，字段重点为股票代码、股票简称、交易日期、质押比例、质押股数、质押笔数、质押市值；日级低频刷新，质押比例超过 30% 写入 `risk_findings(risk_type=pledge_ratio)` 并由回避池消费 | P2 |
 | 分红配送 | 分红派息、历史分红、股息率 | 价值/红利因子 | P2 |
 | 新股数据 | 新股申购、中签、上市首日、次新股 | 新股种子池、次新风险过滤 | P2 |
 | 融资融券 | `stock_margin_*`、两融账户、标的证券名单 | 杠杆情绪、拥挤风险 | P2 |

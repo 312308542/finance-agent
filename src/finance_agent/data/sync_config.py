@@ -1218,6 +1218,7 @@ def collection_group_for_task(task: DataSyncTaskPreview) -> str | tuple[str, ...
             "event_refresh": "ashare-p1",
             "event_article_enrichment": "ashare-p1",
             "restricted_release_refresh": "ashare-risk",
+            "pledge_risk_refresh": "ashare-risk",
             "risk_sentiment_refresh": "ashare-risk",
         }[task.task_type]
     if task.market == "fund":
@@ -1263,6 +1264,9 @@ def build_ashare_collection_params(task: DataSyncTaskPreview) -> JsonDict:
     if task.task_type == "risk_sentiment_refresh":
         params["group"] = ["ashare-risk"]
     if task.task_type == "restricted_release_refresh":
+        params["group"] = ["ashare-risk"]
+        params["source_limit"] = task.batch_size
+    if task.task_type == "pledge_risk_refresh":
         params["group"] = ["ashare-risk"]
         params["source_limit"] = task.batch_size
     return params
@@ -1569,6 +1573,28 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 sources=["stock_restricted_release_detail_em"],
                 data_packages=["risk_sentiment", "events"],
                 notes=["写入限售解禁事件，并对临近高占比解禁生成风险发现。"],
+            )
+        )
+        tasks.append(
+            DataSyncTaskPreview(
+                task_key="ashare.pledge",
+                market="ashare",
+                task_type="pledge_risk_refresh",
+                title="刷新 A 股股权质押风险",
+                interval_seconds=config.interval_seconds.get(
+                    "pledge_risk",
+                    24 * 60 * 60,
+                ),
+                mode="daily_risk_snapshot",
+                schedule_type="daily_time",
+                run_at=["18:45"],
+                timezone="Asia/Shanghai",
+                trading_day_policy="trading_day_only",
+                batch_size=config.batch_size,
+                lookback=f"{config.lookback_days}d",
+                sources=["stock_gpzy_pledge_ratio_em"],
+                data_packages=["risk_sentiment"],
+                notes=["质押比例超过红线时写入风险发现，并在回避池重建时剔除。"],
             )
         )
         tasks.append(

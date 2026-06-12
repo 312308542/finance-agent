@@ -2426,6 +2426,33 @@ class AshareRiskSentimentCollector:
         self._persist_risk_result(result, raw_record_id=raw_record_id)
         return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
+    def collect_pledge_ratio(
+        self,
+        *,
+        date: str | None = None,
+        limit: int | None = None,
+        risk_ratio_threshold: Decimal = Decimal("0.30"),
+    ) -> ArchivedProviderResult:
+        """采集上市公司股权质押比例，并写入风险发现。"""
+
+        result = self.risk_provider.fetch_pledge_ratio(
+            date=date,
+            limit=limit,
+            risk_ratio_threshold=risk_ratio_threshold,
+        )
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_gpzy_pledge_ratio_em",
+            request_params={
+                "date": date,
+                "limit": limit,
+                "risk_ratio_threshold": str(risk_ratio_threshold),
+            },
+        )
+        self._persist_risk_result(result, raw_record_id=raw_record_id)
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
     def _persist_sentiment_result(
         self,
         result: SentimentSignalsResult,

@@ -3647,6 +3647,101 @@ def test_restricted_release_watermark_timeframe_fits_schema_limit() -> None:
     assert len(timeframe) <= 16
 
 
+def test_ashare_pledge_risk_refresh_dispatches_to_collector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """股权质押任务应由风险入口分发到专用采集方法。"""
+
+    collect_base_data = import_collection_module()
+    calls: list[dict[str, Any]] = []
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            calls.append(
+                {
+                    "task": task,
+                    "provider_key": provider_key,
+                    "parameters": parameters,
+                    "force": force,
+                }
+            )
+            collect()
+            return Namespace(
+                task=task,
+                status="available",
+                raw_record_id="raw:pledge",
+                item_count=1,
+                error_message=None,
+                payload={},
+            )
+
+    monkeypatch.setattr(
+        collect_base_data.AshareRiskSentimentCollector,
+        "__init__",
+        lambda self, session: None,
+    )
+    monkeypatch.setattr(
+        collect_base_data.AshareRiskSentimentCollector,
+        "collect_pledge_ratio",
+        lambda self, **kwargs: calls.append({"task": "collect_pledge_ratio", **kwargs}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_ashare_risk_sentiment_watermark",
+        lambda session, **kwargs: calls.append({"record_kind": "watermark", **kwargs}),
+        raising=False,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-risk"],
+        sync_task_type="pledge_risk_refresh",
+        risk_end="20260612",
+        source_limit=5,
+    )
+
+    results = collect_base_data.run_ashare_risk(object(), args, RecordingRuntime())
+
+    assert [result.task for result in results] == ["ashare_risk_pledge_ratio"]
+    assert calls[0]["provider_key"] == "stock_gpzy_pledge_ratio_em"
+    assert calls[0]["parameters"] == {
+        "date": "20260612",
+        "limit": 5,
+        "risk_ratio_threshold": "0.30",
+    }
+    assert calls[1] == {
+        "task": "collect_pledge_ratio",
+        "date": "20260612",
+        "limit": 5,
+        "risk_ratio_threshold": Decimal("0.30"),
+    }
+    record_call = next(call for call in calls if call.get("record_kind") == "watermark")
+    assert record_call["provider"] == "stock_gpzy_pledge_ratio_em"
+
+
+def test_pledge_risk_watermark_timeframe_fits_schema_limit() -> None:
+    """股权质押水位 timeframe 不应超过 data_sync_watermarks 的长度限制。"""
+
+    collect_base_data = import_collection_module()
+
+    timeframe = collect_base_data.ashare_risk_sentiment_watermark_timeframe(
+        task="ashare_risk_pledge_ratio",
+        provider="stock_gpzy_pledge_ratio_em",
+        parameters={"risk_ratio_threshold": "0.30"},
+    )
+
+    assert timeframe == "pledge_ratio"
+    assert len(timeframe) <= 16
+
+
 def test_ashare_risk_sentiment_skips_only_source_in_failure_cooldown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
