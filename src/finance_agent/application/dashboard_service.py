@@ -249,6 +249,100 @@ class DashboardService:
             },
         }
 
+    def get_report_list(self, *, owner_id: str, limit: int = 20) -> JsonDict:
+        """读取最近中文报告列表摘要。"""
+
+        clean_limit = normalize_dashboard_limit(limit)
+        runs = self._list_recent_workflow_runs(owner_id=owner_id, limit=clean_limit)
+        items = [serialize_report_list_item(item) for item in runs]
+        return {
+            "status": "ok" if items else "empty",
+            "items": items,
+            "metrics": {
+                "report_count": len(items),
+                "succeeded_count": sum(1 for item in items if item["status"] == "succeeded"),
+                "failed_count": sum(1 for item in items if item["status"] == "failed"),
+                "requires_review_count": sum(
+                    1
+                    for item in items
+                    if item["review_status"]
+                    in {"requires_model_review", "review_unavailable", "pending_user_confirmation"}
+                ),
+            },
+        }
+
+    def get_alert_center(
+        self,
+        *,
+        owner_id: str,
+        status: str | None = None,
+        limit: int = 20,
+    ) -> JsonDict:
+        """读取提醒中心合并视图。"""
+
+        clean_limit = normalize_dashboard_limit(limit)
+        alerts = self._list_recent_alerts(owner_id=owner_id, limit=clean_limit)
+        triggers = self._list_recent_trigger_events(owner_id=owner_id, limit=clean_limit)
+        if status:
+            alerts = [item for item in alerts if item.status == status]
+            triggers = [item for item in triggers if item.status == status]
+        serialized_alerts = [serialize_alert(item) for item in alerts]
+        serialized_triggers = [serialize_trigger_event(item) for item in triggers]
+        merged_items = sorted(
+            [
+                *(
+                    serialize_alert_center_item(item, item_type="monitoring_alert")
+                    for item in serialized_alerts
+                ),
+                *(
+                    serialize_alert_center_item(item, item_type="trigger_event")
+                    for item in serialized_triggers
+                ),
+            ],
+            key=lambda item: str(item.get("event_time") or ""),
+            reverse=True,
+        )[:clean_limit]
+        return {
+            "status": "ok" if merged_items else "empty",
+            "items": merged_items,
+            "alerts": serialized_alerts,
+            "triggers": serialized_triggers,
+            "metrics": {
+                "alert_count": len(serialized_alerts),
+                "trigger_count": len(serialized_triggers),
+                "unread_count": sum(
+                    1
+                    for item in [*serialized_alerts, *serialized_triggers]
+                    if item.get("status") in {"open", "pending", "new"}
+                ),
+                "high_severity_count": sum(
+                    1
+                    for item in [*serialized_alerts, *serialized_triggers]
+                    if item.get("severity") == "high"
+                ),
+            },
+        }
+
+    def get_recent_memories(self, *, owner_id: str, limit: int = 20) -> JsonDict:
+        """读取跨资产最近 Finance Memory 流。"""
+
+        clean_limit = normalize_dashboard_limit(limit)
+        memories = self.memories.list_memories(
+            owner_id=owner_id,
+            statuses=("active", "stale"),
+            limit=clean_limit,
+        )
+        items = [serialize_memory(item) for item in memories]
+        return {
+            "status": "ok" if items else "empty",
+            "items": items,
+            "metrics": {
+                "memory_count": len(items),
+                "stale_memory_count": sum(1 for item in items if item["status"] == "stale"),
+                "asset_count": len({item.get("asset_id") for item in items if item.get("asset_id")}),
+            },
+        }
+
     def get_data_health(self, *, limit: int = 20) -> JsonDict:
         """读取数据质量快照摘要。"""
 
@@ -354,6 +448,12 @@ def summarize_section_status(sections: dict[str, JsonDict]) -> str:
     return "ok"
 
 
+def normalize_dashboard_limit(limit: int, *, maximum: int = 200) -> int:
+    """统一控制 Web 只读接口的分页上限。"""
+
+    return max(1, min(limit, maximum))
+
+
 def unavailable_summary(*, owner_id: str, message: str) -> JsonDict:
     """数据库或依赖不可用时的总览降级响应。"""
 
@@ -455,6 +555,91 @@ def serialize_workflow_run(run: AgentWorkflowRunORM) -> JsonDict:
         "output_ref": run.output_ref,
         "payload": json_value(run.payload or {}),
     }
+
+
+def serialize_report_list_item(run: AgentWorkflowRunORM) -> JsonDict:
+    """序列化报告列表项。"""
+
+    payload = json_value(run.payload or {})
+    return {
+        **serialize_workflow_run(run),
+        "title": resolve_report_title(run.workflow_type, payload),
+        "summary": resolve_report_summary(run, payload),
+        "review_status": resolve_report_review_status(payload),
+    }
+
+
+def resolve_report_title(workflow_type: str, payload: JsonDict) -> str:
+    """从 run payload 中解析报告标题。"""
+
+    report = payload.get("report") if isinstance(payload.get("report"), dict) else {}
+    return str(
+        payload.get("report_title")
+        or report.get("title")
+        or WORKFLOW_TYPE_LABELS.get(workflow_type)
+        or workflow_type
+    )
+
+
+def resolve_report_summary(run: AgentWorkflowRunORM, payload: JsonDict) -> str:
+    """从 run payload 中解析报告摘要。"""
+
+    report = payload.get("report") if isinstance(payload.get("report"), dict) else {}
+    context_summary = (
+        payload.get("context_envelope_summary")
+        if isinstance(payload.get("context_envelope_summary"), dict)
+        else {}
+    )
+    return str(
+        payload.get("summary")
+        or report.get("summary")
+        or context_summary.get("summary")
+        or run.output_ref
+        or ""
+    )
+
+
+def resolve_report_review_status(payload: JsonDict) -> str:
+    """从 run payload 中解析复核状态。"""
+
+    report = payload.get("report") if isinstance(payload.get("report"), dict) else {}
+    review_status = (
+        report.get("review_status")
+        if isinstance(report.get("review_status"), dict)
+        else {}
+    )
+    return str(
+        payload.get("review_status")
+        or review_status.get("status")
+        or "unknown"
+    )
+
+
+def serialize_alert_center_item(item: JsonDict, *, item_type: str) -> JsonDict:
+    """为提醒中心列表补统一类型和时间字段。"""
+
+    if item_type == "monitoring_alert":
+        event_time = item.get("as_of")
+        title = item.get("trigger_condition") or item.get("alert_type")
+    else:
+        event_time = item.get("triggered_at")
+        title = item.get("trigger_ref") or item.get("trigger_type")
+    return {
+        **item,
+        "item_type": item_type,
+        "event_time": event_time,
+        "title": title,
+    }
+
+
+WORKFLOW_TYPE_LABELS = {
+    "asset_deep_analysis": "单标的深度分析报告",
+    "portfolio_monitoring": "持仓监控报告",
+    "watchlist_management": "观察池管理报告",
+    "recommendation_decision": "推荐决策报告",
+    "swap_decision": "换股/换币比较报告",
+    "daily_review": "每日复盘报告",
+}
 
 
 def serialize_memory(memory: AssistantMemoryORM) -> JsonDict:

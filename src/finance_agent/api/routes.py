@@ -211,6 +211,20 @@ def workflow_run(
         return {"status": "unavailable", "message": str(exc)[:240], "data": {}}
 
 
+@router.get("/reports")
+def reports(
+    owner_id: str,
+    limit: int = 20,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """返回最近中文报告列表。"""
+
+    try:
+        return DashboardService(session).get_report_list(owner_id=owner_id, limit=limit)
+    except Exception as exc:
+        return {"status": "unavailable", "message": str(exc)[:240], "items": []}
+
+
 @router.get("/reports/{workflow_run_id}")
 def report(
     workflow_run_id: str,
@@ -222,6 +236,45 @@ def report(
         return FinanceAgentInterface(session).get_report(workflow_run_id).to_dict()
     except Exception as exc:
         return {"status": "unavailable", "message": str(exc)[:240], "data": {}}
+
+
+@router.get("/alerts")
+def alerts(
+    owner_id: str,
+    status: str | None = None,
+    limit: int = 20,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """返回提醒中心合并视图。"""
+
+    try:
+        return DashboardService(session).get_alert_center(
+            owner_id=owner_id,
+            status=status,
+            limit=limit,
+        )
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "message": str(exc)[:240],
+            "items": [],
+            "alerts": [],
+            "triggers": [],
+        }
+
+
+@router.get("/memories/recent")
+def recent_memories(
+    owner_id: str,
+    limit: int = 20,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """返回最近 Finance Memory 流。"""
+
+    try:
+        return DashboardService(session).get_recent_memories(owner_id=owner_id, limit=limit)
+    except Exception as exc:
+        return {"status": "unavailable", "message": str(exc)[:240], "items": []}
 
 
 @router.post("/decisions/{decision_id}/feedback")
