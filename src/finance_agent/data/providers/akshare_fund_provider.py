@@ -16,12 +16,24 @@ from finance_agent.data.normalizers import (
     normalize_fund_open_fund_daily_em,
     normalize_fund_open_nav_em,
 )
+from finance_agent.data.providers.ashare_kline_sources import fetch_tencent_kline_direct
+from finance_agent.scheduler.task_queue_model import (
+    ProviderChain,
+    ProviderChainResult,
+    ProviderFetchResult,
+    ProviderSource,
+)
 
 
 class AkshareFundProvider:
     """基金资产池、场内基金日 K 和开放式基金净值 Provider。"""
 
     provider_name = "akshare"
+
+    def __init__(self, *, request_timeout_seconds: float = 15.0) -> None:
+        """设置基金数据源单次 HTTP 请求超时。"""
+
+        self.request_timeout_seconds = request_timeout_seconds
 
     @staticmethod
     def _sina_fund_symbol(symbol: str) -> str:
@@ -30,6 +42,17 @@ class AkshareFundProvider:
         exchange = infer_fund_exchange(symbol)
         prefix = "sh" if exchange == "SSE" else "sz"
         return f"{prefix}{symbol}"
+
+    @staticmethod
+    def _tencent_fund_symbol(symbol: str) -> str:
+        """把基金代码转换为腾讯 K 线接口要求的带交易所前缀格式。"""
+
+        exchange = infer_fund_exchange(symbol)
+        if exchange == "SSE":
+            return f"sh{symbol}"
+        if exchange == "SZSE":
+            return f"sz{symbol}"
+        return symbol
 
     def fetch_etf_assets(self, *, limit: int | None = None) -> AssetListResult:
         """获取 ETF 实时列表。"""
@@ -181,15 +204,53 @@ class AkshareFundProvider:
         """获取 LOF 历史日 K。"""
 
         collected_at = datetime.now(tz=UTC)
-        try:
-            df = ak.fund_lof_hist_em(symbol=symbol, period=period, start_date=start_date, end_date=end_date)
+        primary_source = "akshare:fund_lof_hist_em"
+        fallback_source = "tencent:direct:kline"
+        chain = ProviderChain(
+            [
+                ProviderSource(name=primary_source, rate_key="eastmoney_fund_kline", complexity="fund_lof_kline"),
+                ProviderSource(name=fallback_source, rate_key="tencent_kline", complexity="fund_lof_kline"),
+            ]
+        )
+
+        def fetch(source: ProviderSource) -> ProviderFetchResult:
+            if source.name == primary_source:
+                frame = ak.fund_lof_hist_em(symbol=symbol, period=period, start_date=start_date, end_date=end_date)
+            elif source.name == fallback_source:
+                frame = fetch_tencent_kline_direct(
+                    symbol=self._tencent_fund_symbol(symbol),
+                    start=start_date,
+                    end=end_date,
+                    adjust="qfq",
+                    timeout=self.request_timeout_seconds,
+                )
+            else:
+                return ProviderFetchResult.error(f"未知 LOF K 线数据源: {source.name}")
             if limit:
-                df = df.tail(limit)
+                frame = frame.tail(limit)
+            return ProviderFetchResult.ok(payload=frame, row_count=len(frame))
+
+        chain_result = chain.run(fetch)
+        provider_chain_payload = _provider_chain_payload(chain_result)
+        if chain_result.status != "ok":
+            return MarketBarsResult(
+                provider_name=self.provider_name,
+                status="error",
+                collected_at=collected_at,
+                error_message=chain_result.error_message,
+                payload={
+                    "endpoint": primary_source,
+                    "symbol": symbol,
+                    "fallback_endpoint": fallback_source,
+                    "provider_chain": provider_chain_payload,
+                },
+            )
+        try:
             bars = normalize_fund_lof_hist_em(
-                df,
+                chain_result.payload,
                 symbol=symbol,
                 timeframe="1d",
-                source="akshare:fund_lof_hist_em",
+                source=chain_result.source or primary_source,
                 is_closed=is_closed,
                 status=status,
             )
@@ -199,14 +260,26 @@ class AkshareFundProvider:
                 status="error",
                 collected_at=collected_at,
                 error_message=str(exc),
-                payload={"endpoint": "fund_lof_hist_em", "symbol": symbol},
+                payload={
+                    "endpoint": chain_result.source or primary_source,
+                    "symbol": symbol,
+                    "provider_chain": provider_chain_payload,
+                },
             )
         return MarketBarsResult(
             provider_name=self.provider_name,
             status="available" if bars else "unavailable",
             collected_at=collected_at,
             bars=bars,
-            payload={"endpoint": "fund_lof_hist_em", "symbol": symbol, "row_count": len(bars)},
+            payload={
+                "endpoint": chain_result.source or primary_source,
+                "symbol": symbol,
+                "fallback_used": chain_result.source != primary_source,
+                "fallback_endpoint": fallback_source,
+                "adjust": "qfq" if chain_result.source == fallback_source else "",
+                "provider_chain": provider_chain_payload,
+                "row_count": len(bars),
+            },
         )
 
     def fetch_open_fund_nav(
@@ -251,3 +324,15 @@ class AkshareFundProvider:
                 "row_count": len(snapshots),
             },
         )
+
+
+def _provider_chain_payload(result: ProviderChainResult) -> dict:
+    """把 ProviderChainResult 转为可归档的轻量审计结构。"""
+
+    return {
+        "status": result.status,
+        "source": result.source,
+        "row_count": result.row_count,
+        "error_message": result.error_message,
+        "attempts": [attempt.to_dict() for attempt in result.attempts],
+    }

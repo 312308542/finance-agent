@@ -1653,13 +1653,13 @@ def preview_fund_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                     max_workers=min(config.max_workers, 2),
                     max_retries=0,
                     lookback=FUND_BOOTSTRAP_LOOKBACK,
-                    sources=["fund_lof_hist_em"],
+                    sources=["fund_lof_hist_em", "tencent:direct:kline"],
                     data_packages=["market_bars"],
                     extra_params={
                         "fund_asset_type": "lof",
                         "schedule_failure_retry": False,
                     },
-                    notes=["手动触发，用于 LOF 首次建库或大缺口补齐。"],
+                    notes=["手动触发，用于 LOF 首次建库或大缺口补齐；东方财富主源失败时自动降级腾讯直连 K 线。"],
                 ),
                 DataSyncTaskPreview(
                     task_key="fund.bars.1d.close_final",

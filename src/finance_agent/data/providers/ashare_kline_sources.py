@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -43,6 +44,8 @@ TENCENT_KLINE_BROWSER_HEADERS = {
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
 }
+TENCENT_KLINE_WINDOW_MAX_ATTEMPTS = 3
+TENCENT_KLINE_WINDOW_RETRY_DELAY_SECONDS = 0.5
 
 
 @dataclass(frozen=True)
@@ -237,13 +240,23 @@ def _fetch_tencent_kline_window(
         ),
         "r": "0.8205512681390605",
     }
-    response = requests.get(
-        url,
-        params=params,
-        timeout=timeout,
-        headers=TENCENT_KLINE_BROWSER_HEADERS,
-    )
-    response.raise_for_status()
+    response = None
+    for attempt in range(1, TENCENT_KLINE_WINDOW_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                timeout=timeout,
+                headers=TENCENT_KLINE_BROWSER_HEADERS,
+            )
+            response.raise_for_status()
+            break
+        except requests.RequestException:
+            if attempt >= TENCENT_KLINE_WINDOW_MAX_ATTEMPTS:
+                raise
+            time.sleep(TENCENT_KLINE_WINDOW_RETRY_DELAY_SECONDS)
+    if response is None:
+        raise RuntimeError("腾讯 K 线请求未返回响应")
     payload = _loads_jsonp(response.text)
     symbol_payload = (payload.get("data") or {}).get(prefixed_symbol) or {}
     return (

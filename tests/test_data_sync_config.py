@@ -146,6 +146,7 @@ def test_scheduler_payload_documents_historical_bootstrap_boundaries() -> None:
     assert jobs["fund.etf.bars.1d.bootstrap"]["params"]["fund_asset_type"] == "etf"
     assert jobs["fund.etf.bars.1d.bootstrap"]["params"]["data_packages"] == ["market_bars"]
     assert jobs["fund.lof.bars.1d.bootstrap"]["params"]["fund_asset_type"] == "lof"
+    assert "tencent:direct:kline" in jobs["fund.lof.bars.1d.bootstrap"]["params"]["sources"]
     assert jobs["fund.lof.bars.1d.bootstrap"]["params"]["data_packages"] == ["market_bars"]
     assert jobs["fund.open.nav.bootstrap"]["params"]["fund_asset_type"] == "open_fund"
     assert jobs["fund.open.nav.bootstrap"]["params"]["sync_task_type"] == (
