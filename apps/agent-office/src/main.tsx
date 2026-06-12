@@ -96,6 +96,7 @@ import {
   type TaskMonitorItem,
   type TaskMonitorSourceRateState,
 } from "./taskMonitorView";
+import { ReportPage } from "./pages/ReportPage";
 import "./styles.css";
 
 const ownerId = "default-owner";
@@ -747,13 +748,7 @@ function DetailPage({
         </section>
       );
     case "report":
-      return (
-        <section className="page-grid">
-          <ReportPanel workflows={workflows} recommendations={recommendations} risks={risks} />
-          <RecommendationPanel recommendations={recommendations} />
-          <RiskPanel risks={risks} />
-        </section>
-      );
+      return <ReportPage ownerId={ownerId} />;
     case "memory":
       return (
         <section className="page-grid">
@@ -2709,31 +2704,6 @@ function ChatDock({
         </button>
       )}
     </aside>
-  );
-}
-
-function ReportPanel({
-  workflows,
-  recommendations,
-  risks,
-}: Pick<ConsolePageProps, "workflows" | "recommendations" | "risks">) {
-  return (
-    <Panel title="中文报告工作台" subtitle="汇总推荐、风险反驳和 Workflow 审计" icon={<FileText size={16} />}>
-      <div className="portfolio-strip">
-        <MetricBlock label="可生成 Workflow" value={workflows?.available?.length ?? 0} />
-        <MetricBlock label="推荐条目" value={recommendations?.metrics?.recommendation_count ?? 0} />
-        <MetricBlock label="风险触发" value={risks?.metrics?.trigger_count ?? 0} />
-        <MetricBlock label="报告状态" value="待生成" />
-      </div>
-      <Timeline
-        items={(workflows?.runs ?? []).slice(0, 6).map((item: any) => ({
-          title: `${item.workflow_type} 报告线索`,
-          meta: item.status,
-          detail: item.started_at,
-        }))}
-        emptyText="暂无可用报告审计"
-      />
-    </Panel>
   );
 }
 

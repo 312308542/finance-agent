@@ -285,6 +285,26 @@ export async function loadModelRoutePreview(): Promise<Record<string, any>> {
   }
 }
 
+export async function loadReports(ownerId: string, limit = 30): Promise<Record<string, any>> {
+  const normalizedLimit = Math.min(200, Math.max(1, Math.round(limit)));
+  return getJson(
+    `/api/reports?owner_id=${encodeURIComponent(ownerId)}&limit=${normalizedLimit}`,
+    { items: [], metrics: {} },
+  );
+}
+
+export async function loadReportDetail(workflowRunId: string): Promise<Record<string, any>> {
+  if (!workflowRunId.trim()) {
+    return { status: "empty", data: {} };
+  }
+  return getJson(`/api/reports/${encodeURIComponent(workflowRunId)}`, {
+    workflow_run_id: workflowRunId,
+    report: null,
+    review_results: [],
+    report_review_appended: null,
+  });
+}
+
 export async function loadDataSyncConfig(): Promise<Record<string, any>> {
   return getJson("/api/data/sync/config", { data: { preview: { tasks: [] }, validation: {} } });
 }

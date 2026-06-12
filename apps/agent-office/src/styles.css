@@ -691,6 +691,427 @@ tbody tr:last-child td {
   -webkit-line-clamp: 2;
 }
 
+.report-workspace {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.34fr) minmax(0, 1fr);
+  gap: 14px;
+  min-height: calc(100vh - 128px);
+}
+
+.report-list-panel,
+.report-detail-panel {
+  min-width: 0;
+}
+
+.report-list-panel {
+  align-self: start;
+  max-height: calc(100vh - 132px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.report-panel-head {
+  align-items: center;
+}
+
+.report-panel-head > div {
+  min-width: 0;
+  flex: 1;
+}
+
+.report-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.report-metric,
+.report-detail-facts article {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0d1420;
+}
+
+.report-metric span,
+.report-detail-facts span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.report-metric strong,
+.report-detail-facts strong {
+  display: block;
+  margin-top: 5px;
+  overflow: hidden;
+  color: var(--text);
+  font-family:
+    "Fira Code",
+    Consolas,
+    monospace;
+  font-size: 17px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.report-notice {
+  margin-bottom: 10px;
+  padding: 10px;
+  color: var(--amber);
+}
+
+.report-list {
+  display: grid;
+  gap: 8px;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.report-list-item {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0d1420;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color 150ms ease,
+    background 150ms ease;
+}
+
+.report-list-item:hover,
+.report-list-item.is-active {
+  border-color: var(--blue);
+  background: #142036;
+}
+
+.report-dot {
+  width: 8px;
+  height: 8px;
+  margin-top: 5px;
+  border-radius: 999px;
+  background: var(--muted);
+  box-shadow: 0 0 0 4px rgba(141, 153, 170, 0.12);
+}
+
+.report-dot.tone-green {
+  background: var(--green);
+  box-shadow: 0 0 0 4px rgba(35, 178, 109, 0.12);
+}
+
+.report-dot.tone-amber {
+  background: var(--amber);
+  box-shadow: 0 0 0 4px rgba(216, 163, 51, 0.12);
+}
+
+.report-dot.tone-blue {
+  background: var(--blue);
+  box-shadow: 0 0 0 4px rgba(79, 140, 255, 0.12);
+}
+
+.report-dot.tone-red {
+  background: var(--red);
+  box-shadow: 0 0 0 4px rgba(230, 92, 92, 0.12);
+}
+
+.report-list-content,
+.report-list-topline,
+.report-list-meta {
+  min-width: 0;
+}
+
+.report-list-content {
+  display: grid;
+  gap: 7px;
+}
+
+.report-list-topline {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.report-list-topline strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.report-list-topline em {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-style: normal;
+  font-size: 11px;
+}
+
+.report-list-summary {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.report-list-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.report-list-meta small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.report-pill {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.report-pill.tone-green {
+  border-color: rgba(35, 178, 109, 0.35);
+  color: var(--green);
+  background: rgba(35, 178, 109, 0.1);
+}
+
+.report-pill.tone-amber {
+  border-color: rgba(216, 163, 51, 0.35);
+  color: var(--amber);
+  background: rgba(216, 163, 51, 0.1);
+}
+
+.report-pill.tone-blue {
+  border-color: rgba(79, 140, 255, 0.35);
+  color: var(--blue);
+  background: rgba(79, 140, 255, 0.1);
+}
+
+.report-pill.tone-red {
+  border-color: rgba(230, 92, 92, 0.38);
+  color: var(--red);
+  background: rgba(230, 92, 92, 0.1);
+}
+
+.report-detail-panel {
+  display: grid;
+  align-self: start;
+  gap: 12px;
+}
+
+.report-detail-header {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.report-detail-header > div:first-child {
+  min-width: 0;
+}
+
+.report-detail-header h2 {
+  margin-top: 4px;
+  font-size: 22px;
+  line-height: 1.22;
+}
+
+.report-detail-header p {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.report-detail-status {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 7px;
+  justify-content: flex-end;
+}
+
+.report-detail-facts {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.2fr) repeat(3, minmax(0, 0.65fr));
+  gap: 8px;
+}
+
+.report-detail-facts strong {
+  font-size: 13px;
+}
+
+.report-anchor-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0d1420;
+}
+
+.report-anchor-nav a {
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--soft);
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.report-anchor-nav a:hover {
+  border-color: var(--blue);
+  color: var(--text);
+}
+
+.report-markdown-shell {
+  min-height: 420px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0b111b;
+}
+
+.report-markdown {
+  display: grid;
+  gap: 12px;
+  color: var(--soft);
+  font-size: 14px;
+  line-height: 1.75;
+}
+
+.report-markdown h1,
+.report-markdown h2,
+.report-markdown h3,
+.report-markdown h4 {
+  color: var(--text);
+  line-height: 1.28;
+}
+
+.report-markdown h1 {
+  font-size: 22px;
+}
+
+.report-markdown h2 {
+  margin-top: 6px;
+  font-size: 18px;
+}
+
+.report-markdown h3,
+.report-markdown h4 {
+  font-size: 15px;
+}
+
+.report-markdown p,
+.report-markdown ul,
+.report-markdown blockquote {
+  margin: 0;
+}
+
+.report-markdown ul {
+  padding-left: 20px;
+}
+
+.report-markdown strong {
+  color: var(--text);
+}
+
+.report-markdown code {
+  padding: 2px 5px;
+  border-radius: 5px;
+  background: #141d2b;
+  color: var(--cyan);
+  font-family:
+    "Fira Code",
+    Consolas,
+    monospace;
+  font-size: 12px;
+}
+
+.report-markdown blockquote {
+  padding: 10px 12px;
+  border-left: 3px solid var(--blue);
+  border-radius: 8px;
+  background: rgba(79, 140, 255, 0.08);
+}
+
+.report-markdown table {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.report-review-box {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid rgba(79, 140, 255, 0.28);
+  border-radius: 8px;
+  background: rgba(79, 140, 255, 0.08);
+}
+
+.report-review-title {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  color: var(--text);
+}
+
+.report-review-title span {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.report-review-list {
+  display: grid;
+  gap: 8px;
+}
+
+.report-review-list article {
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0d1420;
+}
+
+.report-review-list p {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .chat-dock {
   position: fixed;
   right: 18px;
@@ -3385,9 +3806,14 @@ tbody tr:last-child td {
 
   .main-grid,
   .bottom-grid,
+  .report-workspace,
   .task-monitor-shell,
   .task-detail-grid {
     grid-template-columns: 1fr;
+  }
+
+  .report-list-panel {
+    max-height: 460px;
   }
 
   .status-grid {
@@ -3504,6 +3930,8 @@ tbody tr:last-child td {
   .processing-summary,
   .agent-summary,
   .agent-model-summary,
+  .report-metrics,
+  .report-detail-facts,
   .task-metric-grid,
   .task-runtime-grid,
   .stage-row,
@@ -3521,6 +3949,23 @@ tbody tr:last-child td {
 
   .task-monitor-shell {
     grid-template-columns: 1fr;
+  }
+
+  .report-workspace {
+    min-height: auto;
+  }
+
+  .report-detail-header {
+    flex-direction: column;
+  }
+
+  .report-detail-status {
+    justify-content: flex-start;
+  }
+
+  .report-markdown-shell {
+    min-height: 280px;
+    padding: 12px;
   }
 
   .task-monitor-list-panel {
