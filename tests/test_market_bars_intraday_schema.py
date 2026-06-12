@@ -37,3 +37,14 @@ def test_market_bars_intraday_migration_has_independent_timescale_policy() -> No
     assert "chunk_time_interval => INTERVAL '7 days'" in content
     assert "add_compression_policy" in content
     assert "INTERVAL '7 days'" in content
+
+
+def test_market_bars_intraday_documented_as_reserved_without_writer() -> None:
+    """数据库设计应明确分钟线表当前只预留，不作为盘中触发事实源。"""
+
+    content = Path("docs/数据库设计.md").read_text(encoding="utf-8")
+
+    assert "market_bars_intraday" in content
+    assert "预留，无写入方" in content
+    assert "realtime_quote_snapshots" in content
+    assert "暂不建分钟 K 线采集任务" in content
