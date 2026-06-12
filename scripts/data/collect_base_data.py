@@ -16,6 +16,7 @@ import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -1696,6 +1697,60 @@ def run_ashare_risk(
 
     collector = AshareRiskSentimentCollector(session)
     source_limit = list_source_limit(args)
+    if task_type_name(args) == "restricted_release_refresh":
+        provider_key = "stock_restricted_release_detail_em"
+        parameters = {
+            "start_date": args.risk_start,
+            "end_date": args.risk_end,
+            "limit": source_limit,
+            "risk_window_days": 30,
+            "risk_ratio_threshold": "0.05",
+        }
+        timeframe = ashare_risk_sentiment_watermark_timeframe(
+            task="ashare_risk_restricted_release",
+            provider=provider_key,
+            parameters=parameters,
+        )
+        if not args.force_provider and not ashare_risk_sentiment_watermark_allows_collection(
+            session,
+            provider=provider_key,
+            timeframe=timeframe,
+        ):
+            return [
+                CollectionTaskResult(
+                    task="ashare_risk_restricted_release",
+                    status="skipped",
+                    raw_record_id=None,
+                    item_count=0,
+                    error_message="风险情绪源处于失败冷却期，等待下次重跑。",
+                    payload={
+                        "provider_key": provider_key,
+                        "data_domain": ASHARE_RISK_SENTIMENT_DATA_DOMAIN,
+                        "timeframe": timeframe,
+                    },
+                )
+            ]
+        result = runtime.run_task(
+            task="ashare_risk_restricted_release",
+            provider_key=provider_key,
+            parameters=parameters,
+            force=args.force_provider,
+            collect=lambda: collector.collect_restricted_release(
+                start_date=args.risk_start,
+                end_date=args.risk_end,
+                limit=source_limit,
+                risk_window_days=30,
+                risk_ratio_threshold=Decimal("0.05"),
+            ),
+        )
+        record_ashare_risk_sentiment_watermark(
+            session,
+            task="ashare_risk_restricted_release",
+            provider=provider_key,
+            timeframe=timeframe,
+            result=result,
+        )
+        return [result]
     source_tasks: list[dict[str, Any]] = [
         {
             "task": "ashare_risk_stop_list",
@@ -3962,6 +4017,9 @@ def ashare_risk_sentiment_watermark_timeframe(
         start_date = str(parameters.get("start_date") or "").strip() or "latest"
         end_date = str(parameters.get("end_date") or "").strip() or "latest"
         return f"{provider}:{symbol}:{start_date}:{end_date}"
+    if task == "ashare_risk_restricted_release":
+        end_date = str(parameters.get("end_date") or "").strip() or "latest"
+        return f"rr:{end_date}"
     if task == "ashare_risk_margin_szse":
         return f"margin_szse:{parameters.get('date') or 'latest'}"
     return task or provider

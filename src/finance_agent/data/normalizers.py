@@ -1117,6 +1117,107 @@ def normalize_ashare_delist_list(
     return risks, events
 
 
+def normalize_ashare_restricted_release_detail(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    collected_at: datetime,
+    limit: int | None = None,
+    risk_window_days: int = 30,
+    risk_ratio_threshold: Decimal = Decimal("0.05"),
+) -> tuple[list[RiskFindingData], list[EventRecordData]]:
+    """归一化限售解禁详情为事件和临近解禁风险。"""
+
+    risks: list[RiskFindingData] = []
+    events: list[EventRecordData] = []
+    rows = df.head(limit) if limit else df
+    for row in rows.to_dict("records"):
+        symbol = normalize_ashare_symbol(
+            str(_first_present(row, ["股票代码", "证券代码", "代码"]) or "")
+        )
+        if not symbol or not is_main_board_ashare_stock_symbol(symbol):
+            continue
+        name = str(_first_present(row, ["股票简称", "证券简称", "名称"]) or symbol).strip()
+        release_at = (
+            parse_ashare_datetime(_first_present(row, ["解禁时间", "解禁日期", "日期"]))
+            or collected_at
+        )
+        release_type = str(_first_present(row, ["限售股类型", "解禁类型"]) or "限售股解禁")
+        release_quantity = _first_decimal(row, ["实际解禁数量", "解禁数量"])
+        release_value = _first_decimal(row, ["实际解禁市值", "解禁市值"])
+        release_ratio = _first_decimal(row, ["占解禁前流通市值比例", "占总股本比例", "占流通股比例"])
+        asset_id = f"ashare:{symbol}"
+        event_id = stable_id("event", source, "restricted_release", symbol, release_at.isoformat())
+        summary = (
+            f"{release_type}；实际解禁数量：{release_quantity}；"
+            f"实际解禁市值：{release_value}；占解禁前流通市值比例：{release_ratio}。"
+        )
+        importance = (
+            "high"
+            if release_ratio is not None and release_ratio >= risk_ratio_threshold
+            else "medium"
+        )
+        events.append(
+            EventRecordData(
+                event_id=event_id,
+                asset_id=asset_id,
+                symbol=symbol,
+                market="ashare",
+                event_type="restricted_release",
+                title=f"{name}({symbol}) 限售股解禁",
+                summary=summary,
+                sentiment="negative",
+                importance=importance,
+                source=source,
+                published_at=release_at,
+                collected_at=collected_at,
+                payload={
+                    "raw": row,
+                    "release_type": release_type,
+                    "release_quantity": str(release_quantity)
+                    if release_quantity is not None
+                    else None,
+                    "release_value": str(release_value) if release_value is not None else None,
+                    "release_ratio": str(release_ratio) if release_ratio is not None else None,
+                },
+            )
+        )
+        days_until_release = (release_at.date() - collected_at.date()).days
+        if (
+            0 <= days_until_release <= risk_window_days
+            and release_ratio is not None
+            and release_ratio >= risk_ratio_threshold
+        ):
+            severity = "high" if release_ratio >= Decimal("0.05") else "medium"
+            risks.append(
+                RiskFindingData(
+                    risk_id=stable_id(
+                        "risk",
+                        source,
+                        "restricted_release",
+                        symbol,
+                        release_at.isoformat(),
+                    ),
+                    asset_id=asset_id,
+                    scope="asset",
+                    risk_type="restricted_release",
+                    severity=severity,
+                    score=Decimal("0.8") if severity == "high" else Decimal("0.45"),
+                    title=f"{name}({symbol}) 临近限售股解禁",
+                    description=summary,
+                    as_of=release_at,
+                    evidence_ids=[event_id],
+                    payload={
+                        "raw": row,
+                        "event_id": event_id,
+                        "days_until_release": days_until_release,
+                        "release_ratio": str(release_ratio),
+                    },
+                )
+            )
+    return risks, events
+
+
 def normalize_ashare_hot_rank(
     df: pd.DataFrame,
     *,

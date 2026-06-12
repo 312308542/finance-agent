@@ -18,6 +18,7 @@ from finance_agent.data.normalizers import (
     normalize_ashare_hot_rank,
     normalize_ashare_lhb_detail,
     normalize_ashare_margin_summary,
+    normalize_ashare_restricted_release_detail,
     normalize_ashare_st_list,
     normalize_ashare_stop_list,
     normalize_ashare_zt_pool,
@@ -325,6 +326,57 @@ class AshareRiskProvider:
                 "endpoint": endpoint,
                 "date": date,
                 "row_count": len(risks),
+                "actual_source": source,
+            },
+        )
+
+    def fetch_restricted_release(
+        self,
+        *,
+        start_date: str,
+        end_date: str,
+        limit: int | None = None,
+        risk_window_days: int = 30,
+        risk_ratio_threshold: Any = "0.05",
+    ) -> RiskFindingsResult:
+        """获取限售解禁详情，用于事件因子和临近解禁风险。"""
+
+        collected_at = datetime.now(tz=UTC)
+        endpoint = "stock_restricted_release_detail_em"
+        source = f"akshare:{endpoint}"
+        try:
+            df = ak.stock_restricted_release_detail_em(
+                start_date=start_date,
+                end_date=end_date,
+            )
+            risks, events = normalize_ashare_restricted_release_detail(
+                df,
+                source=source,
+                collected_at=collected_at,
+                limit=limit,
+                risk_window_days=risk_window_days,
+                risk_ratio_threshold=risk_ratio_threshold,
+            )
+        except Exception as exc:
+            return RiskFindingsResult(
+                provider_name=self.provider_name,
+                status="error",
+                collected_at=collected_at,
+                error_message=str(exc),
+                payload={"endpoint": endpoint, "start_date": start_date, "end_date": end_date},
+            )
+        return RiskFindingsResult(
+            provider_name=self.provider_name,
+            status="available" if risks or events else "unavailable",
+            collected_at=collected_at,
+            risks=risks,
+            events=events,
+            payload={
+                "endpoint": endpoint,
+                "start_date": start_date,
+                "end_date": end_date,
+                "row_count": len(events),
+                "risk_count": len(risks),
                 "actual_source": source,
             },
         )

@@ -3545,6 +3545,108 @@ def test_ashare_risk_sentiment_records_independent_source_watermarks(
     ]
 
 
+def test_ashare_restricted_release_refresh_dispatches_to_collector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """限售解禁任务应由风险入口分发到专用采集方法。"""
+
+    collect_base_data = import_collection_module()
+    calls: list[dict[str, Any]] = []
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            calls.append(
+                {
+                    "task": task,
+                    "provider_key": provider_key,
+                    "parameters": parameters,
+                    "force": force,
+                }
+            )
+            collect()
+            return Namespace(
+                task=task,
+                status="available",
+                raw_record_id="raw:restricted",
+                item_count=1,
+                error_message=None,
+                payload={},
+            )
+
+    monkeypatch.setattr(
+        collect_base_data.AshareRiskSentimentCollector,
+        "__init__",
+        lambda self, session: None,
+    )
+    monkeypatch.setattr(
+        collect_base_data.AshareRiskSentimentCollector,
+        "collect_restricted_release",
+        lambda self, **kwargs: calls.append(
+            {"task": "collect_restricted_release", **kwargs}
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_ashare_risk_sentiment_watermark",
+        lambda session, **kwargs: calls.append({"record_kind": "watermark", **kwargs}),
+        raising=False,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-risk"],
+        sync_task_type="restricted_release_refresh",
+        risk_start="20260601",
+        risk_end="20260630",
+        source_limit=5,
+    )
+
+    results = collect_base_data.run_ashare_risk(object(), args, RecordingRuntime())
+
+    assert [result.task for result in results] == ["ashare_risk_restricted_release"]
+    assert calls[0]["provider_key"] == "stock_restricted_release_detail_em"
+    assert calls[0]["parameters"] == {
+        "start_date": "20260601",
+        "end_date": "20260630",
+        "limit": 5,
+        "risk_window_days": 30,
+        "risk_ratio_threshold": "0.05",
+    }
+    assert calls[1] == {
+        "task": "collect_restricted_release",
+        "start_date": "20260601",
+        "end_date": "20260630",
+        "limit": 5,
+        "risk_window_days": 30,
+        "risk_ratio_threshold": Decimal("0.05"),
+    }
+    record_call = next(call for call in calls if call.get("record_kind") == "watermark")
+    assert record_call["provider"] == "stock_restricted_release_detail_em"
+
+
+def test_restricted_release_watermark_timeframe_fits_schema_limit() -> None:
+    """限售解禁水位 timeframe 不应超过 data_sync_watermarks 的长度限制。"""
+
+    collect_base_data = import_collection_module()
+
+    timeframe = collect_base_data.ashare_risk_sentiment_watermark_timeframe(
+        task="ashare_risk_restricted_release",
+        provider="stock_restricted_release_detail_em",
+        parameters={"start_date": "20260601", "end_date": "20260630"},
+    )
+
+    assert timeframe == "rr:20260630"
+    assert len(timeframe) <= 16
+
+
 def test_ashare_risk_sentiment_skips_only_source_in_failure_cooldown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

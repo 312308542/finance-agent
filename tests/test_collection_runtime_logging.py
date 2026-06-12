@@ -4,7 +4,15 @@ import logging
 from finance_agent.cache.null_cache import NullCacheClient
 from finance_agent.data.collection_runtime import CollectionRuntime, summarize_archive
 from finance_agent.data.collectors import ArchivedProviderResult
-from finance_agent.data.models import AssetData, AssetListResult, MarketBarData, MarketBarsResult, ProviderResult
+from finance_agent.data.models import (
+    AssetData,
+    AssetListResult,
+    EventRecordData,
+    MarketBarData,
+    MarketBarsResult,
+    ProviderResult,
+    RiskFindingsResult,
+)
 
 
 def test_collection_runtime_logs_console_progress(caplog) -> None:
@@ -181,3 +189,39 @@ def test_summarize_archive_includes_latest_timestamp_for_market_bars() -> None:
 
     assert summary.payload["earliest_at"] == "2026-06-11T00:00:00+00:00"
     assert summary.payload["latest_at"] == "2026-06-12T00:00:00+00:00"
+
+
+def test_summarize_archive_counts_risk_result_events_when_no_risks() -> None:
+    """风险结果只有事件时，摘要数量也应反映已落库事件数。"""
+
+    collected_at = datetime.now(tz=UTC)
+    archive = ArchivedProviderResult(
+        result=RiskFindingsResult(
+            provider_name="akshare",
+            status="available",
+            collected_at=collected_at,
+            events=[
+                EventRecordData(
+                    event_id="event:restricted:600750",
+                    market="ashare",
+                    event_type="restricted_release",
+                    title="华润江中(600750) 限售股解禁",
+                    source="akshare:stock_restricted_release_detail_em",
+                    collected_at=collected_at,
+                ),
+                EventRecordData(
+                    event_id="event:restricted:603286",
+                    market="ashare",
+                    event_type="restricted_release",
+                    title="日盈电子(603286) 限售股解禁",
+                    source="akshare:stock_restricted_release_detail_em",
+                    collected_at=collected_at,
+                ),
+            ],
+        ),
+        raw_record_id="raw:restricted",
+    )
+
+    summary = summarize_archive("ashare_risk_restricted_release", archive)
+
+    assert summary.item_count == 2

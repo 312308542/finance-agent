@@ -1217,6 +1217,7 @@ def collection_group_for_task(task: DataSyncTaskPreview) -> str | tuple[str, ...
             "northbound_flow_refresh": "ashare-p1",
             "event_refresh": "ashare-p1",
             "event_article_enrichment": "ashare-p1",
+            "restricted_release_refresh": "ashare-risk",
             "risk_sentiment_refresh": "ashare-risk",
         }[task.task_type]
     if task.market == "fund":
@@ -1261,6 +1262,9 @@ def build_ashare_collection_params(task: DataSyncTaskPreview) -> JsonDict:
         params["priority_symbol_limit"] = task.batch_size
     if task.task_type == "risk_sentiment_refresh":
         params["group"] = ["ashare-risk"]
+    if task.task_type == "restricted_release_refresh":
+        params["group"] = ["ashare-risk"]
+        params["source_limit"] = task.batch_size
     return params
 
 
@@ -1502,7 +1506,7 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 lookback=f"{config.lookback_days}d",
                 sources=["stock_hsgt_hist_em", "stock_hsgt_individual_em"],
                 data_packages=["capital_flow"],
-                notes=["默认刷新市场级北向资金；个股级北向接口保留给重点标的补采。"],
+                notes=["默认刷新市场级北向资金，并按水位小批轮转用户可交易主板标的。"],
             )
         )
     if "events" in config.data_packages:
@@ -1545,6 +1549,28 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
             )
         )
     if "risk_sentiment" in config.data_packages:
+        tasks.append(
+            DataSyncTaskPreview(
+                task_key="ashare.restricted_release",
+                market="ashare",
+                task_type="restricted_release_refresh",
+                title="刷新 A 股限售解禁",
+                interval_seconds=config.interval_seconds.get(
+                    "restricted_release",
+                    24 * 60 * 60,
+                ),
+                mode="daily_event_risk_snapshot",
+                schedule_type="daily_time",
+                run_at=["18:30"],
+                timezone="Asia/Shanghai",
+                trading_day_policy="trading_day_only",
+                batch_size=config.batch_size,
+                lookback=f"{config.lookback_days}d",
+                sources=["stock_restricted_release_detail_em"],
+                data_packages=["risk_sentiment", "events"],
+                notes=["写入限售解禁事件，并对临近高占比解禁生成风险发现。"],
+            )
+        )
         tasks.append(
             DataSyncTaskPreview(
                 task_key="ashare.risk_sentiment",

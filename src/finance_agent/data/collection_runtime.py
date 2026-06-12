@@ -337,7 +337,7 @@ def infer_item_count(result: Any) -> int:
 
     for attr_name in ("assets", "bars", "seeds", "snapshots", "risks", "events", "evidence"):
         value = getattr(result, attr_name, None)
-        if value is not None:
+        if value:
             return len(value)
     if getattr(result, "snapshot", None) is not None:
         return 1

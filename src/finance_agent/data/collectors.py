@@ -2393,6 +2393,39 @@ class AshareRiskSentimentCollector:
         self._persist_risk_result(result, raw_record_id=raw_record_id)
         return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
+    def collect_restricted_release(
+        self,
+        *,
+        start_date: str,
+        end_date: str,
+        limit: int | None = None,
+        risk_window_days: int = 30,
+        risk_ratio_threshold: Decimal = Decimal("0.05"),
+    ) -> ArchivedProviderResult:
+        """采集限售解禁详情，并写入事件和临近解禁风险。"""
+
+        result = self.risk_provider.fetch_restricted_release(
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+            risk_window_days=risk_window_days,
+            risk_ratio_threshold=risk_ratio_threshold,
+        )
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_restricted_release_detail_em",
+            request_params={
+                "start_date": start_date,
+                "end_date": end_date,
+                "limit": limit,
+                "risk_window_days": risk_window_days,
+                "risk_ratio_threshold": str(risk_ratio_threshold),
+            },
+        )
+        self._persist_risk_result(result, raw_record_id=raw_record_id)
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
     def _persist_sentiment_result(
         self,
         result: SentimentSignalsResult,

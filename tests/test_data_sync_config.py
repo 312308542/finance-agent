@@ -241,6 +241,22 @@ def test_scheduler_payload_exports_ashare_northbound_flow_job() -> None:
     assert "stock_hsgt_individual_em" in jobs["ashare.northbound"]["params"]["sources"]
 
 
+def test_scheduler_payload_exports_ashare_restricted_release_job() -> None:
+    """A 股风险包应包含限售解禁任务，供事件和风险因子消费。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+
+    assert jobs["ashare.restricted_release"]["job_type"] == "collection"
+    assert jobs["ashare.restricted_release"]["group"] == "ashare-risk"
+    assert jobs["ashare.restricted_release"]["params"]["sync_task_type"] == "restricted_release_refresh"
+    assert jobs["ashare.restricted_release"]["params"]["group"] == ["ashare-risk"]
+    assert jobs["ashare.restricted_release"]["params"]["source_limit"] == jobs["ashare.restricted_release"]["limit"]
+    assert "stock_restricted_release_detail_em" in jobs["ashare.restricted_release"]["params"]["sources"]
+
+
 def test_scheduler_payload_marks_ashare_fundamentals_as_incremental_resume() -> None:
     """基本面/估值定时任务应默认按水位增量补齐，避免每轮重复扫完整资产池。"""
 
