@@ -1,6 +1,7 @@
 import * as React from "react";
-import { AlertTriangle, Bell, ShieldAlert } from "lucide-react";
-import { loadRiskOverview } from "../api";
+import { AlertTriangle, Bell, ClipboardCheck, ShieldAlert } from "lucide-react";
+import { loadRiskOverview, loadUpcomingReviews } from "../api";
+import { buildUpcomingReviewsModel } from "../actionLoopView";
 import { buildRiskPageModel } from "../consolePagesView";
 
 type RiskPageProps = {
@@ -10,9 +11,11 @@ type RiskPageProps = {
 
 export function RiskPage({ ownerId, initialPayload = null }: RiskPageProps) {
   const [payload, setPayload] = React.useState<Record<string, any> | null>(initialPayload);
+  const [reviewPayload, setReviewPayload] = React.useState<Record<string, any> | null>(null);
   const [loading, setLoading] = React.useState(!initialPayload);
   const [error, setError] = React.useState<string | null>(null);
   const model = React.useMemo(() => buildRiskPageModel(payload), [payload]);
+  const reviewModel = React.useMemo(() => buildUpcomingReviewsModel(reviewPayload), [reviewPayload]);
 
   const refresh = React.useCallback(async (silent = false) => {
     if (!silent) {
@@ -20,7 +23,12 @@ export function RiskPage({ ownerId, initialPayload = null }: RiskPageProps) {
     }
     setError(null);
     try {
-      setPayload(await loadRiskOverview(ownerId, 80));
+      const [riskData, reviews] = await Promise.all([
+        loadRiskOverview(ownerId, 80),
+        loadUpcomingReviews(ownerId, 80),
+      ]);
+      setPayload(riskData);
+      setReviewPayload(reviews);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -51,6 +59,7 @@ export function RiskPage({ ownerId, initialPayload = null }: RiskPageProps) {
         <Metric label="触发事件" value={model.metrics.triggerCount} />
         <Metric label="风险发现" value={model.metrics.riskFindingCount} />
         <Metric label="高优先级" value={model.metrics.highSeverityCount} />
+        <Metric label="待复盘" value={reviewModel.metrics.pendingCount} />
       </div>
       <section className="severity-strip">
         {model.severityBreakdown.map((item) => (
@@ -121,6 +130,28 @@ export function RiskPage({ ownerId, initialPayload = null }: RiskPageProps) {
               <span>{item.latestDataAt || "-"}</span>
             </div>
           )) : <p className="empty-copy">暂无数据质量异常</p>}
+        </div>
+      </article>
+      <article className="panel action-loop-panel">
+        <div className="panel-head">
+          <div>
+            <p className="eyebrow">Review Tasks</p>
+            <h2>待复盘</h2>
+            <p>登记执行结果后生成的到期回看任务，用于比较建议、实际执行与后续表现。</p>
+          </div>
+          <ClipboardCheck size={16} />
+        </div>
+        <div className="event-stack">
+          {reviewModel.items.length ? reviewModel.items.map((item) => (
+            <div className="event-row tone-blue" key={item.reviewTaskId}>
+              <ClipboardCheck size={15} />
+              <div>
+                <strong>{item.title}</strong>
+                <span>{item.statusLabel} · 到期 {item.dueAt || "-"}</span>
+                <p>{item.detail}</p>
+              </div>
+            </div>
+          )) : <p className="empty-copy">{reviewModel.emptyText}</p>}
         </div>
       </article>
     </section>

@@ -1,10 +1,12 @@
 import React from "react";
 import { BarChart3, ChevronRight, MessageSquareText, RefreshCcw, ShieldAlert } from "lucide-react";
 import {
+  confirmDecision,
+  createOrderDraft,
   loadLatestRecommendations,
   loadPendingDecisions,
-  submitDecisionFeedback,
 } from "../api";
+import { normalizeOrderDraft, type OrderDraftModel } from "../actionLoopView";
 import {
   buildDecisionFeedbackPayload,
   buildRecommendationPageModel,
@@ -35,6 +37,11 @@ export function RecommendationPage({ ownerId }: RecommendationPageProps) {
   const [notice, setNotice] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [savingFeedback, setSavingFeedback] = React.useState(false);
+  const [savingDraftDecisionId, setSavingDraftDecisionId] = React.useState<string | null>(null);
+  const [draftByDecisionId, setDraftByDecisionId] = React.useState<Record<string, OrderDraftModel>>({});
+  const [confirmedDecisionByRecommendationId, setConfirmedDecisionByRecommendationId] = React.useState<
+    Record<string, string>
+  >({});
 
   const model = React.useMemo(
     () =>
@@ -78,12 +85,28 @@ export function RecommendationPage({ ownerId }: RecommendationPageProps) {
       return;
     }
     setSavingFeedback(true);
-    const result = await submitDecisionFeedback(
+    const feedbackPayload = buildDecisionFeedbackPayload(feedbackType, feedbackComment, modifiedAction);
+    const result = await confirmDecision(
       feedbackTarget.pendingDecision.decisionId,
-      buildDecisionFeedbackPayload(feedbackType, feedbackComment, modifiedAction),
+      {
+        feedback: feedbackType,
+        comment: feedbackPayload.comment,
+        modified_action: feedbackPayload.modified_action,
+      },
     );
     if (result.status === "ok") {
-      setNotice("反馈已记录，并将进入 Finance Memory 闭环。");
+      const canCreateDraft = Boolean(result.data?.can_create_order_draft);
+      if (canCreateDraft) {
+        setConfirmedDecisionByRecommendationId((decisions) => ({
+          ...decisions,
+          [feedbackTarget.recommendationId]: feedbackTarget.pendingDecision?.decisionId ?? "",
+        }));
+      }
+      setNotice(
+        canCreateDraft
+          ? "确认已记录，可继续生成订单草案；草案仅用于外部操作前核对。"
+          : "确认已记录，并将进入 Finance Memory 闭环。",
+      );
       setFeedbackTarget(null);
       setFeedbackComment("");
       setDecisionPayload(await loadPendingDecisions(ownerId, 80));
@@ -91,6 +114,26 @@ export function RecommendationPage({ ownerId }: RecommendationPageProps) {
       setNotice(String(result.message ?? "反馈提交失败"));
     }
     setSavingFeedback(false);
+  };
+
+  const generateOrderDraft = async (item: RecommendationItemModel, confirmedDecisionId?: string | null) => {
+    const decisionId = item.pendingDecision?.decisionId || confirmedDecisionId;
+    if (!decisionId) {
+      setNotice("该建议暂无可生成草案的待确认决策。");
+      return;
+    }
+    setSavingDraftDecisionId(decisionId);
+    const result = await createOrderDraft(decisionId);
+    if (result.status === "ok") {
+      const draft = normalizeOrderDraft(result.data);
+      if (draft) {
+        setDraftByDecisionId((drafts) => ({ ...drafts, [decisionId]: draft }));
+      }
+      setNotice("订单草案已生成。请在外部交易软件自行操作，完成后再登记执行结果。");
+    } else {
+      setNotice(String(result.message ?? "订单草案生成失败"));
+    }
+    setSavingDraftDecisionId(null);
   };
 
   return (
@@ -113,6 +156,10 @@ export function RecommendationPage({ ownerId }: RecommendationPageProps) {
           expandedId={expandedId}
           onToggle={(id) => setExpandedId(expandedId === id ? null : id)}
           onFeedback={setFeedbackTarget}
+          onGenerateDraft={generateOrderDraft}
+          draftByDecisionId={draftByDecisionId}
+          savingDraftDecisionId={savingDraftDecisionId}
+          confirmedDecisionByRecommendationId={confirmedDecisionByRecommendationId}
         />
       </section>
 
@@ -230,11 +277,19 @@ function RecommendationTable({
   expandedId,
   onToggle,
   onFeedback,
+  onGenerateDraft,
+  draftByDecisionId,
+  savingDraftDecisionId,
+  confirmedDecisionByRecommendationId,
 }: {
   model: RecommendationPageModel;
   expandedId: string | null;
   onToggle: (recommendationId: string) => void;
   onFeedback: (item: RecommendationItemModel) => void;
+  onGenerateDraft: (item: RecommendationItemModel, confirmedDecisionId?: string | null) => void;
+  draftByDecisionId: Record<string, OrderDraftModel>;
+  savingDraftDecisionId: string | null;
+  confirmedDecisionByRecommendationId: Record<string, string>;
 }) {
   if (!model.items.length) {
     return <div className="empty-state">{model.emptyText}</div>;
@@ -269,7 +324,20 @@ function RecommendationTable({
             </span>
           </button>
           {expandedId === item.recommendationId ? (
-            <RecommendationExpanded item={item} onFeedback={onFeedback} />
+            (() => {
+              const confirmedDecisionId = confirmedDecisionByRecommendationId[item.recommendationId] || null;
+              const draftDecisionId = item.pendingDecision?.decisionId || confirmedDecisionId;
+              return (
+                <RecommendationExpanded
+                  item={item}
+                  onFeedback={onFeedback}
+                  onGenerateDraft={onGenerateDraft}
+                  confirmedDecisionId={confirmedDecisionId}
+                  draft={draftDecisionId ? draftByDecisionId[draftDecisionId] ?? null : null}
+                  savingDraft={Boolean(draftDecisionId) && savingDraftDecisionId === draftDecisionId}
+                />
+              );
+            })()
           ) : null}
         </article>
       ))}
@@ -280,10 +348,19 @@ function RecommendationTable({
 function RecommendationExpanded({
   item,
   onFeedback,
+  onGenerateDraft,
+  confirmedDecisionId,
+  draft,
+  savingDraft,
 }: {
   item: RecommendationItemModel;
   onFeedback: (item: RecommendationItemModel) => void;
+  onGenerateDraft: (item: RecommendationItemModel, confirmedDecisionId?: string | null) => void;
+  confirmedDecisionId: string | null;
+  draft: OrderDraftModel | null;
+  savingDraft: boolean;
 }) {
+  const canCreateDraft = Boolean(item.pendingDecision || confirmedDecisionId);
   return (
     <section className="recommendation-expanded">
       <div>
@@ -321,8 +398,46 @@ function RecommendationExpanded({
           <MessageSquareText size={15} />
           {item.pendingDecision ? "反馈确认" : "无待确认决策"}
         </button>
+        <button
+          className="button button-ghost"
+          type="button"
+          disabled={!canCreateDraft || savingDraft}
+          onClick={() => onGenerateDraft(item, confirmedDecisionId)}
+        >
+          {savingDraft ? "生成中" : "生成订单草案"}
+        </button>
       </div>
+      {draft ? <OrderDraftCard draft={draft} /> : null}
     </section>
+  );
+}
+
+function OrderDraftCard({ draft }: { draft: OrderDraftModel }) {
+  return (
+    <article className="order-draft-card">
+      <div>
+        <span className="eyebrow">Order Draft</span>
+        <h3>{draft.assetLabel} 订单草案</h3>
+      </div>
+      <dl>
+        <div>
+          <dt>动作</dt>
+          <dd>{draft.actionLabel}</dd>
+        </div>
+        <div>
+          <dt>价格区间</dt>
+          <dd>{draft.priceRangeDisplay}</dd>
+        </div>
+        <div>
+          <dt>仓位参考</dt>
+          <dd>{draft.positionRatioDisplay}</dd>
+        </div>
+      </dl>
+      <p>{draft.disclaimer || "非投资建议，仅用于用户自行决策前的订单草案。"}</p>
+      <a className="button button-primary" href="#execution-registration">
+        我已在外部执行，去登记
+      </a>
+    </article>
   );
 }
 

@@ -1751,7 +1751,7 @@ tbody tr:last-child td {
 
 .recommendation-expanded {
   display: grid;
-  grid-template-columns: minmax(180px, 0.7fr) minmax(240px, 1fr) auto;
+  grid-template-columns: minmax(180px, 0.7fr) minmax(240px, 1fr) minmax(160px, auto);
   gap: 12px;
   padding: 12px;
   border-top: 1px solid var(--line);
@@ -1804,6 +1804,64 @@ tbody tr:last-child td {
   align-items: stretch;
   justify-content: center;
   min-width: 150px;
+}
+
+.order-draft-card {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(180px, 0.7fr) minmax(260px, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid rgba(79, 140, 255, 0.26);
+  border-radius: 8px;
+  background: rgba(79, 140, 255, 0.08);
+}
+
+.order-draft-card h3 {
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.order-draft-card dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.order-draft-card div,
+.order-draft-card dd,
+.order-draft-card dt,
+.order-draft-card p {
+  min-width: 0;
+}
+
+.order-draft-card dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.order-draft-card dd {
+  margin: 4px 0 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.order-draft-card p {
+  color: var(--soft);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.order-draft-card .button {
+  justify-self: end;
+  white-space: nowrap;
 }
 
 .feedback-dialog-backdrop {
@@ -1903,6 +1961,59 @@ tbody tr:last-child td {
   min-height: 96px;
   padding: 10px;
   resize: vertical;
+}
+
+.action-loop-columns {
+  align-items: start;
+}
+
+.action-loop-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.action-loop-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.action-loop-form label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.action-loop-form label span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.action-loop-form input,
+.action-loop-form select,
+.action-loop-form textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0b111b;
+  color: var(--text);
+}
+
+.action-loop-form input,
+.action-loop-form select {
+  min-height: 38px;
+  padding: 0 10px;
+}
+
+.action-loop-form textarea {
+  min-height: 82px;
+  padding: 10px;
+  resize: vertical;
+}
+
+.action-loop-form-wide {
+  grid-column: 1 / -1;
 }
 
 .chat-dock {

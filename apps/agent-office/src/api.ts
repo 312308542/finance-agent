@@ -96,6 +96,29 @@ export type DataSchedulerJobRunPayload = {
   dry_run: boolean;
 };
 
+export type DecisionConfirmationPayload = {
+  feedback: "accepted" | "rejected" | "modified" | "deferred";
+  comment?: string;
+  modified_action?: string;
+};
+
+export type ExecutionRecordPayload = {
+  owner_id: string;
+  portfolio_id: string;
+  asset_id: string;
+  market: string;
+  action: string;
+  executed_price: string;
+  executed_quantity: string;
+  executed_at: string;
+  execution_id?: string;
+  order_draft_id?: string;
+  decision_log_id?: string;
+  fee?: string;
+  note?: string;
+  source: "user_reported";
+};
+
 export type ChatStreamEvent = {
   event: string;
   data: Record<string, any>;
@@ -388,6 +411,69 @@ export async function submitDecisionFeedback(
     `/api/decisions/${encodeURIComponent(decisionId)}/feedback`,
     payload,
     requestTimeoutMs,
+  );
+}
+
+export async function confirmDecision(
+  decisionId: string,
+  payload: DecisionConfirmationPayload,
+): Promise<Record<string, any>> {
+  return requestJson(
+    "POST",
+    `/api/decisions/${encodeURIComponent(decisionId)}/confirm`,
+    payload,
+    requestTimeoutMs,
+  );
+}
+
+export async function createOrderDraft(decisionId: string): Promise<Record<string, any>> {
+  return requestJson(
+    "POST",
+    `/api/decisions/${encodeURIComponent(decisionId)}/order-draft`,
+    {},
+    requestTimeoutMs,
+  );
+}
+
+export async function loadOrderDrafts(
+  ownerId: string,
+  status?: string | null,
+  limit = 50,
+): Promise<Record<string, any>> {
+  const params = new URLSearchParams({
+    owner_id: ownerId,
+    limit: String(Math.min(200, Math.max(1, Math.round(limit)))),
+  });
+  if (status) {
+    params.set("status", status);
+  }
+  return getJson(`/api/order-drafts?${params.toString()}`, { items: [] });
+}
+
+export async function recordExecution(payload: ExecutionRecordPayload): Promise<Record<string, any>> {
+  return requestJson("POST", "/api/executions", payload, requestTimeoutMs);
+}
+
+export async function loadExecutionRecords(
+  ownerId: string,
+  assetId?: string | null,
+  limit = 50,
+): Promise<Record<string, any>> {
+  const params = new URLSearchParams({
+    owner_id: ownerId,
+    limit: String(Math.min(200, Math.max(1, Math.round(limit)))),
+  });
+  if (assetId) {
+    params.set("asset_id", assetId);
+  }
+  return getJson(`/api/executions?${params.toString()}`, { items: [] });
+}
+
+export async function loadUpcomingReviews(ownerId: string, limit = 50): Promise<Record<string, any>> {
+  const normalizedLimit = Math.min(200, Math.max(1, Math.round(limit)));
+  return getJson(
+    `/api/reviews/upcoming?owner_id=${encodeURIComponent(ownerId)}&limit=${normalizedLimit}`,
+    { items: [] },
   );
 }
 
