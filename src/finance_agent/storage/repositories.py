@@ -41,6 +41,7 @@ from finance_agent.storage.orm import (
     DecisionLogORM,
     EventRecordORM,
     EvidenceORM,
+    ExecutionRecordORM,
     FactorFrameORM,
     FinancialMemoryEdgeORM,
     FundNavSnapshotORM,
@@ -53,6 +54,7 @@ from finance_agent.storage.orm import (
     ModelProviderORM,
     ModelRoutingRuleORM,
     MonitoringAlertORM,
+    OrderDraftORM,
     PortfolioORM,
     PortfolioSnapshotORM,
     PositionORM,
@@ -75,6 +77,9 @@ from finance_agent.storage.orm import (
 
 JsonDict = dict[str, Any]
 FINAL_MARKET_BAR_STATUSES = ("available", "revised")
+ACTION_LOOP_DISCLAIMER = (
+    "非投资建议，仅用于用户自行决策前的操作草案；系统不会连接券商或交易所执行真实下单。"
+)
 
 
 def _ensure_not_mixed_market(market: str, *, context: str) -> None:
@@ -3885,6 +3890,186 @@ class DecisionLogRepository:
             statement = statement.where(DecisionLogORM.asset_id == asset_id)
         return list(
             self.session.scalars(statement.order_by(DecisionLogORM.created_at.desc()).limit(limit))
+        )
+
+
+class ActionLoopRepository:
+    """人工确认、订单草案和执行登记仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_order_draft(
+        self,
+        *,
+        order_draft_id: str,
+        owner_id: str,
+        portfolio_id: str,
+        asset_id: str,
+        market: str,
+        decision_log_id: str,
+        action: str,
+        suggested_price_range: JsonDict | None = None,
+        suggested_position_ratio: Decimal | None = None,
+        constraints: JsonDict | None = None,
+        status: str = "drafted",
+        disclaimer: str | None = None,
+        created_at: datetime | None = None,
+        updated_at: datetime | None = None,
+    ) -> OrderDraftORM:
+        """按 `order_draft_id` 幂等写入订单草案。"""
+
+        now = datetime.now().astimezone()
+        values = {
+            "order_draft_id": order_draft_id,
+            "owner_id": owner_id,
+            "portfolio_id": portfolio_id,
+            "asset_id": asset_id,
+            "market": market,
+            "decision_log_id": decision_log_id,
+            "action": action,
+            "suggested_price_range": _json_safe(suggested_price_range or {}),
+            "suggested_position_ratio": suggested_position_ratio,
+            "constraints": _json_safe(constraints or {}),
+            "status": status,
+            "disclaimer": disclaimer or ACTION_LOOP_DISCLAIMER,
+            "created_at": created_at or now,
+            "updated_at": updated_at or created_at or now,
+        }
+        if not str(values["disclaimer"]).strip():
+            raise ValueError("订单草案 disclaimer 不能为空")
+        statement = insert(OrderDraftORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"order_draft_id", "created_at"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[OrderDraftORM.order_draft_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(OrderDraftORM, order_draft_id)
+
+    def get_order_draft(self, order_draft_id: str) -> OrderDraftORM | None:
+        """按 ID 查询订单草案。"""
+
+        return self.session.get(OrderDraftORM, order_draft_id)
+
+    def list_order_drafts(
+        self,
+        *,
+        owner_id: str,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[OrderDraftORM]:
+        """查询用户订单草案列表。"""
+
+        statement = select(OrderDraftORM).where(OrderDraftORM.owner_id == owner_id)
+        if status:
+            statement = statement.where(OrderDraftORM.status == status)
+        return list(
+            self.session.scalars(statement.order_by(OrderDraftORM.created_at.desc()).limit(limit))
+        )
+
+    def supersede_active_order_drafts(
+        self,
+        *,
+        decision_log_id: str,
+        superseded_at: datetime | None = None,
+    ) -> int:
+        """把同一决策下仍处于 drafted 的旧草案标记为 superseded。"""
+
+        changed_at = superseded_at or datetime.now().astimezone()
+        statement = select(OrderDraftORM).where(
+            OrderDraftORM.decision_log_id == decision_log_id,
+            OrderDraftORM.status == "drafted",
+        )
+        drafts = list(self.session.scalars(statement))
+        for draft in drafts:
+            draft.status = "superseded"
+            draft.updated_at = changed_at
+        self.session.flush()
+        return len(drafts)
+
+    def upsert_execution_record(
+        self,
+        *,
+        execution_id: str,
+        owner_id: str,
+        portfolio_id: str,
+        asset_id: str,
+        market: str,
+        action: str,
+        executed_price: Decimal,
+        executed_quantity: Decimal,
+        executed_at: datetime,
+        order_draft_id: str | None = None,
+        decision_log_id: str | None = None,
+        fee: Decimal | None = None,
+        note: str | None = None,
+        source: str = "user_reported",
+        created_at: datetime | None = None,
+    ) -> ExecutionRecordORM:
+        """按 `execution_id` 幂等写入用户手工执行登记。"""
+
+        if source != "user_reported":
+            raise ValueError("执行登记 source 当前只能为 user_reported")
+        values = {
+            "execution_id": execution_id,
+            "owner_id": owner_id,
+            "portfolio_id": portfolio_id,
+            "asset_id": asset_id,
+            "market": market,
+            "order_draft_id": order_draft_id,
+            "decision_log_id": decision_log_id,
+            "action": action,
+            "executed_price": executed_price,
+            "executed_quantity": executed_quantity,
+            "executed_at": executed_at,
+            "fee": fee,
+            "note": note,
+            "source": source,
+            "created_at": created_at or datetime.now().astimezone(),
+        }
+        statement = insert(ExecutionRecordORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"execution_id", "created_at"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[ExecutionRecordORM.execution_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(ExecutionRecordORM, execution_id)
+
+    def get_execution_record(self, execution_id: str) -> ExecutionRecordORM | None:
+        """按 ID 查询执行登记。"""
+
+        return self.session.get(ExecutionRecordORM, execution_id)
+
+    def list_execution_records(
+        self,
+        *,
+        owner_id: str,
+        asset_id: str | None = None,
+        limit: int = 50,
+    ) -> list[ExecutionRecordORM]:
+        """查询用户执行登记列表。"""
+
+        statement = select(ExecutionRecordORM).where(ExecutionRecordORM.owner_id == owner_id)
+        if asset_id:
+            statement = statement.where(ExecutionRecordORM.asset_id == asset_id)
+        return list(
+            self.session.scalars(
+                statement.order_by(ExecutionRecordORM.executed_at.desc()).limit(limit)
+            )
         )
 
 

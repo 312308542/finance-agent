@@ -1471,6 +1471,74 @@ class DecisionLogORM(Base):
     )
 
 
+class OrderDraftORM(Base):
+    """用户确认建议后的订单草案，只作为文档性操作清单。"""
+
+    __tablename__ = "order_drafts"
+    __table_args__ = (
+        Index("idx_order_drafts_owner_status", "owner_id", "status"),
+        Index("idx_order_drafts_decision_status", "decision_log_id", "status"),
+        Index("idx_order_drafts_asset_created", "asset_id", "created_at"),
+    )
+
+    order_draft_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    portfolio_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    decision_log_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    suggested_price_range: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    suggested_position_ratio: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    constraints: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'drafted'"), nullable=False
+    )
+    disclaimer: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class ExecutionRecordORM(Base):
+    """用户在外部完成交易后的手工执行登记。"""
+
+    __tablename__ = "execution_records"
+    __table_args__ = (
+        Index("idx_execution_records_owner_created", "owner_id", "created_at"),
+        Index("idx_execution_records_asset_executed", "asset_id", "executed_at"),
+        Index("idx_execution_records_draft", "order_draft_id"),
+        Index("idx_execution_records_decision", "decision_log_id"),
+    )
+
+    execution_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    portfolio_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    order_draft_id: Mapped[str | None] = mapped_column(String(192))
+    decision_log_id: Mapped[str | None] = mapped_column(String(160))
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    executed_price: Mapped[Decimal] = mapped_column(Numeric(36, 10), nullable=False)
+    executed_quantity: Mapped[Decimal] = mapped_column(Numeric(36, 10), nullable=False)
+    executed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    fee: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    note: Mapped[str | None] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(
+        String(64), server_default=text("'user_reported'"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class AssistantMemoryORM(Base):
     """Finance Memory 长期记忆表，不保存 Hermes 通用对话记忆。"""
 

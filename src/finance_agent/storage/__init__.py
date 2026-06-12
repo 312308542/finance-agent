@@ -7,6 +7,7 @@ from finance_agent.storage.db import (
 )
 from finance_agent.storage.orm import Base
 from finance_agent.storage.repositories import (
+    ActionLoopRepository,
     AssetRepository,
     AssetScoreRepository,
     AssistantTriggerRepository,
@@ -29,6 +30,7 @@ from finance_agent.storage.repositories import (
 )
 
 __all__ = [
+    "ActionLoopRepository",
     "AssetScoreRepository",
     "AssetRepository",
     "AssistantTriggerRepository",
