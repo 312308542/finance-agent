@@ -5,7 +5,7 @@ import ts from "typescript";
 
 const source = await readFile(new URL("../src/taskMonitorView.ts", import.meta.url), "utf8");
 const styleSource = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
-const appSource = await readFile(new URL("../src/main.tsx", import.meta.url), "utf8");
+const appSource = await readFile(new URL("../src/pages/TaskMonitorPage.tsx", import.meta.url), "utf8");
 const apiSource = await readFile(new URL("../src/api.ts", import.meta.url), "utf8");
 const { outputText } = ts.transpileModule(source, {
   compilerOptions: {
