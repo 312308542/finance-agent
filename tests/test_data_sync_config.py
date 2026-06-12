@@ -224,6 +224,23 @@ def test_scheduler_payload_exports_low_symbol_fetch_concurrency() -> None:
     assert jobs["crypto_future.bars.1h"]["params"]["max_workers"] == 4
 
 
+def test_scheduler_payload_exports_ashare_northbound_flow_job() -> None:
+    """A 股资金流包应拆出北向资金任务，供因子侧消费外资偏好。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+
+    assert jobs["ashare.northbound"]["job_type"] == "collection"
+    assert jobs["ashare.northbound"]["group"] == "ashare-p1"
+    assert jobs["ashare.northbound"]["params"]["sync_task_type"] == "northbound_flow_refresh"
+    assert jobs["ashare.northbound"]["params"]["group"] == ["ashare-p1"]
+    assert jobs["ashare.northbound"]["params"]["source_limit"] == jobs["ashare.northbound"]["limit"]
+    assert "stock_hsgt_hist_em" in jobs["ashare.northbound"]["params"]["sources"]
+    assert "stock_hsgt_individual_em" in jobs["ashare.northbound"]["params"]["sources"]
+
+
 def test_scheduler_payload_marks_ashare_fundamentals_as_incremental_resume() -> None:
     """基本面/估值定时任务应默认按水位增量补齐，避免每轮重复扫完整资产池。"""
 

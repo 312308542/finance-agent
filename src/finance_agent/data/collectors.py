@@ -1689,6 +1689,55 @@ class AshareP1Collector:
         )
         return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
+    def collect_northbound_flow(
+        self,
+        *,
+        symbol: str = "北向资金",
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集北向资金市场级或个股数据，并写入资金流快照。"""
+
+        result = self.flow_provider.fetch_northbound_flow(symbol=symbol, limit=limit)
+        endpoint = (
+            "stock_hsgt_hist_em"
+            if str(symbol or "").strip() in {"北向资金", "沪股通", "深股通"}
+            else "stock_hsgt_individual_em"
+        )
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint=endpoint,
+            request_params={"symbol": symbol, "limit": limit},
+            symbol=None if endpoint == "stock_hsgt_hist_em" else symbol,
+        )
+        if result.status != "available":
+            return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+        _persist_rows(
+            self.capital_flows,
+            "upsert_capital_flow_snapshots",
+            "upsert_capital_flow_snapshot",
+            [
+                {
+                    "snapshot_id": snapshot.snapshot_id,
+                    "asset_id": snapshot.asset_id,
+                    "symbol": snapshot.symbol,
+                    "market": snapshot.market,
+                    "main_net_inflow": snapshot.main_net_inflow,
+                    "northbound_net_inflow": snapshot.northbound_net_inflow,
+                    "turnover_rate": snapshot.turnover_rate,
+                    "amount": snapshot.amount,
+                    "window": snapshot.window,
+                    "source": snapshot.source,
+                    "status": snapshot.status,
+                    "as_of": snapshot.as_of,
+                    "payload": snapshot.payload | {"raw_record_id": raw_record_id},
+                }
+                for snapshot in result.snapshots
+            ],
+        )
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
     def collect_stock_news(
         self,
         *,

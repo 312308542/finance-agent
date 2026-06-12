@@ -82,6 +82,9 @@ ASHARE_RISK_SENTIMENT_DATA_DOMAIN = "risk_sentiment"
 ASHARE_FINANCIAL_INDICATORS_PROVIDER = "stock_financial_analysis_indicator_em"
 ASHARE_VALUATION_PROVIDER = "stock_value_em"
 ASHARE_CAPITAL_FLOW_PROVIDER = "stock_individual_fund_flow_rank"
+ASHARE_NORTHBOUND_FLOW_PROVIDER = "stock_hsgt_hist_em"
+ASHARE_NORTHBOUND_INDIVIDUAL_PROVIDER = "stock_hsgt_individual_em"
+ASHARE_NORTHBOUND_INDIVIDUAL_TIMEFRAME = "northbound"
 CRYPTO_MARKET_BAR_DATA_DOMAIN = "market_bars"
 CRYPTO_MARKET_BAR_PROVIDER = "ccxt_binance_fetch_ohlcv"
 CRYPTO_DERIVATIVE_DATA_DOMAIN = "derivatives"
@@ -956,6 +959,38 @@ def run_ashare_p1(
             result=result,
         )
         return [result]
+    if task_type == "northbound_flow_refresh":
+        source_limit = list_source_limit(args)
+        results = [
+            runtime.run_task(
+                task="ashare_p1_northbound_flow",
+                provider_key=ASHARE_NORTHBOUND_FLOW_PROVIDER,
+                parameters={"symbol": "北向资金", "limit": source_limit},
+                force=args.force_provider,
+                collect=lambda: collector.collect_northbound_flow(
+                    symbol="北向资金",
+                    limit=source_limit,
+                ),
+            )
+        ]
+        for symbol in resolve_ashare_northbound_symbols(session, args):
+            result = runtime.run_task(
+                task="ashare_p1_northbound_flow",
+                provider_key=ASHARE_NORTHBOUND_INDIVIDUAL_PROVIDER,
+                parameters={"symbol": symbol, "limit": source_limit},
+                force=args.force_provider,
+                collect=lambda symbol=symbol: collector.collect_northbound_flow(
+                    symbol=symbol,
+                    limit=source_limit,
+                ),
+            )
+            record_ashare_northbound_individual_watermark(
+                session,
+                symbol=symbol,
+                result=result,
+            )
+            results.append(result)
+        return results
     if task_type == "event_refresh":
         source_limit = list_source_limit(args)
         return [
@@ -3347,6 +3382,75 @@ def batch_ashare_fundamental_symbols(
     return symbols
 
 
+def batch_ashare_northbound_symbols(
+    session: Any,
+    *,
+    limit: int | None = None,
+    fallback_symbol: str,
+    now: datetime | None = None,
+) -> list[str]:
+    """按北向个股水位选择需要刷新的主板标的。"""
+
+    symbols: list[str] = []
+    try:
+        repo = AssetRepository(session)
+        eligibility = TradeableAssetEligibilityService()
+        assets = eligibility.filter_tradeable_assets(repo.find_by_market("ashare"))
+        asset_ids = [str(asset.asset_id) for asset in assets]
+        watermarks = _fetch_data_sync_watermarks(
+            session,
+            asset_ids,
+            data_domain=ASHARE_CAPITAL_FLOW_DATA_DOMAIN,
+            provider=ASHARE_NORTHBOUND_INDIVIDUAL_PROVIDER,
+            timeframe=ASHARE_NORTHBOUND_INDIVIDUAL_TIMEFRAME,
+        )
+        current_time = now or datetime.now(tz=UTC)
+        eligible_assets = [
+            asset
+            for asset in assets
+            if _watermark_allows_collection(watermarks.get(str(asset.asset_id)), now=current_time)
+        ]
+        ranked_assets = sorted(
+            eligible_assets,
+            key=lambda asset: (
+                _northbound_watermark_time(watermarks.get(str(asset.asset_id)))
+                or datetime.min.replace(tzinfo=UTC),
+                normalize_ashare_symbol(str(getattr(asset, "symbol", "") or "")),
+            ),
+        )
+        for asset in ranked_assets:
+            asset_id = str(asset.asset_id)
+            _append_unique_ashare_symbol(
+                symbols,
+                normalize_ashare_symbol(str(getattr(asset, "symbol", "") or "")),
+            )
+    except Exception as exc:
+        logger.warning(
+            "北向个股采集标的筛选失败 fallback_symbol=%s error=%s",
+            fallback_symbol,
+            exc,
+            exc_info=True,
+        )
+        symbols = []
+    if not symbols:
+        symbols = [fallback_symbol]
+    if limit:
+        return symbols[:limit]
+    return symbols
+
+
+def _northbound_watermark_time(watermark: Any) -> datetime | None:
+    """读取北向个股水位时间，用于小批轮转覆盖。"""
+
+    if watermark is None:
+        return None
+    return getattr(watermark, "watermark_at", None) or getattr(
+        watermark,
+        "last_success_at",
+        None,
+    )
+
+
 def _asset_requires_ashare_fundamental_collection(
     asset: Any,
     *,
@@ -4058,6 +4162,58 @@ def record_ashare_capital_flow_watermark(
     )
 
 
+def record_ashare_northbound_individual_watermark(
+    session: Any,
+    *,
+    symbol: str,
+    result: Any,
+    occurred_at: datetime | None = None,
+    schedule_retry: bool = True,
+) -> None:
+    """根据北向个股采集结果更新标的级水位。"""
+
+    status = str(getattr(result, "status", "") or "").strip().lower()
+    if status not in {"available", "error", "unavailable", "failed"}:
+        return
+    normalized_symbol = normalize_ashare_symbol(symbol)
+    if not is_tradeable_ashare_symbol(normalized_symbol):
+        return
+    now = occurred_at or datetime.now(tz=UTC)
+    asset_id = f"ashare:{normalized_symbol}"
+    repository = DataSyncWatermarkRepository(session)
+    payload = {
+        "status": status,
+        "item_count": result_item_count(result),
+        "task": getattr(result, "task", None),
+        "provider": ASHARE_NORTHBOUND_INDIVIDUAL_PROVIDER,
+    } | _result_payload_metadata(result)
+    if status == "available":
+        repository.record_success(
+            asset_id=asset_id,
+            symbol=normalized_symbol,
+            market="ashare",
+            data_domain=ASHARE_CAPITAL_FLOW_DATA_DOMAIN,
+            provider=ASHARE_NORTHBOUND_INDIVIDUAL_PROVIDER,
+            timeframe=ASHARE_NORTHBOUND_INDIVIDUAL_TIMEFRAME,
+            watermark_at=now,
+            occurred_at=now,
+            payload=payload,
+        )
+        return
+    repository.record_failure(
+        asset_id=asset_id,
+        symbol=normalized_symbol,
+        market="ashare",
+        data_domain=ASHARE_CAPITAL_FLOW_DATA_DOMAIN,
+        provider=ASHARE_NORTHBOUND_INDIVIDUAL_PROVIDER,
+        timeframe=ASHARE_NORTHBOUND_INDIVIDUAL_TIMEFRAME,
+        occurred_at=now,
+        retry_after=timedelta(minutes=15) if schedule_retry else None,
+        error_message=result_error_message(result),
+        payload=payload,
+    )
+
+
 def classify_collection_error(error_message: str | None) -> str:
     """按常见错误文案粗分失败类型，避免前端只能看到长异常文本。"""
 
@@ -4129,6 +4285,19 @@ def resolve_ashare_fundamental_symbols(session: Any, args: argparse.Namespace) -
             )
         return batch_ashare_fundamental_symbols(session, **kwargs)
     return [args.ashare_symbol]
+
+
+def resolve_ashare_northbound_symbols(session: Any, args: argparse.Namespace) -> list[str]:
+    """根据采集参数解析本次北向个股刷新标的。"""
+
+    symbol_source = str(getattr(args, "symbol_source", "") or "").strip()
+    if symbol_source in {"market_assets", "universe"}:
+        return batch_ashare_northbound_symbols(
+            session,
+            limit=getattr(args, "source_limit", None),
+            fallback_symbol=args.ashare_symbol,
+        )
+    return TradeableAssetEligibilityService().filter_tradeable_ashare_symbols([args.ashare_symbol])
 
 
 def resolve_fund_bar_collection_symbols(

@@ -86,7 +86,7 @@ AKShare 在本系统里应视为 **A 股数据 Provider 族**，不是单一 K �
 | 行业板块 | `stock_board_industry_*` | 行业种子池、行业动量、行业轮动 | P1 |
 | 概念板块 | `stock_board_concept_*` | 主题种子池、主题热度、事件解释 | P1 |
 | 资金流向 | `stock_individual_fund_flow`、`stock_main_fund_flow`、`stock_sector_fund_flow_*` | 主力资金、板块资金、资金流因子、资金流榜单种子 | P1 |
-| 沪深港通资金流 | `stock_hsgt_*` | 北向资金、外资偏好、资金确认 | P1 |
+| 沪深港通资金流 | `stock_hsgt_hist_em`、`stock_hsgt_individual_em` | 市场级北向资金、个股北向持仓/增持资金、外资偏好确认；字段重点为日期/持股日期、北向资金或当日成交净买额、今日增持资金、持股市值；日级低频刷新，失败常见模式为东财连接断开、最新市场级数值为空或个股历史窗口较短 | P1 |
 | 个股新闻 | `stock_news_*`、个股新闻 | 事件证据、Agent 中文解释 | P1 |
 | 公告/披露 | `stock_notice_report`、`stock_individual_notice_report`、`stock_zh_a_disclosure_report_cninfo` | 重大事件、财报披露、风险反驳 | P1 |
 | 财报发行 | 财报发行、预约披露时间 | 数据时效、财报事件提醒 | P1 |

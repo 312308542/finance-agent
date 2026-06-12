@@ -341,6 +341,11 @@ def build_capital_flow_group(
         history,
         window=spec.capital_flow_continuity_window,
     )
+    northbound_strength = safe_decimal_ratio(snapshot.northbound_net_inflow, snapshot.amount)
+    northbound_continuity = northbound_flow_continuity(
+        history,
+        window=spec.capital_flow_continuity_window,
+    )
     flow_price_divergence = payload_float(
         snapshot.payload,
         "flow_price_divergence",
@@ -348,8 +353,10 @@ def build_capital_flow_group(
     )
     factors = {
         "main_net_inflow_strength": strength,
+        "northbound_net_inflow_strength": northbound_strength,
         "flow_rank_percentile": flow_rank_percentile,
         "flow_continuity": flow_continuity,
+        "northbound_flow_continuity": northbound_continuity,
         "flow_price_divergence": flow_price_divergence,
         "window": snapshot.window,
     }
@@ -359,8 +366,13 @@ def build_capital_flow_group(
             strength,
             scale=spec.main_flow_strength_scale,
         ),
+        "northbound_net_inflow_strength": signed_float_score(
+            northbound_strength,
+            scale=spec.main_flow_strength_scale,
+        ),
         "flow_rank_percentile": percentile_score(flow_rank_percentile),
         "flow_continuity": positive_float_score(flow_continuity, scale=1),
+        "northbound_flow_continuity": positive_float_score(northbound_continuity, scale=1),
         "flow_price_divergence": signed_float_score(flow_price_divergence, scale=0.05),
     }
     return {
@@ -789,6 +801,24 @@ def capital_flow_continuity(
         item.main_net_inflow
         for item in history[-window:]
         if item.main_net_inflow is not None
+    ]
+    if not recent:
+        return None
+    positive_count = sum(1 for item in recent if item > 0)
+    return clamp(positive_count / len(recent), 0, 1)
+
+
+def northbound_flow_continuity(
+    history: list[CapitalFlowSnapshotORM],
+    *,
+    window: int,
+) -> float | None:
+    """计算最近窗口内北向净流入为正的占比。"""
+
+    recent = [
+        item.northbound_net_inflow
+        for item in history[-window:]
+        if item.northbound_net_inflow is not None
     ]
     if not recent:
         return None

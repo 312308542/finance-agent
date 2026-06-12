@@ -1214,6 +1214,7 @@ def collection_group_for_task(task: DataSyncTaskPreview) -> str | tuple[str, ...
             "market_bars_revision": "ashare-p0",
             "fundamental_refresh": "ashare-p2",
             "capital_flow_refresh": "ashare-p1",
+            "northbound_flow_refresh": "ashare-p1",
             "event_refresh": "ashare-p1",
             "event_article_enrichment": "ashare-p1",
             "risk_sentiment_refresh": "ashare-risk",
@@ -1249,6 +1250,9 @@ def build_ashare_collection_params(task: DataSyncTaskPreview) -> JsonDict:
         params["group"] = ["ashare-p2"]
     if task.task_type == "capital_flow_refresh":
         params["group"] = ["ashare-p1"]
+    if task.task_type == "northbound_flow_refresh":
+        params["group"] = ["ashare-p1"]
+        params["source_limit"] = task.batch_size
     if task.task_type == "event_refresh":
         params["group"] = ["ashare-p1"]
         params["priority_symbol_limit"] = task.batch_size
@@ -1480,6 +1484,25 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 lookback=f"{config.lookback_days}d",
                 sources=["individual_fund_flow_rank"],
                 data_packages=["capital_flow"],
+            )
+        )
+        tasks.append(
+            DataSyncTaskPreview(
+                task_key="ashare.northbound",
+                market="ashare",
+                task_type="northbound_flow_refresh",
+                title="刷新 A 股北向资金",
+                interval_seconds=config.interval_seconds.get("northbound_flow", 24 * 60 * 60),
+                mode="daily_market_flow_snapshot",
+                schedule_type="daily_time",
+                run_at=["18:10"],
+                timezone="Asia/Shanghai",
+                trading_day_policy="trading_day_only",
+                batch_size=config.batch_size,
+                lookback=f"{config.lookback_days}d",
+                sources=["stock_hsgt_hist_em", "stock_hsgt_individual_em"],
+                data_packages=["capital_flow"],
+                notes=["默认刷新市场级北向资金；个股级北向接口保留给重点标的补采。"],
             )
         )
     if "events" in config.data_packages:

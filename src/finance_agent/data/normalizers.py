@@ -499,6 +499,106 @@ def normalize_ashare_fund_flow_rank(
     return snapshots
 
 
+def normalize_ashare_northbound_market_flow(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    symbol: str,
+    as_of: datetime,
+    limit: int | None = None,
+) -> list[CapitalFlowSnapshotData]:
+    """归一化沪深港通市场级北向资金历史。"""
+
+    snapshots: list[CapitalFlowSnapshotData] = []
+    rows = df.tail(limit) if limit else df
+    for row in rows.to_dict("records"):
+        snapshot_at = parse_ashare_datetime(_first_present(row, ["日期", "数据日期"])) or as_of
+        northbound_net_inflow = _first_decimal(
+            row,
+            [
+                "北向资金",
+                "当日资金流入",
+                "当日成交净买额",
+                "净买额",
+                "资金净流入",
+            ],
+        )
+        snapshots.append(
+            CapitalFlowSnapshotData(
+                snapshot_id=stable_id("capital_flow", source, symbol, snapshot_at.isoformat()),
+                asset_id="market:ashare:northbound",
+                symbol="northbound",
+                market="ashare",
+                window="daily",
+                source=source,
+                as_of=snapshot_at,
+                northbound_net_inflow=northbound_net_inflow,
+                status="available" if northbound_net_inflow is not None else "partial",
+                payload={"raw": row, "source_symbol": symbol},
+            )
+        )
+    return snapshots
+
+
+def normalize_ashare_northbound_individual_flow(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    symbol: str,
+    as_of: datetime,
+    limit: int | None = None,
+) -> list[CapitalFlowSnapshotData]:
+    """归一化沪深港通个股持仓/资金数据。"""
+
+    snapshots: list[CapitalFlowSnapshotData] = []
+    rows = df.tail(limit) if limit else df
+    for row in rows.to_dict("records"):
+        clean_symbol = normalize_ashare_symbol(
+            str(_first_present(row, ["股票代码", "证券代码", "代码"]) or symbol)
+        )
+        if not is_main_board_ashare_stock_symbol(clean_symbol):
+            continue
+        snapshot_at = (
+            parse_ashare_datetime(_first_present(row, ["持股日期", "日期", "数据日期"])) or as_of
+        )
+        northbound_net_inflow = _first_decimal(
+            row,
+            [
+                "当日净买额",
+                "净买额",
+                "买入成交净额",
+                "今日增持资金",
+                "持股市值变化-1日",
+                "今日持股市值变化",
+                "持股市值变化",
+            ],
+        )
+        amount = _first_decimal(row, ["持股市值", "持股金额", "市值"])
+        snapshots.append(
+            CapitalFlowSnapshotData(
+                snapshot_id=stable_id(
+                    "capital_flow",
+                    source,
+                    clean_symbol,
+                    snapshot_at.isoformat(),
+                ),
+                asset_id=f"ashare:{clean_symbol}",
+                symbol=clean_symbol,
+                market="ashare",
+                window="daily",
+                source=source,
+                as_of=snapshot_at,
+                northbound_net_inflow=northbound_net_inflow,
+                amount=amount,
+                status="available"
+                if northbound_net_inflow is not None or amount is not None
+                else "partial",
+                payload={"raw": row, "source_symbol": symbol},
+            )
+        )
+    return snapshots
+
+
 def normalize_ashare_stock_news(
     df: pd.DataFrame,
     *,

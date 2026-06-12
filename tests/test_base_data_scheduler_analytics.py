@@ -3039,6 +3039,241 @@ def test_ashare_capital_flow_records_rank_watermark(
     assert watermark_calls[0]["result"].status == "available"
 
 
+def test_ashare_northbound_flow_refresh_dispatches_to_collector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """北向资金任务应由 A 股 P1 入口分发到专用采集方法。"""
+
+    collect_base_data = import_collection_module()
+    calls: list[dict[str, Any]] = []
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            calls.append(
+                {
+                    "task": task,
+                    "provider_key": provider_key,
+                    "parameters": parameters,
+                    "force": force,
+                }
+            )
+            collect()
+            return Namespace(
+                task=task,
+                status="available",
+                raw_record_id="raw:northbound",
+                item_count=1,
+                error_message=None,
+                payload={},
+            )
+
+    monkeypatch.setattr(
+        collect_base_data.AshareP1Collector,
+        "__init__",
+        lambda self, session: None,
+    )
+    monkeypatch.setattr(
+        collect_base_data.AshareP1Collector,
+        "collect_northbound_flow",
+        lambda self, symbol, limit: calls.append(
+            {"task": "collect_northbound_flow", "symbol": symbol, "limit": limit}
+        )
+        or Namespace(
+            task=f"collect_northbound_flow:{symbol}",
+            status="available",
+            raw_record_id=f"raw:northbound:{symbol}",
+            item_count=1,
+            error_message=None,
+            payload={},
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "resolve_ashare_northbound_symbols",
+        lambda session, args: ["000001", "600519"],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_ashare_northbound_individual_watermark",
+        lambda session, symbol, result: calls.append(
+            {
+                "task": "record_northbound_watermark",
+                "symbol": symbol,
+                "status": result.status,
+            }
+        ),
+        raising=False,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p1"],
+        sync_task_type="northbound_flow_refresh",
+        source_limit=3,
+    )
+
+    results = collect_base_data.run_ashare_p1(object(), args, RecordingRuntime())
+
+    assert [result.task for result in results] == [
+        "ashare_p1_northbound_flow",
+        "ashare_p1_northbound_flow",
+        "ashare_p1_northbound_flow",
+    ]
+    assert calls[0]["provider_key"] == "stock_hsgt_hist_em"
+    assert calls[0]["parameters"] == {"symbol": "北向资金", "limit": 3}
+    assert calls[1] == {"task": "collect_northbound_flow", "symbol": "北向资金", "limit": 3}
+    assert calls[2]["provider_key"] == "stock_hsgt_individual_em"
+    assert calls[2]["parameters"] == {"symbol": "000001", "limit": 3}
+    assert calls[3] == {"task": "collect_northbound_flow", "symbol": "000001", "limit": 3}
+    assert calls[4] == {
+        "task": "record_northbound_watermark",
+        "symbol": "000001",
+        "status": "available",
+    }
+    assert calls[5]["provider_key"] == "stock_hsgt_individual_em"
+    assert calls[5]["parameters"] == {"symbol": "600519", "limit": 3}
+    assert calls[6] == {"task": "collect_northbound_flow", "symbol": "600519", "limit": 3}
+    assert calls[7] == {
+        "task": "record_northbound_watermark",
+        "symbol": "600519",
+        "status": "available",
+    }
+
+
+def test_batch_ashare_northbound_symbols_skips_failure_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """北向个股采集应跳过失败冷却期内的主板标的。"""
+
+    collect_base_data = import_collection_module()
+    now = datetime.now(tz=UTC)
+    assets = [
+        Namespace(asset_id="ashare:000001", symbol="000001", market="ashare", asset_type="stock"),
+        Namespace(asset_id="ashare:600519", symbol="600519", market="ashare", asset_type="stock"),
+    ]
+    watermarks = {
+        "ashare:000001": Namespace(
+            status="error",
+            next_retry_at=now + timedelta(minutes=10),
+        )
+    }
+
+    class FakeAssetRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def find_by_market(self, market: str) -> list[Any]:
+            assert market == "ashare"
+            return assets
+
+    monkeypatch.setattr(collect_base_data, "AssetRepository", FakeAssetRepository)
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_data_sync_watermarks",
+        lambda *args, **kwargs: watermarks,
+    )
+
+    symbols = collect_base_data.batch_ashare_northbound_symbols(
+        object(),
+        fallback_symbol="000001",
+        now=now,
+    )
+
+    assert symbols == ["600519"]
+
+
+def test_batch_ashare_northbound_symbols_prefers_missing_and_old_watermarks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """北向个股小批刷新应优先未采和最久未采的标的。"""
+
+    collect_base_data = import_collection_module()
+    now = datetime.now(tz=UTC)
+    assets = [
+        Namespace(asset_id="ashare:000001", symbol="000001", market="ashare", asset_type="stock"),
+        Namespace(asset_id="ashare:600519", symbol="600519", market="ashare", asset_type="stock"),
+        Namespace(asset_id="ashare:601398", symbol="601398", market="ashare", asset_type="stock"),
+    ]
+    watermarks = {
+        "ashare:000001": Namespace(
+            status="available",
+            watermark_at=now - timedelta(days=1),
+            last_success_at=now - timedelta(days=1),
+            next_retry_at=None,
+        ),
+        "ashare:600519": Namespace(
+            status="available",
+            watermark_at=now - timedelta(days=8),
+            last_success_at=now - timedelta(days=8),
+            next_retry_at=None,
+        ),
+    }
+
+    class FakeAssetRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def find_by_market(self, market: str) -> list[Any]:
+            assert market == "ashare"
+            return assets
+
+    monkeypatch.setattr(collect_base_data, "AssetRepository", FakeAssetRepository)
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_data_sync_watermarks",
+        lambda *args, **kwargs: watermarks,
+    )
+
+    symbols = collect_base_data.batch_ashare_northbound_symbols(
+        object(),
+        fallback_symbol="000001",
+        limit=2,
+        now=now,
+    )
+
+    assert symbols == ["601398", "600519"]
+
+
+def test_record_ashare_northbound_individual_watermark_uses_short_timeframe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """北向个股水位 timeframe 必须短于表结构限制。"""
+
+    collect_base_data = import_collection_module()
+    calls: list[dict[str, Any]] = []
+
+    class FakeWatermarkRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def record_success(self, **kwargs: Any) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "DataSyncWatermarkRepository",
+        FakeWatermarkRepository,
+    )
+
+    collect_base_data.record_ashare_northbound_individual_watermark(
+        object(),
+        symbol="000001",
+        result=Namespace(status="available", item_count=1, task="northbound", payload={}),
+    )
+
+    assert calls[0]["timeframe"] == "northbound"
+    assert len(calls[0]["timeframe"]) <= 16
+
+
 def test_ashare_capital_flow_skips_when_failure_watermark_in_cooldown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

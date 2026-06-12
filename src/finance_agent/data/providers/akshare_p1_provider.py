@@ -20,6 +20,8 @@ from finance_agent.data.normalizers import (
     normalize_ashare_board_members,
     normalize_ashare_fund_flow_rank,
     normalize_ashare_index_members,
+    normalize_ashare_northbound_individual_flow,
+    normalize_ashare_northbound_market_flow,
     normalize_ashare_notice_reports,
     normalize_ashare_stock_news,
 )
@@ -418,6 +420,97 @@ class AshareCapitalFlowProvider:
                 "actual_source": actual_source,
                 "fallback_used": actual_source != primary_source,
                 "fallback_trace": fallback_trace,
+            },
+        )
+
+    def fetch_northbound_flow(
+        self,
+        *,
+        symbol: str = "北向资金",
+        limit: int | None = None,
+    ) -> CapitalFlowSnapshotsResult:
+        """按 symbol 路由北向市场级或个股资金数据。"""
+
+        normalized_symbol = str(symbol or "北向资金").strip()
+        if normalized_symbol in {"北向资金", "沪股通", "深股通"}:
+            return self.fetch_northbound_market_flow(symbol=normalized_symbol, limit=limit)
+        return self.fetch_northbound_individual_flow(symbol=normalized_symbol, limit=limit)
+
+    def fetch_northbound_market_flow(
+        self,
+        *,
+        symbol: str = "北向资金",
+        limit: int | None = None,
+    ) -> CapitalFlowSnapshotsResult:
+        """获取沪深港通市场级北向资金历史。"""
+
+        collected_at = datetime.now(tz=UTC)
+        try:
+            df = ak.stock_hsgt_hist_em(symbol=symbol)
+            snapshots = normalize_ashare_northbound_market_flow(
+                df,
+                source="akshare:stock_hsgt_hist_em",
+                symbol=symbol,
+                as_of=collected_at,
+                limit=limit,
+            )
+        except Exception as exc:
+            return CapitalFlowSnapshotsResult(
+                provider_name=self.provider_name,
+                status="error",
+                collected_at=collected_at,
+                error_message=str(exc),
+                payload={"endpoint": "stock_hsgt_hist_em", "symbol": symbol},
+            )
+        return CapitalFlowSnapshotsResult(
+            provider_name=self.provider_name,
+            status="available" if snapshots else "unavailable",
+            collected_at=collected_at,
+            snapshots=snapshots,
+            payload={
+                "endpoint": "stock_hsgt_hist_em",
+                "symbol": symbol,
+                "row_count": len(snapshots),
+                "actual_source": "akshare:stock_hsgt_hist_em",
+            },
+        )
+
+    def fetch_northbound_individual_flow(
+        self,
+        *,
+        symbol: str,
+        limit: int | None = None,
+    ) -> CapitalFlowSnapshotsResult:
+        """获取沪深港通个股持仓/资金历史。"""
+
+        collected_at = datetime.now(tz=UTC)
+        try:
+            df = ak.stock_hsgt_individual_em(symbol=symbol)
+            snapshots = normalize_ashare_northbound_individual_flow(
+                df,
+                source="akshare:stock_hsgt_individual_em",
+                symbol=symbol,
+                as_of=collected_at,
+                limit=limit,
+            )
+        except Exception as exc:
+            return CapitalFlowSnapshotsResult(
+                provider_name=self.provider_name,
+                status="error",
+                collected_at=collected_at,
+                error_message=str(exc),
+                payload={"endpoint": "stock_hsgt_individual_em", "symbol": symbol},
+            )
+        return CapitalFlowSnapshotsResult(
+            provider_name=self.provider_name,
+            status="available" if snapshots else "unavailable",
+            collected_at=collected_at,
+            snapshots=snapshots,
+            payload={
+                "endpoint": "stock_hsgt_individual_em",
+                "symbol": symbol,
+                "row_count": len(snapshots),
+                "actual_source": "akshare:stock_hsgt_individual_em",
             },
         )
 
