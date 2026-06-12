@@ -305,6 +305,52 @@ export async function loadReportDetail(workflowRunId: string): Promise<Record<st
   });
 }
 
+export async function loadPortfolioOverview(ownerId: string): Promise<Record<string, any>> {
+  return getJson(`/api/portfolio/overview?owner_id=${encodeURIComponent(ownerId)}`, {
+    status: "empty",
+    portfolios: [],
+    positions: [],
+    concentration_warnings: [],
+    metrics: {},
+  });
+}
+
+export async function loadRiskOverview(ownerId: string, limit = 50): Promise<Record<string, any>> {
+  const normalizedLimit = Math.min(200, Math.max(1, Math.round(limit)));
+  return getJson(
+    `/api/risks?owner_id=${encodeURIComponent(ownerId)}&limit=${normalizedLimit}`,
+    {
+      status: "empty",
+      triggers: [],
+      alerts: [],
+      risk_findings: [],
+      data_quality: [],
+      metrics: {},
+    },
+  );
+}
+
+export async function loadWorkflowOverview(ownerId: string, limit = 50): Promise<Record<string, any>> {
+  const normalizedLimit = Math.min(200, Math.max(1, Math.round(limit)));
+  const payload = await getJson(
+    `/api/dashboard/summary?owner_id=${encodeURIComponent(ownerId)}&limit=${normalizedLimit}`,
+    {
+      sections: {
+        workflows: { status: "empty", runs: [], available: [], metrics: {} },
+      },
+    },
+  );
+  return payload.sections?.workflows ?? { status: "empty", runs: [], available: [], metrics: {} };
+}
+
+export async function loadRecentMemories(ownerId: string, limit = 50): Promise<Record<string, any>> {
+  const normalizedLimit = Math.min(200, Math.max(1, Math.round(limit)));
+  return getJson(
+    `/api/memories/recent?owner_id=${encodeURIComponent(ownerId)}&limit=${normalizedLimit}`,
+    { status: "empty", items: [], metrics: {} },
+  );
+}
+
 export async function loadLatestRecommendations(
   ownerId: string,
   market?: string | null,

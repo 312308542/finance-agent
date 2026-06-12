@@ -1112,6 +1112,380 @@ tbody tr:last-child td {
   line-height: 1.5;
 }
 
+.real-page-grid,
+.real-page-columns,
+.real-metric-grid {
+  display: grid;
+  min-width: 0;
+}
+
+.real-page-grid {
+  gap: 14px;
+}
+
+.real-page-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.real-page-head h2 {
+  font-size: 20px;
+  line-height: 1.2;
+}
+
+.real-metric-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.real-metric-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0d1420;
+}
+
+.real-metric-card span,
+.empty-copy {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.real-metric-card strong {
+  display: block;
+  overflow: hidden;
+  margin-top: 6px;
+  color: var(--text);
+  font-family:
+    "Fira Code",
+    Consolas,
+    monospace;
+  font-size: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.real-alert-band {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid rgba(216, 163, 51, 0.32);
+  border-radius: 8px;
+  background: rgba(216, 163, 51, 0.08);
+  color: var(--amber);
+}
+
+.real-alert-band svg {
+  justify-self: center;
+}
+
+.real-alert-band strong,
+.real-alert-band span {
+  display: block;
+  min-width: 0;
+}
+
+.real-alert-band span {
+  overflow: hidden;
+  margin-top: 3px;
+  color: var(--soft);
+  font-size: 12px;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.real-page-columns {
+  grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
+  gap: 14px;
+}
+
+.real-table,
+.event-stack,
+.memory-stack,
+.agent-runtime-stack,
+.weight-list {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
+.real-table-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1.2fr) repeat(5, minmax(0, 0.8fr));
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0d1420;
+  color: var(--soft);
+  font-size: 12px;
+}
+
+.real-table-workflows .real-table-row {
+  grid-template-columns: minmax(150px, 1.1fr) repeat(5, minmax(0, 0.8fr));
+}
+
+.real-table-row strong,
+.real-table-row span,
+.weight-list-row span,
+.weight-list-row strong {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.real-table-row strong {
+  color: var(--text);
+}
+
+.weight-list {
+  margin-top: 12px;
+}
+
+.weight-list h3 {
+  color: var(--soft);
+  font-size: 13px;
+}
+
+.weight-list-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0d1420;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.weight-list-row strong {
+  color: var(--text);
+}
+
+.severity-strip,
+.workflow-chip-list {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+.severity-item,
+.workflow-chip-list span,
+.runtime-badge {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0d1420;
+}
+
+.severity-item span,
+.severity-item strong,
+.workflow-chip-list span,
+.runtime-badge span,
+.runtime-badge strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.severity-item span,
+.runtime-badge span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.severity-item strong,
+.runtime-badge strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--text);
+  font-family:
+    "Fira Code",
+    Consolas,
+    monospace;
+}
+
+.severity-item.tone-red {
+  border-color: rgba(230, 92, 92, 0.34);
+}
+
+.severity-item.tone-amber {
+  border-color: rgba(216, 163, 51, 0.34);
+}
+
+.severity-item.tone-blue {
+  border-color: rgba(79, 140, 255, 0.34);
+}
+
+.event-row {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 9px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0d1420;
+}
+
+.event-row svg,
+.memory-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #101827;
+  color: var(--soft);
+}
+
+.event-row.tone-red svg {
+  color: var(--red);
+}
+
+.event-row.tone-amber svg {
+  color: var(--amber);
+}
+
+.event-row.tone-blue svg {
+  color: var(--blue);
+}
+
+.event-row strong,
+.event-row span,
+.event-row p {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+}
+
+.event-row strong {
+  display: block;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.event-row span {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.event-row p {
+  margin-top: 6px;
+  color: var(--soft);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.workflow-chip-list {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.workflow-chip-list span {
+  color: var(--soft);
+  font-size: 12px;
+}
+
+.runtime-badge {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.runtime-badge svg {
+  color: var(--green);
+}
+
+.memory-timeline {
+  min-width: 0;
+}
+
+.memory-item {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0d1420;
+}
+
+.memory-icon {
+  width: 32px;
+  height: 32px;
+  color: var(--blue);
+}
+
+.memory-item-head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.memory-item-head strong,
+.memory-item-head span,
+.memory-item p,
+.memory-item em {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+}
+
+.memory-item-head strong {
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.memory-item-head span {
+  flex: 0 0 auto;
+  color: var(--blue);
+  font-family:
+    "Fira Code",
+    Consolas,
+    monospace;
+  font-size: 12px;
+}
+
+.memory-item p {
+  margin-top: 6px;
+  color: var(--soft);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.memory-item em {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-style: normal;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .recommendation-workspace,
 .recommendation-panel {
   min-width: 0;
@@ -4356,6 +4730,10 @@ tbody tr:last-child td {
   .recommendation-row-main,
   .recommendation-expanded,
   .feedback-options,
+  .real-metric-grid,
+  .real-page-columns,
+  .severity-strip,
+  .workflow-chip-list,
   .task-metric-grid,
   .task-runtime-grid,
   .stage-row,
@@ -4394,6 +4772,7 @@ tbody tr:last-child td {
 
   .recommendation-head,
   .recommendation-expanded-actions,
+  .real-page-head,
   .feedback-dialog header,
   .feedback-dialog footer {
     align-items: stretch;
@@ -4410,6 +4789,19 @@ tbody tr:last-child td {
 
   .recommendation-row-main > *:nth-child(n + 3) {
     grid-column: 2;
+  }
+
+  .real-table-row,
+  .real-table-workflows .real-table-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .real-alert-band span,
+  .event-row strong,
+  .event-row span,
+  .memory-item-head strong,
+  .memory-item em {
+    white-space: normal;
   }
 
   .recommendation-actions {

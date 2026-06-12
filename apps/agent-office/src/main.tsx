@@ -96,8 +96,12 @@ import {
   type TaskMonitorItem,
   type TaskMonitorSourceRateState,
 } from "./taskMonitorView";
+import { AgentPage } from "./pages/AgentPage";
+import { MemoryPage } from "./pages/MemoryPage";
+import { PortfolioPage } from "./pages/PortfolioPage";
 import { ReportPage } from "./pages/ReportPage";
 import { RecommendationPage } from "./pages/RecommendationPage";
+import { RiskPage } from "./pages/RiskPage";
 import "./styles.css";
 
 const ownerId = "default-owner";
@@ -725,12 +729,7 @@ function DetailPage({
 }: ConsolePageProps & { activeNav: NavId }) {
   switch (activeNav) {
     case "portfolio":
-      return (
-        <section className="page-grid">
-          <PortfolioPanel portfolio={portfolio} />
-          <RiskPanel risks={risks} />
-        </section>
-      );
+      return <PortfolioPage ownerId={ownerId} initialPayload={portfolio} />;
     case "watchlist":
       return (
         <section className="page-grid">
@@ -746,30 +745,13 @@ function DetailPage({
     case "recommendation":
       return <RecommendationPage ownerId={ownerId} />;
     case "risk":
-      return (
-        <section className="page-grid">
-          <RiskPanel risks={risks} />
-          <DataHealthPanel dataHealth={dataHealth} />
-          <PortfolioPanel portfolio={portfolio} />
-        </section>
-      );
+      return <RiskPage ownerId={ownerId} initialPayload={risks} />;
     case "agent":
-      return (
-        <section className="page-grid">
-          <AgentSummaryPanel workflows={workflows} models={models} modelPreview={modelPreview} />
-          <MemoryPanel memories={memories} />
-        </section>
-      );
+      return <AgentPage ownerId={ownerId} initialPayload={workflows} />;
     case "report":
       return <ReportPage ownerId={ownerId} initialWorkflowRunId={reportWorkflowRunId} />;
     case "memory":
-      return (
-        <section className="page-grid">
-          <MemoryPanel memories={memories} />
-          <WatchlistPanel watchlists={watchlists} />
-          <RecommendationPanel recommendations={recommendations} />
-        </section>
-      );
+      return <MemoryPage ownerId={ownerId} initialPayload={memories} />;
     case "data":
       return (
         <section className="page-grid">
