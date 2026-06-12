@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from finance_agent.application.action_loop_service import ActionLoopService
+from finance_agent.application.action_loop_service import ActionLoopService, ExecutionRegistration
 
 
 NOW = datetime(2026, 6, 13, 10, 30, tzinfo=UTC)
@@ -36,8 +36,10 @@ class FakeMemoryService:
 
 class FakeActionRepository:
     def __init__(self) -> None:
+        self.executions_by_id: dict[str, Any] = {}
         self.superseded: list[dict[str, Any]] = []
         self.drafts: list[dict[str, Any]] = []
+        self.executions: list[dict[str, Any]] = []
 
     def supersede_active_order_drafts(self, **kwargs: Any) -> int:
         self.superseded.append(kwargs)
@@ -45,6 +47,69 @@ class FakeActionRepository:
 
     def upsert_order_draft(self, **kwargs: Any) -> Any:
         self.drafts.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    def get_order_draft(self, order_draft_id: str) -> Any | None:
+        return next(
+            (
+                SimpleNamespace(**draft)
+                for draft in self.drafts
+                if draft["order_draft_id"] == order_draft_id
+            ),
+            None,
+        )
+
+    def get_execution_record(self, execution_id: str) -> Any | None:
+        return self.executions_by_id.get(execution_id)
+
+    def upsert_execution_record(self, **kwargs: Any) -> Any:
+        self.executions.append(kwargs)
+        record = SimpleNamespace(**kwargs)
+        self.executions_by_id[kwargs["execution_id"]] = record
+        return record
+
+
+class FakePortfolioService:
+    def __init__(self, positions: list[Any] | None = None) -> None:
+        self.positions = positions or []
+        self.upserts: list[dict[str, Any]] = []
+
+    def load_portfolio_snapshot(self, portfolio_id: str) -> Any:
+        return SimpleNamespace(portfolio=SimpleNamespace(portfolio_id=portfolio_id), positions=tuple(self.positions))
+
+    def upsert_position(self, **kwargs: Any) -> Any:
+        self.upserts.append(kwargs)
+        position = SimpleNamespace(**kwargs)
+        self.positions = [
+            existing
+            for existing in self.positions
+            if not (
+                existing.portfolio_id == kwargs["portfolio_id"]
+                and existing.asset_id == kwargs["asset_id"]
+                and existing.side == kwargs["side"]
+            )
+        ]
+        self.positions.append(position)
+        return position
+
+
+class FakeExecutionMemoryService(FakeMemoryService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.decisions: list[dict[str, Any]] = []
+        self.memories: list[dict[str, Any]] = []
+        self.review_tasks: list[dict[str, Any]] = []
+
+    def record_decision(self, **kwargs: Any) -> Any:
+        self.decisions.append(kwargs)
+        return SimpleNamespace(decision_id=kwargs["decision_id"])
+
+    def upsert_memory(self, **kwargs: Any) -> Any:
+        self.memories.append(kwargs)
+        return SimpleNamespace(memory_id=kwargs["memory_id"])
+
+    def schedule_review(self, **kwargs: Any) -> Any:
+        self.review_tasks.append(kwargs)
         return SimpleNamespace(**kwargs)
 
 
@@ -157,6 +222,186 @@ def test_create_order_draft_supersedes_old_draft_and_builds_new_one() -> None:
     assert "非投资建议" in draft.disclaimer
 
 
+def test_record_execution_buy_adds_weighted_average_position() -> None:
+    """买入登记应写执行记录，并按加权平均成本更新已有持仓。"""
+
+    position = build_position(quantity=Decimal("100"), avg_cost=Decimal("10"))
+    repository = FakeActionRepository()
+    portfolio = FakePortfolioService([position])
+    memory = FakeExecutionMemoryService()
+
+    record = ActionLoopService(
+        session=FakeDecisionStore([]),
+        action_repository=repository,
+        portfolio_service=portfolio,
+        memory_service=memory,
+        now=lambda: NOW,
+    ).record_execution(
+        ExecutionRegistration(
+            owner_id="owner:demo",
+            portfolio_id="portfolio:demo",
+            asset_id="ashare:600519",
+            market="ashare",
+            action="buy",
+            executed_price=Decimal("12"),
+            executed_quantity=Decimal("50"),
+            executed_at=NOW,
+            decision_log_id="decision:600519:1",
+            order_draft_id=None,
+            fee=Decimal("3"),
+            note="外部软件已执行。",
+        )
+    )
+
+    assert record.source == "user_reported"
+    assert repository.executions[0]["execution_id"].startswith("execution:owner:demo:ashare-600519:")
+    updated = portfolio.upserts[0]
+    assert updated["quantity"] == Decimal("150")
+    assert updated["avg_cost"] == Decimal("10.6666666667")
+    assert updated["last_price"] == Decimal("12")
+    assert updated["market_value"] == Decimal("1800")
+    assert updated["status"] == "active"
+    assert memory.memories[0]["memory_type"] == "execution_note"
+    assert memory.review_tasks[0]["source_decision_id"] == "decision:600519:1"
+
+
+def test_record_execution_sell_rejects_oversell() -> None:
+    """卖出登记不得超过当前持仓数量。"""
+
+    position = build_position(quantity=Decimal("100"), avg_cost=Decimal("10"))
+    repository = FakeActionRepository()
+
+    with pytest.raises(ValueError, match="卖出数量不能超过当前持仓"):
+        ActionLoopService(
+            session=FakeDecisionStore([]),
+            action_repository=repository,
+            portfolio_service=FakePortfolioService([position]),
+            memory_service=FakeExecutionMemoryService(),
+            now=lambda: NOW,
+        ).record_execution(
+            ExecutionRegistration(
+                owner_id="owner:demo",
+                portfolio_id="portfolio:demo",
+                asset_id="ashare:600519",
+                market="ashare",
+                action="sell",
+                executed_price=Decimal("11"),
+                executed_quantity=Decimal("120"),
+                executed_at=NOW,
+            )
+        )
+    assert repository.executions == []
+
+
+def test_record_execution_sell_closes_position_when_quantity_zero() -> None:
+    """卖出登记清空持仓后，应把持仓状态置为 closed。"""
+
+    position = build_position(quantity=Decimal("100"), avg_cost=Decimal("10"))
+    portfolio = FakePortfolioService([position])
+
+    ActionLoopService(
+        session=FakeDecisionStore([]),
+        action_repository=FakeActionRepository(),
+        portfolio_service=portfolio,
+        memory_service=FakeExecutionMemoryService(),
+        now=lambda: NOW,
+    ).record_execution(
+        ExecutionRegistration(
+            owner_id="owner:demo",
+            portfolio_id="portfolio:demo",
+            asset_id="ashare:600519",
+            market="ashare",
+            action="sell",
+            executed_price=Decimal("11"),
+            executed_quantity=Decimal("100"),
+            executed_at=NOW,
+        )
+    )
+
+    updated = portfolio.upserts[0]
+    assert updated["quantity"] == Decimal("0")
+    assert updated["avg_cost"] == Decimal("10")
+    assert updated["status"] == "closed"
+
+
+def test_record_execution_allows_autonomous_registration_without_draft() -> None:
+    """用户自主交易也可以登记，只要来源仍是 user_reported。"""
+
+    repository = FakeActionRepository()
+    portfolio = FakePortfolioService()
+
+    record = ActionLoopService(
+        session=FakeDecisionStore([]),
+        action_repository=repository,
+        portfolio_service=portfolio,
+        memory_service=FakeExecutionMemoryService(),
+        now=lambda: NOW,
+    ).record_execution(
+        ExecutionRegistration(
+            owner_id="owner:demo",
+            portfolio_id="portfolio:demo",
+            asset_id="ashare:000001",
+            market="ashare",
+            action="buy",
+            executed_price=Decimal("10"),
+            executed_quantity=Decimal("100"),
+            executed_at=NOW,
+        )
+    )
+
+    assert record.order_draft_id is None
+    assert record.decision_log_id is None
+    assert portfolio.upserts[0]["position_id"] == "position:portfolio:demo:ashare-000001:long"
+
+
+def test_record_execution_is_idempotent_by_execution_id() -> None:
+    """同一个 execution_id 重复提交不得重复更新持仓。"""
+
+    existing_record = SimpleNamespace(
+        execution_id="execution:fixed",
+        owner_id="owner:demo",
+        portfolio_id="portfolio:demo",
+        asset_id="ashare:600519",
+        market="ashare",
+        order_draft_id=None,
+        decision_log_id=None,
+        action="buy",
+        executed_price=Decimal("10"),
+        executed_quantity=Decimal("100"),
+        executed_at=NOW,
+        fee=None,
+        note=None,
+        source="user_reported",
+    )
+    repository = FakeActionRepository()
+    repository.executions_by_id[existing_record.execution_id] = existing_record
+    portfolio = FakePortfolioService()
+
+    result = ActionLoopService(
+        session=FakeDecisionStore([]),
+        action_repository=repository,
+        portfolio_service=portfolio,
+        memory_service=FakeExecutionMemoryService(),
+        now=lambda: NOW,
+    ).record_execution(
+        ExecutionRegistration(
+            execution_id="execution:fixed",
+            owner_id="owner:demo",
+            portfolio_id="portfolio:demo",
+            asset_id="ashare:600519",
+            market="ashare",
+            action="buy",
+            executed_price=Decimal("10"),
+            executed_quantity=Decimal("100"),
+            executed_at=NOW,
+        )
+    )
+
+    assert result is existing_record
+    assert repository.executions == []
+    assert portfolio.upserts == []
+
+
 def build_decision(
     *,
     user_action: str,
@@ -175,4 +420,31 @@ def build_decision(
         summary="等待用户确认。",
         workflow_run_id="workflow:1",
         payload=payload or {"review_status": "pending_user_confirmation"},
+    )
+
+
+def build_position(
+    *,
+    quantity: Decimal,
+    avg_cost: Decimal,
+    status: str = "active",
+) -> Any:
+    return SimpleNamespace(
+        position_id="position:portfolio:demo:ashare-600519:long",
+        portfolio_id="portfolio:demo",
+        asset_id="ashare:600519",
+        symbol="600519",
+        market="ashare",
+        side="long",
+        quantity=quantity,
+        avg_cost=avg_cost,
+        last_price=avg_cost,
+        market_value=quantity * avg_cost,
+        unrealized_pnl=None,
+        unrealized_pnl_pct=None,
+        portfolio_weight=None,
+        leverage=None,
+        liquidation_price=None,
+        status=status,
+        payload={},
     )

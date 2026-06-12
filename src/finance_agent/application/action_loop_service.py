@@ -7,14 +7,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol
 
 from sqlalchemy.orm import Session
 
 from finance_agent.application.memory_service import MemoryService
-from finance_agent.storage.orm import DecisionLogORM, OrderDraftORM
+from finance_agent.application.portfolio_service import PortfolioService, PortfolioSnapshot
+from finance_agent.storage.orm import DecisionLogORM, ExecutionRecordORM, OrderDraftORM, PositionORM
 from finance_agent.storage.repositories import (
     ACTION_LOOP_DISCLAIMER,
     ActionLoopRepository,
@@ -24,17 +25,27 @@ JsonDict = dict[str, Any]
 EXECUTABLE_ACTIONS = {"buy", "sell", "add", "reduce"}
 HIGH_RISK_ACTIONS = {"sell", "reduce"}
 APPROVED_REVIEW_STATUSES = {"approved_by_review", "pending_user_confirmation"}
+POSITION_QUANT = Decimal("0.0000000001")
 
 
-class FeedbackMemoryService(Protocol):
-    """确认决策时需要的用户反馈记忆端口。"""
+class ActionLoopMemoryService(Protocol):
+    """人工确认、执行登记和复盘任务需要的记忆端口。"""
 
     def record_user_feedback(self, **kwargs: Any) -> Any:
         """记录用户反馈并反写 Finance Memory。"""
 
+    def record_decision(self, **kwargs: Any) -> Any:
+        """记录执行登记审计节点。"""
+
+    def upsert_memory(self, **kwargs: Any) -> Any:
+        """沉淀执行登记记忆。"""
+
+    def schedule_review(self, **kwargs: Any) -> Any:
+        """创建后续复盘任务。"""
+
 
 class ActionRepository(Protocol):
-    """订单草案仓储端口。"""
+    """订单草案和执行登记仓储端口。"""
 
     def supersede_active_order_drafts(
         self,
@@ -46,6 +57,25 @@ class ActionRepository(Protocol):
 
     def upsert_order_draft(self, **kwargs: Any) -> OrderDraftORM:
         """写入订单草案。"""
+
+    def get_order_draft(self, order_draft_id: str) -> OrderDraftORM | None:
+        """查询订单草案。"""
+
+    def get_execution_record(self, execution_id: str) -> ExecutionRecordORM | None:
+        """查询执行登记。"""
+
+    def upsert_execution_record(self, **kwargs: Any) -> ExecutionRecordORM:
+        """写入执行登记。"""
+
+
+class PortfolioPositionService(Protocol):
+    """执行登记更新持仓需要的组合服务端口。"""
+
+    def load_portfolio_snapshot(self, portfolio_id: str) -> PortfolioSnapshot:
+        """读取组合当前持仓。"""
+
+    def upsert_position(self, **kwargs: Any) -> PositionORM:
+        """幂等写入当前持仓和快照。"""
 
 
 @dataclass(frozen=True)
@@ -59,6 +89,36 @@ class DecisionConfirmationResult:
     suggested_action: str
 
 
+@dataclass(frozen=True)
+class ExecutionRegistration:
+    """用户在外部交易软件完成操作后的手工登记。"""
+
+    owner_id: str
+    portfolio_id: str
+    asset_id: str
+    market: str
+    action: str
+    executed_price: Decimal
+    executed_quantity: Decimal
+    executed_at: datetime
+    execution_id: str | None = None
+    order_draft_id: str | None = None
+    decision_log_id: str | None = None
+    fee: Decimal | None = None
+    note: str | None = None
+    source: str = "user_reported"
+
+
+@dataclass(frozen=True)
+class PositionUpdate:
+    """执行登记预校验后的持仓更新结果。"""
+
+    position_id: str
+    quantity: Decimal
+    avg_cost: Decimal | None
+    status: str
+
+
 class ActionLoopService:
     """人工确认与订单草案服务。"""
 
@@ -66,13 +126,15 @@ class ActionLoopService:
         self,
         session: Session,
         *,
-        memory_service: FeedbackMemoryService | None = None,
+        memory_service: ActionLoopMemoryService | None = None,
         action_repository: ActionRepository | None = None,
+        portfolio_service: PortfolioPositionService | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.session = session
         self.memory_service = memory_service or MemoryService(session)
         self.action_repository = action_repository or ActionLoopRepository(session)
+        self.portfolio_service = portfolio_service or PortfolioService(session)
         self.now = now or (lambda: datetime.now().astimezone())
 
     def confirm_decision(
@@ -161,6 +223,178 @@ class ActionLoopService:
             updated_at=created_at,
         )
 
+    def record_execution(self, registration: ExecutionRegistration) -> ExecutionRecordORM:
+        """登记用户外部执行结果，并同步当前持仓与后续复盘任务。"""
+
+        execution_id = registration.execution_id or build_execution_id(
+            registration=registration,
+            as_of=registration.executed_at,
+        )
+        existing = self.action_repository.get_execution_record(execution_id)
+        if existing is not None:
+            return existing
+        normalized_action = normalize_action(registration.action)
+        validate_execution_registration(
+            registration=registration,
+            action=normalized_action,
+        )
+        decision_log_id = resolve_execution_decision_log_id(
+            repository=self.action_repository,
+            registration=registration,
+        )
+        current = find_current_position(
+            self.portfolio_service.load_portfolio_snapshot(registration.portfolio_id),
+            asset_id=registration.asset_id,
+        )
+        position_update = build_position_update_from_registration(
+            registration=registration,
+            action=normalized_action,
+            current=current,
+        )
+        record = self.action_repository.upsert_execution_record(
+            execution_id=execution_id,
+            owner_id=registration.owner_id,
+            portfolio_id=registration.portfolio_id,
+            asset_id=registration.asset_id,
+            market=registration.market,
+            order_draft_id=registration.order_draft_id,
+            decision_log_id=decision_log_id,
+            action=normalized_action,
+            executed_price=registration.executed_price,
+            executed_quantity=registration.executed_quantity,
+            executed_at=registration.executed_at,
+            fee=registration.fee,
+            note=registration.note,
+            source=registration.source,
+            created_at=self.now(),
+        )
+        position = self.apply_position_update(record=record, update=position_update)
+        self.record_execution_audit(record=record, position=position)
+        return record
+
+    def update_position_from_execution(self, execution: ExecutionRecordORM) -> PositionORM:
+        """根据执行登记更新当前持仓。"""
+
+        current = find_current_position(
+            self.portfolio_service.load_portfolio_snapshot(execution.portfolio_id),
+            asset_id=execution.asset_id,
+        )
+        update = build_position_update_from_registration(
+            registration=ExecutionRegistration(
+                execution_id=execution.execution_id,
+                owner_id=execution.owner_id,
+                portfolio_id=execution.portfolio_id,
+                asset_id=execution.asset_id,
+                market=execution.market,
+                action=execution.action,
+                executed_price=execution.executed_price,
+                executed_quantity=execution.executed_quantity,
+                executed_at=execution.executed_at,
+                order_draft_id=execution.order_draft_id,
+                decision_log_id=execution.decision_log_id,
+                fee=execution.fee,
+                note=execution.note,
+                source=execution.source,
+            ),
+            action=execution.action,
+            current=current,
+        )
+        return self.apply_position_update(record=execution, update=update)
+
+    def apply_position_update(
+        self,
+        *,
+        record: ExecutionRecordORM,
+        update: "PositionUpdate",
+    ) -> PositionORM:
+        """写入已校验的持仓更新。"""
+
+        return self.portfolio_service.upsert_position(
+            position_id=update.position_id,
+            portfolio_id=record.portfolio_id,
+            asset_id=record.asset_id,
+            symbol=resolve_asset_symbol(record.asset_id),
+            market=record.market,
+            side="long",
+            quantity=update.quantity,
+            avg_cost=update.avg_cost,
+            last_price=record.executed_price,
+            market_value=(update.quantity * record.executed_price).quantize(POSITION_QUANT),
+            status=update.status,
+            as_of=record.executed_at,
+            snapshot_source="action_loop_execution",
+            payload={
+                "source_execution_id": record.execution_id,
+                "last_execution_action": record.action,
+                "last_execution_at": record.executed_at.isoformat(),
+            },
+        )
+
+    def record_execution_audit(
+        self,
+        *,
+        record: ExecutionRecordORM,
+        position: PositionORM,
+    ) -> None:
+        """沉淀执行登记审计节点、执行记忆和后续复盘任务。"""
+
+        payload = {
+            "execution_id": record.execution_id,
+            "order_draft_id": record.order_draft_id,
+            "source_decision_id": record.decision_log_id,
+            "position_id": position.position_id,
+            "action": record.action,
+            "executed_price": str(record.executed_price),
+            "executed_quantity": str(record.executed_quantity),
+            "fee": str(record.fee) if record.fee is not None else None,
+        }
+        execution_decision = self.memory_service.record_decision(
+            decision_id=build_execution_decision_id(record.execution_id),
+            owner_id=record.owner_id,
+            portfolio_id=record.portfolio_id,
+            asset_id=record.asset_id,
+            decision_type="execution_registration",
+            suggested_action=record.action,
+            user_action="executed",
+            summary=build_execution_summary(record),
+            source_recommendation_id=None,
+            source_alert_id=None,
+            workflow_run_id=None,
+            reason_ids=[],
+            risk_ids=[],
+            evidence_ids=[],
+            created_at=record.executed_at,
+            payload=payload,
+        )
+        self.memory_service.upsert_memory(
+            memory_id=build_execution_memory_id(record.execution_id),
+            owner_id=record.owner_id,
+            memory_type="execution_note",
+            scope="asset",
+            asset_id=record.asset_id,
+            source_decision_id=execution_decision.decision_id,
+            content=build_execution_summary(record),
+            confidence=Decimal("0.900000"),
+            payload=payload,
+            auto_index=False,
+        )
+        self.memory_service.schedule_review(
+            review_task_id=build_execution_review_task_id(record.execution_id),
+            owner_id=record.owner_id,
+            asset_id=record.asset_id,
+            source_decision_id=record.decision_log_id,
+            review_type="execution_outcome",
+            due_at=record.executed_at + timedelta(days=20),
+            status="pending",
+            review_questions=[
+                {
+                    "question": "比较原建议、实际执行价格和后续表现，判断执行是否改善了结果。",
+                    "source": "action_loop_execution",
+                }
+            ],
+            payload=payload,
+        )
+
     def _get_decision(self, decision_log_id: str) -> DecisionLogORM:
         decision = self.session.get(DecisionLogORM, decision_log_id)
         if decision is None:
@@ -179,6 +413,176 @@ def resolve_feedback_user_action(*, feedback: str, modified_action: str | None =
     if feedback not in {"accepted", "rejected", "deferred"}:
         raise ValueError(f"不支持的反馈类型：{feedback}")
     return feedback
+
+
+def validate_execution_registration(
+    *,
+    registration: ExecutionRegistration,
+    action: str,
+) -> None:
+    """校验用户执行登记输入。"""
+
+    if registration.source != "user_reported":
+        raise ValueError("执行登记 source 当前只能为 user_reported")
+    if action not in EXECUTABLE_ACTIONS:
+        raise ValueError(f"不支持的执行动作：{registration.action}")
+    if registration.executed_price <= 0:
+        raise ValueError("执行价格必须大于 0")
+    if registration.executed_quantity <= 0:
+        raise ValueError("执行数量必须大于 0")
+
+
+def resolve_execution_decision_log_id(
+    *,
+    repository: ActionRepository,
+    registration: ExecutionRegistration,
+) -> str | None:
+    """解析执行登记关联的原始决策 ID。"""
+
+    if registration.decision_log_id:
+        return registration.decision_log_id
+    if not registration.order_draft_id:
+        return None
+    draft = repository.get_order_draft(registration.order_draft_id)
+    return draft.decision_log_id if draft is not None else None
+
+
+def find_current_position(
+    snapshot: PortfolioSnapshot,
+    *,
+    asset_id: str,
+    side: str = "long",
+) -> PositionORM | None:
+    """从组合快照里找到当前活跃持仓。"""
+
+    for position in snapshot.positions:
+        if (
+            position.asset_id == asset_id
+            and position.side == side
+            and getattr(position, "status", "active") == "active"
+        ):
+            return position
+    return None
+
+
+def build_position_update_from_registration(
+    *,
+    registration: ExecutionRegistration,
+    action: str,
+    current: PositionORM | None,
+) -> PositionUpdate:
+    """根据执行登记预计算并校验持仓变化。"""
+
+    position_id = getattr(
+        current,
+        "position_id",
+        build_position_id(
+            portfolio_id=registration.portfolio_id,
+            asset_id=registration.asset_id,
+            side="long",
+        ),
+    )
+    if action in {"buy", "add"}:
+        current_quantity = decimal_or_zero(getattr(current, "quantity", None))
+        return PositionUpdate(
+            position_id=position_id,
+            quantity=current_quantity + registration.executed_quantity,
+            avg_cost=weighted_average_cost(
+                current_quantity=current_quantity,
+                current_avg_cost=getattr(current, "avg_cost", None),
+                added_quantity=registration.executed_quantity,
+                added_price=registration.executed_price,
+            ),
+            status="active",
+        )
+    if action in {"sell", "reduce"}:
+        if current is None or getattr(current, "status", "active") != "active":
+            raise ValueError(f"当前没有可卖出持仓：{registration.asset_id}")
+        current_quantity = decimal_or_zero(current.quantity)
+        if registration.executed_quantity > current_quantity:
+            raise ValueError("卖出数量不能超过当前持仓")
+        quantity = current_quantity - registration.executed_quantity
+        return PositionUpdate(
+            position_id=position_id,
+            quantity=quantity,
+            avg_cost=current.avg_cost,
+            status="closed" if quantity == 0 else "active",
+        )
+    raise ValueError(f"不支持的执行动作：{registration.action}")
+
+
+def decimal_or_zero(value: Decimal | None) -> Decimal:
+    """把可空 Decimal 归一为 0。"""
+
+    return value if value is not None else Decimal("0")
+
+
+def weighted_average_cost(
+    *,
+    current_quantity: Decimal,
+    current_avg_cost: Decimal | None,
+    added_quantity: Decimal,
+    added_price: Decimal,
+) -> Decimal:
+    """计算买入/加仓后的加权平均成本。"""
+
+    total_quantity = current_quantity + added_quantity
+    if total_quantity <= 0:
+        raise ValueError("持仓数量必须大于 0")
+    current_cost = current_quantity * decimal_or_zero(current_avg_cost)
+    added_cost = added_quantity * added_price
+    return ((current_cost + added_cost) / total_quantity).quantize(POSITION_QUANT)
+
+
+def build_execution_id(*, registration: ExecutionRegistration, as_of: datetime) -> str:
+    """生成执行登记 ID。"""
+
+    asset_part = registration.asset_id.replace(":", "-")
+    stamp = as_of.astimezone(UTC).strftime("%Y%m%d%H%M%S%f")
+    return f"execution:{registration.owner_id}:{asset_part}:{stamp}"
+
+
+def build_position_id(*, portfolio_id: str, asset_id: str, side: str) -> str:
+    """生成持仓 ID。"""
+
+    asset_part = asset_id.replace(":", "-")
+    return f"position:{portfolio_id}:{asset_part}:{side}"
+
+
+def build_execution_decision_id(execution_id: str) -> str:
+    """生成执行登记审计决策 ID。"""
+
+    return f"decision:{execution_id}:registration"
+
+
+def build_execution_memory_id(execution_id: str) -> str:
+    """生成执行登记记忆 ID。"""
+
+    return f"memory:{execution_id}:execution_note"
+
+
+def build_execution_review_task_id(execution_id: str) -> str:
+    """生成执行登记后续复盘任务 ID。"""
+
+    return f"review:{execution_id}:outcome"
+
+
+def build_execution_summary(record: ExecutionRecordORM) -> str:
+    """生成执行登记摘要。"""
+
+    note = f"备注：{record.note}" if record.note else "无备注。"
+    return (
+        f"用户登记外部执行：{record.action} {record.asset_id}，"
+        f"价格 {record.executed_price}，数量 {record.executed_quantity}。{note}"
+    )
+
+
+def resolve_asset_symbol(asset_id: str) -> str:
+    """从资产 ID 中解析交易代码。"""
+
+    if ":" in asset_id:
+        return asset_id.split(":", 1)[1]
+    return asset_id
 
 
 def update_decision_feedback_state(
