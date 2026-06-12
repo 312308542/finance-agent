@@ -695,6 +695,7 @@ def export_scheduler_payload(config: DataSyncConfig) -> JsonDict:
             *build_technical_screening_scheduler_jobs(config),
             *build_universe_preparation_scheduler_jobs(config),
             *build_recommendation_scheduler_jobs(config),
+            *build_backtest_scheduler_jobs(config),
             *build_trigger_scheduler_jobs(config),
         ],
         "processing": preview_data_processing_plan(config, tasks=tasks),
@@ -841,6 +842,40 @@ def build_recommendation_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict
                 )
             )
     return jobs
+
+
+def build_backtest_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
+    """为推荐策略生成低频回测任务。"""
+
+    if not config.enabled:
+        return []
+    ashare_config = config.markets.get("ashare")
+    if ashare_config is None or not ashare_config.enabled:
+        return []
+    if "market_bars" not in ashare_config.data_packages:
+        return []
+    return [
+        {
+            "name": "analytics.backtest.weekly",
+            "job_type": "backtest_run",
+            "group": "analytics",
+            "enabled": True,
+            "interval_seconds": 7 * 24 * 60 * 60,
+            "market": "ashare",
+            "depends_on": ["analytics.recommendations.ashare.all_a"],
+            "params": {
+                "sync_task_type": "analytics.backtest.weekly",
+                "strategy": "factor_score_topn",
+                "universe_id": "universe:merged:ashare:recommendation",
+                "strategy_id": "strategy:ashare:short_swing",
+                "years": 5,
+                "score_mode": "replayed",
+                "topn": 20,
+                "rebalance": "once",
+                "timeframe": (ashare_config.timeframes or ["1d"])[0],
+            },
+        }
+    ]
 
 
 def build_universe_preparation_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:

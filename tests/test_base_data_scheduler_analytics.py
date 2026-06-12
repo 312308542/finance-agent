@@ -245,6 +245,39 @@ def test_parse_scheduler_config_accepts_reviews_due_job() -> None:
     assert config.jobs[0].group == "analytics"
 
 
+def test_parse_scheduler_config_accepts_backtest_run_job() -> None:
+    """调度配置应能表达低频策略回测任务。"""
+
+    config = parse_scheduler_config(
+        {
+            "enabled": True,
+            "jobs": [
+                {
+                    "name": "analytics.backtest.weekly",
+                    "job_type": "backtest_run",
+                    "group": "analytics",
+                    "enabled": True,
+                    "interval_seconds": 7 * 24 * 60 * 60,
+                    "market": "ashare",
+                    "depends_on": ["analytics.recommendations.ashare.all_a"],
+                    "params": {
+                        "sync_task_type": "analytics.backtest.weekly",
+                        "strategy": "factor_score_topn",
+                        "universe_id": "universe:merged:ashare:recommendation",
+                        "strategy_id": "strategy:ashare:short_swing",
+                        "years": 5,
+                        "score_mode": "replayed",
+                    },
+                }
+            ],
+        }
+    )
+
+    assert config.jobs[0].job_type == "backtest_run"
+    assert config.jobs[0].group == "analytics"
+    assert config.jobs[0].depends_on == ("analytics.recommendations.ashare.all_a",)
+
+
 def test_parse_scheduler_config_accepts_universe_merge_and_avoid_pool_jobs() -> None:
     """调度配置应能表达候选池合并和回避池重建任务。"""
 
@@ -946,6 +979,71 @@ def test_scheduler_runs_universe_merge_without_collection() -> None:
                 "universe:technical:ashare:main_board": 2.0,
             },
             "strategy_context": "recommendation_universe_merge",
+        }
+    ]
+
+
+def test_scheduler_runs_backtest_without_collection() -> None:
+    """回测任务应调用回测执行器，而不是误走基础采集入口。"""
+
+    calls: list[dict[str, Any]] = []
+
+    def run_backtest(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "status": "available",
+            "backtest_id": "bt:ashare:short_swing:20260613",
+            "metrics": {"cagr": 0.12},
+        }
+
+    def collect_base_data(_: Any) -> dict[str, Any]:
+        raise AssertionError("回测任务不应调用基础采集入口")
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="analytics.backtest.weekly",
+                job_type="backtest_run",
+                group="analytics",
+                interval_seconds=7 * 24 * 60 * 60,
+                market="ashare",
+                depends_on=("analytics.recommendations.ashare.all_a",),
+                params={
+                    "strategy": "factor_score_topn",
+                    "universe_id": "universe:merged:ashare:recommendation",
+                    "strategy_id": "strategy:ashare:short_swing",
+                    "years": 5,
+                    "score_mode": "replayed",
+                    "topn": 20,
+                    "rebalance": "once",
+                    "timeframe": "1d",
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        run_backtest_func=run_backtest,
+    )
+
+    result = scheduler.run_once()
+
+    assert result["jobs"][0]["status"] == "executed"
+    assert result["jobs"][0]["summary"]["backtest_id"] == "bt:ashare:short_swing:20260613"
+    assert calls == [
+        {
+            "market": "ashare",
+            "strategy": "factor_score_topn",
+            "universe_id": "universe:merged:ashare:recommendation",
+            "strategy_id": "strategy:ashare:short_swing",
+            "years": 5,
+            "score_mode": "replayed",
+            "topn": 20,
+            "rebalance": "once",
+            "timeframe": "1d",
         }
     ]
 

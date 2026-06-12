@@ -252,6 +252,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="只列出待复核队列，不调用模型、不写回结果。",
     )
 
+    backtest = subparsers.add_parser("backtest", help="轻量策略回测与绩效验证。")
+    backtest_commands = backtest.add_subparsers(dest="command", required=True)
+    backtest_run = backtest_commands.add_parser(
+        "run",
+        help="运行内置评分 TopN 回测策略。",
+    )
+    backtest_run.add_argument(
+        "--strategy",
+        default="factor_score_topn",
+        choices=["factor_score_topn"],
+        help="回测策略，当前支持 factor_score_topn。",
+    )
+    backtest_run.add_argument("--market", default="ashare", help="市场，默认 ashare。")
+    backtest_run.add_argument("--universe", required=True, help="回测候选池 ID。")
+    backtest_run.add_argument("--strategy-id", required=True, help="评分策略 ID。")
+    backtest_run.add_argument("--years", type=int, default=5, help="回测年限，默认 5 年。")
+    backtest_run.add_argument(
+        "--score-mode",
+        choices=["replayed", "historical"],
+        default="replayed",
+        help="评分截面模式：replayed 为当前规则回放，historical 为历史评分。",
+    )
+    backtest_run.add_argument("--topn", type=int, default=20, help="每期选取得分前 N 个标的。")
+    backtest_run.add_argument("--rebalance", default="once", help="再平衡频率，默认 once。")
+    backtest_run.add_argument("--timeframe", default="1d", help="行情周期，默认 1d。")
+    backtest_run.add_argument("--horizon", default="swing", help="评分周期，默认 swing。")
+    backtest_run.add_argument("--start-at", default=None, help="ISO 开始时间；不传则按 years 回推。")
+    backtest_run.add_argument("--end-at", default=None, help="ISO 结束时间；不传则为当前时间。")
+    backtest_run.add_argument("--price-source", default=None, help="可选：限定行情数据源。")
+
     add_data_arguments(subparsers)
 
     models = subparsers.add_parser("models", help="模型配置、路由预览和本地测试。")
@@ -486,6 +516,8 @@ def dispatch(args: argparse.Namespace) -> JsonDict:
             return dispatch_triggers(session, args)
         if args.group == "agent":
             return dispatch_agent(session, args)
+        if args.group == "backtest":
+            return dispatch_backtest(session, args)
     raise ValueError(f"未知命令组：{args.group}")
 
 
@@ -772,6 +804,34 @@ def dispatch_agent(session: Any, args: argparse.Namespace) -> JsonDict:
         )
         return {"status": "ok", "data": result.to_dict()}
     raise ValueError(f"未知 agent 命令：{args.command}")
+
+
+def dispatch_backtest(session: Any, args: argparse.Namespace) -> JsonDict:
+    """处理轻量回测命令。"""
+
+    if args.command == "run":
+        from finance_agent.backtesting.runner import run_factor_score_topn_backtest
+
+        return {
+            "status": "ok",
+            "data": run_factor_score_topn_backtest(
+                session,
+                strategy=args.strategy,
+                market=args.market,
+                universe_id=args.universe,
+                strategy_id=args.strategy_id,
+                years=args.years,
+                score_mode=args.score_mode,
+                topn=args.topn,
+                rebalance=args.rebalance,
+                timeframe=args.timeframe,
+                horizon=args.horizon,
+                start_at=parse_datetime(args.start_at),
+                end_at=parse_datetime(args.end_at),
+                price_source=args.price_source,
+            ),
+        }
+    raise ValueError(f"未知 backtest 命令：{args.command}")
 
 
 def dispatch_models(args: argparse.Namespace) -> JsonDict:

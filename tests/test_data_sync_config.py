@@ -111,6 +111,34 @@ def test_scheduler_payload_registers_real_universe_recommendation_jobs() -> None
     )
 
 
+def test_scheduler_payload_registers_weekly_backtest_job() -> None:
+    """推荐策略应导出每周低频回测任务，形成推荐报告的历史证据来源。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+    backtest_job = jobs["analytics.backtest.weekly"]
+
+    assert backtest_job["job_type"] == "backtest_run"
+    assert backtest_job["group"] == "analytics"
+    assert backtest_job["enabled"] is True
+    assert backtest_job["interval_seconds"] == 7 * 24 * 60 * 60
+    assert backtest_job["market"] == "ashare"
+    assert backtest_job["depends_on"] == ["analytics.recommendations.ashare.all_a"]
+    assert backtest_job["params"] == {
+        "sync_task_type": "analytics.backtest.weekly",
+        "strategy": "factor_score_topn",
+        "universe_id": "universe:merged:ashare:recommendation",
+        "strategy_id": "strategy:ashare:short_swing",
+        "years": 5,
+        "score_mode": "replayed",
+        "topn": 20,
+        "rebalance": "once",
+        "timeframe": "1d",
+    }
+
+
 def test_scheduler_payload_uses_long_enough_bar_lookback_for_analytics() -> None:
     """默认补采窗口应覆盖 analytics 的最小 K 线数量，避免 technical 长期缺失。"""
 

@@ -49,6 +49,7 @@ JOB_TYPES = {
     "reviews_due",
     "universe_merge",
     "universe_avoid_pool_rebuild",
+    "backtest_run",
 }
 SCHEDULE_TYPES = {"interval", "daily_time", "trading_session", "manual", "after_success"}
 TRADING_DAY_POLICIES = {
@@ -624,6 +625,7 @@ class BaseDataScheduler:
         run_reviews_due_func: Callable[..., JsonDict] | None = None,
         run_universe_merge_func: Callable[..., JsonDict] | None = None,
         run_avoid_pool_rebuild_func: Callable[..., JsonDict] | None = None,
+        run_backtest_func: Callable[..., JsonDict] | None = None,
         sleep_func: Callable[[float], None] = time.sleep,
         status_file: str | Path | None = None,
         event_log_file: str | Path | None = None,
@@ -642,6 +644,7 @@ class BaseDataScheduler:
         self._run_reviews_due = run_reviews_due_func
         self._run_universe_merge = run_universe_merge_func
         self._run_avoid_pool_rebuild = run_avoid_pool_rebuild_func
+        self._run_backtest = run_backtest_func
         self._uses_injected_collect_base_data = collect_base_data_func is not None
         self._sleep = sleep_func
         self.status_file = Path(status_file) if status_file else None
@@ -1034,6 +1037,8 @@ class BaseDataScheduler:
             planned["universe_merge_args"] = self.build_universe_merge_kwargs(job)
         elif job.job_type == "universe_avoid_pool_rebuild":
             planned["avoid_pool_rebuild_args"] = self.build_avoid_pool_rebuild_kwargs(job)
+        elif job.job_type == "backtest_run":
+            planned["backtest_args"] = self.build_backtest_kwargs(job)
         else:
             raise ValueError(f"不支持的调度任务类型：{job.job_type}")
 
@@ -1238,6 +1243,9 @@ class BaseDataScheduler:
         if job.job_type == "universe_avoid_pool_rebuild":
             kwargs = self.build_avoid_pool_rebuild_kwargs(job)
             return self.run_avoid_pool_rebuild(**kwargs)
+        if job.job_type == "backtest_run":
+            kwargs = self.build_backtest_kwargs(job)
+            return self.run_backtest(**kwargs)
         raise ValueError(f"不支持的调度任务类型：{job.job_type}")
 
     def build_collection_args(self, job: BaseDataSchedulerJob) -> Any:
@@ -1518,6 +1526,32 @@ class BaseDataScheduler:
             "strategy_context": str(job.params.get("strategy_context") or "avoid_pool"),
         }
 
+    def build_backtest_kwargs(self, job: BaseDataSchedulerJob) -> JsonDict:
+        """把回测任务配置转换为回测运行参数。"""
+
+        if job.job_type != "backtest_run":
+            raise ValueError(f"{job.name} 不是回测任务")
+        market = str(job.params.get("market") or job.market or "").strip()
+        if not market:
+            raise ValueError(f"{job.name}.params.market 不能为空")
+        universe_id = str(job.params.get("universe_id") or "").strip()
+        if not universe_id:
+            raise ValueError(f"{job.name}.params.universe_id 不能为空")
+        strategy_id = str(job.params.get("strategy_id") or "").strip()
+        if not strategy_id:
+            raise ValueError(f"{job.name}.params.strategy_id 不能为空")
+        return {
+            "market": market,
+            "strategy": str(job.params.get("strategy") or "factor_score_topn"),
+            "universe_id": universe_id,
+            "strategy_id": strategy_id,
+            "years": int(job.params.get("years") or 5),
+            "score_mode": str(job.params.get("score_mode") or "replayed"),
+            "topn": int(job.params.get("topn") or job.limit or 20),
+            "rebalance": str(job.params.get("rebalance") or "once"),
+            "timeframe": str(job.params.get("timeframe") or "1d"),
+        }
+
     def run_recommendation_pipeline(self, **kwargs: Any) -> JsonDict:
         """执行候选池推荐流水线。"""
 
@@ -1586,6 +1620,19 @@ class BaseDataScheduler:
             "market": kwargs["market"],
             "member_count": len(plans),
         }
+
+    def run_backtest(self, **kwargs: Any) -> JsonDict:
+        """执行轻量回测任务。"""
+
+        if self._run_backtest is not None:
+            return self._run_backtest(**kwargs)
+
+        from finance_agent.backtesting.runner import run_factor_score_topn_backtest
+        from finance_agent.storage.db import create_session_factory, session_scope
+
+        session_factory = create_session_factory()
+        with session_scope(session_factory) as session:
+            return run_factor_score_topn_backtest(session, **kwargs)
 
     def sync_recommendations_to_default_watchlist(
         self,
@@ -2382,6 +2429,7 @@ def as_job_group_choice(
         "reviews_due",
         "universe_merge",
         "universe_avoid_pool_rebuild",
+        "backtest_run",
     }:
         return as_choice(value, choices={"analytics"}, field_name=field_name)
     if job_type == "agent_loop_consume":
