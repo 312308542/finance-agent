@@ -192,7 +192,7 @@ def test_start_scheduler_refreshes_existing_scheduler_config(
     assert popen_call["kwargs"]["stdout"] is not None
     assert popen_call["kwargs"]["stderr"] is not None
     assert {job["params"]["universe_id"] for job in analytics_jobs} == {
-        "universe:base:ashare:p0:all_a",
+        "universe:merged:ashare:recommendation",
         "universe:base:crypto:spot:binance",
         "universe:base:crypto:future:binance",
     }
