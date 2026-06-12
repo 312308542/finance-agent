@@ -1013,6 +1013,9 @@ def test_recommendation_intake_records_system_research_semantics() -> None:
         def record_event(self, **kwargs: Any) -> None:
             self.events.append(kwargs)
 
+        def get_research_intake_cooldown(self, **kwargs: Any) -> None:
+            return None
+
     class FakeMemory:
         def record_alert(self, **kwargs: Any) -> Namespace:
             return Namespace(alert_id=kwargs["alert_id"])
@@ -1127,6 +1130,9 @@ def test_recommendation_intake_applies_score_and_confidence_thresholds() -> None
         def record_event(self, **kwargs: Any) -> None:
             return None
 
+        def get_research_intake_cooldown(self, **kwargs: Any) -> None:
+            return None
+
     class FakeMemory:
         def record_alert(self, **kwargs: Any) -> Namespace:
             return Namespace(alert_id=kwargs["alert_id"])
@@ -1209,6 +1215,113 @@ def test_recommendation_intake_applies_score_and_confidence_thresholds() -> None
         if event["event_type"] == "recommendation_skipped"
     ]
     assert skipped_reasons == ["below_min_total_score", "below_min_confidence"]
+
+
+def test_recommendation_intake_skips_recently_removed_research_item() -> None:
+    """研究池冷却期内的标的应跳过自动入池，并写入 recommendation_skipped 审计。"""
+
+    class FakeRecommendations:
+        def list_top_recommendations(self, *, run_id: str, limit: int) -> list[Namespace]:
+            return [
+                Namespace(
+                    recommendation_id="asset_rec:ashare:600519",
+                    asset_id="ashare:600519",
+                    symbol="600519",
+                    name="贵州茅台",
+                    market="ashare",
+                    action="watch",
+                    rank=1,
+                    total_score=Decimal("88.00"),
+                    confidence=Decimal("0.80"),
+                    conviction="medium",
+                    summary="贵州茅台进入系统研究跟踪。",
+                    watch_conditions={},
+                    invalid_if={},
+                    score_id=None,
+                    factor_frame_id=None,
+                    risk_ids=(),
+                    evidence_ids=("evidence:600519",),
+                    signal_ids=(),
+                )
+            ]
+
+    class FakeWatchlists:
+        def __init__(self) -> None:
+            self.items: list[dict[str, Any]] = []
+
+        def get_research_intake_cooldown(self, **kwargs: Any) -> dict[str, Any] | None:
+            assert kwargs["watchlist_id"] == "watchlist:default-owner:ashare:research"
+            assert kwargs["asset_id"] == "ashare:600519"
+            assert kwargs["cooldown_days"] == 7
+            return {
+                "reason": "cooldown",
+                "event_type": "research_removed",
+                "last_exit_at": "2026-06-10T09:30:00+00:00",
+                "cooldown_until": "2026-06-17T09:30:00+00:00",
+                "cooldown_days": 7,
+            }
+
+        def add_or_update_item(self, **kwargs: Any) -> Namespace:
+            self.items.append(kwargs)
+            return Namespace(watchlist_item_id=kwargs["watchlist_item_id"], status=kwargs["status"])
+
+        def record_event(self, **kwargs: Any) -> None:
+            return None
+
+    class FakeMemory:
+        def record_alert(self, **kwargs: Any) -> Namespace:
+            raise AssertionError("冷却期内不应创建提醒")
+
+        def record_decision(self, **kwargs: Any) -> Namespace:
+            raise AssertionError("冷却期内不应创建决策")
+
+        def upsert_memory(self, **kwargs: Any) -> Namespace:
+            raise AssertionError("冷却期内不应写入记忆")
+
+        def link_memory_edge(self, **kwargs: Any) -> None:
+            raise AssertionError("冷却期内不应写入记忆边")
+
+        def schedule_review(self, **kwargs: Any) -> Namespace:
+            raise AssertionError("冷却期内不应创建复盘任务")
+
+    class FakeWorkflowAudit:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        def start_run(self, **kwargs: Any) -> None:
+            return None
+
+        def record_event(self, **kwargs: Any) -> None:
+            self.events.append(kwargs)
+
+        def finish_run(self, **kwargs: Any) -> None:
+            return None
+
+    service = PersonalFinanceAgentService.__new__(PersonalFinanceAgentService)
+    service.recommendations = FakeRecommendations()
+    service.watchlists = FakeWatchlists()
+    service.memory = FakeMemory()
+    service.workflow_audit = FakeWorkflowAudit()
+
+    result = service.sync_recommendations_to_watchlist(
+        owner_id="default-owner",
+        recommendation_run_id="run:research",
+        watchlist_id="watchlist:default-owner:ashare:research",
+        as_of=datetime(2026, 6, 12, 9, 30, tzinfo=UTC),
+        limit=1,
+        workflow_run_id="workflow:research",
+    )
+
+    assert result.watchlist_item_ids == ()
+    assert service.watchlists.items == []
+    skipped_events = [
+        event
+        for event in service.workflow_audit.events
+        if event["event_type"] == "recommendation_skipped"
+    ]
+    assert len(skipped_events) == 1
+    assert skipped_events[0]["payload"]["reason"] == "cooldown"
+    assert skipped_events[0]["payload"]["cooldown_until"] == "2026-06-17T09:30:00+00:00"
 
 
 def test_scheduler_logs_job_progress_to_standard_logging(caplog) -> None:

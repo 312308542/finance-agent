@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -21,6 +21,10 @@ DEFAULT_ASHARE_RESEARCH_WATCHLIST_ID = "watchlist:default-owner:ashare:research"
 LEGACY_ASHARE_RECOMMENDATION_WATCHLIST_ID = (
     "watchlist:default-owner:ashare:recommendations"
 )
+RESEARCH_EXIT_EVENT_TYPES = frozenset(
+    {"research_expired", "research_removed", "expired", "removed"}
+)
+RESEARCH_EXIT_STATUSES = frozenset({"expired", "removed"})
 
 
 class WatchlistService:
@@ -373,6 +377,46 @@ class WatchlistService:
         return tuple(
             self.repository.list_watchlist_events(watchlist_id=watchlist_id, limit=limit)
         )
+
+    def get_research_intake_cooldown(
+        self,
+        *,
+        watchlist_id: str,
+        asset_id: str,
+        as_of: datetime,
+        cooldown_days: int = 7,
+    ) -> JsonDict | None:
+        """查询研究池自动入池冷却信息，未命中冷却窗口时返回 None。"""
+
+        if cooldown_days <= 0:
+            return None
+        current_at = normalize_datetime(as_of)
+        for event in self.repository.list_recent_watchlist_item_events(
+            watchlist_id=watchlist_id,
+            asset_id=asset_id,
+            limit=10,
+        ):
+            event_type = str(getattr(event, "event_type", "") or "")
+            to_status = str(getattr(event, "to_status", "") or "")
+            if (
+                event_type not in RESEARCH_EXIT_EVENT_TYPES
+                and to_status not in RESEARCH_EXIT_STATUSES
+            ):
+                continue
+            exit_at = normalize_datetime(event.created_at)
+            cooldown_until = exit_at + timedelta(days=cooldown_days)
+            if current_at >= cooldown_until:
+                return None
+            return {
+                "reason": "cooldown",
+                "event_id": event.event_id,
+                "event_type": event_type,
+                "last_exit_at": exit_at.isoformat(),
+                "cooldown_until": cooldown_until.isoformat(),
+                "cooldown_days": cooldown_days,
+                "last_exit_reason": event.reason,
+            }
+        return None
 
     def record_thesis(
         self,

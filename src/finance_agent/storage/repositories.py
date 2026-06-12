@@ -3381,6 +3381,26 @@ class WatchlistRepository:
         )
         return list(self.session.scalars(statement))
 
+    def list_recent_watchlist_item_events(
+        self,
+        *,
+        watchlist_id: str,
+        asset_id: str,
+        limit: int = 10,
+    ) -> list[WatchlistItemEventORM]:
+        """按观察池和资产查询最近成员事件，供研究池冷却期判断使用。"""
+
+        statement = (
+            select(WatchlistItemEventORM)
+            .where(
+                WatchlistItemEventORM.watchlist_id == watchlist_id,
+                WatchlistItemEventORM.asset_id == asset_id,
+            )
+            .order_by(WatchlistItemEventORM.created_at.desc())
+            .limit(limit)
+        )
+        return list(self.session.scalars(statement))
+
 
 class AssistantTriggerRepository:
     """私人金融助手触发事件仓储。"""

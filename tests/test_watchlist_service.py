@@ -122,6 +122,83 @@ def test_expire_research_pool_items_marks_only_expired_entries() -> None:
     assert service.repository.events[0]["event_type"] == "research_expired"
 
 
+def test_research_intake_cooldown_blocks_recent_exit_events() -> None:
+    """最近被移出或过期的研究池标的，应在冷却窗口内阻止自动重新入池。"""
+
+    class FakeRepository:
+        def list_recent_watchlist_item_events(
+            self,
+            *,
+            watchlist_id: str,
+            asset_id: str,
+            limit: int = 10,
+        ) -> list[Any]:
+            assert watchlist_id == DEFAULT_ASHARE_RESEARCH_WATCHLIST_ID
+            assert asset_id == "ashare:600519"
+            assert limit == 10
+            return [
+                SimpleNamespace(
+                    event_id="watchlist_event:expired",
+                    event_type="research_expired",
+                    to_status="expired",
+                    created_at=datetime(2026, 6, 10, 9, 30, tzinfo=UTC),
+                    reason="系统研究跟踪有效期已到期。",
+                    payload={},
+                )
+            ]
+
+    service = WatchlistService.__new__(WatchlistService)
+    service.repository = FakeRepository()
+
+    cooldown = service.get_research_intake_cooldown(
+        watchlist_id=DEFAULT_ASHARE_RESEARCH_WATCHLIST_ID,
+        asset_id="ashare:600519",
+        as_of=datetime(2026, 6, 12, 9, 30, tzinfo=UTC),
+        cooldown_days=7,
+    )
+
+    assert cooldown is not None
+    assert cooldown["reason"] == "cooldown"
+    assert cooldown["event_type"] == "research_expired"
+    assert cooldown["last_exit_at"] == "2026-06-10T09:30:00+00:00"
+    assert cooldown["cooldown_until"] == "2026-06-17T09:30:00+00:00"
+
+
+def test_research_intake_cooldown_allows_after_window() -> None:
+    """超过冷却窗口后，同一标的可以再次由推荐链路自动进入研究池。"""
+
+    class FakeRepository:
+        def list_recent_watchlist_item_events(
+            self,
+            *,
+            watchlist_id: str,
+            asset_id: str,
+            limit: int = 10,
+        ) -> list[Any]:
+            return [
+                SimpleNamespace(
+                    event_id="watchlist_event:removed",
+                    event_type="research_removed",
+                    to_status="removed",
+                    created_at=datetime(2026, 6, 1, 9, 30, tzinfo=UTC),
+                    reason="人工移出研究池。",
+                    payload={},
+                )
+            ]
+
+    service = WatchlistService.__new__(WatchlistService)
+    service.repository = FakeRepository()
+
+    cooldown = service.get_research_intake_cooldown(
+        watchlist_id=DEFAULT_ASHARE_RESEARCH_WATCHLIST_ID,
+        asset_id="ashare:600519",
+        as_of=datetime(2026, 6, 12, 9, 30, tzinfo=UTC),
+        cooldown_days=7,
+    )
+
+    assert cooldown is None
+
+
 def research_item(symbol: str, expires_at: str | None) -> SimpleNamespace:
     return SimpleNamespace(
         watchlist_item_id=f"watchlist_item:{DEFAULT_ASHARE_RESEARCH_WATCHLIST_ID}:ashare:{symbol}",

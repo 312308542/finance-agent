@@ -613,6 +613,7 @@ class PersonalFinanceAgentService:
         workflow_run_id: str | None = None,
         min_total_score: Decimal | None = None,
         min_confidence: Decimal | None = None,
+        research_cooldown_days: int = 7,
     ) -> RecommendationIntakeRunSummary:
         """把一次推荐运行的 Top N 同步到私人观察池。"""
 
@@ -695,6 +696,34 @@ class PersonalFinanceAgentService:
                         "reason": skip_reason,
                         "total_score": str(recommendation.total_score),
                         "confidence": str(recommendation.confidence),
+                    },
+                )
+                continue
+
+            cooldown = self.watchlists.get_research_intake_cooldown(
+                watchlist_id=watchlist_id,
+                asset_id=recommendation.asset_id,
+                as_of=as_of,
+                cooldown_days=research_cooldown_days,
+            )
+            if cooldown is not None:
+                self.workflow_audit.record_event(
+                    workflow_event_id=(
+                        f"{run_id}:event:skip:{recommendation.asset_id}:cooldown"
+                    ),
+                    workflow_run_id=run_id,
+                    event_type="recommendation_skipped",
+                    agent_name="recommendation_intake",
+                    message=(
+                        "标的近期已从系统研究跟踪池移出或过期，"
+                        f"冷却至 {cooldown['cooldown_until']}，本次跳过自动入池。"
+                    ),
+                    evidence_ids=list(recommendation.evidence_ids),
+                    created_at=as_of,
+                    payload={
+                        "recommendation_id": recommendation.recommendation_id,
+                        "action": recommendation.action,
+                        **cooldown,
                     },
                 )
                 continue
