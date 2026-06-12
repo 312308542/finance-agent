@@ -1,0 +1,39 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# TA-Lib Python 包依赖 TA-Lib C 库；slim 镜像中通常没有预装。
+ARG TA_LIB_VERSION=0.4.0
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        make \
+        wget \
+    && wget -O /tmp/ta-lib.tar.gz "https://prdownloads.sourceforge.net/ta-lib/ta-lib-${TA_LIB_VERSION}-src.tar.gz" \
+    && mkdir -p /tmp/ta-lib-src \
+    && tar -xzf /tmp/ta-lib.tar.gz -C /tmp/ta-lib-src --strip-components=1 \
+    && cd /tmp/ta-lib-src \
+    && ./configure --prefix=/usr \
+    && make \
+    && make install \
+    && ldconfig \
+    && rm -rf /tmp/ta-lib.tar.gz /tmp/ta-lib-src \
+    && apt-get purge -y --auto-remove wget make \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md ./
+COPY src ./src
+COPY scripts ./scripts
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir .
+
+RUN mkdir -p /app/runtime/base_data_scheduler
+
+CMD ["python", "scripts/data/run_base_data_scheduler.py", "--loop", "--status-file", "runtime/base_data_scheduler/status.json", "--event-log-file", "runtime/base_data_scheduler/events.jsonl"]

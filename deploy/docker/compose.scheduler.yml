@@ -1,0 +1,21 @@
+services:
+  finance-agent-scheduler:
+    container_name: finance-agent-scheduler
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.scheduler
+    restart: unless-stopped
+    environment:
+      FINANCE_AGENT_DATABASE_URL: ${FINANCE_AGENT_DATABASE_URL:-postgresql+psycopg://finance_agent:finance_agent@postgres:5432/finance_agent}
+      FINANCE_AGENT_REDIS_URL: ${FINANCE_AGENT_REDIS_URL:-redis://redis:6379/0}
+      FINANCE_AGENT_CACHE_BACKEND: ${FINANCE_AGENT_CACHE_BACKEND:-redis}
+    volumes:
+      - ../../runtime:/app/runtime
+    command:
+      - python
+      - scripts/data/run_base_data_scheduler.py
+      - --loop
+      - --status-file
+      - runtime/base_data_scheduler/status.json
+      - --event-log-file
+      - runtime/base_data_scheduler/events.jsonl
