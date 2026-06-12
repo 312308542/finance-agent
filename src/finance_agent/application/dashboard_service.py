@@ -27,6 +27,7 @@ from finance_agent.storage.orm import (
     DataQualitySnapshotORM,
     DecisionLogORM,
     MonitoringAlertORM,
+    RiskFindingORM,
 )
 from finance_agent.storage.repositories import (
     DataQualityRepository,
@@ -90,7 +91,15 @@ class DashboardService:
 
         portfolios = self.portfolios.list_portfolios(owner_id=owner_id, status="active")
         if not portfolios:
-            return {"status": "empty", "portfolios": [], "positions": [], "metrics": {}}
+            return {
+                "status": "empty",
+                "portfolios": [],
+                "positions": [],
+                "concentration_warnings": [],
+                "metrics": {
+                    "concentration": empty_portfolio_concentration_summary(),
+                },
+            }
         active = portfolios[0]
         positions = self.portfolios.list_positions(active.portfolio_id)
         positive_count = sum(
@@ -102,17 +111,23 @@ class DashboardService:
         total_weight = sum(
             (position.portfolio_weight or Decimal("0")) for position in positions
         )
+        concentration = build_portfolio_concentration(
+            portfolio=active,
+            positions=positions,
+        )
         return {
             "status": "ok",
             "active_portfolio_id": active.portfolio_id,
             "portfolios": [serialize_portfolio(item) for item in portfolios],
             "positions": [serialize_position(item) for item in positions],
+            "concentration_warnings": concentration["warnings"],
             "metrics": {
                 "position_count": len(positions),
                 "positive_position_count": positive_count,
                 "negative_position_count": negative_count,
                 "total_weight": json_value(total_weight),
                 "risk_profile": active.risk_profile,
+                "concentration": concentration["summary"],
             },
         }
 
@@ -194,20 +209,27 @@ class DashboardService:
 
         triggers = self._list_recent_trigger_events(owner_id=owner_id, limit=limit)
         alerts = self._list_recent_alerts(owner_id=owner_id, limit=limit)
+        risk_findings = self._list_recent_risk_findings(limit=limit)
         qualities = self.data_quality.list_latest_quality(limit=limit)
-        status = "ok" if triggers or alerts or qualities else "empty"
+        severity_breakdown = build_risk_severity_breakdown(risk_findings)
+        status = "ok" if triggers or alerts or risk_findings or qualities else "empty"
         return {
             "status": status,
             "triggers": [serialize_trigger_event(item) for item in triggers],
             "alerts": [serialize_alert(item) for item in alerts],
+            "risk_findings": [serialize_risk_finding(item) for item in risk_findings],
             "data_quality": [serialize_data_quality(item) for item in qualities],
             "metrics": {
                 "trigger_count": len(triggers),
                 "alert_count": len(alerts),
+                "risk_finding_count": len(risk_findings),
+                "risk_severity_breakdown": severity_breakdown,
                 "data_issue_count": sum(item.issue_count for item in qualities),
                 "high_severity_count": sum(
                     1 for item in [*triggers, *alerts] if item.severity == "high"
-                ),
+                )
+                + severity_breakdown["critical"]
+                + severity_breakdown["high"],
             },
         }
 
@@ -420,6 +442,10 @@ class DashboardService:
         )
         return list(self.session.scalars(statement))
 
+    def _list_recent_risk_findings(self, *, limit: int) -> list[RiskFindingORM]:
+        statement = select(RiskFindingORM).order_by(RiskFindingORM.as_of.desc()).limit(limit)
+        return list(self.session.scalars(statement))
+
     def _list_recent_workflow_runs(
         self,
         *,
@@ -454,6 +480,83 @@ def normalize_dashboard_limit(limit: int, *, maximum: int = 200) -> int:
     return max(1, min(limit, maximum))
 
 
+def build_portfolio_concentration(*, portfolio: Any, positions: list[Any]) -> JsonDict:
+    """计算组合集中度摘要。
+
+    只使用持仓当前快照字段和 payload 中已有行业信息，不做外部补数，避免 UI 层展示假数据。
+    """
+
+    market_weights: dict[str, Decimal] = {}
+    sector_weights: dict[str, Decimal] = {}
+    industry_weights: dict[str, Decimal] = {}
+    max_position_weight = Decimal("0")
+    max_position_asset_id: str | None = None
+    threshold = portfolio.max_position_weight
+    warnings: list[JsonDict] = []
+
+    for position in positions:
+        weight = position.portfolio_weight or Decimal("0")
+        market_weights[position.market or "unknown"] = (
+            market_weights.get(position.market or "unknown", Decimal("0")) + weight
+        )
+        payload = position.payload or {}
+        sector = str(payload.get("sector") or "未分类")
+        industry = str(payload.get("industry") or "未分类")
+        sector_weights[sector] = sector_weights.get(sector, Decimal("0")) + weight
+        industry_weights[industry] = industry_weights.get(industry, Decimal("0")) + weight
+        if weight > max_position_weight:
+            max_position_weight = weight
+            max_position_asset_id = position.asset_id
+        if threshold is not None and weight > threshold:
+            warnings.append(
+                {
+                    "type": "single_position_concentration",
+                    "asset_id": position.asset_id,
+                    "symbol": position.symbol,
+                    "weight": json_value(weight),
+                    "threshold": json_value(threshold),
+                    "message": "单标的持仓权重超过组合阈值。",
+                }
+            )
+
+    return {
+        "summary": {
+            "max_position_weight": json_value(max_position_weight),
+            "max_position_asset_id": max_position_asset_id,
+            "position_threshold": json_value(threshold),
+            "over_position_threshold_count": len(warnings),
+            "market_weights": json_value(market_weights),
+            "sector_weights": json_value(sector_weights),
+            "industry_weights": json_value(industry_weights),
+        },
+        "warnings": warnings,
+    }
+
+
+def build_risk_severity_breakdown(risk_findings: list[RiskFindingORM]) -> JsonDict:
+    """按严重度统计风险发现数量。"""
+
+    breakdown = {"critical": 0, "high": 0, "medium": 0, "low": 0, "unknown": 0}
+    for item in risk_findings:
+        severity = item.severity if item.severity in breakdown else "unknown"
+        breakdown[severity] += 1
+    return breakdown
+
+
+def empty_portfolio_concentration_summary() -> JsonDict:
+    """返回组合为空或不可用时的集中度空态。"""
+
+    return {
+        "max_position_weight": "0",
+        "max_position_asset_id": None,
+        "position_threshold": None,
+        "over_position_threshold_count": 0,
+        "market_weights": {},
+        "sector_weights": {},
+        "industry_weights": {},
+    }
+
+
 def unavailable_summary(*, owner_id: str, message: str) -> JsonDict:
     """数据库或依赖不可用时的总览降级响应。"""
 
@@ -463,10 +566,28 @@ def unavailable_summary(*, owner_id: str, message: str) -> JsonDict:
         "generated_at": datetime.now(UTC).isoformat(),
         "message": message,
         "sections": {
-            "portfolio": {"status": "unavailable", "portfolios": [], "positions": []},
+            "portfolio": {
+                "status": "unavailable",
+                "portfolios": [],
+                "positions": [],
+                "concentration_warnings": [],
+                "metrics": {
+                    "concentration": empty_portfolio_concentration_summary(),
+                },
+            },
             "watchlists": {"status": "unavailable", "items": []},
             "recommendations": {"status": "unavailable", "runs": [], "recommendations": []},
-            "risks": {"status": "unavailable", "triggers": [], "alerts": []},
+            "risks": {
+                "status": "unavailable",
+                "triggers": [],
+                "alerts": [],
+                "risk_findings": [],
+                "data_quality": [],
+                "metrics": {
+                    "risk_finding_count": 0,
+                    "risk_severity_breakdown": build_risk_severity_breakdown([]),
+                },
+            },
             "workflows": {"status": "unavailable", "runs": []},
             "memories": {"status": "unavailable", "memories": [], "decisions": []},
             "data_health": {"status": "unavailable", "items": []},
@@ -535,6 +656,24 @@ def serialize_data_quality(item: DataQualitySnapshotORM) -> JsonDict:
         "checked_at": json_value(item.checked_at),
         "missing_items": json_value(item.missing_items or []),
         "issue_count": item.issue_count,
+        "payload": json_value(item.payload or {}),
+    }
+
+
+def serialize_risk_finding(item: RiskFindingORM) -> JsonDict:
+    """序列化风险发现条目。"""
+
+    return {
+        "risk_id": item.risk_id,
+        "asset_id": item.asset_id,
+        "scope": item.scope,
+        "risk_type": item.risk_type,
+        "severity": item.severity,
+        "score": json_value(item.score),
+        "title": item.title,
+        "description": item.description,
+        "as_of": json_value(item.as_of),
+        "evidence_ids": json_value(item.evidence_ids or []),
         "payload": json_value(item.payload or {}),
     }
 

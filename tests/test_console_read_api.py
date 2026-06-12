@@ -177,6 +177,135 @@ def test_dashboard_recent_memories_returns_cross_asset_flow() -> None:
     assert payload["items"][0]["asset_id"] == "ashare:600519"
 
 
+def test_portfolio_overview_exposes_concentration_metrics() -> None:
+    """组合概览应提供单标的、市场和行业集中度，方便前端风险提示。"""
+
+    service = DashboardService.__new__(DashboardService)
+    service.portfolios = SimpleNamespace(
+        list_portfolios=lambda *, owner_id, status: [
+            SimpleNamespace(
+                portfolio_id="portfolio:demo",
+                owner_id=owner_id,
+                name="测试组合",
+                portfolio_type="manual",
+                base_currency="CNY",
+                risk_profile="balanced",
+                total_equity=Decimal("100000"),
+                cash=Decimal("10000"),
+                market_value=Decimal("90000"),
+                max_position_weight=Decimal("0.25"),
+                max_drawdown_alert=Decimal("0.12"),
+                status=status,
+                as_of=datetime(2026, 6, 12, 10, 0, tzinfo=UTC),
+                payload={},
+            )
+        ],
+        list_positions=lambda portfolio_id: [
+            SimpleNamespace(
+                position_id="pos:1",
+                portfolio_id=portfolio_id,
+                asset_id="ashare:600519",
+                symbol="600519",
+                market="ashare",
+                side="long",
+                quantity=Decimal("100"),
+                avg_cost=Decimal("1000"),
+                last_price=Decimal("1200"),
+                market_value=Decimal("30000"),
+                unrealized_pnl=Decimal("20000"),
+                unrealized_pnl_pct=Decimal("0.20"),
+                portfolio_weight=Decimal("0.30"),
+                status="active",
+                as_of=datetime(2026, 6, 12, 10, 0, tzinfo=UTC),
+                payload={"industry": "白酒", "sector": "消费"},
+            ),
+            SimpleNamespace(
+                position_id="pos:2",
+                portfolio_id=portfolio_id,
+                asset_id="ashare:000001",
+                symbol="000001",
+                market="ashare",
+                side="long",
+                quantity=Decimal("2000"),
+                avg_cost=Decimal("10"),
+                last_price=Decimal("12"),
+                market_value=Decimal("20000"),
+                unrealized_pnl=Decimal("-1000"),
+                unrealized_pnl_pct=Decimal("-0.05"),
+                portfolio_weight=Decimal("0.20"),
+                status="active",
+                as_of=datetime(2026, 6, 12, 10, 0, tzinfo=UTC),
+                payload={"industry": "银行", "sector": "金融"},
+            ),
+        ],
+    )
+
+    payload = service.get_portfolio_overview(owner_id="owner:demo")
+
+    concentration = payload["metrics"]["concentration"]
+    assert concentration["max_position_weight"] == "0.30"
+    assert concentration["max_position_asset_id"] == "ashare:600519"
+    assert concentration["position_threshold"] == "0.25"
+    assert concentration["over_position_threshold_count"] == 1
+    assert concentration["market_weights"] == {"ashare": "0.50"}
+    assert concentration["industry_weights"] == {"白酒": "0.30", "银行": "0.20"}
+    assert payload["concentration_warnings"][0]["asset_id"] == "ashare:600519"
+
+
+def test_risk_overview_exposes_recent_risk_findings_and_severity_breakdown() -> None:
+    """风险概览应返回 risk_findings 明细和严重度分布。"""
+
+    service = DashboardService.__new__(DashboardService)
+    service._list_recent_trigger_events = lambda *, owner_id, limit: []
+    service._list_recent_alerts = lambda *, owner_id, limit: []
+    service._list_recent_risk_findings = lambda *, limit: [
+        SimpleNamespace(
+            risk_id="risk:high:1",
+            asset_id="ashare:600519",
+            scope="asset",
+            risk_type="trend_break",
+            severity="high",
+            score=Decimal("0.82"),
+            title="趋势破位",
+            description="跌破中期趋势线。",
+            as_of=datetime(2026, 6, 12, 10, 0, tzinfo=UTC),
+            evidence_ids=["evidence:1"],
+            payload={"source": "technical"},
+        ),
+        SimpleNamespace(
+            risk_id="risk:medium:1",
+            asset_id="ashare:000001",
+            scope="asset",
+            risk_type="data_quality",
+            severity="medium",
+            score=Decimal("0.40"),
+            title="数据质量下降",
+            description=None,
+            as_of=datetime(2026, 6, 12, 9, 0, tzinfo=UTC),
+            evidence_ids=[],
+            payload={},
+        ),
+    ]
+    service.data_quality = SimpleNamespace(list_latest_quality=lambda limit: [])
+
+    payload = service.get_risk_overview(owner_id="owner:demo", limit=20)
+
+    assert payload["status"] == "ok"
+    assert [item["risk_id"] for item in payload["risk_findings"]] == [
+        "risk:high:1",
+        "risk:medium:1",
+    ]
+    assert payload["metrics"]["risk_finding_count"] == 2
+    assert payload["metrics"]["risk_severity_breakdown"] == {
+        "critical": 0,
+        "high": 1,
+        "medium": 1,
+        "low": 0,
+        "unknown": 0,
+    }
+    assert payload["metrics"]["high_severity_count"] == 1
+
+
 def test_console_read_routes_delegate_to_dashboard_service(monkeypatch: Any) -> None:
     """新增只读端点应复用 DashboardService，不在路由中拼业务逻辑。"""
 
