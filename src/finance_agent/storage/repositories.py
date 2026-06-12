@@ -25,6 +25,7 @@ from finance_agent.storage.orm import (
     AssetProfileORM,
     AssetProviderMappingORM,
     AssetRecommendationORM,
+    BacktestResultORM,
     AssetScoreORM,
     AssetStatusSnapshotORM,
     AssetThesisORM,
@@ -2361,6 +2362,105 @@ class ScoringStrategyRepository:
             )
             for strategy in strategies
         ]
+
+
+class BacktestRepository:
+    """轻量回测结果仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_result(
+        self,
+        *,
+        backtest_id: str,
+        market: str,
+        strategy_id: str,
+        universe_id: str,
+        start_at: datetime,
+        end_at: datetime,
+        rebalance_frequency: str,
+        metrics: JsonDict,
+        data_versions: JsonDict,
+        status: str,
+        payload: JsonDict | None = None,
+        created_at: datetime | None = None,
+    ) -> BacktestResultORM:
+        """按 `backtest_id` 幂等写入回测结果。"""
+
+        values = {
+            "backtest_id": backtest_id,
+            "market": market,
+            "strategy_id": strategy_id,
+            "universe_id": universe_id,
+            "start_at": start_at,
+            "end_at": end_at,
+            "rebalance_frequency": rebalance_frequency,
+            "metrics": _json_safe(metrics),
+            "data_versions": _json_safe(data_versions),
+            "status": status,
+            "created_at": created_at or datetime.now().astimezone(),
+            "payload": _json_safe(payload or {}),
+        }
+        statement = insert(BacktestResultORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "backtest_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[BacktestResultORM.backtest_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(BacktestResultORM, backtest_id)
+
+    def get_latest_result(
+        self,
+        *,
+        market: str,
+        strategy_id: str,
+        universe_id: str,
+        status: str = "available",
+    ) -> BacktestResultORM | None:
+        """查询指定市场、策略和候选池最近一次可用回测结果。"""
+
+        statement = (
+            select(BacktestResultORM)
+            .where(
+                BacktestResultORM.market == market,
+                BacktestResultORM.strategy_id == strategy_id,
+                BacktestResultORM.universe_id == universe_id,
+                BacktestResultORM.status == status,
+            )
+            .order_by(BacktestResultORM.created_at.desc())
+            .limit(1)
+        )
+        return self.session.scalars(statement).one_or_none()
+
+    def list_results(
+        self,
+        *,
+        market: str | None = None,
+        strategy_id: str | None = None,
+        universe_id: str | None = None,
+        status: str | None = None,
+        limit: int = 20,
+    ) -> list[BacktestResultORM]:
+        """查询最近回测结果，默认按创建时间倒序。"""
+
+        statement = select(BacktestResultORM)
+        if market:
+            statement = statement.where(BacktestResultORM.market == market)
+        if strategy_id:
+            statement = statement.where(BacktestResultORM.strategy_id == strategy_id)
+        if universe_id:
+            statement = statement.where(BacktestResultORM.universe_id == universe_id)
+        if status:
+            statement = statement.where(BacktestResultORM.status == status)
+        return list(
+            self.session.scalars(
+                statement.order_by(BacktestResultORM.created_at.desc()).limit(limit)
+            )
+        )
 
 
 class SignalSnapshotRepository:

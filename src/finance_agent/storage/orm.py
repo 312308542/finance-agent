@@ -883,6 +883,39 @@ class ScoringStrategyORM(Base):
     )
 
 
+class BacktestResultORM(Base):
+    """轻量回测结果表，保存策略历史验证摘要和可复现数据版本。"""
+
+    __tablename__ = "backtest_results"
+    __table_args__ = (
+        Index("idx_backtest_results_strategy_created", "strategy_id", "created_at"),
+        Index("idx_backtest_results_universe_created", "universe_id", "created_at"),
+        Index("idx_backtest_results_market_status", "market", "status"),
+        Index("idx_backtest_results_window", "start_at", "end_at"),
+    )
+
+    backtest_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    universe_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    rebalance_frequency: Mapped[str] = mapped_column(String(32), nullable=False)
+    metrics: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    data_versions: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
 class SignalSnapshotORM(Base):
     """可解释信号快照表。"""
 
