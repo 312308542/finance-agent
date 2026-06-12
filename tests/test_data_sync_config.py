@@ -61,7 +61,7 @@ def test_scheduler_payload_registers_real_universe_recommendation_jobs() -> None
     assert processing["analytics"]["scheduler_status"] == "covered_by_analytics_jobs"
     assert jobs["analytics.recommendations.ashare.all_a"]["job_type"] == "recommendation_pipeline"
     assert jobs["analytics.recommendations.ashare.all_a"]["params"]["universe_id"] == (
-        "universe:base:ashare:p0:all_a"
+        "universe:merged:ashare:recommendation"
     )
     assert jobs["analytics.recommendations.ashare.all_a"]["params"]["min_bars"] == 60
     assert (
@@ -80,9 +80,7 @@ def test_scheduler_payload_registers_real_universe_recommendation_jobs() -> None
         ]
         == 3
     )
-    assert jobs["analytics.recommendations.ashare.all_a"]["params"]["candidate_source"] == (
-        "technical_screening_pool"
-    )
+    assert jobs["analytics.recommendations.ashare.all_a"]["params"]["candidate_source"] is None
     assert jobs["analytics.recommendations.crypto_spot.binance"]["params"]["universe_id"] == (
         "universe:base:crypto:spot:binance"
     )
@@ -382,7 +380,7 @@ def test_ashare_analytics_jobs_run_after_close_final_not_midday_partial() -> Non
     ashare_recommendation = jobs["analytics.recommendations.ashare.all_a"]
     assert ashare_recommendation["schedule_type"] == "after_success"
     assert ashare_recommendation["depends_on"] == [
-        "analytics.technical_screening.ashare.main_board"
+        "analytics.universe.merge.ashare.recommendation"
     ]
     assert not [
         job
@@ -412,8 +410,40 @@ def test_scheduler_payload_registers_technical_screening_jobs() -> None:
 
     recommendation_job = jobs["analytics.recommendations.ashare.all_a"]
     assert recommendation_job["depends_on"] == [
-        "analytics.technical_screening.ashare.main_board"
+        "analytics.universe.merge.ashare.recommendation"
     ]
+
+
+def test_scheduler_payload_registers_universe_merge_and_avoid_pool_jobs() -> None:
+    """推荐前置链应先合并候选池，并定期重建同市场回避池。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+
+    merge_job = jobs["analytics.universe.merge.ashare.recommendation"]
+    assert merge_job["job_type"] == "universe_merge"
+    assert merge_job["group"] == "analytics"
+    assert merge_job["schedule_type"] == "after_success"
+    assert merge_job["depends_on"] == ["analytics.technical_screening.ashare.main_board"]
+    assert merge_job["params"]["target_universe_id"] == "universe:merged:ashare:recommendation"
+    assert merge_job["params"]["source_universe_ids"] == [
+        "universe:base:ashare:p0:all_a",
+        "universe:technical:ashare:main_board",
+    ]
+    assert merge_job["params"]["source_weights"] == {
+        "universe:base:ashare:p0:all_a": 1.0,
+        "universe:technical:ashare:main_board": 2.0,
+    }
+
+    avoid_job = jobs["analytics.universe.rebuild_avoid_pool.ashare"]
+    assert avoid_job["job_type"] == "universe_avoid_pool_rebuild"
+    assert avoid_job["group"] == "analytics"
+    assert avoid_job["schedule_type"] == "after_success"
+    assert avoid_job["depends_on"] == ["ashare.risk_sentiment"]
+    assert avoid_job["params"]["universe_id"] == "universe:avoid:ashare:system"
+    assert avoid_job["params"]["market"] == "ashare"
 
 
 def test_scheduler_payload_splits_stock_news_article_enrichment_task() -> None:

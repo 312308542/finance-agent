@@ -191,6 +191,59 @@ def test_parse_scheduler_config_accepts_high_risk_reviews_job() -> None:
     assert config.jobs[0].depends_on == ("agent.loop.consume.after_trigger",)
 
 
+def test_parse_scheduler_config_accepts_universe_merge_and_avoid_pool_jobs() -> None:
+    """调度配置应能表达候选池合并和回避池重建任务。"""
+
+    config = parse_scheduler_config(
+        {
+            "enabled": True,
+            "jobs": [
+                {
+                    "name": "analytics.universe.merge.ashare.recommendation",
+                    "job_type": "universe_merge",
+                    "group": "analytics",
+                    "enabled": True,
+                    "schedule_type": "after_success",
+                    "depends_on": ["analytics.technical_screening.ashare.main_board"],
+                    "market": "ashare",
+                    "params": {
+                        "sync_task_type": "analytics.universe.merge",
+                        "target_universe_id": "universe:merged:ashare:recommendation",
+                        "name": "A 股推荐合并候选池",
+                        "source_universe_ids": [
+                            "universe:base:ashare:p0:all_a",
+                            "universe:technical:ashare:main_board",
+                        ],
+                    },
+                },
+                {
+                    "name": "analytics.universe.rebuild_avoid_pool.ashare",
+                    "job_type": "universe_avoid_pool_rebuild",
+                    "group": "analytics",
+                    "enabled": True,
+                    "schedule_type": "after_success",
+                    "depends_on": ["ashare.risk_sentiment"],
+                    "market": "ashare",
+                    "params": {
+                        "sync_task_type": "analytics.universe.rebuild_avoid_pool",
+                        "universe_id": "universe:avoid:ashare:system",
+                        "name": "A 股系统回避池",
+                        "market": "ashare",
+                    },
+                },
+            ],
+        }
+    )
+
+    merge_job, avoid_job = config.jobs
+    assert merge_job.job_type == "universe_merge"
+    assert merge_job.group == "analytics"
+    assert merge_job.depends_on == ("analytics.technical_screening.ashare.main_board",)
+    assert avoid_job.job_type == "universe_avoid_pool_rebuild"
+    assert avoid_job.group == "analytics"
+    assert avoid_job.depends_on == ("ashare.risk_sentiment",)
+
+
 def test_parse_scheduler_config_accepts_calendar_schedule_fields() -> None:
     """调度配置应能表达固定时间、手动和依赖成功触发的任务。"""
 
@@ -715,6 +768,134 @@ def test_scheduler_runs_high_risk_reviews_without_collection() -> None:
         {
             "owner_id": "default-owner",
             "limit": 10,
+        }
+    ]
+
+
+def test_scheduler_runs_universe_merge_without_collection() -> None:
+    """候选池合并任务应调用数据生产执行器，而不是误走基础采集入口。"""
+
+    calls: list[dict[str, Any]] = []
+
+    def run_universe_merge(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "status": "available",
+            "target_universe_id": kwargs["target_universe_id"],
+            "member_count": 88,
+        }
+
+    def collect_base_data(_: Any) -> dict[str, Any]:
+        raise AssertionError("候选池合并任务不应调用基础采集入口")
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="analytics.universe.merge.ashare.recommendation",
+                job_type="universe_merge",
+                group="analytics",
+                interval_seconds=0,
+                schedule_type="after_success",
+                depends_on=("analytics.technical_screening.ashare.main_board",),
+                market="ashare",
+                params={
+                    "target_universe_id": "universe:merged:ashare:recommendation",
+                    "name": "A 股推荐合并候选池",
+                    "source_universe_ids": [
+                        "universe:base:ashare:p0:all_a",
+                        "universe:technical:ashare:main_board",
+                    ],
+                    "source_weights": {
+                        "universe:base:ashare:p0:all_a": 1.0,
+                        "universe:technical:ashare:main_board": 2.0,
+                    },
+                    "strategy_context": "recommendation_universe_merge",
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        run_universe_merge_func=run_universe_merge,
+    )
+
+    result = scheduler.run_once()
+
+    assert result["jobs"][0]["status"] == "executed"
+    assert result["jobs"][0]["summary"]["member_count"] == 88
+    assert calls == [
+        {
+            "target_universe_id": "universe:merged:ashare:recommendation",
+            "name": "A 股推荐合并候选池",
+            "source_universe_ids": [
+                "universe:base:ashare:p0:all_a",
+                "universe:technical:ashare:main_board",
+            ],
+            "source_weights": {
+                "universe:base:ashare:p0:all_a": 1.0,
+                "universe:technical:ashare:main_board": 2.0,
+            },
+            "strategy_context": "recommendation_universe_merge",
+        }
+    ]
+
+
+def test_scheduler_runs_avoid_pool_rebuild_without_collection() -> None:
+    """回避池重建任务应调用数据生产执行器，而不是误走基础采集入口。"""
+
+    calls: list[dict[str, Any]] = []
+
+    def run_avoid_pool_rebuild(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "status": "available",
+            "universe_id": kwargs["universe_id"],
+            "member_count": 3,
+        }
+
+    def collect_base_data(_: Any) -> dict[str, Any]:
+        raise AssertionError("回避池重建任务不应调用基础采集入口")
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="analytics.universe.rebuild_avoid_pool.ashare",
+                job_type="universe_avoid_pool_rebuild",
+                group="analytics",
+                interval_seconds=0,
+                schedule_type="after_success",
+                depends_on=("ashare.risk_sentiment",),
+                market="ashare",
+                params={
+                    "universe_id": "universe:avoid:ashare:system",
+                    "name": "A 股系统回避池",
+                    "market": "ashare",
+                    "strategy_context": "avoid_pool",
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        run_avoid_pool_rebuild_func=run_avoid_pool_rebuild,
+    )
+
+    result = scheduler.run_once()
+
+    assert result["jobs"][0]["status"] == "executed"
+    assert result["jobs"][0]["summary"]["member_count"] == 3
+    assert calls == [
+        {
+            "universe_id": "universe:avoid:ashare:system",
+            "name": "A 股系统回避池",
+            "market": "ashare",
+            "strategy_context": "avoid_pool",
         }
     ]
 

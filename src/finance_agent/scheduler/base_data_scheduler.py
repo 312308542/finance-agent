@@ -46,6 +46,8 @@ JOB_TYPES = {
     "trigger_evaluation",
     "agent_loop_consume",
     "high_risk_reviews",
+    "universe_merge",
+    "universe_avoid_pool_rebuild",
 }
 SCHEDULE_TYPES = {"interval", "daily_time", "trading_session", "manual", "after_success"}
 TRADING_DAY_POLICIES = {
@@ -618,6 +620,8 @@ class BaseDataScheduler:
         run_trigger_evaluation_func: Callable[..., JsonDict] | None = None,
         run_agent_loop_consume_func: Callable[..., JsonDict] | None = None,
         run_high_risk_reviews_func: Callable[..., JsonDict] | None = None,
+        run_universe_merge_func: Callable[..., JsonDict] | None = None,
+        run_avoid_pool_rebuild_func: Callable[..., JsonDict] | None = None,
         sleep_func: Callable[[float], None] = time.sleep,
         status_file: str | Path | None = None,
         event_log_file: str | Path | None = None,
@@ -633,6 +637,8 @@ class BaseDataScheduler:
         self._run_trigger_evaluation = run_trigger_evaluation_func
         self._run_agent_loop_consume = run_agent_loop_consume_func
         self._run_high_risk_reviews = run_high_risk_reviews_func
+        self._run_universe_merge = run_universe_merge_func
+        self._run_avoid_pool_rebuild = run_avoid_pool_rebuild_func
         self._uses_injected_collect_base_data = collect_base_data_func is not None
         self._sleep = sleep_func
         self.status_file = Path(status_file) if status_file else None
@@ -1019,6 +1025,10 @@ class BaseDataScheduler:
             planned["agent_loop_consume_args"] = self.build_agent_loop_consume_kwargs(job)
         elif job.job_type == "high_risk_reviews":
             planned["high_risk_review_args"] = self.build_high_risk_review_kwargs(job)
+        elif job.job_type == "universe_merge":
+            planned["universe_merge_args"] = self.build_universe_merge_kwargs(job)
+        elif job.job_type == "universe_avoid_pool_rebuild":
+            planned["avoid_pool_rebuild_args"] = self.build_avoid_pool_rebuild_kwargs(job)
         else:
             raise ValueError(f"不支持的调度任务类型：{job.job_type}")
 
@@ -1214,6 +1224,12 @@ class BaseDataScheduler:
         if job.job_type == "high_risk_reviews":
             kwargs = self.build_high_risk_review_kwargs(job)
             return self.run_high_risk_reviews(**kwargs)
+        if job.job_type == "universe_merge":
+            kwargs = self.build_universe_merge_kwargs(job)
+            return self.run_universe_merge(**kwargs)
+        if job.job_type == "universe_avoid_pool_rebuild":
+            kwargs = self.build_avoid_pool_rebuild_kwargs(job)
+            return self.run_avoid_pool_rebuild(**kwargs)
         raise ValueError(f"不支持的调度任务类型：{job.job_type}")
 
     def build_collection_args(self, job: BaseDataSchedulerJob) -> Any:
@@ -1431,6 +1447,52 @@ class BaseDataScheduler:
             "limit": int(job.params.get("limit") or job.limit or 10),
         }
 
+    def build_universe_merge_kwargs(self, job: BaseDataSchedulerJob) -> JsonDict:
+        """把候选池合并任务配置转换为数据生产服务参数。"""
+
+        if job.job_type != "universe_merge":
+            raise ValueError(f"{job.name} 不是候选池合并任务")
+        target_universe_id = str(job.params.get("target_universe_id") or "").strip()
+        if not target_universe_id:
+            raise ValueError(f"{job.name}.params.target_universe_id 不能为空")
+        name = str(job.params.get("name") or "").strip()
+        if not name:
+            raise ValueError(f"{job.name}.params.name 不能为空")
+        source_universe_ids = parse_string_list(job.params.get("source_universe_ids"))
+        if not source_universe_ids:
+            raise ValueError(f"{job.name}.params.source_universe_ids 不能为空")
+        source_weights = parse_float_mapping(job.params.get("source_weights"))
+        return {
+            "target_universe_id": target_universe_id,
+            "name": name,
+            "source_universe_ids": source_universe_ids,
+            "source_weights": source_weights,
+            "strategy_context": str(
+                job.params.get("strategy_context") or "recommendation_universe_merge"
+            ),
+        }
+
+    def build_avoid_pool_rebuild_kwargs(self, job: BaseDataSchedulerJob) -> JsonDict:
+        """把回避池重建任务配置转换为数据生产服务参数。"""
+
+        if job.job_type != "universe_avoid_pool_rebuild":
+            raise ValueError(f"{job.name} 不是回避池重建任务")
+        universe_id = str(job.params.get("universe_id") or "").strip()
+        if not universe_id:
+            raise ValueError(f"{job.name}.params.universe_id 不能为空")
+        name = str(job.params.get("name") or "").strip()
+        if not name:
+            raise ValueError(f"{job.name}.params.name 不能为空")
+        market = str(job.params.get("market") or job.market or "").strip()
+        if not market:
+            raise ValueError(f"{job.name}.params.market 不能为空")
+        return {
+            "universe_id": universe_id,
+            "name": name,
+            "market": market,
+            "strategy_context": str(job.params.get("strategy_context") or "avoid_pool"),
+        }
+
     def run_recommendation_pipeline(self, **kwargs: Any) -> JsonDict:
         """执行候选池推荐流水线。"""
 
@@ -1461,6 +1523,44 @@ class BaseDataScheduler:
                     limit=recommendation_intake_limit or int(kwargs.get("limit") or 20),
                 )
         return payload
+
+    def run_universe_merge(self, **kwargs: Any) -> JsonDict:
+        """执行候选池合并任务。"""
+
+        if self._run_universe_merge is not None:
+            return self._run_universe_merge(**kwargs)
+
+        from finance_agent.application.data_production_service import ProductionUniverseService
+        from finance_agent.storage.db import create_session_factory, session_scope
+
+        session_factory = create_session_factory()
+        with session_scope(session_factory) as session:
+            plans = ProductionUniverseService(session).merge_universes(**kwargs)
+        return {
+            "status": "available",
+            "target_universe_id": kwargs["target_universe_id"],
+            "member_count": len(plans),
+            "source_universe_ids": list(kwargs["source_universe_ids"]),
+        }
+
+    def run_avoid_pool_rebuild(self, **kwargs: Any) -> JsonDict:
+        """执行回避池重建任务。"""
+
+        if self._run_avoid_pool_rebuild is not None:
+            return self._run_avoid_pool_rebuild(**kwargs)
+
+        from finance_agent.application.data_production_service import ProductionUniverseService
+        from finance_agent.storage.db import create_session_factory, session_scope
+
+        session_factory = create_session_factory()
+        with session_scope(session_factory) as session:
+            plans = ProductionUniverseService(session).rebuild_avoid_pool(**kwargs)
+        return {
+            "status": "available",
+            "universe_id": kwargs["universe_id"],
+            "market": kwargs["market"],
+            "member_count": len(plans),
+        }
 
     def sync_recommendations_to_default_watchlist(
         self,
@@ -2179,6 +2279,28 @@ def parse_json_object(value: Any, *, field_name: str) -> JsonDict:
     return dict(value)
 
 
+def parse_string_list(value: Any) -> list[str]:
+    """解析逗号分隔字符串或字符串数组。"""
+
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list | tuple):
+        return [str(item).strip() for item in value if str(item).strip()]
+    raise ValueError("配置值必须是字符串或字符串数组")
+
+
+def parse_float_mapping(value: Any) -> dict[str, float]:
+    """解析字符串到浮点数的 JSON 对象。"""
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("source_weights 必须是对象")
+    return {str(key): float(item) for key, item in value.items()}
+
+
 def as_group_choice(value: Any, *, field_name: str) -> str | tuple[str, ...]:
     """解析采集分组，支持单分组和多分组。"""
 
@@ -2206,6 +2328,8 @@ def as_job_group_choice(
         "technical_screening_refresh",
         "trigger_evaluation",
         "high_risk_reviews",
+        "universe_merge",
+        "universe_avoid_pool_rebuild",
     }:
         return as_choice(value, choices={"analytics"}, field_name=field_name)
     if job_type == "agent_loop_consume":

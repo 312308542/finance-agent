@@ -655,6 +655,7 @@ def candidate_universe_patterns(markets: list[str]) -> list[str]:
                 "universe:base:ashare:p1:concept:<concept_name>",
                 "universe:base:ashare:p2:sentiment:hot_rank",
                 "universe:base:ashare:p2:sentiment:zt_pool:<date>",
+                "universe:merged:ashare:recommendation",
             ]
         )
     if "fund" in markets:
@@ -692,6 +693,7 @@ def export_scheduler_payload(config: DataSyncConfig) -> JsonDict:
             *[build_scheduler_job(task) for task in tasks],
             *build_data_quality_scheduler_jobs(config),
             *build_technical_screening_scheduler_jobs(config),
+            *build_universe_preparation_scheduler_jobs(config),
             *build_recommendation_scheduler_jobs(config),
             *build_trigger_scheduler_jobs(config),
         ],
@@ -778,7 +780,7 @@ def build_recommendation_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict
                 build_recommendation_scheduler_job(
                     name="analytics.recommendations.ashare.all_a",
                     market="ashare",
-                    universe_id="universe:base:ashare:p0:all_a",
+                    universe_id="universe:merged:ashare:recommendation",
                     interval_seconds=market_config.interval_seconds.get("market_bars", 60 * 60),
                     timeframe=(market_config.timeframes or ["1d"])[0],
                     limit=min(market_config.batch_size, 200),
@@ -786,13 +788,12 @@ def build_recommendation_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict
                     min_indicator_coverage_ratio=0.7,
                     min_factor_coverage_ratio=0.5,
                     min_available_factor_groups=3,
-                    candidate_source="technical_screening_pool",
                     auto_sync_watchlist=True,
                     owner_id="default-owner",
                     watchlist_id="watchlist:default-owner:ashare:research",
                     recommendation_intake_limit=20,
                     schedule_type="after_success",
-                    depends_on=["analytics.technical_screening.ashare.main_board"],
+                    depends_on=["analytics.universe.merge.ashare.recommendation"],
                 )
             )
         elif market == "crypto_spot":
@@ -835,6 +836,65 @@ def build_recommendation_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict
                     recommendation_intake_limit=20,
                 )
             )
+    return jobs
+
+
+def build_universe_preparation_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
+    """生成推荐前置的候选池合并和回避池重建任务。"""
+
+    if not config.enabled:
+        return []
+    jobs: list[JsonDict] = []
+    ashare_config = config.markets.get("ashare")
+    if ashare_config is None or not ashare_config.enabled:
+        return jobs
+    if "market_bars" in ashare_config.data_packages:
+        jobs.append(
+            {
+                "name": "analytics.universe.merge.ashare.recommendation",
+                "job_type": "universe_merge",
+                "group": "analytics",
+                "enabled": True,
+                "interval_seconds": 0,
+                "schedule_type": "after_success",
+                "depends_on": ["analytics.technical_screening.ashare.main_board"],
+                "market": "ashare",
+                "params": {
+                    "sync_task_type": "analytics.universe.merge",
+                    "target_universe_id": "universe:merged:ashare:recommendation",
+                    "name": "A 股推荐合并候选池",
+                    "source_universe_ids": [
+                        "universe:base:ashare:p0:all_a",
+                        "universe:technical:ashare:main_board",
+                    ],
+                    "source_weights": {
+                        "universe:base:ashare:p0:all_a": 1.0,
+                        "universe:technical:ashare:main_board": 2.0,
+                    },
+                    "strategy_context": "recommendation_universe_merge",
+                },
+            }
+        )
+    if "risk_sentiment" in ashare_config.data_packages:
+        jobs.append(
+            {
+                "name": "analytics.universe.rebuild_avoid_pool.ashare",
+                "job_type": "universe_avoid_pool_rebuild",
+                "group": "analytics",
+                "enabled": True,
+                "interval_seconds": 0,
+                "schedule_type": "after_success",
+                "depends_on": ["ashare.risk_sentiment"],
+                "market": "ashare",
+                "params": {
+                    "sync_task_type": "analytics.universe.rebuild_avoid_pool",
+                    "universe_id": "universe:avoid:ashare:system",
+                    "name": "A 股系统回避池",
+                    "market": "ashare",
+                    "strategy_context": "avoid_pool",
+                },
+            }
+        )
     return jobs
 
 
