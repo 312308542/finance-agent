@@ -411,6 +411,16 @@ class FinanceAgentInterface:
 
         events = self.assistant.langgraph_adapter.list_events(workflow_run_id)
         report = find_report_from_events(events)
+        report_review_appended = (
+            report.get("report_review_appended")
+            if isinstance(report, dict)
+            else build_report_review_appended([])
+        )
+        review_results = (
+            report.get("review_results")
+            if isinstance(report, dict)
+            else []
+        )
         if markdown and report:
             return AgentInterfaceResult(
                 status="ok",
@@ -418,11 +428,18 @@ class FinanceAgentInterface:
                     "workflow_run_id": workflow_run_id,
                     "markdown": report.get("markdown", ""),
                     "report": report,
+                    "review_results": review_results,
+                    "report_review_appended": report_review_appended,
                 },
             )
         return AgentInterfaceResult(
             status="ok",
-            data={"workflow_run_id": workflow_run_id, "report": report},
+            data={
+                "workflow_run_id": workflow_run_id,
+                "report": report,
+                "review_results": review_results,
+                "report_review_appended": report_review_appended,
+            },
         )
 
 
@@ -643,7 +660,106 @@ def find_report_from_events(events: tuple[AgentWorkflowEventORM, ...]) -> JsonDi
     payload = report_events[-1].payload or {}
     output = payload.get("output", {})
     report = output.get("report") or output
-    return json_value(report)
+    return append_report_review_results(
+        report=json_value(report),
+        review_results=extract_report_review_results(events),
+    )
+
+
+def extract_report_review_results(events: tuple[AgentWorkflowEventORM, ...]) -> list[JsonDict]:
+    """从审计链提取异步高风险复核结果。"""
+
+    results: list[JsonDict] = []
+    for event in events:
+        payload = event.payload or {}
+        result_payload: JsonDict | None = None
+        if event.event_type == "model_review_result" and isinstance(payload, dict):
+            result_payload = payload
+        elif event.event_type == "model_review" and isinstance(payload, dict):
+            output = payload.get("output")
+            if isinstance(output, dict) and isinstance(output.get("review_result"), dict):
+                result_payload = output["review_result"]
+        if result_payload is None:
+            continue
+        result = json_value(result_payload)
+        if not isinstance(result, dict):
+            continue
+        created_at = getattr(event, "created_at", None)
+        if created_at is not None:
+            result.setdefault("created_at", json_value(created_at))
+        workflow_event_id = getattr(event, "workflow_event_id", None)
+        if workflow_event_id:
+            result.setdefault("workflow_event_id", workflow_event_id)
+        results.append(result)
+    return results
+
+
+def append_report_review_results(
+    *,
+    report: JsonDict,
+    review_results: list[JsonDict],
+) -> JsonDict:
+    """把异步复核结果追加到报告结构和 Markdown 中。"""
+
+    if not review_results:
+        return report
+    enriched = dict(report)
+    appended = build_report_review_appended(review_results)
+    review_status = dict(enriched.get("review_status") or {})
+    latest_result = review_results[-1]
+    review_status["status"] = str(
+        latest_result.get("review_status")
+        or latest_result.get("verdict")
+        or review_status.get("status")
+        or "review_completed"
+    )
+    review_status["result_count"] = len(review_results)
+    review_status["latest_result"] = latest_result
+    enriched["review_status"] = review_status
+    enriched["review_results"] = review_results
+    enriched["report_review_appended"] = appended
+
+    markdown = str(enriched.get("markdown") or "")
+    appendix = appended["markdown"]
+    if appendix and "## 异步高风险复核结果" not in markdown:
+        enriched["markdown"] = (
+            f"{markdown.rstrip()}\n\n{appendix}" if markdown else appendix
+        )
+    return enriched
+
+
+def build_report_review_appended(review_results: list[JsonDict]) -> JsonDict:
+    """构造报告详情页可直接展示的复核追加片段。"""
+
+    if not review_results:
+        return {"items": [], "markdown": ""}
+    lines = ["## 异步高风险复核结果"]
+    for index, result in enumerate(review_results, start=1):
+        status = result.get("review_status") or result.get("verdict") or "unknown"
+        verdict = result.get("verdict") or "unknown"
+        confidence = result.get("confidence")
+        confidence_text = "无" if confidence is None else str(confidence)
+        lines.append(
+            f"- 复核 {index}：状态 {status}，裁决 {verdict}，置信度 {confidence_text}。"
+        )
+        reasons = normalize_report_text_list(result.get("reasons"))
+        blocking_risks = normalize_report_text_list(result.get("blocking_risks"))
+        data_gaps = normalize_report_text_list(result.get("data_gaps"))
+        if reasons:
+            lines.extend(f"  - 理由：{item}" for item in reasons)
+        if blocking_risks:
+            lines.extend(f"  - 阻断风险：{item}" for item in blocking_risks)
+        if data_gaps:
+            lines.extend(f"  - 数据缺口：{item}" for item in data_gaps)
+    return {"items": review_results, "markdown": "\n".join(lines)}
+
+
+def normalize_report_text_list(value: object) -> list[str]:
+    """安全读取复核结果中的文本列表。"""
+
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
 
 
 def extract_node_trace(events: tuple[AgentWorkflowEventORM, ...]) -> list[str]:
