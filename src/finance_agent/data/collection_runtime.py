@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -108,7 +109,7 @@ class CollectionRuntime:
             return result
 
         try:
-            archive: ArchivedProviderResult = collect()
+            archive: ArchivedProviderResult | Sequence[ArchivedProviderResult] = collect()
             result = summarize_archive(task, archive)
             self.record_provider_result(provider_key=provider_key, result=result)
             log_method = logger.info if result.status == "available" else logger.warning
@@ -220,8 +221,14 @@ class CollectionRuntime:
         return states
 
 
-def summarize_archive(task: str, archive: ArchivedProviderResult) -> CollectionTaskResult:
+def summarize_archive(
+    task: str,
+    archive: ArchivedProviderResult | Sequence[ArchivedProviderResult],
+) -> CollectionTaskResult:
     """把带归档编号的 Provider 结果压缩成命令输出摘要。"""
+
+    if not isinstance(archive, ArchivedProviderResult):
+        return summarize_archives(task, archive)
 
     result = archive.result
     return CollectionTaskResult(
@@ -235,8 +242,94 @@ def summarize_archive(task: str, archive: ArchivedProviderResult) -> CollectionT
             "fallback_used": result.payload.get("fallback_used"),
             "source_coverage": result.payload.get("source_coverage"),
             "rate_limited": result.payload.get("rate_limited"),
+        }
+        | infer_time_range_payload(result),
+    )
+
+
+def summarize_archives(
+    task: str,
+    archives: Sequence[ArchivedProviderResult],
+) -> CollectionTaskResult:
+    """把多 Provider 归档结果合并成一个任务摘要。"""
+
+    if not archives:
+        return CollectionTaskResult(
+            task=task,
+            status="unavailable",
+            raw_record_id=None,
+            item_count=0,
+            error_message="没有 Provider 归档结果",
+            payload={"raw_record_ids": [], "source_results": []},
+        )
+
+    source_results: list[JsonDict] = []
+    raw_record_ids: list[str] = []
+    actual_sources: list[str] = []
+    error_messages: list[str] = []
+    item_count = 0
+    statuses: list[str] = []
+
+    for archived in archives:
+        result = archived.result
+        count = infer_item_count(result)
+        actual_source = result.payload.get("actual_source")
+        source_results.append(
+            {
+                "provider_name": result.provider_name,
+                "status": result.status,
+                "raw_record_id": archived.raw_record_id,
+                "item_count": count,
+                "actual_source": actual_source,
+                "error_message": result.error_message,
+            }
+            | infer_time_range_payload(result)
+        )
+        raw_record_ids.append(archived.raw_record_id)
+        statuses.append(result.status)
+        if result.status == "available":
+            item_count += count
+            if actual_source:
+                actual_sources.append(str(actual_source))
+        elif result.error_message:
+            error_messages.append(result.error_message)
+
+    status = merge_archive_statuses(statuses)
+    return CollectionTaskResult(
+        task=task,
+        status=status,
+        raw_record_id=None,
+        item_count=item_count,
+        error_message=None if status == "available" else "; ".join(error_messages) or None,
+        payload={
+            "actual_source": actual_sources,
+            "fallback_used": any(
+                bool(archived.result.payload.get("fallback_used")) for archived in archives
+            ),
+            "source_coverage": [
+                archived.result.payload.get("source_coverage")
+                for archived in archives
+                if archived.result.payload.get("source_coverage") is not None
+            ],
+            "rate_limited": any(
+                bool(archived.result.payload.get("rate_limited")) for archived in archives
+            ),
+            "raw_record_ids": raw_record_ids,
+            "source_results": source_results,
         },
     )
+
+
+def merge_archive_statuses(statuses: Sequence[str]) -> str:
+    """合并多个 Provider 状态，任一可用源即可让任务摘要可用。"""
+
+    if any(status == "available" for status in statuses):
+        return "available"
+    if any(status == "error" for status in statuses):
+        return "error"
+    if any(status == "unavailable" for status in statuses):
+        return "unavailable"
+    return statuses[0] if statuses else "unavailable"
 
 
 def infer_item_count(result: Any) -> int:
@@ -249,6 +342,32 @@ def infer_item_count(result: Any) -> int:
     if getattr(result, "snapshot", None) is not None:
         return 1
     return 0
+
+
+def infer_time_range_payload(result: Any) -> JsonDict:
+    """从 Provider 结果中提取最早和最新数据日期。"""
+
+    bars = getattr(result, "bars", None)
+    if bars:
+        timestamps = [bar.timestamp for bar in bars if getattr(bar, "timestamp", None) is not None]
+        if timestamps:
+            return {
+                "earliest_at": min(timestamps).isoformat(),
+                "latest_at": max(timestamps).isoformat(),
+            }
+    snapshots = getattr(result, "snapshots", None)
+    if snapshots:
+        nav_dates = [
+            snapshot.nav_date
+            for snapshot in snapshots
+            if getattr(snapshot, "nav_date", None) is not None
+        ]
+        if nav_dates:
+            return {
+                "earliest_at": min(nav_dates).isoformat(),
+                "latest_at": max(nav_dates).isoformat(),
+            }
+    return {}
 
 
 def provider_state_key(provider_key: str) -> str:

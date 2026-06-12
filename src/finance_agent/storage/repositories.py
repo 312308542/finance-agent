@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Select, String, func, or_, select, text
+from sqlalchemy import Select, String, delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -453,6 +453,27 @@ class AssetRepository:
             chunk_size=chunk_size,
             build_statement=build_statement,
         )
+
+    def delete_fund_open_placeholders_without_nav(self, symbols: Sequence[str]) -> int:
+        """删除没有净值事实的开放式基金占位，避免与 ETF/LOF 主数据冲突。"""
+
+        normalized_symbols = sorted({str(symbol).strip() for symbol in symbols if str(symbol).strip()})
+        if not normalized_symbols:
+            return 0
+        nav_exists = (
+            select(FundNavSnapshotORM.asset_id)
+            .where(FundNavSnapshotORM.asset_id == AssetORM.asset_id)
+            .exists()
+        )
+        statement = delete(AssetORM).where(
+            AssetORM.market == "fund",
+            AssetORM.asset_type == "open_fund",
+            AssetORM.symbol.in_(normalized_symbols),
+            ~nav_exists,
+        )
+        result = self.session.execute(statement)
+        self.session.flush()
+        return int(result.rowcount or 0)
 
     def ensure_assets(
         self,

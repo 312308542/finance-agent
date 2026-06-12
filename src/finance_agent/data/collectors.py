@@ -64,6 +64,7 @@ JsonDict = dict[str, Any]
 logger = logging.getLogger(__name__)
 UNIVERSE_SEED_MAPPING_SOURCE = "akshare:universe_seed"
 CANONICAL_ASHARE_KLINE_SOURCE = "canonical:ashare:kline"
+EXCHANGE_TRADED_FUND_TYPES = {"etf", "lof"}
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,26 @@ class ArchivedProviderResult:
 
     result: ProviderResult
     raw_record_id: str
+
+
+def _deduplicate_fund_assets_by_symbol(assets: Sequence[AssetData]) -> list[AssetData]:
+    """基金资产按代码去重，同代码优先保留 ETF/LOF 交易所交易形态。"""
+
+    priority = {"etf": 3, "lof": 2, "open_fund": 1}
+    ordered_symbols: list[str] = []
+    selected: dict[str, AssetData] = {}
+    for asset in assets:
+        symbol = str(asset.symbol or "").strip()
+        if not symbol:
+            continue
+        if symbol not in selected:
+            ordered_symbols.append(symbol)
+            selected[symbol] = asset
+            continue
+        current = selected[symbol]
+        if priority.get(asset.asset_type, 0) > priority.get(current.asset_type, 0):
+            selected[symbol] = asset
+    return [selected[symbol] for symbol in ordered_symbols if symbol in selected]
 
 
 def archive_provider_result(
@@ -1133,6 +1154,7 @@ class FundDataCollector:
         ]
         archived_results: list[ArchivedProviderResult] = []
         all_assets: list[AssetData] = []
+        exchange_traded_symbols: set[str] = set()
         latest_as_of: datetime | None = None
         for source, result in results:
             raw_record_id = archive_provider_result(
@@ -1148,10 +1170,24 @@ class FundDataCollector:
             )
             if result.status != "available":
                 continue
-            all_assets.extend(result.assets)
+            assets_to_persist = list(result.assets)
+            result_asset_types = {asset.asset_type for asset in assets_to_persist}
+            current_exchange_traded_symbols = {
+                asset.symbol
+                for asset in assets_to_persist
+                if asset.asset_type in EXCHANGE_TRADED_FUND_TYPES
+            }
+            if current_exchange_traded_symbols:
+                self.assets.delete_fund_open_placeholders_without_nav(current_exchange_traded_symbols)
+                exchange_traded_symbols.update(current_exchange_traded_symbols)
+            if "open_fund" in result_asset_types and exchange_traded_symbols:
+                assets_to_persist = [
+                    asset for asset in assets_to_persist if asset.symbol not in exchange_traded_symbols
+                ]
+            all_assets.extend(assets_to_persist)
             _persist_asset_identity_rows(
                 self.assets,
-                result.assets,
+                assets_to_persist,
                 as_of=result.collected_at,
                 raw_record_id=raw_record_id,
                 source=source,
@@ -1159,6 +1195,7 @@ class FundDataCollector:
 
         if latest_as_of is None:
             latest_as_of = datetime.now(tz=UTC)
+        all_assets = _deduplicate_fund_assets_by_symbol(all_assets)
         self.universes.upsert_universe(
             universe_id=universe_id,
             name=universe_name,

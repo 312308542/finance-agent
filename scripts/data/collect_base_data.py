@@ -2862,15 +2862,20 @@ def batch_fund_bar_symbols(
     now: datetime | None = None,
     only_failed_or_stale: bool = False,
     stale_before: datetime | None = None,
+    required_start_at: datetime | None = None,
+    required_end_at: datetime | None = None,
 ) -> list[str]:
     """按覆盖情况和水位选择基金日 K 任务本轮要处理的代码。"""
 
+    selection_failed = False
+    has_candidate_assets = False
     try:
         assets = [
             asset
             for asset in AssetRepository(session).find_by_market("fund")
             if str(getattr(asset, "asset_type", "") or "").strip() == asset_type
         ]
+        has_candidate_assets = bool(assets)
         symbol_by_asset_id = {
             str(asset.asset_id): str(getattr(asset, "symbol", "") or "").strip() for asset in assets
         }
@@ -2897,21 +2902,31 @@ def batch_fund_bar_symbols(
                         watermark=watermarks.get(asset.asset_id),
                         now=current_time,
                         stale_before=stale_before,
+                        required_start_at=required_start_at,
+                        required_end_at=required_end_at,
                     )
                 )
             ],
             key=lambda asset: (
-                coverage.get(asset.asset_id, (0, None))[0],
-                coverage.get(asset.asset_id, (0, None))[1] or datetime.min.replace(tzinfo=UTC),
+                _coverage_bar_count(coverage.get(asset.asset_id)),
+                _coverage_latest_bar_at(coverage.get(asset.asset_id))
+                or datetime.min.replace(tzinfo=UTC),
                 symbol_by_asset_id.get(asset.asset_id, ""),
             ),
         )
         symbols = [symbol_by_asset_id.get(asset.asset_id, "") for asset in ranked_assets]
     except Exception as exc:
         logger.warning("基金日 K 标的筛选失败 asset_type=%s error=%s", asset_type, exc, exc_info=True)
+        if only_failed_or_stale and has_candidate_assets:
+            raise RuntimeError(
+                "基金日 K 补采标的筛选失败，已停止任务，避免回退默认标的导致误报完成。"
+            ) from exc
+        selection_failed = True
         symbols = []
     symbols = [symbol for symbol in symbols if symbol]
     if not symbols:
+        if only_failed_or_stale and has_candidate_assets and not selection_failed:
+            return []
         symbols = [fallback_symbol]
     return symbols[:limit] if limit else symbols
 
@@ -2927,12 +2942,15 @@ def batch_open_fund_nav_symbols(
 ) -> list[str]:
     """按净值覆盖和失败水位选择开放式基金任务本轮要处理的代码。"""
 
+    selection_failed = False
+    has_candidate_assets = False
     try:
         assets = [
             asset
             for asset in AssetRepository(session).find_by_market("fund")
             if str(getattr(asset, "asset_type", "") or "").strip() == "open_fund"
         ]
+        has_candidate_assets = bool(assets)
         symbol_by_asset_id = {
             str(asset.asset_id): str(getattr(asset, "symbol", "") or "").strip() for asset in assets
         }
@@ -2971,9 +2989,16 @@ def batch_open_fund_nav_symbols(
         symbols = [symbol_by_asset_id.get(asset.asset_id, "") for asset in ranked_assets]
     except Exception as exc:
         logger.warning("开放式基金净值标的筛选失败 error=%s", exc, exc_info=True)
+        if only_failed_or_stale and has_candidate_assets:
+            raise RuntimeError(
+                "开放式基金净值补采标的筛选失败，已停止任务，避免回退默认标的导致误报完成。"
+            ) from exc
+        selection_failed = True
         symbols = []
     symbols = [symbol for symbol in symbols if symbol]
     if not symbols:
+        if only_failed_or_stale and has_candidate_assets and not selection_failed:
+            return []
         symbols = [fallback_symbol]
     return symbols[:limit] if limit else symbols
 
@@ -3089,10 +3114,12 @@ def _fetch_fund_nav_coverage(
 def _asset_requires_fund_bar_collection(
     asset: Any,
     *,
-    coverage: dict[str, tuple[int, datetime | None]],
+    coverage: dict[str, tuple[int, datetime | None, datetime | None]],
     watermark: Any,
     now: datetime,
     stale_before: datetime | None,
+    required_start_at: datetime | None = None,
+    required_end_at: datetime | None = None,
 ) -> bool:
     """判断基金日 K 是否需要补采。"""
 
@@ -3100,8 +3127,15 @@ def _asset_requires_fund_bar_collection(
     next_retry_at = getattr(watermark, "next_retry_at", None) if watermark else None
     if status == "error" and (next_retry_at is None or next_retry_at <= now):
         return True
-    bar_count, latest_bar_at = coverage.get(asset.asset_id, (0, None))
+    latest_coverage = coverage.get(asset.asset_id)
+    bar_count = _coverage_bar_count(latest_coverage)
+    earliest_bar_at = _coverage_earliest_bar_at(latest_coverage)
+    latest_bar_at = _coverage_latest_bar_at(latest_coverage)
     if bar_count <= 0 or latest_bar_at is None:
+        return True
+    if _datetime_after(earliest_bar_at, required_start_at):
+        return True
+    if _datetime_before(latest_bar_at, required_end_at):
         return True
     if stale_before is not None and latest_bar_at < stale_before:
         return True
@@ -4108,12 +4142,20 @@ def resolve_fund_bar_collection_symbols(
     symbol_source = str(getattr(args, "symbol_source", "") or "").strip()
     if symbol_source in {"market_assets", "universe"}:
         kwargs: JsonDict = {
-            "limit": None,
+            "limit": getattr(args, "source_limit", None),
             "fallback_symbol": getattr(args, "fund_symbol", COLLECTION_ARG_DEFAULTS["fund_symbol"]),
             "asset_type": asset_type,
             "timeframe": getattr(args, "fund_timeframe", "1d"),
         }
-        if bool(getattr(args, "only_failed_or_stale", False)):
+        if task_type_name(args) == "market_bars_full_history_backfill":
+            kwargs["only_failed_or_stale"] = True
+            kwargs["required_start_at"] = parse_ashare_datetime_or_none(
+                getattr(args, "ashare_start", None)
+            )
+            kwargs["required_end_at"] = parse_ashare_datetime_or_none(
+                getattr(args, "ashare_end", None)
+            )
+        elif bool(getattr(args, "only_failed_or_stale", False)):
             kwargs["only_failed_or_stale"] = True
             kwargs["stale_before"] = parse_ashare_datetime_or_none(getattr(args, "ashare_start", None))
         return batch_fund_bar_symbols(session, **kwargs)
@@ -4129,10 +4171,13 @@ def resolve_fund_nav_collection_symbols(
     symbol_source = str(getattr(args, "symbol_source", "") or "").strip()
     if symbol_source in {"market_assets", "universe"}:
         kwargs: JsonDict = {
-            "limit": None,
+            "limit": getattr(args, "source_limit", None),
             "fallback_symbol": getattr(args, "fund_symbol", COLLECTION_ARG_DEFAULTS["fund_symbol"]),
         }
-        if bool(getattr(args, "only_failed_or_stale", False)):
+        if task_type_name(args) == "fund_nav_full_history_backfill":
+            kwargs["only_failed_or_stale"] = True
+            kwargs["stale_before"] = parse_ashare_datetime_or_none(getattr(args, "ashare_start", None))
+        elif bool(getattr(args, "only_failed_or_stale", False)):
             kwargs["only_failed_or_stale"] = True
             kwargs["stale_before"] = parse_ashare_datetime_or_none(getattr(args, "ashare_start", None))
         return batch_open_fund_nav_symbols(session, **kwargs)
@@ -4251,12 +4296,18 @@ def _record_fund_symbol_watermark(
     now = occurred_at or datetime.now(tz=UTC)
     repository = DataSyncWatermarkRepository(session)
     if status == "available":
-        if data_domain == FUND_NAV_DATA_DOMAIN:
+        payload_watermark_at = result_watermark_at(result)
+        if payload_watermark_at is not None:
+            latest_count = result_item_count(result)
+            latest_at = payload_watermark_at
+        elif data_domain == FUND_NAV_DATA_DOMAIN:
             coverage = _fetch_fund_nav_coverage(session, [asset_id])
             latest_count, latest_at = coverage.get(asset_id, (0, None))
         else:
             coverage = _fetch_fund_bar_coverage(session, [asset_id], timeframe=timeframe)
-            latest_count, latest_at = coverage.get(asset_id, (0, None))
+            latest_coverage = coverage.get(asset_id)
+            latest_count = _coverage_bar_count(latest_coverage)
+            latest_at = _coverage_latest_bar_at(latest_coverage)
         repository.record_success(
             asset_id=asset_id,
             symbol=symbol,
@@ -4978,6 +5029,32 @@ def result_item_count(result: Any) -> int:
             total += result_item_count(item)
         return total
     return 0
+
+
+def result_watermark_at(result: Any) -> datetime | None:
+    """从采集摘要 payload 中读取最新数据日期。"""
+
+    value = optional_result_payload(result, "latest_at")
+    if not payload_value_present(value):
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time(), tzinfo=UTC)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed_datetime = datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            parsed_date = date.fromisoformat(text)
+        except ValueError:
+            return None
+        return datetime.combine(parsed_date, datetime.min.time(), tzinfo=UTC)
+    if parsed_datetime.tzinfo is None:
+        return parsed_datetime.replace(tzinfo=UTC)
+    return parsed_datetime.astimezone(UTC)
 
 
 def result_error_message(result: Any) -> str | None:
