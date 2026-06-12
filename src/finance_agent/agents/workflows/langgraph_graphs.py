@@ -159,9 +159,20 @@ def build_recommendation_asset_contexts(
             "memory": {
                 "memories": workflow_input.memories_by_asset.get(recommendation.asset_id, ()),
             },
+            "backtest": extract_recommendation_backtest_evidence(recommendation),
         }
         for recommendation in workflow_input.recommendations
     }
+
+
+def extract_recommendation_backtest_evidence(recommendation: Any) -> dict[str, Any] | None:
+    """从推荐 payload 中提取回测证据，供报告和圆桌上下文消费。"""
+
+    payload = getattr(recommendation, "payload", None)
+    if not isinstance(payload, dict):
+        return None
+    backtest = payload.get("backtest_evidence")
+    return backtest if isinstance(backtest, dict) else None
 
 
 def _load_langgraph() -> tuple[Any, Any, Any]:
@@ -777,17 +788,7 @@ def build_recommendation_decision_graph() -> Any:
             ],
             roundtable_opinions=state.get("roundtable_opinions", []),
             high_risk_reviews=state.get("high_risk_reviews", []),
-            asset_contexts={
-                recommendation.asset_id: {
-                    "profile": {
-                        "asset_id": recommendation.asset_id,
-                        "symbol": recommendation.symbol,
-                        "market": recommendation.market,
-                    },
-                    "factor": state.get("factor_contexts", {}).get(recommendation.asset_id, {}),
-                }
-                for recommendation in recommendations
-            },
+            asset_contexts=build_recommendation_asset_contexts(state),
             model_routes=state.get("model_routes", []),
             review_model_routes=state.get("review_model_routes", []),
         )

@@ -54,7 +54,48 @@ def test_report_roundtable_section_keeps_rule_based_summary_compatible() -> None
     assert "- technical_analyst（fallback）: 规则版技术观点。" in report["markdown"]
 
 
-def build_report(*, roundtable_opinions: list[dict[str, Any]]) -> dict[str, Any]:
+def test_report_key_evidence_renders_backtest_summary() -> None:
+    report = build_report(
+        roundtable_opinions=[],
+        backtest={
+            "status": "available",
+            "backtest_id": "bt:factor_score_topn:ashare:1",
+            "summary": "近 5 年模拟回放：年化收益 12.34%，最大回撤 -18.20%，夏普 1.21。",
+            "metrics": {"cagr": 0.1234},
+        },
+    )
+
+    backtest_items = [
+        item for item in report["key_evidence"] if item.get("source") == "backtest"
+    ]
+    assert backtest_items[0]["evidence_id"] == "bt:factor_score_topn:ashare:1"
+    assert backtest_items[0]["title"] == "策略回测证据"
+    assert "年化收益 12.34%" in report["markdown"]
+
+
+def test_report_key_evidence_marks_missing_backtest() -> None:
+    report = build_report(
+        roundtable_opinions=[],
+        backtest={
+            "status": "missing",
+            "reason": "暂无同策略回测证据",
+            "certainty_adjustment": "lower",
+        },
+    )
+
+    backtest_items = [
+        item for item in report["key_evidence"] if item.get("source") == "backtest"
+    ]
+    assert backtest_items[0]["title"] == "暂无回测证据"
+    assert "暂无同策略回测证据" in report["markdown"]
+    assert "仅基于当前评分、信号和风险事实" in report["markdown"]
+
+
+def build_report(
+    *,
+    roundtable_opinions: list[dict[str, Any]],
+    backtest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return build_chinese_decision_report(
         title="圆桌模型报告",
         summary="圆桌模型报告摘要。",
@@ -89,6 +130,7 @@ def build_report(*, roundtable_opinions: list[dict[str, Any]]) -> dict[str, Any]
                     ],
                 },
                 "signal_risk": {"data_quality": []},
+                "backtest": backtest,
             }
         },
         model_routes=[],

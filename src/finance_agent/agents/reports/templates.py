@@ -166,7 +166,66 @@ def build_key_evidence(*, asset_contexts: dict[str, dict[str, Any]]) -> list[dic
                     "indicator_frame_id": indicator.get("indicator_frame_id"),
                 }
             )
+        backtest = extract_backtest_evidence(context=context, factor_context=factor_context)
+        if backtest is not None:
+            evidence_items.append(
+                build_backtest_evidence_item(
+                    asset_id=asset_id,
+                    symbol=profile.get("symbol") or asset_id,
+                    backtest=backtest,
+                )
+            )
     return evidence_items
+
+
+def extract_backtest_evidence(
+    *,
+    context: dict[str, Any],
+    factor_context: dict[str, Any],
+) -> dict[str, Any] | None:
+    """从资产上下文中提取回测证据。"""
+
+    for candidate in (
+        context.get("backtest"),
+        context.get("backtest_evidence"),
+        factor_context.get("backtest_evidence"),
+    ):
+        if isinstance(candidate, dict):
+            return candidate
+    return None
+
+
+def build_backtest_evidence_item(
+    *,
+    asset_id: str,
+    symbol: str,
+    backtest: dict[str, Any],
+) -> dict[str, Any]:
+    """把回测结果转换成报告证据项。"""
+
+    if backtest.get("status") == "available":
+        return {
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "evidence_id": backtest.get("backtest_id"),
+            "source": "backtest",
+            "title": "策略回测证据",
+            "summary": backtest.get("summary") or "同策略回测结果可用，但暂无可读摘要。",
+            "score": None,
+            "indicator_frame_id": None,
+        }
+    reason = backtest.get("reason") or "暂无同策略回测证据"
+    return {
+        "asset_id": asset_id,
+        "symbol": symbol,
+        "evidence_id": backtest.get("backtest_id"),
+        "source": "backtest",
+        "title": "暂无回测证据",
+        "summary": f"{reason}，报告结论仅基于当前评分、信号和风险事实。",
+        "score": None,
+        "indicator_frame_id": None,
+        "certainty_adjustment": backtest.get("certainty_adjustment") or "lower",
+    }
 
 
 def build_roundtable_section(

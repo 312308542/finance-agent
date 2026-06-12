@@ -19,6 +19,7 @@ from finance_agent.storage.orm import AssetScoreORM, RiskFindingORM, SignalSnaps
 from finance_agent.storage.repositories import (
     AssetRepository,
     AssetScoreRepository,
+    BacktestRepository,
     RecommendationRepository,
     RiskRepository,
     ScreeningRepository,
@@ -55,6 +56,7 @@ class RecommendationService:
         self.signals = SignalSnapshotRepository(session)
         self.risks = RiskRepository(session)
         self.recommendations = RecommendationRepository(session)
+        self.backtests = BacktestRepository(session)
 
     def rank_from_screening(
         self,
@@ -79,6 +81,22 @@ class RecommendationService:
         )
         scores = self.scores.list_scores_for_screening(screening_id)[:limit]
         ensure_scores_match_market(scores=scores, market=screening.market)
+        backtest_strategy_id = resolve_backtest_strategy_id(scores=scores, fallback=strategy)
+        backtests = getattr(self, "backtests", None)
+        backtest_evidence = (
+            build_backtest_evidence(
+                backtests=backtests,
+                market=screening.market,
+                strategy_id=backtest_strategy_id,
+                universe_id=screening.universe_id,
+            )
+            if backtests is not None
+            else build_missing_backtest_evidence(
+                market=screening.market,
+                strategy_id=backtest_strategy_id,
+                universe_id=screening.universe_id,
+            )
+        )
         recommendation_ids: list[str] = []
 
         self.recommendations.upsert_run_universe(
@@ -107,6 +125,7 @@ class RecommendationService:
                 rank=rank,
                 run_id=run_id,
                 rule_version=rule_version,
+                backtest_evidence=backtest_evidence,
             )
             saved = self.recommendations.upsert_asset_recommendation(
                 recommendation_id=recommendation["recommendation_id"],
@@ -152,6 +171,7 @@ class RecommendationService:
                 "universe_id": screening.universe_id,
                 "score_count": len(scores),
             },
+            "backtest_evidence": backtest_evidence,
         }
         if audit_payload:
             run_payload.update(audit_payload)
@@ -198,6 +218,7 @@ def build_recommendation_payload(
     rank: int,
     run_id: str,
     rule_version: str,
+    backtest_evidence: JsonDict | None = None,
 ) -> JsonDict:
     """构建单标的推荐 payload。"""
 
@@ -249,7 +270,135 @@ def build_recommendation_payload(
         "missing_data": missing_data,
         "score_strategy_id": score.payload.get("strategy_id"),
         "score_weight_snapshot": score.payload.get("weight_snapshot"),
+        "backtest_evidence": backtest_evidence,
     }
+
+
+def resolve_backtest_strategy_id(
+    *,
+    scores: list[AssetScoreORM],
+    fallback: str,
+) -> str:
+    """从评分快照解析回测使用的策略 ID，缺失时回退到推荐策略名。"""
+
+    for score in scores:
+        strategy_id = score.payload.get("strategy_id")
+        if strategy_id:
+            return str(strategy_id)
+    return fallback
+
+
+def build_backtest_evidence(
+    *,
+    backtests: BacktestRepository,
+    market: str,
+    strategy_id: str,
+    universe_id: str,
+) -> JsonDict:
+    """读取同市场、同策略、同候选池的最近可用回测证据。"""
+
+    row = backtests.get_latest_result(
+        market=market,
+        strategy_id=strategy_id,
+        universe_id=universe_id,
+        status="available",
+    )
+    if row is None:
+        return build_missing_backtest_evidence(
+            market=market,
+            strategy_id=strategy_id,
+            universe_id=universe_id,
+        )
+    metrics = _json_safe(row.metrics or {})
+    evidence = {
+        "status": row.status,
+        "backtest_id": row.backtest_id,
+        "market": row.market,
+        "strategy_id": row.strategy_id,
+        "universe_id": row.universe_id,
+        "start_at": _isoformat(row.start_at),
+        "end_at": _isoformat(row.end_at),
+        "rebalance_frequency": row.rebalance_frequency,
+        "metrics": metrics,
+        "data_versions": _json_safe(row.data_versions or {}),
+        "created_at": _isoformat(row.created_at),
+        "summary": build_backtest_summary(metrics=metrics, start_at=row.start_at, end_at=row.end_at),
+    }
+    warnings = (row.payload or {}).get("warnings") if isinstance(row.payload, dict) else None
+    if warnings:
+        evidence["warnings"] = _json_safe(warnings)
+    return evidence
+
+
+def build_missing_backtest_evidence(
+    *,
+    market: str,
+    strategy_id: str,
+    universe_id: str,
+) -> JsonDict:
+    """生成缺失回测证据的标准标记。"""
+
+    return {
+        "status": "missing",
+        "market": market,
+        "strategy_id": strategy_id,
+        "universe_id": universe_id,
+        "reason": "暂无同策略回测证据",
+        "certainty_adjustment": "lower",
+    }
+
+
+def build_backtest_summary(
+    *,
+    metrics: JsonDict,
+    start_at: datetime,
+    end_at: datetime,
+) -> str:
+    """把核心回测指标整理成可直接进入报告的中文摘要。"""
+
+    year_span = max(round((end_at - start_at).days / 365), 1)
+    return (
+        f"近 {year_span} 年模拟回放：年化收益 {format_ratio(metrics.get('cagr'))}，"
+        f"最大回撤 {format_ratio(metrics.get('max_drawdown'))}，"
+        f"夏普 {format_number(metrics.get('sharpe'))}，"
+        f"周期胜率 {format_ratio(metrics.get('period_win_rate'))}。"
+    )
+
+
+def format_ratio(value: Any) -> str:
+    """格式化回测比例指标。"""
+
+    if value is None:
+        return "未知"
+    return f"{float(value) * 100:.2f}%"
+
+
+def format_number(value: Any) -> str:
+    """格式化回测普通数值指标。"""
+
+    if value is None:
+        return "未知"
+    return f"{float(value):.2f}"
+
+
+def _json_safe(value: Any) -> Any:
+    """把 ORM/Decimal/时间对象转换为 JSON 友好结构。"""
+
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _isoformat(value: datetime | None) -> str | None:
+    """安全输出 ISO 时间字符串。"""
+
+    return value.isoformat() if value is not None else None
 
 
 def ensure_recommendation_market(market: str) -> None:
