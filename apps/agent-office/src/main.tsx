@@ -97,6 +97,7 @@ import {
   type TaskMonitorSourceRateState,
 } from "./taskMonitorView";
 import { ReportPage } from "./pages/ReportPage";
+import { RecommendationPage } from "./pages/RecommendationPage";
 import "./styles.css";
 
 const ownerId = "default-owner";
@@ -208,6 +209,7 @@ function App() {
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [activeNav, setActiveNav] = React.useState<NavId>("overview");
+  const [reportWorkflowRunId, setReportWorkflowRunId] = React.useState<string | null>(null);
   const [message, setMessage] = React.useState("");
   const [chatLines, setChatLines] = React.useState<ChatLine[]>([
     {
@@ -243,6 +245,21 @@ function App() {
   React.useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  React.useEffect(() => {
+    const applyHashRoute = () => {
+      const hash = window.location.hash || "";
+      if (!hash.startsWith("#report:")) {
+        return;
+      }
+      const runId = decodeURIComponent(hash.slice("#report:".length));
+      setReportWorkflowRunId(runId || null);
+      setActiveNav("report");
+    };
+    applyHashRoute();
+    window.addEventListener("hashchange", applyHashRoute);
+    return () => window.removeEventListener("hashchange", applyHashRoute);
+  }, []);
 
   const refreshDataSync = React.useCallback(async () => {
     const [config, status] = await Promise.all([
@@ -594,6 +611,7 @@ function App() {
             taskSchedulerJobs={taskSchedulerJobs}
             taskMonitorLoading={taskMonitorLoading}
             refreshTaskMonitor={refreshTaskMonitor}
+            reportWorkflowRunId={reportWorkflowRunId}
           />
         )}
       </section>
@@ -703,6 +721,7 @@ function DetailPage({
   taskSchedulerJobs,
   taskMonitorLoading,
   refreshTaskMonitor,
+  reportWorkflowRunId,
 }: ConsolePageProps & { activeNav: NavId }) {
   switch (activeNav) {
     case "portfolio":
@@ -725,13 +744,7 @@ function DetailPage({
         </section>
       );
     case "recommendation":
-      return (
-        <section className="page-grid">
-          <RecommendationPanel recommendations={recommendations} />
-          <RiskPanel risks={risks} />
-          <AgentSummaryPanel workflows={workflows} models={models} modelPreview={modelPreview} />
-        </section>
-      );
+      return <RecommendationPage ownerId={ownerId} />;
     case "risk":
       return (
         <section className="page-grid">
@@ -748,7 +761,7 @@ function DetailPage({
         </section>
       );
     case "report":
-      return <ReportPage ownerId={ownerId} />;
+      return <ReportPage ownerId={ownerId} initialWorkflowRunId={reportWorkflowRunId} />;
     case "memory":
       return (
         <section className="page-grid">
@@ -817,6 +830,7 @@ type ConsolePageProps = {
   taskSchedulerJobs?: Record<string, any> | null;
   taskMonitorLoading?: boolean;
   refreshTaskMonitor?: (silent?: boolean) => Promise<void>;
+  reportWorkflowRunId?: string | null;
 };
 
 function PendingActionsPanel({

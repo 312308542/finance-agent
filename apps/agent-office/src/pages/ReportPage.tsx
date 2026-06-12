@@ -11,18 +11,20 @@ import {
 
 type ReportPageProps = {
   ownerId: string;
+  initialWorkflowRunId?: string | null;
 };
 
 const emptyListPayload = { status: "empty", items: [], metrics: {} };
 
-export function ReportPage({ ownerId }: ReportPageProps) {
+export function ReportPage({ ownerId, initialWorkflowRunId = null }: ReportPageProps) {
   const [listPayload, setListPayload] = React.useState<Record<string, any> | null>(null);
   const [detailPayload, setDetailPayload] = React.useState<Record<string, any> | null>(null);
-  const [selectedRunId, setSelectedRunId] = React.useState<string | null>(null);
+  const [selectedRunId, setSelectedRunId] = React.useState<string | null>(initialWorkflowRunId);
   const [loading, setLoading] = React.useState(true);
   const [detailLoading, setDetailLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const selectedRunIdRef = React.useRef<string | null>(null);
+  selectedRunIdRef.current = selectedRunId;
 
   const model = React.useMemo(
     () => buildReportPageModel(listPayload ?? emptyListPayload, detailPayload, selectedRunId),
@@ -47,6 +49,13 @@ export function ReportPage({ ownerId }: ReportPageProps) {
     }
     setLoading(false);
   }, [ownerId]);
+
+  React.useEffect(() => {
+    if (initialWorkflowRunId && initialWorkflowRunId !== selectedRunIdRef.current) {
+      selectedRunIdRef.current = initialWorkflowRunId;
+      setSelectedRunId(initialWorkflowRunId);
+    }
+  }, [initialWorkflowRunId]);
 
   React.useEffect(() => {
     void refreshList();

@@ -305,6 +305,46 @@ export async function loadReportDetail(workflowRunId: string): Promise<Record<st
   });
 }
 
+export async function loadLatestRecommendations(
+  ownerId: string,
+  market?: string | null,
+  limit = 50,
+): Promise<Record<string, any>> {
+  const normalizedLimit = Math.min(200, Math.max(1, Math.round(limit)));
+  const params = new URLSearchParams({
+    owner_id: ownerId,
+    limit: String(normalizedLimit),
+  });
+  if (market) {
+    params.set("market", market);
+  }
+  return getJson(`/api/recommendations/latest?${params.toString()}`, {
+    runs: [],
+    recommendations: [],
+    metrics: {},
+  });
+}
+
+export async function loadPendingDecisions(ownerId: string, limit = 50): Promise<Record<string, any>> {
+  const normalizedLimit = Math.min(200, Math.max(1, Math.round(limit)));
+  return getJson(
+    `/api/decisions/pending-confirmation?owner_id=${encodeURIComponent(ownerId)}&limit=${normalizedLimit}`,
+    { items: [] },
+  );
+}
+
+export async function submitDecisionFeedback(
+  decisionId: string,
+  payload: Record<string, unknown>,
+): Promise<Record<string, any>> {
+  return requestJson(
+    "POST",
+    `/api/decisions/${encodeURIComponent(decisionId)}/feedback`,
+    payload,
+    requestTimeoutMs,
+  );
+}
+
 export async function loadDataSyncConfig(): Promise<Record<string, any>> {
   return getJson("/api/data/sync/config", { data: { preview: { tasks: [] }, validation: {} } });
 }

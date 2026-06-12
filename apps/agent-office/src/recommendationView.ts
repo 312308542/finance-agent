@@ -1,0 +1,395 @@
+export type RecommendationTone = "green" | "amber" | "blue" | "red" | "muted";
+export type DecisionFeedbackType = "accepted" | "rejected" | "modified" | "deferred";
+
+export type PendingDecisionModel = {
+  decisionId: string;
+  assetId: string;
+  sourceRecommendationId: string;
+  suggestedAction: string;
+  summary: string;
+  reviewStatus: string;
+};
+
+export type ScoreBreakdownItem = {
+  group: string;
+  value: number;
+  tone: RecommendationTone;
+};
+
+export type RecommendationItemModel = {
+  recommendationId: string;
+  runId: string;
+  assetId: string;
+  symbol: string;
+  name: string;
+  assetLabel: string;
+  market: string;
+  marketLabel: string;
+  action: string;
+  actionLabel: string;
+  actionTone: RecommendationTone;
+  rank: number;
+  totalScore: number;
+  scoreDisplay: string;
+  confidence: number;
+  confidenceDisplay: string;
+  riskCount: number;
+  evidenceCount: number;
+  summary: string;
+  scoreBreakdown: ScoreBreakdownItem[];
+  riskRebuttal: string;
+  reportWorkflowRunId: string;
+  pendingDecision: PendingDecisionModel | null;
+  payload: Record<string, any>;
+};
+
+export type RecommendationRunModel = {
+  runId: string;
+  market: string;
+  marketLabel: string;
+  strategy: string;
+  status: string;
+  startedAt: string;
+  payload: Record<string, any>;
+};
+
+export type RecommendationPageModel = {
+  status: string;
+  selectedMarket: string;
+  marketTabs: Array<{ id: string; label: string; count: number }>;
+  runs: RecommendationRunModel[];
+  activeRun: RecommendationRunModel | null;
+  items: RecommendationItemModel[];
+  allItems: RecommendationItemModel[];
+  pendingDecisions: PendingDecisionModel[];
+  avoidPoolSummary: {
+    count: number;
+    description: string;
+    assets: Array<Record<string, any>>;
+  };
+  metrics: {
+    recommendationCount: number;
+    buyCount: number;
+    watchCount: number;
+    pendingDecisionCount: number;
+  };
+  emptyText: string;
+};
+
+const marketLabels: Record<string, string> = {
+  ashare: "A 股",
+  crypto_spot: "数字货币现货",
+  crypto_future: "数字货币合约",
+};
+
+const actionMeta: Record<string, { label: string; tone: RecommendationTone }> = {
+  buy: { label: "候选买入", tone: "green" },
+  strong_buy: { label: "强候选买入", tone: "green" },
+  watch: { label: "建议观察", tone: "blue" },
+  hold: { label: "建议持有观察", tone: "blue" },
+  wait: { label: "建议等待", tone: "amber" },
+  wait_for_pullback: { label: "建议等待回撤", tone: "amber" },
+  avoid: { label: "建议回避", tone: "red" },
+  reject: { label: "建议回避", tone: "red" },
+  sell: { label: "候选减仓", tone: "red" },
+};
+
+export function formatMarketLabel(market: string | null | undefined): string {
+  const normalized = normalizeText(market);
+  return (marketLabels[normalized] ?? normalized) || "未分市场";
+}
+
+export function actionLabel(action: string | null | undefined): string {
+  const normalized = normalizeText(action).toLowerCase();
+  return actionMeta[normalized]?.label ?? `建议${normalized || "观察"}`;
+}
+
+export function buildRecommendationPageModel(
+  recommendationPayload: Record<string, any> | null | undefined,
+  decisionsPayload: Record<string, any> | null | undefined,
+  selectedMarket: string | null | undefined,
+): RecommendationPageModel {
+  const pendingDecisions = normalizePendingDecisions(decisionsPayload);
+  const allItems = normalizeRecommendationItems(recommendationPayload, pendingDecisions);
+  const runs = normalizeRecommendationRuns(recommendationPayload);
+  const marketTabs = buildMarketTabs(allItems, runs);
+  const fallbackMarket = marketTabs[0]?.id ?? "ashare";
+  const currentMarket = selectedMarket && marketTabs.some((tab) => tab.id === selectedMarket)
+    ? selectedMarket
+    : fallbackMarket;
+  const items = allItems.filter((item) => item.market === currentMarket);
+  const activeRuns = Array.isArray(recommendationPayload?.active_runs)
+    ? recommendationPayload.active_runs
+        .map((item: unknown) => normalizeRecommendationRun(item))
+        .filter((item: RecommendationRunModel | null): item is RecommendationRunModel => Boolean(item))
+    : [];
+  const activeRun =
+    activeRuns.find((run) => run.market === currentMarket) ??
+    normalizeRecommendationRun(recommendationPayload?.active_run) ??
+    runs.find((run) => run.market === currentMarket) ??
+    runs[0] ??
+    null;
+  const avoidPoolSummary = summarizeAvoidPool(activeRun?.payload);
+  const metrics = isRecord(recommendationPayload?.metrics) ? recommendationPayload.metrics : {};
+  return {
+    status: normalizeText(recommendationPayload?.status) || "empty",
+    selectedMarket: currentMarket,
+    marketTabs,
+    runs,
+    activeRun,
+    items,
+    allItems,
+    pendingDecisions,
+    avoidPoolSummary,
+    metrics: {
+      recommendationCount: normalizeNumber(metrics.recommendation_count ?? allItems.length),
+      buyCount: normalizeNumber(metrics.buy_count ?? allItems.filter((item) => item.action.includes("buy")).length),
+      watchCount: normalizeNumber(metrics.watch_count ?? allItems.filter((item) => item.action === "watch").length),
+      pendingDecisionCount: pendingDecisions.length,
+    },
+    emptyText: "暂无推荐运行，等待推荐流水线生成候选建议。",
+  };
+}
+
+export function normalizeRecommendationItem(
+  item: unknown,
+  pendingDecisions: PendingDecisionModel[] = [],
+): RecommendationItemModel | null {
+  if (!isRecord(item)) {
+    return null;
+  }
+  const recommendationId = normalizeText(item.recommendation_id || item.recommendationId);
+  const symbol = normalizeText(item.symbol);
+  const market = normalizeText(item.market);
+  if (!recommendationId && !symbol) {
+    return null;
+  }
+  const action = normalizeText(item.action).toLowerCase();
+  const meta = actionMeta[action] ?? { label: actionLabel(action), tone: "blue" as RecommendationTone };
+  const payload = isRecord(item.payload) ? item.payload : {};
+  const riskIds = Array.isArray(item.risk_ids) ? item.risk_ids : [];
+  const evidenceIds = Array.isArray(item.evidence_ids) ? item.evidence_ids : [];
+  const score = normalizeNumber(item.total_score);
+  const confidence = normalizeNumber(item.confidence);
+  const pendingDecision =
+    pendingDecisions.find((decision) => {
+      if (decision.sourceRecommendationId && recommendationId) {
+        return decision.sourceRecommendationId === recommendationId;
+      }
+      return decision.assetId && decision.assetId === normalizeText(item.asset_id);
+    }) ?? null;
+  return {
+    recommendationId,
+    runId: normalizeText(item.run_id),
+    assetId: normalizeText(item.asset_id),
+    symbol,
+    name: normalizeText(item.name),
+    assetLabel: `${symbol}${item.name ? ` ${normalizeText(item.name)}` : ""}`.trim(),
+    market,
+    marketLabel: formatMarketLabel(market),
+    action,
+    actionLabel: meta.label,
+    actionTone: meta.tone,
+    rank: normalizeNumber(item.rank),
+    totalScore: score,
+    scoreDisplay: formatScore(score),
+    confidence,
+    confidenceDisplay: formatPercent(confidence),
+    riskCount: riskIds.length,
+    evidenceCount: evidenceIds.length,
+    summary: normalizeText(item.summary),
+    scoreBreakdown: normalizeScoreBreakdown(payload.score_breakdown || payload.scoreBreakdown),
+    riskRebuttal: normalizeText(payload.risk_rebuttal || payload.riskRebuttal || payload.risk_summary),
+    reportWorkflowRunId: normalizeText(payload.workflow_run_id || payload.report_workflow_run_id),
+    pendingDecision,
+    payload,
+  };
+}
+
+export function buildDecisionFeedbackPayload(
+  feedback: DecisionFeedbackType,
+  comment: string,
+  modifiedAction?: string | null,
+): Record<string, string> {
+  const payload: Record<string, string> = { feedback };
+  const cleanComment = comment.trim();
+  if (cleanComment) {
+    payload.comment = cleanComment;
+  }
+  if (feedback === "modified") {
+    const cleanAction = normalizeText(modifiedAction);
+    if (cleanAction) {
+      payload.modified_action = cleanAction;
+    }
+  }
+  return payload;
+}
+
+export function mergeRecommendationPayloads(payloads: Array<Record<string, any> | null | undefined>): Record<string, any> {
+  const validPayloads = payloads.filter((payload): payload is Record<string, any> => isRecord(payload));
+  const runs = validPayloads.flatMap((payload) => (Array.isArray(payload.runs) ? payload.runs : []));
+  const recommendations = validPayloads.flatMap((payload) =>
+    Array.isArray(payload.recommendations) ? payload.recommendations : [],
+  );
+  const activeRuns = validPayloads
+    .map((payload) => payload.active_run)
+    .filter(isRecord);
+  const metrics = validPayloads.reduce(
+    (acc, payload) => {
+      const source = isRecord(payload.metrics) ? payload.metrics : {};
+      acc.recommendation_count += normalizeNumber(source.recommendation_count);
+      acc.buy_count += normalizeNumber(source.buy_count);
+      acc.watch_count += normalizeNumber(source.watch_count);
+      return acc;
+    },
+    { recommendation_count: 0, buy_count: 0, watch_count: 0 },
+  );
+  return {
+    status: recommendations.length ? "ok" : validPayloads.some((payload) => payload.status === "unavailable") ? "unavailable" : "empty",
+    runs,
+    active_runs: activeRuns,
+    active_run: activeRuns[0] ?? null,
+    recommendations,
+    metrics,
+  };
+}
+
+function normalizeRecommendationItems(
+  payload: Record<string, any> | null | undefined,
+  pendingDecisions: PendingDecisionModel[],
+): RecommendationItemModel[] {
+  const rows = Array.isArray(payload?.recommendations) ? payload.recommendations : [];
+  return rows
+    .map((item) => normalizeRecommendationItem(item, pendingDecisions))
+    .filter((item): item is RecommendationItemModel => Boolean(item));
+}
+
+function normalizeRecommendationRuns(payload: Record<string, any> | null | undefined): RecommendationRunModel[] {
+  const rows = Array.isArray(payload?.runs) ? payload.runs : [];
+  return rows
+    .map((item) => normalizeRecommendationRun(item))
+    .filter((item): item is RecommendationRunModel => Boolean(item));
+}
+
+function normalizeRecommendationRun(item: unknown): RecommendationRunModel | null {
+  if (!isRecord(item)) {
+    return null;
+  }
+  const runId = normalizeText(item.run_id || item.runId);
+  if (!runId) {
+    return null;
+  }
+  const market = normalizeText(item.market);
+  return {
+    runId,
+    market,
+    marketLabel: formatMarketLabel(market),
+    strategy: normalizeText(item.strategy),
+    status: normalizeText(item.status),
+    startedAt: normalizeText(item.started_at || item.finished_at),
+    payload: isRecord(item.payload) ? item.payload : {},
+  };
+}
+
+function normalizePendingDecisions(payload: Record<string, any> | null | undefined): PendingDecisionModel[] {
+  const data = isRecord(payload?.data) ? payload.data : payload;
+  const rows = Array.isArray(data?.items) ? data.items : [];
+  return rows
+    .map((item) => {
+      if (!isRecord(item)) {
+        return null;
+      }
+      const decisionId = normalizeText(item.decision_id || item.decisionId);
+      if (!decisionId) {
+        return null;
+      }
+      return {
+        decisionId,
+        assetId: normalizeText(item.asset_id),
+        sourceRecommendationId: normalizeText(item.source_recommendation_id),
+        suggestedAction: normalizeText(item.suggested_action),
+        summary: normalizeText(item.summary),
+        reviewStatus: normalizeText(item.review_status || item.user_action),
+      };
+    })
+    .filter((item): item is PendingDecisionModel => Boolean(item));
+}
+
+function buildMarketTabs(items: RecommendationItemModel[], runs: RecommendationRunModel[]) {
+  const markets = new Map<string, number>();
+  items.forEach((item) => markets.set(item.market, (markets.get(item.market) ?? 0) + 1));
+  runs.forEach((run) => {
+    if (!markets.has(run.market)) {
+      markets.set(run.market, 0);
+    }
+  });
+  return Array.from(markets.entries())
+    .filter(([market]) => Boolean(market))
+    .map(([market, count]) => ({
+      id: market,
+      label: formatMarketLabel(market),
+      count,
+    }));
+}
+
+function summarizeAvoidPool(payload: Record<string, any> | null | undefined) {
+  const source = isRecord(payload?.avoid_pool_excluded) ? payload.avoid_pool_excluded : {};
+  const assets = Array.isArray(source.assets) ? source.assets.filter(isRecord) : [];
+  const count = normalizeNumber(source.count ?? assets.length);
+  return {
+    count,
+    description: count > 0 ? `本次运行剔除回避池 ${count} 项，已从候选建议中排除。` : "本次运行未发现回避池剔除项。",
+    assets,
+  };
+}
+
+function normalizeScoreBreakdown(value: unknown): ScoreBreakdownItem[] {
+  if (!isRecord(value)) {
+    return [];
+  }
+  return Object.entries(value).map(([group, raw]) => {
+    const score = normalizeNumber(raw);
+    return {
+      group,
+      value: score,
+      tone: score < 0 ? "red" : score >= 20 ? "green" : "blue",
+    };
+  });
+}
+
+function formatScore(value: number): string {
+  if (!Number.isFinite(value)) {
+    return "—";
+  }
+  return value.toFixed(2).replace(/\.00$/, "");
+}
+
+function formatPercent(value: number): string {
+  if (!Number.isFinite(value)) {
+    return "—";
+  }
+  const normalized = value <= 1 ? value * 100 : value;
+  return `${Math.round(normalized)}%`;
+}
+
+function normalizeText(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return "";
+}
+
+function normalizeNumber(value: unknown): number {
+  const next = Number(value ?? 0);
+  return Number.isFinite(next) ? next : 0;
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
