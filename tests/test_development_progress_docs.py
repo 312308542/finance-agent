@@ -50,3 +50,27 @@ def test_frontend_closed_loop_docs_reflect_07_completion() -> None:
 
     assert "| 07 前端用户闭环页面 | 已完成，T8 待联调 |" in overall_plan
     assert "| T9 文档同步 | 已完成 |" in frontend_plan
+
+
+def test_action_loop_docs_reflect_08_completion() -> None:
+    """08 方案收尾后，文档应同步人工确认与操作闭环边界。"""
+
+    readme = read_doc("README.md")
+    project_plan = read_doc("docs/项目计划.md")
+    project_progress = read_doc("docs/项目进度跟踪表.md")
+    optimization_progress = read_doc("docs/优化版本进度跟踪表.md")
+    overall_plan = read_doc("docs/开发方案/00-总体规划与执行约定.md")
+    action_loop_plan = read_doc("docs/开发方案/08-人工确认与操作闭环.md")
+
+    assert "人工确认、订单草案、执行登记和到期复盘已形成闭环" in readme
+    assert "系统仍不接入券商或交易所写接口，也不会自动真实下单" in readme
+
+    assert "订单草案与执行登记闭环已实现" in project_plan
+    assert "执行登记只接受用户在外部完成交易后的手工填报" in project_plan
+
+    assert "| 前端办公室 | 08 人工确认与操作闭环完成 |" in project_progress
+    assert "| V2.0 | 私人金融助手体验闭环 | 已完成 |" in optimization_progress
+    assert "| O9 | 人工确认和交易动作闭环 | 已完成 |" in optimization_progress
+
+    assert "| 08 人工确认与操作闭环 | 已完成 |" in overall_plan
+    assert "| T8 文档同步 | 已完成 |" in action_loop_plan

@@ -247,7 +247,8 @@ $env:VITE_FINANCE_AGENT_API_BASE="http://127.0.0.1:8000"
 - Dashboard 总览
 - 报告、推荐、持仓、风险、Agent 运行和 Finance Memory 页面已接真实后端只读接口
 - 中文报告列表与 Markdown 详情展示，支持从推荐项跳转到关联 Workflow 报告
-- 推荐结果、风险反驳和待确认决策反馈入口；推荐页反馈会调用决策反馈 API，真实落库验收留到统一联调阶段
+- 推荐结果、风险反驳、待确认决策反馈、人工确认、订单草案、执行登记和到期复盘已形成闭环；系统仍不接入券商或交易所写接口，也不会自动真实下单
+- 推荐页反馈会调用决策反馈 API，真实落库验收留到统一联调阶段
 - 持仓集中度、风险发现、Workflow 审计和记忆时间线展示
 - 数据同步配置与调度器控制
 - 模型供应商、模型实例和路由配置
@@ -301,6 +302,7 @@ npm run test:chat-stream
 .\.venv\Scripts\python.exe scripts\storage\smoke_dashboard_api.py
 .\.venv\Scripts\python.exe scripts\storage\smoke_data_sync_control_service.py
 .\.venv\Scripts\python.exe scripts\storage\smoke_agent_chat_model_tool_loop.py
+.\.venv\Scripts\python.exe scripts\storage\smoke_action_loop_closed_cycle.py
 ```
 
 ## 路线图
@@ -309,7 +311,7 @@ npm run test:chat-stream
 
 - 完善数据同步配置向导，降低 A 股和数字货币基础池初始化成本。
 - 增强调度器可观测性，补全任务事件、健康检查和失败重试视图。
-- 继续完善 Web 控制台的人工确认、操作草案、执行登记和复盘闭环。
+- 打磨 Web 控制台的人工确认、订单草案、执行登记和复盘提醒体验，补充更多空态和错误态提示。
 - 强化模型配置体验，支持更多 OpenAI-compatible 供应商和路由预览场景。
 
 ### 中期
@@ -321,7 +323,7 @@ npm run test:chat-stream
 
 ### 长期
 
-- 构建更完整的个人投资复盘闭环：建议、确认、执行记录、反馈、复盘和记忆更新。
+- 扩展个人投资复盘闭环的统计分析能力，在已完成的建议、确认、执行记录、反馈、复盘和记忆更新基础上增加绩效归因。
 - 引入可验证的量化模型实验框架，但保持 LLM 只负责解释、比较和反驳。
 - 在严格人工确认和权限控制下，探索订单草稿与交易系统适配。
 
