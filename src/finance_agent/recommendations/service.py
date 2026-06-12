@@ -247,6 +247,8 @@ def build_recommendation_payload(
         "watch_conditions": watch_conditions,
         "invalid_if": invalid_if,
         "missing_data": missing_data,
+        "score_strategy_id": score.payload.get("strategy_id"),
+        "score_weight_snapshot": score.payload.get("weight_snapshot"),
     }
 
 

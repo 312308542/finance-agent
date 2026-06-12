@@ -241,7 +241,10 @@ class UniverseRecommendationPipeline:
             strategy=strategy,
             horizon=horizon,
             limit=limit,
-            audit_payload=audit_payload,
+            audit_payload=recommendation_audit_payload(
+                audit_payload=audit_payload,
+                strategy_id=strategy_id,
+            ),
         )
         status = run_status(
             universe=universe,
@@ -482,6 +485,15 @@ def exclude_avoid_pool_members(
             "assets": excluded_assets,
         }
     }
+
+
+def recommendation_audit_payload(*, audit_payload: JsonDict, strategy_id: str | None) -> JsonDict:
+    """补充推荐运行审计 payload，保留评分策略可追溯信息。"""
+
+    payload = dict(audit_payload)
+    if strategy_id:
+        payload["scoring_strategy_id"] = strategy_id
+    return payload
 
 
 def avoid_pool_reason(member: AssetUniverseMemberORM) -> str | None:
