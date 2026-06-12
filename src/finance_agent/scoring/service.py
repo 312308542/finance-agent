@@ -13,10 +13,12 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from finance_agent.scoring.strategies import strategy_weight_snapshot
 from finance_agent.storage.orm import FactorFrameORM
 from finance_agent.storage.repositories import (
     AssetScoreRepository,
     FactorFrameRepository,
+    ScoringStrategyRepository,
     ScreeningRepository,
 )
 
@@ -42,6 +44,7 @@ class ScoringService:
         self.screenings = ScreeningRepository(session)
         self.factors = FactorFrameRepository(session)
         self.scores = AssetScoreRepository(session)
+        self.strategies = ScoringStrategyRepository(session)
 
     def score_screening(
         self,
@@ -49,16 +52,18 @@ class ScoringService:
         screening_id: str,
         horizon: str = "swing",
         rule_version: str = RULE_VERSION,
+        strategy_id: str | None = None,
     ) -> ScoringRunResult:
         """对一次初筛结果生成评分。"""
 
+        strategy = self.resolve_strategy(strategy_id)
         items = self.screenings.list_items(screening_id=screening_id, passed_only=True)
         ranked_inputs: list[tuple[JsonDict, FactorFrameORM, Any]] = []
         for item in items:
             factor = self.factors.get_latest_factor_frame(asset_id=item.asset_id, horizon=horizon)
             if factor is None:
                 continue
-            score_payload = compute_asset_score(factor)
+            score_payload = compute_asset_score(factor, strategy=strategy)
             ranked_inputs.append((score_payload, factor, item))
 
         ranked_inputs.sort(key=lambda item: item[0]["total_score"], reverse=True)
@@ -70,6 +75,28 @@ class ScoringService:
                 horizon=horizon,
                 factor_frame_id=factor.factor_frame_id,
             )
+            payload = {
+                "schema_version": "1.0",
+                "score_groups": score_payload["score_groups"],
+                "missing_groups": factor.missing_groups,
+                "partial_groups": factor.payload.get("partial_groups", []),
+                "source_ids": factor.source_ids,
+                "policy": {
+                    "weighting": "renormalize_available_groups",
+                    "missing_penalty_per_group": 4,
+                    "llm_role": "explanation_only",
+                },
+            }
+            if strategy_id:
+                payload["strategy_id"] = score_payload["weight_snapshot"]["strategy_id"]
+                payload["weight_snapshot"] = score_payload["weight_snapshot"]
+                payload["policy"]["missing_penalty_per_group"] = score_payload[
+                    "weight_snapshot"
+                ]["missing_penalty"]["per_missing_group"]
+                payload["policy"]["missing_penalty_per_partial_group"] = score_payload[
+                    "weight_snapshot"
+                ]["missing_penalty"]["per_partial_group"]
+
             saved = self.scores.upsert_asset_score(
                 score_id=score_id,
                 asset_id=item.asset_id,
@@ -98,18 +125,7 @@ class ScoringService:
                 rule_version=rule_version,
                 status=score_payload["status"],
                 as_of=factor.as_of,
-                payload={
-                    "schema_version": "1.0",
-                    "score_groups": score_payload["score_groups"],
-                    "missing_groups": factor.missing_groups,
-                    "partial_groups": factor.payload.get("partial_groups", []),
-                    "source_ids": factor.source_ids,
-                    "policy": {
-                        "weighting": "renormalize_available_groups",
-                        "missing_penalty_per_group": 4,
-                        "llm_role": "explanation_only",
-                    },
-                },
+                payload=payload,
             )
             saved_ids.append(saved.score_id)
 
@@ -120,12 +136,28 @@ class ScoringService:
             top_score_id=saved_ids[0] if saved_ids else None,
         )
 
+    def resolve_strategy(self, strategy_id: str | None) -> Any | None:
+        """按 ID 读取启用中的评分策略。"""
 
-def compute_asset_score(factor: FactorFrameORM) -> JsonDict:
+        if strategy_id is None:
+            return None
+        strategy = self.strategies.get_active_strategy(strategy_id)
+        if strategy is None:
+            raise ValueError(f"找不到启用中的评分策略：{strategy_id}")
+        return strategy
+
+
+def compute_asset_score(factor: FactorFrameORM, *, strategy: Any | None = None) -> JsonDict:
     """计算单标的透明评分。"""
 
     groups = {group.get("group"): group for group in factor.payload.get("factor_groups") or []}
-    weights = score_weights(factor.market)
+    weight_snapshot = strategy_weight_snapshot(strategy) if strategy is not None else None
+    weights = weight_snapshot["group_weights"] if weight_snapshot else score_weights(factor.market)
+    missing_penalty_config = (
+        weight_snapshot["missing_penalty"]
+        if weight_snapshot
+        else {"per_missing_group": 4.0, "per_partial_group": 1.5}
+    )
     score_groups: list[JsonDict] = []
     group_scores: dict[str, float | None] = {}
     weighted_sum = 0.0
@@ -152,16 +184,18 @@ def compute_asset_score(factor: FactorFrameORM) -> JsonDict:
 
     base_score = weighted_sum / used_weight if used_weight > 0 else 0.0
     risk_penalty = compute_risk_penalty(groups.get("risk"))
-    missing_penalty = len(factor.missing_groups) * 4 + len(
+    missing_penalty = len(factor.missing_groups) * missing_penalty_config[
+        "per_missing_group"
+    ] + len(
         factor.payload.get("partial_groups") or []
-    ) * 1.5
+    ) * missing_penalty_config["per_partial_group"]
     total_score = clamp(base_score - missing_penalty - risk_penalty, 0, 100)
     confidence = clamp(used_weight / sum(weights.values()) - missing_penalty / 100 * 0.4, 0.05, 1)
     status = "available" if factor.status == "available" and confidence >= 0.6 else "partial"
     if used_weight == 0:
         status = "unavailable"
 
-    return {
+    payload = {
         "status": status,
         "total_score": total_score,
         "confidence": confidence,
@@ -170,6 +204,9 @@ def compute_asset_score(factor: FactorFrameORM) -> JsonDict:
         "group_scores": group_scores,
         "score_groups": score_groups,
     }
+    if weight_snapshot:
+        payload["weight_snapshot"] = weight_snapshot
+    return payload
 
 
 def score_weights(market: str) -> dict[str, float]:

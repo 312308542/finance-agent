@@ -855,6 +855,34 @@ class AssetScoreORM(Base):
     )
 
 
+class ScoringStrategyORM(Base):
+    """评分策略配置表，保存不同推荐策略的因子组权重。"""
+
+    __tablename__ = "scoring_strategies"
+    __table_args__ = (
+        Index("idx_scoring_strategies_market_status", "market", "status"),
+        Index("idx_scoring_strategies_status", "status"),
+    )
+
+    strategy_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    group_weights: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
+    missing_penalty: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'draft'"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
 class SignalSnapshotORM(Base):
     """可解释信号快照表。"""
 

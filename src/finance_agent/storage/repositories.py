@@ -64,6 +64,7 @@ from finance_agent.storage.orm import (
     RetrievalProfileORM,
     ReviewTaskORM,
     RiskFindingORM,
+    ScoringStrategyORM,
     ScreeningResultItemORM,
     ScreeningResultORM,
     SignalSnapshotORM,
@@ -2244,6 +2245,96 @@ class AssetScoreRepository:
             .limit(1)
         )
         return self.session.scalars(statement).one_or_none()
+
+
+class ScoringStrategyRepository:
+    """评分策略仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_strategy(
+        self,
+        *,
+        strategy_id: str,
+        market: str,
+        name: str,
+        description: str | None,
+        group_weights: JsonDict,
+        missing_penalty: JsonDict,
+        status: str = "draft",
+    ) -> ScoringStrategyORM:
+        """按 `strategy_id` 幂等写入评分策略。"""
+
+        values = {
+            "strategy_id": strategy_id,
+            "market": market,
+            "name": name,
+            "description": description,
+            "group_weights": _json_safe(group_weights),
+            "missing_penalty": _json_safe(missing_penalty),
+            "status": status,
+            "updated_at": datetime.now().astimezone(),
+        }
+        statement = insert(ScoringStrategyORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "strategy_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[ScoringStrategyORM.strategy_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(ScoringStrategyORM, strategy_id)
+
+    def get_strategy(self, strategy_id: str) -> ScoringStrategyORM | None:
+        """按 ID 查询评分策略。"""
+
+        return self.session.get(ScoringStrategyORM, strategy_id)
+
+    def get_active_strategy(self, strategy_id: str) -> ScoringStrategyORM | None:
+        """按 ID 查询启用中的评分策略。"""
+
+        statement = select(ScoringStrategyORM).where(
+            ScoringStrategyORM.strategy_id == strategy_id,
+            ScoringStrategyORM.status == "active",
+        )
+        return self.session.scalars(statement).one_or_none()
+
+    def list_strategies(
+        self,
+        *,
+        market: str | None = None,
+        status: str | None = None,
+    ) -> list[ScoringStrategyORM]:
+        """查询评分策略列表。"""
+
+        statement = select(ScoringStrategyORM)
+        if market:
+            statement = statement.where(ScoringStrategyORM.market == market)
+        if status:
+            statement = statement.where(ScoringStrategyORM.status == status)
+        return list(
+            self.session.scalars(
+                statement.order_by(ScoringStrategyORM.market, ScoringStrategyORM.strategy_id)
+            )
+        )
+
+    def seed_defaults(self, strategies: Sequence[JsonDict]) -> list[ScoringStrategyORM]:
+        """幂等写入默认评分策略。"""
+
+        return [
+            self.upsert_strategy(
+                strategy_id=strategy["strategy_id"],
+                market=strategy["market"],
+                name=strategy["name"],
+                description=strategy.get("description"),
+                group_weights=strategy["group_weights"],
+                missing_penalty=strategy["missing_penalty"],
+                status=strategy.get("status", "active"),
+            )
+            for strategy in strategies
+        ]
 
 
 class SignalSnapshotRepository:

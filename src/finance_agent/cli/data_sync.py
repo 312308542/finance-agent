@@ -29,7 +29,12 @@ from finance_agent.data.sync_config import (
     validate_data_sync_config,
 )
 from finance_agent.data.sync_tui import render_data_sync_tui
+from finance_agent.scoring.strategies import (
+    default_scoring_strategy_seeds,
+    validate_scoring_strategy_payload,
+)
 from finance_agent.storage.db import create_session_factory, session_scope
+from finance_agent.storage.repositories import ScoringStrategyRepository
 
 JsonDict = dict[str, Any]
 
@@ -139,12 +144,58 @@ def add_data_arguments(subparsers: argparse._SubParsersAction[argparse.ArgumentP
     )
     avoid.add_argument("--strategy-context", default="avoid_pool", help="策略上下文。")
 
+    strategy = data_commands.add_parser("strategy", help="评分策略权重管理。")
+    strategy_commands = strategy.add_subparsers(dest="subcommand", required=True)
+    strategy_commands.add_parser("init", help="写入默认评分策略。")
+    strategy_list = strategy_commands.add_parser("list", help="列出评分策略。")
+    strategy_list.add_argument(
+        "--market",
+        default=None,
+        choices=["ashare", "crypto_spot", "crypto_future"],
+        help="按市场过滤。",
+    )
+    strategy_list.add_argument(
+        "--status",
+        default=None,
+        choices=["active", "draft", "archived"],
+        help="按策略状态过滤。",
+    )
+    strategy_show = strategy_commands.add_parser("show", help="查看单个评分策略。")
+    strategy_show.add_argument("strategy_id", help="评分策略 ID。")
+    strategy_set = strategy_commands.add_parser("set", help="新增或更新评分策略。")
+    strategy_set.add_argument("strategy_id", help="评分策略 ID。")
+    strategy_set.add_argument(
+        "--market",
+        required=True,
+        choices=["ashare", "crypto_spot", "crypto_future"],
+        help="适用市场。",
+    )
+    strategy_set.add_argument("--name", required=True, help="策略中文名称。")
+    strategy_set.add_argument("--description", default="", help="策略说明。")
+    strategy_set.add_argument(
+        "--group-weights",
+        required=True,
+        help='因子组权重 JSON，例如 {"technical":0.7,"fundamental":0.3}。',
+    )
+    strategy_set.add_argument(
+        "--missing-penalty",
+        default='{"per_missing_group":4,"per_partial_group":1.5}',
+        help="缺失惩罚 JSON。",
+    )
+    strategy_set.add_argument(
+        "--activate",
+        action="store_true",
+        help="写入后直接标记为 active；未指定时保存为 draft。",
+    )
+
 
 def dispatch_data(args: argparse.Namespace) -> JsonDict:
     """执行数据同步配置命令。"""
 
     if args.command == "production":
         return dispatch_data_production(args)
+    if args.command == "strategy":
+        return dispatch_data_strategy(args)
     if args.command != "config":
         raise ValueError(f"未知 data 命令：{args.command}")
 
@@ -270,6 +321,71 @@ def dispatch_data_production(args: argparse.Namespace) -> JsonDict:
     raise ValueError(f"未知 data production 命令：{args.subcommand}")
 
 
+def dispatch_data_strategy(args: argparse.Namespace) -> JsonDict:
+    """执行评分策略管理命令。"""
+
+    session_factory = create_session_factory(args.database_url)
+    with session_scope(session_factory) as session:
+        repository = ScoringStrategyRepository(session)
+        if args.subcommand == "init":
+            seeded = repository.seed_defaults(default_scoring_strategy_seeds())
+            return {
+                "status": "ok",
+                "data": {
+                    "seeded_count": len(seeded),
+                    "strategy_ids": [item.strategy_id for item in seeded],
+                    "strategies": [serialize_scoring_strategy(item) for item in seeded],
+                },
+            }
+        if args.subcommand == "list":
+            strategies = repository.list_strategies(
+                market=getattr(args, "market", None),
+                status=getattr(args, "status", None),
+            )
+            return {
+                "status": "ok",
+                "data": {
+                    "count": len(strategies),
+                    "strategies": [serialize_scoring_strategy(item) for item in strategies],
+                },
+            }
+        if args.subcommand == "show":
+            strategy = repository.get_strategy(args.strategy_id)
+            if strategy is None:
+                raise ValueError(f"找不到评分策略：{args.strategy_id}")
+            return {
+                "status": "ok",
+                "data": {
+                    "strategy": serialize_scoring_strategy(strategy),
+                },
+            }
+        if args.subcommand == "set":
+            existing = repository.get_strategy(args.strategy_id)
+            if existing is not None and existing.status != "draft":
+                raise ValueError(
+                    f"评分策略 {args.strategy_id} 当前状态为 {existing.status}，只能修改 draft 策略。"
+                )
+            payload = validate_scoring_strategy_payload(
+                {
+                    "strategy_id": args.strategy_id,
+                    "market": args.market,
+                    "name": args.name,
+                    "description": args.description,
+                    "group_weights": parse_optional_json_object(args.group_weights),
+                    "missing_penalty": parse_optional_json_object(args.missing_penalty),
+                    "status": "active" if args.activate else "draft",
+                }
+            )
+            strategy = repository.upsert_strategy(**payload)
+            return {
+                "status": "ok",
+                "data": {
+                    "strategy": serialize_scoring_strategy(strategy),
+                },
+            }
+    raise ValueError(f"未知 data strategy 命令：{args.subcommand}")
+
+
 def build_config_from_args(args: argparse.Namespace) -> DataSyncConfig:
     """根据 CLI 参数构建数据同步配置。"""
 
@@ -318,3 +434,17 @@ def parse_optional_json_object(value: str | None) -> JsonDict | None:
     if not isinstance(parsed, dict):
         raise ValueError("参数必须是 JSON 对象。")
     return parsed
+
+
+def serialize_scoring_strategy(strategy: Any) -> JsonDict:
+    """把评分策略 ORM/对象转换成可序列化结构。"""
+
+    return {
+        "strategy_id": strategy.strategy_id,
+        "market": strategy.market,
+        "name": strategy.name,
+        "description": strategy.description,
+        "group_weights": dict(strategy.group_weights),
+        "missing_penalty": dict(strategy.missing_penalty),
+        "status": strategy.status,
+    }
