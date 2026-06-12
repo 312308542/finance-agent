@@ -59,6 +59,33 @@ def test_parse_scheduler_config_accepts_recommendation_pipeline_job() -> None:
     assert config.jobs[0].group == "analytics"
 
 
+def test_recommendation_pipeline_job_kwargs_include_strategy_and_avoid_pool() -> None:
+    """推荐调度任务应把评分策略和回避池 ID 透传给流水线。"""
+
+    job = BaseDataSchedulerJob(
+        name="analytics.recommendations.ashare.all_a",
+        job_type="recommendation_pipeline",
+        group="analytics",
+        enabled=True,
+        interval_seconds=3600,
+        limit=20,
+        market="ashare",
+        params={
+            "universe_id": "universe:merged:ashare:recommendation",
+            "strategy": "balanced_swing_v1",
+            "strategy_id": "strategy:ashare:short_swing",
+            "avoid_universe_id": "universe:avoid:ashare:system",
+            "horizon": "swing",
+        },
+    )
+    scheduler = BaseDataScheduler(BaseDataSchedulerConfig(jobs=(job,)))
+
+    kwargs = scheduler.build_recommendation_pipeline_kwargs(job)
+
+    assert kwargs["strategy_id"] == "strategy:ashare:short_swing"
+    assert kwargs["avoid_universe_id"] == "universe:avoid:ashare:system"
+
+
 def test_parse_scheduler_config_accepts_data_quality_refresh_job() -> None:
     """调度配置应能表达数据质量快照刷新任务。"""
 

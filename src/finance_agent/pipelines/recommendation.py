@@ -83,6 +83,7 @@ class UniverseRecommendationPipeline:
         candidate_source: str | None = None,
         technical_screening_strategy: str = TECHNICAL_SCREENING_STRATEGY,
         avoid_universe_id: str | None = None,
+        strategy_id: str | None = None,
     ) -> UniverseRecommendationRunResult:
         """执行一次候选池推荐流水线。"""
 
@@ -221,6 +222,7 @@ class UniverseRecommendationPipeline:
         scoring = self.scoring.score_screening(
             screening_id=screening.screening_id,
             horizon=horizon,
+            strategy_id=strategy_id,
         )
 
         usable_factor_asset_ids = usable_factor_asset_ids_from_results(

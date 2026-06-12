@@ -81,8 +81,17 @@ def test_scheduler_payload_registers_real_universe_recommendation_jobs() -> None
         == 3
     )
     assert jobs["analytics.recommendations.ashare.all_a"]["params"]["candidate_source"] is None
+    assert jobs["analytics.recommendations.ashare.all_a"]["params"]["avoid_universe_id"] == (
+        "universe:avoid:ashare:system"
+    )
+    assert jobs["analytics.recommendations.ashare.all_a"]["params"]["strategy_id"] == (
+        "strategy:ashare:short_swing"
+    )
     assert jobs["analytics.recommendations.crypto_spot.binance"]["params"]["universe_id"] == (
         "universe:base:crypto:spot:binance"
+    )
+    assert jobs["analytics.recommendations.crypto_spot.binance"]["params"]["strategy_id"] == (
+        "strategy:crypto:crypto_swing"
     )
     assert jobs["analytics.recommendations.crypto_spot.binance"]["params"]["min_bars"] == 120
     assert (

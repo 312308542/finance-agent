@@ -1301,7 +1301,14 @@ class BaseDataScheduler:
             "horizon": str(job.params.get("horizon") or "swing"),
             "limit": job.limit or int(job.params.get("limit") or 20),
         }
-        for key in ("timeframe", "source", "candidate_source", "technical_screening_strategy"):
+        for key in (
+            "timeframe",
+            "source",
+            "candidate_source",
+            "technical_screening_strategy",
+            "strategy_id",
+            "avoid_universe_id",
+        ):
             value = job.params.get(key)
             if value is not None:
                 params[key] = value

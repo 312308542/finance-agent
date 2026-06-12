@@ -90,7 +90,11 @@ class _Screenings:
 
 
 class _Scoring:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
     def score_screening(self, **kwargs: Any) -> SimpleNamespace:
+        self.calls.append(kwargs)
         return SimpleNamespace(scored_count=1)
 
 
@@ -228,3 +232,36 @@ def test_recommendation_pipeline_prefers_latest_technical_screening_pool() -> No
     assert result.member_count == 1
     assert result.indicator_count == 1
     assert factors.calls == ["ashare:000001"]
+
+
+def test_recommendation_pipeline_passes_strategy_id_to_scoring_service() -> None:
+    """候选池流水线应把调度层传入的评分策略 ID 透传到评分服务。"""
+
+    pipeline = UniverseRecommendationPipeline.__new__(UniverseRecommendationPipeline)
+    pipeline.universes = _Universes([_Member(asset_id="ashare:000001", symbol="000001")])
+    pipeline.indicators = _Indicators(available_asset_ids={"ashare:000001"})
+    pipeline.factors = _Factors()
+    pipeline.screening_repository = _TechnicalScreeningRepository()
+    pipeline.screenings = _Screenings()
+    scoring = _Scoring()
+    pipeline.scoring = scoring
+    pipeline.signals = _Signals()
+    pipeline.recommendations = _Recommendations()
+
+    result = pipeline.run_for_universe(
+        universe_id="universe:test:ashare",
+        horizon="swing",
+        timeframe="1d",
+        strategy_id="strategy:ashare:short_swing",
+        min_indicator_coverage_ratio=0.5,
+        min_factor_coverage_ratio=0.0,
+    )
+
+    assert result.screening_id == "screen:balanced"
+    assert scoring.calls == [
+        {
+            "screening_id": "screen:balanced",
+            "horizon": "swing",
+            "strategy_id": "strategy:ashare:short_swing",
+        }
+    ]
