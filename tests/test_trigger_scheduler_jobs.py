@@ -29,6 +29,7 @@ def test_build_trigger_scheduler_jobs_exports_evaluate_and_consume_jobs() -> Non
         "agent.loop.consume.sweep",
         "analytics.high_risk_reviews.after_agent",
         "analytics.high_risk_reviews.sweep",
+        "analytics.reviews.due",
     }
 
     daily = jobs["analytics.triggers.evaluate.daily"]
@@ -95,6 +96,14 @@ def test_build_trigger_scheduler_jobs_exports_evaluate_and_consume_jobs() -> Non
     assert high_risk_sweep["params"]["owner_id"] == "default-owner"
     assert high_risk_sweep["params"]["limit"] == 10
 
+    reviews_due = jobs["analytics.reviews.due"]
+    assert reviews_due["job_type"] == "reviews_due"
+    assert reviews_due["group"] == "analytics"
+    assert reviews_due["interval_seconds"] == 60 * 60
+    assert reviews_due["params"]["sync_task_type"] == "analytics.reviews.due"
+    assert reviews_due["params"]["owner_id"] == "default-owner"
+    assert reviews_due["params"]["limit"] == 20
+
 
 def test_scheduler_payload_includes_trigger_jobs_with_intraday_disabled() -> None:
     """导出的调度计划应包含触发任务，且盘中任务默认禁用。"""
@@ -117,3 +126,4 @@ def test_scheduler_payload_includes_trigger_jobs_with_intraday_disabled() -> Non
         "agent.loop.consume.after_trigger"
     ]
     assert jobs["analytics.high_risk_reviews.sweep"]["interval_seconds"] == 60 * 60
+    assert jobs["analytics.reviews.due"]["job_type"] == "reviews_due"

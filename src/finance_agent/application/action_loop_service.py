@@ -11,14 +11,22 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from finance_agent.application.memory_service import MemoryService
 from finance_agent.application.portfolio_service import PortfolioService, PortfolioSnapshot
-from finance_agent.storage.orm import DecisionLogORM, ExecutionRecordORM, OrderDraftORM, PositionORM
+from finance_agent.storage.orm import (
+    DecisionLogORM,
+    ExecutionRecordORM,
+    OrderDraftORM,
+    PositionORM,
+    ReviewTaskORM,
+)
 from finance_agent.storage.repositories import (
     ACTION_LOOP_DISCLAIMER,
     ActionLoopRepository,
+    MarketDataRepository,
 )
 
 JsonDict = dict[str, Any]
@@ -42,6 +50,9 @@ class ActionLoopMemoryService(Protocol):
 
     def schedule_review(self, **kwargs: Any) -> Any:
         """创建后续复盘任务。"""
+
+    def complete_review_task(self, **kwargs: Any) -> Any:
+        """完成复盘任务并沉淀结论。"""
 
 
 class ActionRepository(Protocol):
@@ -119,6 +130,17 @@ class PositionUpdate:
     status: str
 
 
+@dataclass(frozen=True)
+class ExecutionOutcomeReviewResult:
+    """执行复盘比较结果。"""
+
+    review_task_id: str
+    execution_id: str | None
+    outcome: str
+    result_summary: str
+    payload: JsonDict
+
+
 class ActionLoopService:
     """人工确认与订单草案服务。"""
 
@@ -129,12 +151,14 @@ class ActionLoopService:
         memory_service: ActionLoopMemoryService | None = None,
         action_repository: ActionRepository | None = None,
         portfolio_service: PortfolioPositionService | None = None,
+        latest_price_loader: Callable[..., JsonDict | None] | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.session = session
         self.memory_service = memory_service or MemoryService(session)
         self.action_repository = action_repository or ActionLoopRepository(session)
         self.portfolio_service = portfolio_service or PortfolioService(session)
+        self.latest_price_loader = latest_price_loader or load_latest_market_bar_price
         self.now = now or (lambda: datetime.now().astimezone())
 
     def confirm_decision(
@@ -395,6 +419,201 @@ class ActionLoopService:
             payload=payload,
         )
 
+    def compare_execution_outcome(self, review_task: ReviewTaskORM) -> ExecutionOutcomeReviewResult:
+        """比较建议、执行和后续行情，并完成执行复盘任务。"""
+
+        payload = dict(review_task.payload or {})
+        execution_id = str(payload.get("execution_id") or "").strip() or None
+        if not execution_id:
+            outcome_payload = {
+                "review_task_id": review_task.review_task_id,
+                "execution_id": None,
+                "missing_fields": ["execution_id"],
+                "status": "partial",
+            }
+            return self._complete_execution_outcome_review(
+                review_task=review_task,
+                execution_id=None,
+                outcome="partial",
+                result_summary="执行复盘缺少 execution_id，暂时只能标记为部分完成。",
+                outcome_payload=outcome_payload,
+            )
+
+        record = self.action_repository.get_execution_record(execution_id)
+        if record is None:
+            outcome_payload = {
+                "review_task_id": review_task.review_task_id,
+                "execution_id": execution_id,
+                "missing_fields": ["execution_record"],
+                "status": "partial",
+            }
+            return self._complete_execution_outcome_review(
+                review_task=review_task,
+                execution_id=execution_id,
+                outcome="partial",
+                result_summary=f"执行复盘找不到执行记录 {execution_id}，暂时无法比较后续表现。",
+                outcome_payload=outcome_payload,
+            )
+
+        suggested_price = resolve_suggested_price(
+            payload=payload,
+            record=record,
+            repository=self.action_repository,
+        )
+        latest = self.latest_price_loader(
+            session=self.session,
+            asset_id=record.asset_id,
+            timeframe=str(payload.get("timeframe") or "1d"),
+            executed_at=record.executed_at,
+        )
+        latest_price = extract_latest_price(latest)
+        missing_fields = []
+        if suggested_price is None:
+            missing_fields.append("suggested_price")
+        if latest_price is None:
+            missing_fields.append("latest_price")
+
+        slippage_pct = (
+            calculate_price_slippage_pct(
+                action=record.action,
+                suggested_price=suggested_price,
+                executed_price=record.executed_price,
+            )
+            if suggested_price is not None
+            else None
+        )
+        holding_return_pct = (
+            calculate_execution_return_pct(
+                action=record.action,
+                executed_price=record.executed_price,
+                latest_price=latest_price,
+            )
+            if latest_price is not None
+            else None
+        )
+        outcome = resolve_execution_review_outcome(
+            missing_fields=missing_fields,
+            holding_return_pct=holding_return_pct,
+        )
+        outcome_payload = build_execution_outcome_payload(
+            review_task=review_task,
+            record=record,
+            suggested_price=suggested_price,
+            latest=latest,
+            latest_price=latest_price,
+            slippage_pct=slippage_pct,
+            holding_return_pct=holding_return_pct,
+            missing_fields=missing_fields,
+            outcome=outcome,
+        )
+        summary = build_execution_outcome_summary(
+            record=record,
+            outcome=outcome,
+            missing_fields=missing_fields,
+            slippage_pct=slippage_pct,
+            holding_return_pct=holding_return_pct,
+        )
+        return self._complete_execution_outcome_review(
+            review_task=review_task,
+            execution_id=execution_id,
+            outcome=outcome,
+            result_summary=summary,
+            outcome_payload=outcome_payload,
+        )
+
+    def run_due_reviews(
+        self,
+        *,
+        owner_id: str,
+        limit: int = 20,
+        due_at: datetime | None = None,
+    ) -> JsonDict:
+        """扫描到期执行复盘任务并逐条完成。"""
+
+        due_time = due_at or self.now()
+        statement = (
+            select(ReviewTaskORM)
+            .where(
+                ReviewTaskORM.owner_id == owner_id,
+                ReviewTaskORM.review_type == "execution_outcome",
+                ReviewTaskORM.status == "pending",
+                ReviewTaskORM.due_at <= due_time,
+            )
+            .order_by(ReviewTaskORM.due_at.asc())
+            .limit(max(int(limit), 1))
+        )
+        tasks = list(self.session.scalars(statement))
+        items: list[JsonDict] = []
+        completed_count = 0
+        partial_count = 0
+        failed_count = 0
+        for task in tasks:
+            try:
+                result = self.compare_execution_outcome(task)
+            except Exception as exc:  # pragma: no cover - 调度入口必须兜底单任务异常
+                failed_count += 1
+                items.append(
+                    {
+                        "review_task_id": task.review_task_id,
+                        "status": "failed",
+                        "error_message": str(exc),
+                    }
+                )
+                continue
+            completed_count += 1
+            if result.outcome == "partial":
+                partial_count += 1
+            items.append(
+                {
+                    "review_task_id": result.review_task_id,
+                    "execution_id": result.execution_id,
+                    "status": "completed",
+                    "outcome": result.outcome,
+                }
+            )
+        return {
+            "status": "available",
+            "owner_id": owner_id,
+            "limit": limit,
+            "due_at": due_time.isoformat(),
+            "processed_count": len(tasks),
+            "completed_count": completed_count,
+            "partial_count": partial_count,
+            "failed_count": failed_count,
+            "items": items,
+        }
+
+    def _complete_execution_outcome_review(
+        self,
+        *,
+        review_task: ReviewTaskORM,
+        execution_id: str | None,
+        outcome: str,
+        result_summary: str,
+        outcome_payload: JsonDict,
+    ) -> ExecutionOutcomeReviewResult:
+        """完成执行复盘任务并返回本轮结构化结果。"""
+
+        payload = {
+            "execution_outcome": outcome_payload,
+            "closed_loop_stage": "reviewed",
+        }
+        self.memory_service.complete_review_task(
+            review_task_id=review_task.review_task_id,
+            owner_id=review_task.owner_id,
+            result_summary=result_summary,
+            finished_at=self.now(),
+            outcome=outcome,
+            payload=payload,
+        )
+        return ExecutionOutcomeReviewResult(
+            review_task_id=review_task.review_task_id,
+            execution_id=execution_id,
+            outcome=outcome,
+            result_summary=result_summary,
+            payload=payload,
+        )
+
     def _get_decision(self, decision_log_id: str) -> DecisionLogORM:
         decision = self.session.get(DecisionLogORM, decision_log_id)
         if decision is None:
@@ -575,6 +794,203 @@ def build_execution_summary(record: ExecutionRecordORM) -> str:
         f"用户登记外部执行：{record.action} {record.asset_id}，"
         f"价格 {record.executed_price}，数量 {record.executed_quantity}。{note}"
     )
+
+
+def load_latest_market_bar_price(
+    *,
+    session: Session,
+    asset_id: str,
+    timeframe: str = "1d",
+    **_: Any,
+) -> JsonDict | None:
+    """从本地日 K 表读取最近一根可用收盘价。"""
+
+    bars = MarketDataRepository(session).list_recent_bars(
+        asset_id=asset_id,
+        timeframe=timeframe,
+        limit=1,
+        closed_only=True,
+    )
+    if not bars:
+        return None
+    latest = bars[-1]
+    return {
+        "price": latest.close,
+        "as_of": latest.timestamp,
+        "source": latest.source,
+        "status": latest.status,
+    }
+
+
+def resolve_suggested_price(
+    *,
+    payload: JsonDict,
+    record: ExecutionRecordORM,
+    repository: ActionRepository,
+) -> Decimal | None:
+    """解析复盘可用的原始建议价。"""
+
+    for key in ("suggested_price", "target_price", "reference_price"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return Decimal(str(value))
+    price_range = payload.get("suggested_price_range")
+    price = midpoint_from_price_range(price_range)
+    if price is not None:
+        return price
+    if not record.order_draft_id:
+        return None
+    draft = repository.get_order_draft(record.order_draft_id)
+    if draft is None:
+        return None
+    return midpoint_from_price_range(getattr(draft, "suggested_price_range", None))
+
+
+def midpoint_from_price_range(value: Any) -> Decimal | None:
+    """从建议价区间取中点作为第一版复盘参考价。"""
+
+    if not isinstance(value, dict):
+        return None
+    low = value.get("low")
+    high = value.get("high")
+    if low in (None, "") or high in (None, ""):
+        return None
+    return ((Decimal(str(low)) + Decimal(str(high))) / Decimal("2")).quantize(POSITION_QUANT)
+
+
+def extract_latest_price(value: JsonDict | None) -> Decimal | None:
+    """从行情加载结果中提取最新价格。"""
+
+    if not value:
+        return None
+    price = value.get("price", value.get("close"))
+    if price in (None, ""):
+        return None
+    return Decimal(str(price))
+
+
+def calculate_price_slippage_pct(
+    *,
+    action: str,
+    suggested_price: Decimal,
+    executed_price: Decimal,
+) -> Decimal:
+    """计算执行价相对建议价的滑点比例。"""
+
+    if suggested_price <= 0:
+        return Decimal("0.000000")
+    if normalize_action(action) in {"sell", "reduce"}:
+        value = (suggested_price - executed_price) / suggested_price
+    else:
+        value = (executed_price - suggested_price) / suggested_price
+    return quantize_ratio(value)
+
+
+def calculate_execution_return_pct(
+    *,
+    action: str,
+    executed_price: Decimal,
+    latest_price: Decimal,
+) -> Decimal:
+    """计算执行后至复盘时点的表现。"""
+
+    if executed_price <= 0:
+        return Decimal("0.000000")
+    if normalize_action(action) in {"sell", "reduce"}:
+        value = (executed_price - latest_price) / executed_price
+    else:
+        value = (latest_price - executed_price) / executed_price
+    return quantize_ratio(value)
+
+
+def quantize_ratio(value: Decimal) -> Decimal:
+    """比例字段统一保留 6 位小数。"""
+
+    return value.quantize(Decimal("0.000001"))
+
+
+def resolve_execution_review_outcome(
+    *,
+    missing_fields: list[str],
+    holding_return_pct: Decimal | None,
+) -> str:
+    """根据数据完整性和后续表现给出规则版复盘结论。"""
+
+    if missing_fields:
+        return "partial"
+    if holding_return_pct is None:
+        return "partial"
+    if holding_return_pct > 0:
+        return "confirmed"
+    if holding_return_pct < 0:
+        return "failed"
+    return "mixed"
+
+
+def build_execution_outcome_payload(
+    *,
+    review_task: ReviewTaskORM,
+    record: ExecutionRecordORM,
+    suggested_price: Decimal | None,
+    latest: JsonDict | None,
+    latest_price: Decimal | None,
+    slippage_pct: Decimal | None,
+    holding_return_pct: Decimal | None,
+    missing_fields: list[str],
+    outcome: str,
+) -> JsonDict:
+    """构造执行复盘结构化 payload。"""
+
+    return {
+        "review_task_id": review_task.review_task_id,
+        "execution_id": record.execution_id,
+        "asset_id": record.asset_id,
+        "action": record.action,
+        "executed_at": record.executed_at.isoformat(),
+        "executed_price": decimal_to_text(record.executed_price),
+        "executed_quantity": decimal_to_text(record.executed_quantity),
+        "suggested_price": decimal_to_text(suggested_price),
+        "latest_price": decimal_to_text(latest_price),
+        "latest_price_at": latest.get("as_of").isoformat()
+        if latest and hasattr(latest.get("as_of"), "isoformat")
+        else None,
+        "latest_price_source": latest.get("source") if latest else None,
+        "price_slippage_pct": decimal_to_text(slippage_pct),
+        "holding_return_pct": decimal_to_text(holding_return_pct),
+        "missing_fields": missing_fields,
+        "outcome": outcome,
+    }
+
+
+def build_execution_outcome_summary(
+    *,
+    record: ExecutionRecordORM,
+    outcome: str,
+    missing_fields: list[str],
+    slippage_pct: Decimal | None,
+    holding_return_pct: Decimal | None,
+) -> str:
+    """生成执行复盘中文摘要。"""
+
+    if outcome == "partial":
+        reason = "、".join(missing_fields) or "复盘数据不完整"
+        if "latest_price" in missing_fields:
+            reason = f"行情缺失（{reason}）"
+        return f"执行复盘部分完成：{record.asset_id} 的 {record.action} 登记缺少 {reason}，暂不下确定结论。"
+    direction = "后续表现为正" if holding_return_pct and holding_return_pct > 0 else "后续表现为负"
+    return (
+        f"执行复盘完成：{record.asset_id} {record.action} 执行后{direction}，"
+        f"执行滑点 {decimal_to_text(slippage_pct)}，"
+        f"复盘收益 {decimal_to_text(holding_return_pct)}。"
+    )
+
+
+def decimal_to_text(value: Decimal | None) -> str | None:
+    """把 Decimal 转为稳定、易读的字符串。"""
+
+    if value is None:
+        return None
+    return format(value, "f")
 
 
 def resolve_asset_symbol(asset_id: str) -> str:

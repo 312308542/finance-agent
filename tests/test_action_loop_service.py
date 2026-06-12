@@ -99,6 +99,7 @@ class FakeExecutionMemoryService(FakeMemoryService):
         self.decisions: list[dict[str, Any]] = []
         self.memories: list[dict[str, Any]] = []
         self.review_tasks: list[dict[str, Any]] = []
+        self.completed_reviews: list[dict[str, Any]] = []
 
     def record_decision(self, **kwargs: Any) -> Any:
         self.decisions.append(kwargs)
@@ -111,6 +112,19 @@ class FakeExecutionMemoryService(FakeMemoryService):
     def schedule_review(self, **kwargs: Any) -> Any:
         self.review_tasks.append(kwargs)
         return SimpleNamespace(**kwargs)
+
+    def complete_review_task(self, **kwargs: Any) -> Any:
+        self.completed_reviews.append(kwargs)
+        return SimpleNamespace(**kwargs, status="completed")
+
+
+class FakeReviewSession(FakeDecisionStore):
+    def __init__(self, review_tasks: list[Any]) -> None:
+        super().__init__([])
+        self.review_tasks = review_tasks
+
+    def scalars(self, statement: Any) -> Any:
+        return iter(self.review_tasks)
 
 
 def test_confirm_decision_records_feedback_and_marks_executable() -> None:
@@ -402,6 +416,148 @@ def test_record_execution_is_idempotent_by_execution_id() -> None:
     assert portfolio.upserts == []
 
 
+def test_compare_execution_outcome_completes_review_with_structured_payload() -> None:
+    """到期执行复盘应比较建议价、执行价和后续收盘价，并完成复盘任务。"""
+
+    record = SimpleNamespace(
+        execution_id="execution:600519:1",
+        owner_id="owner:demo",
+        portfolio_id="portfolio:demo",
+        asset_id="ashare:600519",
+        market="ashare",
+        order_draft_id=None,
+        decision_log_id="decision:600519:1",
+        action="buy",
+        executed_price=Decimal("10"),
+        executed_quantity=Decimal("100"),
+        executed_at=NOW,
+        fee=Decimal("2"),
+        note=None,
+        source="user_reported",
+    )
+    repository = FakeActionRepository()
+    repository.executions_by_id[record.execution_id] = record
+    memory = FakeExecutionMemoryService()
+    review_task = build_review_task(
+        payload={
+            "execution_id": record.execution_id,
+            "suggested_price": "9.80",
+        }
+    )
+
+    result = ActionLoopService(
+        session=FakeDecisionStore([]),
+        action_repository=repository,
+        memory_service=memory,
+        latest_price_loader=lambda **_: {
+            "price": Decimal("12.50"),
+            "as_of": datetime(2026, 7, 3, tzinfo=UTC),
+            "source": "market_bars",
+        },
+        now=lambda: datetime(2026, 7, 4, tzinfo=UTC),
+    ).compare_execution_outcome(review_task)
+
+    assert result.outcome == "confirmed"
+    completed = memory.completed_reviews[0]
+    assert completed["review_task_id"] == review_task.review_task_id
+    assert completed["owner_id"] == "owner:demo"
+    assert completed["outcome"] == "confirmed"
+    outcome_payload = completed["payload"]["execution_outcome"]
+    assert outcome_payload["execution_id"] == "execution:600519:1"
+    assert outcome_payload["suggested_price"] == "9.80"
+    assert outcome_payload["executed_price"] == "10"
+    assert outcome_payload["latest_price"] == "12.50"
+    assert outcome_payload["price_slippage_pct"] == "0.020408"
+    assert outcome_payload["holding_return_pct"] == "0.250000"
+    assert "后续表现为正" in completed["result_summary"]
+
+
+def test_compare_execution_outcome_marks_partial_when_latest_price_missing() -> None:
+    """复盘缺少后续行情时必须标记 partial，不能编造收益结论。"""
+
+    record = SimpleNamespace(
+        execution_id="execution:000001:1",
+        owner_id="owner:demo",
+        portfolio_id="portfolio:demo",
+        asset_id="ashare:000001",
+        market="ashare",
+        order_draft_id=None,
+        decision_log_id=None,
+        action="buy",
+        executed_price=Decimal("10"),
+        executed_quantity=Decimal("100"),
+        executed_at=NOW,
+        fee=None,
+        note=None,
+        source="user_reported",
+    )
+    repository = FakeActionRepository()
+    repository.executions_by_id[record.execution_id] = record
+    memory = FakeExecutionMemoryService()
+
+    result = ActionLoopService(
+        session=FakeDecisionStore([]),
+        action_repository=repository,
+        memory_service=memory,
+        latest_price_loader=lambda **_: None,
+        now=lambda: datetime(2026, 7, 4, tzinfo=UTC),
+    ).compare_execution_outcome(build_review_task(payload={"execution_id": record.execution_id}))
+
+    assert result.outcome == "partial"
+    completed = memory.completed_reviews[0]
+    assert completed["outcome"] == "partial"
+    assert "行情缺失" in completed["result_summary"]
+    assert completed["payload"]["execution_outcome"]["missing_fields"] == [
+        "suggested_price",
+        "latest_price",
+    ]
+
+
+def test_run_due_reviews_processes_pending_execution_review_tasks() -> None:
+    """调度入口应扫描到期 execution_outcome 任务并逐条复盘。"""
+
+    record = SimpleNamespace(
+        execution_id="execution:600519:2",
+        owner_id="owner:demo",
+        portfolio_id="portfolio:demo",
+        asset_id="ashare:600519",
+        market="ashare",
+        order_draft_id=None,
+        decision_log_id="decision:600519:2",
+        action="sell",
+        executed_price=Decimal("12"),
+        executed_quantity=Decimal("100"),
+        executed_at=NOW,
+        fee=None,
+        note=None,
+        source="user_reported",
+    )
+    repository = FakeActionRepository()
+    repository.executions_by_id[record.execution_id] = record
+    memory = FakeExecutionMemoryService()
+
+    summary = ActionLoopService(
+        session=FakeReviewSession(
+            [build_review_task(payload={"execution_id": record.execution_id})]
+        ),
+        action_repository=repository,
+        memory_service=memory,
+        latest_price_loader=lambda **_: {
+            "price": Decimal("10"),
+            "as_of": datetime(2026, 7, 3, tzinfo=UTC),
+            "source": "market_bars",
+        },
+        now=lambda: datetime(2026, 7, 4, tzinfo=UTC),
+    ).run_due_reviews(owner_id="owner:demo", limit=5, due_at=datetime(2026, 7, 4, tzinfo=UTC))
+
+    assert summary["status"] == "available"
+    assert summary["processed_count"] == 1
+    assert summary["completed_count"] == 1
+    assert summary["partial_count"] == 1
+    assert summary["failed_count"] == 0
+    assert memory.completed_reviews[0]["review_task_id"] == "review:execution:outcome"
+
+
 def build_decision(
     *,
     user_action: str,
@@ -447,4 +603,18 @@ def build_position(
         liquidation_price=None,
         status=status,
         payload={},
+    )
+
+
+def build_review_task(*, payload: dict[str, Any] | None = None) -> Any:
+    return SimpleNamespace(
+        review_task_id="review:execution:outcome",
+        owner_id="owner:demo",
+        asset_id="ashare:600519",
+        source_decision_id="decision:600519:1",
+        review_type="execution_outcome",
+        due_at=datetime(2026, 7, 3, tzinfo=UTC),
+        status="pending",
+        review_questions=[],
+        payload=payload or {},
     )

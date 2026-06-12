@@ -1138,6 +1138,20 @@ def build_trigger_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
             },
         }
     )
+    jobs.append(
+        {
+            "name": "analytics.reviews.due",
+            "job_type": "reviews_due",
+            "group": "analytics",
+            "enabled": True,
+            "interval_seconds": 60 * 60,
+            "params": {
+                "sync_task_type": "analytics.reviews.due",
+                "owner_id": "default-owner",
+                "limit": 20,
+            },
+        }
+    )
     return jobs
 
 

@@ -46,6 +46,7 @@ JOB_TYPES = {
     "trigger_evaluation",
     "agent_loop_consume",
     "high_risk_reviews",
+    "reviews_due",
     "universe_merge",
     "universe_avoid_pool_rebuild",
 }
@@ -620,6 +621,7 @@ class BaseDataScheduler:
         run_trigger_evaluation_func: Callable[..., JsonDict] | None = None,
         run_agent_loop_consume_func: Callable[..., JsonDict] | None = None,
         run_high_risk_reviews_func: Callable[..., JsonDict] | None = None,
+        run_reviews_due_func: Callable[..., JsonDict] | None = None,
         run_universe_merge_func: Callable[..., JsonDict] | None = None,
         run_avoid_pool_rebuild_func: Callable[..., JsonDict] | None = None,
         sleep_func: Callable[[float], None] = time.sleep,
@@ -637,6 +639,7 @@ class BaseDataScheduler:
         self._run_trigger_evaluation = run_trigger_evaluation_func
         self._run_agent_loop_consume = run_agent_loop_consume_func
         self._run_high_risk_reviews = run_high_risk_reviews_func
+        self._run_reviews_due = run_reviews_due_func
         self._run_universe_merge = run_universe_merge_func
         self._run_avoid_pool_rebuild = run_avoid_pool_rebuild_func
         self._uses_injected_collect_base_data = collect_base_data_func is not None
@@ -1025,6 +1028,8 @@ class BaseDataScheduler:
             planned["agent_loop_consume_args"] = self.build_agent_loop_consume_kwargs(job)
         elif job.job_type == "high_risk_reviews":
             planned["high_risk_review_args"] = self.build_high_risk_review_kwargs(job)
+        elif job.job_type == "reviews_due":
+            planned["reviews_due_args"] = self.build_reviews_due_kwargs(job)
         elif job.job_type == "universe_merge":
             planned["universe_merge_args"] = self.build_universe_merge_kwargs(job)
         elif job.job_type == "universe_avoid_pool_rebuild":
@@ -1224,6 +1229,9 @@ class BaseDataScheduler:
         if job.job_type == "high_risk_reviews":
             kwargs = self.build_high_risk_review_kwargs(job)
             return self.run_high_risk_reviews(**kwargs)
+        if job.job_type == "reviews_due":
+            kwargs = self.build_reviews_due_kwargs(job)
+            return self.run_reviews_due(**kwargs)
         if job.job_type == "universe_merge":
             kwargs = self.build_universe_merge_kwargs(job)
             return self.run_universe_merge(**kwargs)
@@ -1452,6 +1460,16 @@ class BaseDataScheduler:
         return {
             "owner_id": str(job.params.get("owner_id") or "default-owner"),
             "limit": int(job.params.get("limit") or job.limit or 10),
+        }
+
+    def build_reviews_due_kwargs(self, job: BaseDataSchedulerJob) -> JsonDict:
+        """把到期复盘任务配置转换为人工操作闭环服务参数。"""
+
+        if job.job_type != "reviews_due":
+            raise ValueError(f"{job.name} 不是到期复盘任务")
+        return {
+            "owner_id": str(job.params.get("owner_id") or "default-owner"),
+            "limit": int(job.params.get("limit") or job.limit or 20),
         }
 
     def build_universe_merge_kwargs(self, job: BaseDataSchedulerJob) -> JsonDict:
@@ -1814,6 +1832,32 @@ class BaseDataScheduler:
         session_factory = create_session_factory()
         with session_scope(session_factory) as session:
             payload = HighRiskReviewService(session=session).run_pending_reviews(
+                owner_id=owner_id,
+                limit=limit,
+            )
+        payload.update(
+            {
+                "status": "available",
+                "owner_id": owner_id,
+                "limit": limit,
+            }
+        )
+        return payload
+
+    def run_reviews_due(self, **kwargs: Any) -> JsonDict:
+        """执行到期的人工操作闭环复盘任务。"""
+
+        if self._run_reviews_due is not None:
+            return self._run_reviews_due(**kwargs)
+
+        from finance_agent.application.action_loop_service import ActionLoopService
+        from finance_agent.storage.db import create_session_factory, session_scope
+
+        owner_id = str(kwargs.get("owner_id") or "default-owner")
+        limit = int(kwargs.get("limit") or 20)
+        session_factory = create_session_factory()
+        with session_scope(session_factory) as session:
+            payload = ActionLoopService(session).run_due_reviews(
                 owner_id=owner_id,
                 limit=limit,
             )
@@ -2335,6 +2379,7 @@ def as_job_group_choice(
         "technical_screening_refresh",
         "trigger_evaluation",
         "high_risk_reviews",
+        "reviews_due",
         "universe_merge",
         "universe_avoid_pool_rebuild",
     }:

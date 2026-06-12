@@ -218,6 +218,33 @@ def test_parse_scheduler_config_accepts_high_risk_reviews_job() -> None:
     assert config.jobs[0].depends_on == ("agent.loop.consume.after_trigger",)
 
 
+def test_parse_scheduler_config_accepts_reviews_due_job() -> None:
+    """调度配置应能表达到期执行复盘批处理任务。"""
+
+    config = parse_scheduler_config(
+        {
+            "enabled": True,
+            "jobs": [
+                {
+                    "name": "analytics.reviews.due",
+                    "job_type": "reviews_due",
+                    "group": "analytics",
+                    "enabled": True,
+                    "interval_seconds": 60 * 60,
+                    "params": {
+                        "sync_task_type": "analytics.reviews.due",
+                        "owner_id": "default-owner",
+                        "limit": 20,
+                    },
+                }
+            ],
+        }
+    )
+
+    assert config.jobs[0].job_type == "reviews_due"
+    assert config.jobs[0].group == "analytics"
+
+
 def test_parse_scheduler_config_accepts_universe_merge_and_avoid_pool_jobs() -> None:
     """调度配置应能表达候选池合并和回避池重建任务。"""
 
@@ -795,6 +822,59 @@ def test_scheduler_runs_high_risk_reviews_without_collection() -> None:
         {
             "owner_id": "default-owner",
             "limit": 10,
+        }
+    ]
+
+
+def test_scheduler_runs_reviews_due_without_collection() -> None:
+    """到期复盘任务应调用人工操作闭环复盘执行器，而不是误走基础采集入口。"""
+
+    calls: list[dict[str, Any]] = []
+
+    def run_reviews_due(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "status": "available",
+            "processed_count": 2,
+            "completed_count": 1,
+            "partial_count": 1,
+            "failed_count": 0,
+        }
+
+    def collect_base_data(_: Any) -> dict[str, Any]:
+        raise AssertionError("到期复盘任务不应调用基础采集入口")
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="analytics.reviews.due",
+                job_type="reviews_due",
+                group="analytics",
+                interval_seconds=60 * 60,
+                params={
+                    "sync_task_type": "analytics.reviews.due",
+                    "owner_id": "default-owner",
+                    "limit": 20,
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        run_reviews_due_func=run_reviews_due,
+    )
+
+    result = scheduler.run_once()
+
+    assert result["jobs"][0]["status"] == "executed"
+    assert result["jobs"][0]["summary"]["processed_count"] == 2
+    assert calls == [
+        {
+            "owner_id": "default-owner",
+            "limit": 20,
         }
     ]
 
