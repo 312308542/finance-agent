@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -45,6 +47,39 @@ class DecisionFeedbackRequest(BaseModel):
     )
     comment: str | None = Field(default=None, description="用户备注")
     modified_action: str | None = Field(default=None, description="用户修改后的动作")
+
+
+class DecisionConfirmationRequest(BaseModel):
+    """人工确认闭环中的决策确认请求。"""
+
+    feedback: Literal["accepted", "rejected", "modified", "deferred"] = Field(
+        ...,
+        description="用户确认反馈类型",
+    )
+    comment: str | None = Field(default=None, description="用户确认备注")
+    modified_action: str | None = Field(default=None, description="用户修改后的动作")
+
+
+class ExecutionRecordRequest(BaseModel):
+    """用户在外部交易软件完成操作后的执行登记请求。"""
+
+    owner_id: str = Field(..., description="用户 ID")
+    portfolio_id: str = Field(..., description="组合 ID")
+    asset_id: str = Field(..., description="资产 ID")
+    market: str = Field(..., description="市场")
+    action: str = Field(..., description="执行动作")
+    executed_price: Decimal = Field(..., gt=0, description="实际执行价格")
+    executed_quantity: Decimal = Field(..., gt=0, description="实际执行数量")
+    executed_at: datetime = Field(..., description="实际执行时间")
+    execution_id: str | None = Field(default=None, description="执行登记 ID")
+    order_draft_id: str | None = Field(default=None, description="关联订单草案 ID")
+    decision_log_id: str | None = Field(default=None, description="关联原始决策 ID")
+    fee: Decimal | None = Field(default=None, ge=0, description="手续费")
+    note: str | None = Field(default=None, description="用户备注")
+    source: Literal["user_reported"] = Field(
+        default="user_reported",
+        description="执行来源，当前仅允许用户手工登记",
+    )
 
 
 class ModelProviderUpdateRequest(BaseModel):

@@ -28,7 +28,9 @@ from finance_agent.api.schemas import (
     DataSchedulerJobUpdateRequest,
     DataSchedulerStartRequest,
     DataSyncConfigUpdateRequest,
+    DecisionConfirmationRequest,
     DecisionFeedbackRequest,
+    ExecutionRecordRequest,
     ModelInstanceUpdateRequest,
     ModelProviderConnectivityTestRequest,
     ModelProviderUpdateRequest,
@@ -36,6 +38,7 @@ from finance_agent.api.schemas import (
     WorkflowRunRequest,
 )
 from finance_agent.application import MemoryService
+from finance_agent.application.action_loop_service import ActionLoopService, ExecutionRegistration
 from finance_agent.application.dashboard_service import (
     DashboardService,
     serialize_model_instance,
@@ -50,7 +53,12 @@ from finance_agent.storage.db import (
     session_scope,
 )
 from finance_agent.storage.orm import DecisionLogORM
-from finance_agent.storage.repositories import ChatMemoryRepository, ModelRuntimeConfigRepository
+from finance_agent.storage.orm import ReviewTaskORM
+from finance_agent.storage.repositories import (
+    ActionLoopRepository,
+    ChatMemoryRepository,
+    ModelRuntimeConfigRepository,
+)
 
 JsonDict = dict[str, Any]
 
@@ -358,6 +366,156 @@ def list_pending_confirmation_decisions(
     }
 
 
+@router.post("/decisions/{decision_id}/confirm")
+def confirm_decision(
+    decision_id: str,
+    request: DecisionConfirmationRequest,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """推进人工确认闭环，并返回是否可继续生成订单草案。"""
+
+    try:
+        result = ActionLoopService(session).confirm_decision(
+            decision_log_id=decision_id,
+            feedback=request.feedback,
+            comment=request.comment,
+            modified_action=request.modified_action,
+        )
+        session.flush()
+        return {
+            "status": "ok",
+            "data": {
+                "decision_id": result.decision_id,
+                "feedback_decision_id": result.feedback_decision_id,
+                "user_action": result.status,
+                "can_create_order_draft": result.can_create_order_draft,
+                "suggested_action": result.suggested_action,
+            },
+        }
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400], "data": {}}
+
+
+@router.post("/decisions/{decision_id}/order-draft")
+def create_order_draft(
+    decision_id: str,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """为已接受的决策生成文档性质订单草案。"""
+
+    try:
+        draft = ActionLoopService(session).create_order_draft(decision_log_id=decision_id)
+        session.flush()
+        return {"status": "ok", "data": serialize_order_draft(draft)}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400], "data": {}}
+
+
+@router.get("/order-drafts")
+def list_order_drafts(
+    owner_id: str,
+    status: str | None = None,
+    limit: int = 50,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """查询用户订单草案列表。"""
+
+    try:
+        drafts = ActionLoopRepository(session).list_order_drafts(
+            owner_id=owner_id,
+            status=status,
+            limit=limit,
+        )
+        return {
+            "status": "ok",
+            "data": {"items": [serialize_order_draft(draft) for draft in drafts]},
+        }
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400], "data": {"items": []}}
+
+
+@router.post("/executions")
+def record_execution(
+    request: ExecutionRecordRequest,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """登记用户在外部交易软件完成的执行结果。"""
+
+    try:
+        registration = ExecutionRegistration(
+            execution_id=request.execution_id,
+            owner_id=request.owner_id,
+            portfolio_id=request.portfolio_id,
+            asset_id=request.asset_id,
+            market=request.market,
+            action=request.action,
+            executed_price=request.executed_price,
+            executed_quantity=request.executed_quantity,
+            executed_at=request.executed_at,
+            order_draft_id=request.order_draft_id,
+            decision_log_id=request.decision_log_id,
+            fee=request.fee,
+            note=request.note,
+            source=request.source,
+        )
+        record = ActionLoopService(session).record_execution(registration)
+        session.flush()
+        return {"status": "ok", "data": serialize_execution_record(record)}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400], "data": {}}
+
+
+@router.get("/executions")
+def list_execution_records(
+    owner_id: str,
+    asset_id: str | None = None,
+    limit: int = 50,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """查询用户手工执行登记列表。"""
+
+    try:
+        records = ActionLoopRepository(session).list_execution_records(
+            owner_id=owner_id,
+            asset_id=asset_id,
+            limit=limit,
+        )
+        return {
+            "status": "ok",
+            "data": {"items": [serialize_execution_record(record) for record in records]},
+        }
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400], "data": {"items": []}}
+
+
+@router.get("/reviews/upcoming")
+def list_upcoming_reviews(
+    owner_id: str,
+    limit: int = 20,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """查询等待执行复盘的任务。"""
+
+    try:
+        statement = (
+            select(ReviewTaskORM)
+            .where(
+                ReviewTaskORM.owner_id == owner_id,
+                ReviewTaskORM.status == "pending",
+                ReviewTaskORM.review_type == "execution_outcome",
+            )
+            .order_by(ReviewTaskORM.due_at.asc())
+            .limit(limit)
+        )
+        tasks = list(session.scalars(statement))
+        return {
+            "status": "ok",
+            "data": {"items": [serialize_review_task(task) for task in tasks]},
+        }
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400], "data": {"items": []}}
+
+
 def resolve_feedback_user_action(request: DecisionFeedbackRequest) -> str | None:
     """把反馈类型转换为决策日志中的用户动作。"""
 
@@ -447,6 +605,81 @@ def serialize_pending_decision(decision: DecisionLogORM) -> JsonDict:
         "review_status": payload.get("review_status") or decision.user_action,
         "payload": payload,
     }
+
+
+def serialize_order_draft(draft: Any) -> JsonDict:
+    """序列化订单草案，保留免责声明和约束快照。"""
+
+    return {
+        "order_draft_id": draft.order_draft_id,
+        "owner_id": draft.owner_id,
+        "portfolio_id": draft.portfolio_id,
+        "asset_id": draft.asset_id,
+        "market": draft.market,
+        "decision_log_id": draft.decision_log_id,
+        "action": draft.action,
+        "suggested_price_range": draft.suggested_price_range or {},
+        "suggested_position_ratio": serialize_decimal(draft.suggested_position_ratio),
+        "constraints": draft.constraints or {},
+        "status": draft.status,
+        "disclaimer": draft.disclaimer,
+        "created_at": serialize_datetime(draft.created_at),
+        "updated_at": serialize_datetime(draft.updated_at),
+    }
+
+
+def serialize_execution_record(record: Any) -> JsonDict:
+    """序列化用户手工执行登记。"""
+
+    return {
+        "execution_id": record.execution_id,
+        "owner_id": record.owner_id,
+        "portfolio_id": record.portfolio_id,
+        "asset_id": record.asset_id,
+        "market": record.market,
+        "order_draft_id": record.order_draft_id,
+        "decision_log_id": record.decision_log_id,
+        "action": record.action,
+        "executed_price": serialize_decimal(record.executed_price),
+        "executed_quantity": serialize_decimal(record.executed_quantity),
+        "executed_at": serialize_datetime(record.executed_at),
+        "fee": serialize_decimal(record.fee),
+        "note": record.note,
+        "source": record.source,
+        "created_at": serialize_datetime(record.created_at),
+    }
+
+
+def serialize_review_task(task: Any) -> JsonDict:
+    """序列化待复盘任务。"""
+
+    return {
+        "review_task_id": task.review_task_id,
+        "owner_id": task.owner_id,
+        "asset_id": task.asset_id,
+        "source_decision_id": task.source_decision_id,
+        "review_type": task.review_type,
+        "due_at": serialize_datetime(task.due_at),
+        "status": task.status,
+        "review_questions": task.review_questions or [],
+        "result_summary": task.result_summary,
+        "finished_at": serialize_datetime(task.finished_at),
+        "payload": task.payload or {},
+    }
+
+
+def serialize_decimal(value: Any) -> str | None:
+    """把金额、数量和比例字段转为不丢精度的字符串。"""
+
+    if value is None:
+        return None
+    return format(value, "f")
+
+
+def serialize_datetime(value: Any) -> str | None:
+    """把时间字段转为 ISO 字符串。"""
+
+    return value.isoformat() if hasattr(value, "isoformat") else None
 
 
 @router.get("/memory/assets/{asset_id}/timeline")
