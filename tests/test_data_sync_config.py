@@ -207,6 +207,7 @@ def test_scheduler_payload_splits_ashare_daily_bar_lifecycle_jobs() -> None:
     assert jobs["ashare.bars.1d.close_final"]["run_at"] == ["15:50", "17:30"]
     assert jobs["ashare.bars.1d.close_final"]["params"]["is_closed"] is True
     assert jobs["ashare.bars.1d.close_final"]["params"]["status"] == "available"
+    assert jobs["ashare.bars.1d.close_final"]["params"]["only_failed_or_stale"] is True
     assert jobs["ashare.bars.1d.revision"]["run_at"] == ["02:10"]
     assert jobs["ashare.bars.1d.revision"]["trading_day_policy"] == "any_day"
     assert jobs["ashare.bars.1d.revision"]["params"]["sync_task_type"] == (
@@ -231,8 +232,10 @@ def test_scheduler_payload_marks_market_bar_batch_size_as_symbol_batch_size() ->
     assert jobs["ashare.bars.1d.revision"]["params"]["batch_size"] == 200
     assert jobs["crypto_spot.bars.1h"]["limit"] == 150
     assert jobs["crypto_spot.bars.1h"]["params"]["batch_size"] == 150
+    assert jobs["crypto_spot.bars.1h"]["params"]["only_failed_or_stale"] is True
     assert jobs["crypto_future.bars.1h"]["limit"] == 150
     assert jobs["crypto_future.bars.1h"]["params"]["batch_size"] == 150
+    assert jobs["crypto_future.bars.1h"]["params"]["only_failed_or_stale"] is True
 
 
 def test_scheduler_payload_exports_low_symbol_fetch_concurrency() -> None:
@@ -405,7 +408,9 @@ def test_fund_market_preview_and_scheduler_jobs_are_exported() -> None:
     assert jobs["fund.lof.bars.1d.bootstrap"]["limit"] is None
     assert jobs["fund.open.nav.bootstrap"]["params"]["fund_asset_type"] == "open_fund"
     assert jobs["fund.open.nav.bootstrap"]["limit"] is None
+    assert jobs["fund.bars.1d.close_final"]["params"]["only_failed_or_stale"] is True
     assert jobs["fund.open.nav.daily"]["params"]["sync_task_type"] == "fund_nav_daily"
+    assert jobs["fund.open.nav.daily"]["params"]["only_failed_or_stale"] is True
     assert jobs["fund.open.nav.daily"]["limit"] is None
 
 

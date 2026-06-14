@@ -20,7 +20,7 @@ from pandas import DataFrame
 from finance_agent.data.normalizers import with_ashare_exchange_prefix
 from finance_agent.data.providers.eastmoney_curl import (
     eastmoney_headers,
-    ensure_eastmoney_cookie,
+    ensure_eastmoney_kline_cookie,
 )
 
 TENCENT_KLINE_BROWSER_HEADERS = {
@@ -112,7 +112,7 @@ def fetch_eastmoney_kline_direct(
 ) -> DataFrame:
     """直连东方财富 K 线接口，使用统一 Cookie/headers 管理。"""
 
-    ensure_eastmoney_cookie()
+    ensure_eastmoney_kline_cookie()
     try:
         return _fetch_eastmoney_kline_direct_once(
             symbol=symbol,
@@ -123,8 +123,8 @@ def fetch_eastmoney_kline_direct(
             timeout=timeout,
         )
     except Exception:
-        refresh_status = ensure_eastmoney_cookie(force=True)
-        if refresh_status.get("refreshed"):
+        refresh_status = ensure_eastmoney_kline_cookie(force=True)
+        if refresh_status.get("probe_ok"):
             return _fetch_eastmoney_kline_direct_once(
                 symbol=symbol,
                 timeframe=timeframe,

@@ -227,7 +227,7 @@ def summarize_archive(
 ) -> CollectionTaskResult:
     """把带归档编号的 Provider 结果压缩成命令输出摘要。"""
 
-    if not isinstance(archive, ArchivedProviderResult):
+    if not is_single_archived_provider_result(archive):
         return summarize_archives(task, archive)
 
     result = archive.result
@@ -245,6 +245,12 @@ def summarize_archive(
         }
         | infer_time_range_payload(result),
     )
+
+
+def is_single_archived_provider_result(value: Any) -> bool:
+    """判断对象是否为单个已归档 Provider 结果，兼容脚本内轻量包装。"""
+
+    return hasattr(value, "result") and hasattr(value, "raw_record_id")
 
 
 def summarize_archives(

@@ -1290,6 +1290,8 @@ class BaseDataScheduler:
             in {
                 "market_bars_full_history_backfill",
                 "market_bars_close_final",
+                "fund_nav_full_history_backfill",
+                "fund_nav_daily",
             }
             and overrides.get("lookback")
         ):

@@ -37,11 +37,22 @@ EASTMONEY_COOKIE_ENV = "FINANCE_AGENT_EASTMONEY_COOKIE"
 EASTMONEY_COOKIE_FILE_ENV = "FINANCE_AGENT_EASTMONEY_COOKIE_FILE"
 EASTMONEY_COOKIE_AUTO_REFRESH_ENV = "FINANCE_AGENT_EASTMONEY_COOKIE_AUTO_REFRESH"
 EASTMONEY_COOKIE_MAX_AGE_SECONDS_ENV = "FINANCE_AGENT_EASTMONEY_COOKIE_MAX_AGE_SECONDS"
+EASTMONEY_KLINE_COOKIE_COOLDOWN_SECONDS_ENV = "FINANCE_AGENT_EASTMONEY_KLINE_COOKIE_COOLDOWN_SECONDS"
+EASTMONEY_KLINE_COOKIE_PROBE_TTL_SECONDS_ENV = "FINANCE_AGENT_EASTMONEY_KLINE_COOKIE_PROBE_TTL_SECONDS"
 DEFAULT_EASTMONEY_COOKIE_FILE = Path("runtime/secrets/eastmoney_cookie.json")
 DEFAULT_EASTMONEY_COOKIE_MAX_AGE_SECONDS = 12 * 60 * 60
+DEFAULT_EASTMONEY_KLINE_COOKIE_COOLDOWN_SECONDS = 15 * 60
+DEFAULT_EASTMONEY_KLINE_COOKIE_PROBE_TTL_SECONDS = 10 * 60
 _SYNTHETIC_EASTMONEY_COOKIE: str | None = None
 _EASTMONEY_COOKIE_REFRESH_LOCK = threading.Lock()
 _EASTMONEY_COOKIE_REFRESH_GENERATION = 0
+_EASTMONEY_KLINE_COOKIE_HEALTH_LOCK = threading.Lock()
+_EASTMONEY_KLINE_COOKIE_HEALTH: dict[str, Any] = {
+    "state": "unknown",
+    "last_checked_at": 0.0,
+    "unavailable_until": 0.0,
+    "last_error_message": None,
+}
 
 
 def eastmoney_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -163,6 +174,94 @@ def ensure_eastmoney_cookie(*, force: bool = False) -> dict[str, Any]:
             "cookie_count": payload.get("cookie_count"),
         }
 
+
+def ensure_eastmoney_kline_cookie(*, force: bool = False) -> dict[str, Any]:
+    """确保东方财富 K 线 Cookie 对 push2his 接口真实可用。
+
+    通用 Cookie 只证明本机能生成浏览器态 Cookie；K 线采集还必须通过 push2his
+    探测。探测失败时进入短冷却，后续标的会快速降级到腾讯，冷却到期后再自动探测
+    并恢复东方财富。
+    """
+
+    now = time.time()
+    with _EASTMONEY_KLINE_COOKIE_HEALTH_LOCK:
+        unavailable_until = float(_EASTMONEY_KLINE_COOKIE_HEALTH.get("unavailable_until") or 0.0)
+        if unavailable_until > now:
+            remaining = max(0, int(unavailable_until - now))
+            raise RuntimeError(f"东方财富 K 线 Cookie 冷却中，约 {remaining} 秒后重试")
+
+        probe_ttl_seconds = _eastmoney_kline_cookie_probe_ttl_seconds()
+        last_checked_at = float(_EASTMONEY_KLINE_COOKIE_HEALTH.get("last_checked_at") or 0.0)
+        if (
+            not force
+            and _EASTMONEY_KLINE_COOKIE_HEALTH.get("state") == "healthy"
+            and now - last_checked_at <= probe_ttl_seconds
+        ):
+            return {
+                "available": True,
+                "source": eastmoney_cookie_status()["source"],
+                "refreshed": False,
+                "probe_ok": True,
+                "cached": True,
+            }
+
+        cookie_status = ensure_eastmoney_cookie(force=force)
+        try:
+            probe_status = _probe_eastmoney_kline_cookie()
+        except Exception as exc:  # noqa: BLE001 - 这里需要把任意探测失败收敛成冷却状态
+            reason = str(exc)
+            _set_eastmoney_kline_cookie_unavailable(reason, now=now)
+            raise RuntimeError(f"东方财富 K 线 Cookie 校验失败，已进入冷却：{reason}") from exc
+
+        _EASTMONEY_KLINE_COOKIE_HEALTH.update(
+            {
+                "state": "healthy",
+                "last_checked_at": now,
+                "unavailable_until": 0.0,
+                "last_error_message": None,
+            }
+        )
+        return {
+            **cookie_status,
+            "available": True,
+            "source": eastmoney_cookie_status()["source"],
+            "probe_ok": True,
+            "probe_row_count": probe_status["row_count"],
+        }
+
+
+def mark_eastmoney_kline_cookie_unavailable(reason: str) -> dict[str, Any]:
+    """主动标记东方财富 K 线 Cookie 不可用，等待冷却后自动探测恢复。"""
+
+    with _EASTMONEY_KLINE_COOKIE_HEALTH_LOCK:
+        return _set_eastmoney_kline_cookie_unavailable(reason, now=time.time())
+
+
+def eastmoney_kline_cookie_health_status() -> dict[str, Any]:
+    """返回东方财富 K 线 Cookie 健康状态，用于诊断和任务监控展示。"""
+
+    now = time.time()
+    with _EASTMONEY_KLINE_COOKIE_HEALTH_LOCK:
+        unavailable_until = float(_EASTMONEY_KLINE_COOKIE_HEALTH.get("unavailable_until") or 0.0)
+        status = dict(_EASTMONEY_KLINE_COOKIE_HEALTH)
+    status["cooldown_remaining_seconds"] = max(0, int(unavailable_until - now))
+    return status
+
+
+def reset_eastmoney_kline_cookie_health_for_tests() -> None:
+    """重置东方财富 K 线 Cookie 健康状态；仅供测试隔离使用。"""
+
+    with _EASTMONEY_KLINE_COOKIE_HEALTH_LOCK:
+        _EASTMONEY_KLINE_COOKIE_HEALTH.update(
+            {
+                "state": "unknown",
+                "last_checked_at": 0.0,
+                "unavailable_until": 0.0,
+                "last_error_message": None,
+            }
+        )
+
+
 def refresh_eastmoney_cookie_file(
     *,
     output_path: Path | None = None,
@@ -239,6 +338,66 @@ def _eastmoney_cookie_max_age_seconds() -> int:
         return max(0, int(raw_value))
     except ValueError:
         return DEFAULT_EASTMONEY_COOKIE_MAX_AGE_SECONDS
+
+
+def _eastmoney_kline_cookie_cooldown_seconds() -> int:
+    raw_value = os.getenv(EASTMONEY_KLINE_COOKIE_COOLDOWN_SECONDS_ENV, "").strip()
+    if not raw_value:
+        return DEFAULT_EASTMONEY_KLINE_COOKIE_COOLDOWN_SECONDS
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        return DEFAULT_EASTMONEY_KLINE_COOKIE_COOLDOWN_SECONDS
+
+
+def _eastmoney_kline_cookie_probe_ttl_seconds() -> int:
+    raw_value = os.getenv(EASTMONEY_KLINE_COOKIE_PROBE_TTL_SECONDS_ENV, "").strip()
+    if not raw_value:
+        return DEFAULT_EASTMONEY_KLINE_COOKIE_PROBE_TTL_SECONDS
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        return DEFAULT_EASTMONEY_KLINE_COOKIE_PROBE_TTL_SECONDS
+
+
+def _set_eastmoney_kline_cookie_unavailable(reason: str, *, now: float) -> dict[str, Any]:
+    cooldown_seconds = _eastmoney_kline_cookie_cooldown_seconds()
+    unavailable_until = now + cooldown_seconds
+    _EASTMONEY_KLINE_COOKIE_HEALTH.update(
+        {
+            "state": "cooling",
+            "last_checked_at": now,
+            "unavailable_until": unavailable_until,
+            "last_error_message": reason,
+        }
+    )
+    return dict(_EASTMONEY_KLINE_COOKIE_HEALTH)
+
+
+def _probe_eastmoney_kline_cookie() -> dict[str, Any]:
+    """用真实 push2his K 线接口校验当前 Cookie 是否可用。"""
+
+    response = curl_requests.get(
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+        params={
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57",
+            "klt": "101",
+            "fqt": "1",
+            "secid": "1.603507",
+            "beg": "20240101",
+            "end": "20251231",
+        },
+        timeout=10,
+        impersonate="chrome120",
+        headers=eastmoney_headers(),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    klines = (payload.get("data") or {}).get("klines") or []
+    if payload.get("rc") != 0 or not klines:
+        raise RuntimeError(f"push2his probe returned rc={payload.get('rc')} rows={len(klines)}")
+    return {"row_count": len(klines)}
 
 
 def _cookie_file_is_fresh(cookie_path: Path, max_age_seconds: int) -> bool:

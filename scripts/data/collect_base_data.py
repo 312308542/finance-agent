@@ -49,6 +49,7 @@ from finance_agent.data.normalizers import (
     normalize_ashare_symbol,
 )
 from finance_agent.data.providers import AkshareProvider
+from finance_agent.data.providers.eastmoney_curl import eastmoney_kline_cookie_health_status
 from finance_agent.data.source_rate_limiter import (
     build_source_rate_limiter,
     default_source_rate_limiter,
@@ -91,6 +92,7 @@ CRYPTO_MARKET_BAR_PROVIDER = "ccxt_binance_fetch_ohlcv"
 CRYPTO_DERIVATIVE_DATA_DOMAIN = "derivatives"
 CRYPTO_DERIVATIVE_PROVIDER = "binance_derivative_snapshot"
 ASHARE_BAR_COVERAGE_QUERY_CHUNK_SIZE = 500
+EASTMONEY_KLINE_COOKIE_PROGRESS_SOURCE = "eastmoney_kline_cookie"
 FUND_MARKET_BAR_DATA_DOMAIN = "fund_market_bars"
 FUND_NAV_DATA_DOMAIN = "fund_nav"
 SOURCE_RATE_LIMITER = default_source_rate_limiter()
@@ -651,6 +653,30 @@ def run_ashare_p0(
                 )
                 return tasks
         symbols = resolve_ashare_collection_symbols(session, args)
+        backfill_windows_by_symbol: dict[str, list[tuple[str, str]]] = {}
+        if task_type == "market_bars_full_history_backfill":
+            required_start_at = parse_ashare_datetime_or_none(
+                getattr(args, "ashare_start", None)
+            )
+            required_end_at = latest_ashare_trading_datetime(
+                session,
+                parse_ashare_datetime_or_none(getattr(args, "ashare_end", None)),
+            )
+            if required_start_at is not None and required_end_at is not None:
+                try:
+                    backfill_windows_by_symbol = plan_ashare_market_bar_backfill_windows(
+                        session,
+                        symbols,
+                        timeframe=args.ashare_timeframe,
+                        required_start_at=required_start_at,
+                        required_end_at=required_end_at,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "A 股 K 线年度缺口规划失败，本轮退回原始请求窗口 error=%s",
+                        exc,
+                        exc_info=True,
+                    )
         pending_symbols = list(symbols)
         schedule_failure_retry = should_schedule_ashare_failure_retry(args)
         initial_batch_size = runtime_collection_batch_size(args)
@@ -691,65 +717,83 @@ def run_ashare_p0(
             def collect_symbol(symbol: str) -> CollectionTaskResult:
                 wait_for_runtime_scheduler_job_resume(args)
                 ohlcv_limit = ashare_market_bar_source_limit(args)
-                if session_factory is not None and current_max_workers > 1:
-                    with session_scope(session_factory) as worker_session:
-                        worker_collector = AshareP0Collector(worker_session)
-                        return attach_ashare_market_bar_retry_payload(
-                            runtime.run_task(
-                                task="ashare_p0_ohlcv",
-                                provider_key=ashare_ohlcv_provider_key(symbol),
-                                parameters={
-                                    "symbol": symbol,
-                                    "timeframe": args.ashare_timeframe,
-                                    "start": args.ashare_start,
-                                    "end": args.ashare_end,
-                                    "adjust": args.ashare_adjust,
-                                    "limit": ohlcv_limit,
-                                    "is_closed": args.is_closed,
-                                    "status": args.status,
-                                },
-                                force=args.force_provider,
-                                collect=lambda: worker_collector.collect_ohlcv(
-                                    symbol=symbol,
-                                    timeframe=args.ashare_timeframe,
-                                    start=args.ashare_start,
-                                    end=args.ashare_end,
-                                    limit=ohlcv_limit,
-                                    adjust=args.ashare_adjust,
-                                    is_closed=args.is_closed,
-                                    status=args.status,
-                                    source_gate=ashare_kline_source_gate,
-                                ),
-                            ),
-                            schedule_retry=schedule_failure_retry,
-                        )
-                return attach_ashare_market_bar_retry_payload(
-                    runtime.run_task(
+                planned_windows = backfill_windows_by_symbol.get(symbol)
+                if planned_windows is not None and not planned_windows:
+                    return CollectionTaskResult(
+                        task="ashare_p0_ohlcv",
+                        status="skipped",
+                        raw_record_id=None,
+                        item_count=0,
+                        error_message="10 年目标窗口已完整覆盖",
+                        payload={"backfill_windows": []},
+                    )
+                request_windows = planned_windows or [
+                    (args.ashare_start, args.ashare_end)
+                ]
+
+                def execute_window(
+                    target_collector: AshareP0Collector,
+                    *,
+                    window_start: str | None,
+                    window_end: str | None,
+                ) -> CollectionTaskResult:
+                    return runtime.run_task(
                         task="ashare_p0_ohlcv",
                         provider_key=ashare_ohlcv_provider_key(symbol),
                         parameters={
                             "symbol": symbol,
                             "timeframe": args.ashare_timeframe,
-                            "start": args.ashare_start,
-                            "end": args.ashare_end,
+                            "start": window_start,
+                            "end": window_end,
                             "adjust": args.ashare_adjust,
                             "limit": ohlcv_limit,
                             "is_closed": args.is_closed,
                             "status": args.status,
                         },
                         force=args.force_provider,
-                        collect=lambda: collector.collect_ohlcv(
+                        collect=lambda: target_collector.collect_ohlcv(
                             symbol=symbol,
                             timeframe=args.ashare_timeframe,
-                            start=args.ashare_start,
-                            end=args.ashare_end,
+                            start=window_start,
+                            end=window_end,
                             limit=ohlcv_limit,
                             adjust=args.ashare_adjust,
                             is_closed=args.is_closed,
                             status=args.status,
                             source_gate=ashare_kline_source_gate,
                         ),
-                    ),
+                    )
+
+                window_results: list[CollectionTaskResult] = []
+                for window_start, window_end in request_windows:
+                    wait_for_runtime_scheduler_job_resume(args)
+                    if session_factory is not None and current_max_workers > 1:
+                        with session_scope(session_factory) as worker_session:
+                            worker_collector = AshareP0Collector(worker_session)
+                            window_results.append(
+                                execute_window(
+                                    worker_collector,
+                                    window_start=window_start,
+                                    window_end=window_end,
+                                )
+                            )
+                    else:
+                        window_results.append(
+                            execute_window(
+                                collector,
+                                window_start=window_start,
+                                window_end=window_end,
+                            )
+                        )
+                if len(window_results) == 1:
+                    result = window_results[0]
+                else:
+                    result = merge_ashare_market_bar_window_results(
+                        window_results,
+                        windows=request_windows,
+                    )
+                return attach_ashare_market_bar_retry_payload(
+                    result,
                     schedule_retry=schedule_failure_retry,
                 )
 
@@ -2698,7 +2742,15 @@ def ashare_kline_source_gate(source_key: str, collect: Callable[[], Any]) -> Any
     """按真实 K 线数据源拆分限流和进度状态。"""
 
     # A 股 K 线的有效并发由任务队列 worker 控制，源优先级和降级保留在 provider 内部。
-    return collect()
+    try:
+        result = collect()
+    except Exception:
+        if source_key == "eastmoney_kline":
+            emit_eastmoney_kline_cookie_health_progress()
+        raise
+    if source_key == "eastmoney_kline":
+        emit_eastmoney_kline_cookie_health_progress()
+    return result
 
 
 def stock_news_provider_key(symbol: str) -> str:
@@ -2775,6 +2827,26 @@ def emit_source_rate_progress(source_key: str) -> None:
     if not snapshot:
         return
     progress.source_rate_updated(source_key=source_key, snapshot=snapshot)
+
+
+def emit_eastmoney_kline_cookie_health_progress() -> None:
+    """把东方财富 K 线 Cookie 健康状态写入任务监控。"""
+
+    progress = COLLECTION_PROGRESS_RECORDER
+    if progress is None or not hasattr(progress, "source_rate_updated"):
+        return
+    status = eastmoney_kline_cookie_health_status()
+    state = str(status.get("state") or "unknown")
+    snapshot: JsonDict = {
+        "state": state,
+        "cooldown_remaining_seconds": int(status.get("cooldown_remaining_seconds") or 0),
+        "last_error_message": str(status.get("last_error_message") or ""),
+        "failure_rate": 1.0 if state == "cooling" else 0.0,
+        "effective_max_concurrency": 0 if state == "cooling" else 1,
+    }
+    if "probe_ok" in status:
+        snapshot["probe_ok"] = bool(status.get("probe_ok"))
+    progress.source_rate_updated(source_key=EASTMONEY_KLINE_COOKIE_PROGRESS_SOURCE, snapshot=snapshot)
 
 
 def crypto_ohlcv_provider_key(market_type: str, symbol: str) -> str:
@@ -3021,6 +3093,15 @@ def batch_fund_bar_symbols(
         }
         asset_ids = list(symbol_by_asset_id)
         coverage = _fetch_fund_bar_coverage(session, asset_ids, timeframe=timeframe)
+        year_coverage: dict[str, dict[int, tuple[int, Any, Any]]] = {}
+        if required_start_at is not None and required_end_at is not None:
+            year_coverage = _fetch_fund_bar_year_coverage(
+                session,
+                asset_ids,
+                timeframe=timeframe,
+                start_at=required_start_at,
+                end_at=required_end_at,
+            )
         watermarks = _fetch_data_sync_watermarks(
             session,
             asset_ids,
@@ -3044,6 +3125,7 @@ def batch_fund_bar_symbols(
                         stale_before=stale_before,
                         required_start_at=required_start_at,
                         required_end_at=required_end_at,
+                        year_coverage=year_coverage.get(asset.asset_id),
                     )
                 )
             ],
@@ -3079,6 +3161,8 @@ def batch_open_fund_nav_symbols(
     now: datetime | None = None,
     only_failed_or_stale: bool = False,
     stale_before: datetime | None = None,
+    required_start_at: datetime | None = None,
+    required_end_at: datetime | None = None,
 ) -> list[str]:
     """按净值覆盖和失败水位选择开放式基金任务本轮要处理的代码。"""
 
@@ -3096,6 +3180,14 @@ def batch_open_fund_nav_symbols(
         }
         asset_ids = list(symbol_by_asset_id)
         coverage = _fetch_fund_nav_coverage(session, asset_ids)
+        year_coverage: dict[str, dict[int, tuple[int, Any, Any]]] = {}
+        if required_start_at is not None and required_end_at is not None:
+            year_coverage = _fetch_fund_nav_year_coverage(
+                session,
+                asset_ids,
+                start_at=required_start_at,
+                end_at=required_end_at,
+            )
         watermarks = _fetch_data_sync_watermarks(
             session,
             asset_ids,
@@ -3117,12 +3209,15 @@ def batch_open_fund_nav_symbols(
                         watermark=watermarks.get(asset.asset_id),
                         now=current_time,
                         stale_before=stale_before,
+                        required_start_at=required_start_at,
+                        required_end_at=required_end_at,
+                        year_coverage=year_coverage.get(asset.asset_id),
                     )
                 )
             ],
             key=lambda asset: (
                 coverage.get(asset.asset_id, (0, None))[0],
-                coverage.get(asset.asset_id, (0, None))[1] or date.min,
+                _coverage_latest_nav_date(coverage.get(asset.asset_id)) or date.min,
                 symbol_by_asset_id.get(asset.asset_id, ""),
             ),
         )
@@ -3171,6 +3266,46 @@ def _fetch_fund_bar_coverage(
         str(asset_id): (int(count or 0), earliest, latest)
         for asset_id, count, earliest, latest in session.execute(statement)
     }
+
+
+def _fetch_fund_bar_year_coverage(
+    session: Any,
+    asset_ids: list[str],
+    *,
+    timeframe: str,
+    start_at: datetime,
+    end_at: datetime,
+) -> dict[str, dict[int, tuple[int, datetime | None, datetime | None]]]:
+    """按自然年读取基金日 K 覆盖，用于初始化任务识别中间年份缺口。"""
+
+    if not asset_ids:
+        return {}
+    year_expr = func.extract("year", MarketBarORM.timestamp).label("bar_year")
+    statement = (
+        select(
+            MarketBarORM.asset_id,
+            year_expr,
+            func.count(MarketBarORM.timestamp),
+            func.min(MarketBarORM.timestamp),
+            func.max(MarketBarORM.timestamp),
+        )
+        .where(
+            MarketBarORM.market == "fund",
+            MarketBarORM.timeframe == timeframe,
+            MarketBarORM.asset_id.in_(asset_ids),
+            MarketBarORM.timestamp >= start_at,
+            MarketBarORM.timestamp <= end_at,
+        )
+        .group_by(MarketBarORM.asset_id, year_expr)
+    )
+    coverage: dict[str, dict[int, tuple[int, datetime | None, datetime | None]]] = {}
+    for asset_id, bar_year, count, earliest, latest in session.execute(statement):
+        coverage.setdefault(str(asset_id), {})[int(bar_year)] = (
+            int(count or 0),
+            earliest,
+            latest,
+        )
+    return coverage
 
 
 def _coverage_bar_count(value: Any) -> int:
@@ -3231,7 +3366,7 @@ def _datetime_after(left: datetime | None, right: datetime | None) -> bool:
 def _fetch_fund_nav_coverage(
     session: Any,
     asset_ids: list[str],
-) -> dict[str, tuple[int, date | None]]:
+) -> dict[str, tuple[int, date | None, date | None]]:
     """读取开放式基金净值覆盖度。"""
 
     if not asset_ids:
@@ -3240,15 +3375,108 @@ def _fetch_fund_nav_coverage(
         select(
             FundNavSnapshotORM.asset_id,
             func.count(FundNavSnapshotORM.nav_date),
+            func.min(FundNavSnapshotORM.nav_date),
             func.max(FundNavSnapshotORM.nav_date),
         )
         .where(FundNavSnapshotORM.asset_id.in_(asset_ids))
         .group_by(FundNavSnapshotORM.asset_id)
     )
     return {
-        str(asset_id): (int(count or 0), latest)
-        for asset_id, count, latest in session.execute(statement)
+        str(asset_id): (int(count or 0), earliest, latest)
+        for asset_id, count, earliest, latest in session.execute(statement)
     }
+
+
+def _fetch_fund_nav_year_coverage(
+    session: Any,
+    asset_ids: list[str],
+    *,
+    start_at: datetime,
+    end_at: datetime,
+) -> dict[str, dict[int, tuple[int, date | None, date | None]]]:
+    """按自然年读取开放式基金净值覆盖，用于初始化任务识别中间年份缺口。"""
+
+    if not asset_ids:
+        return {}
+    start_date = start_at.date()
+    end_date = end_at.date()
+    year_expr = func.extract("year", FundNavSnapshotORM.nav_date).label("nav_year")
+    statement = (
+        select(
+            FundNavSnapshotORM.asset_id,
+            year_expr,
+            func.count(FundNavSnapshotORM.nav_date),
+            func.min(FundNavSnapshotORM.nav_date),
+            func.max(FundNavSnapshotORM.nav_date),
+        )
+        .where(
+            FundNavSnapshotORM.asset_id.in_(asset_ids),
+            FundNavSnapshotORM.nav_date >= start_date,
+            FundNavSnapshotORM.nav_date <= end_date,
+        )
+        .group_by(FundNavSnapshotORM.asset_id, year_expr)
+    )
+    coverage: dict[str, dict[int, tuple[int, date | None, date | None]]] = {}
+    for asset_id, nav_year, count, earliest, latest in session.execute(statement):
+        coverage.setdefault(str(asset_id), {})[int(nav_year)] = (
+            int(count or 0),
+            earliest,
+            latest,
+        )
+    return coverage
+
+
+def _coverage_earliest_nav_date(value: Any) -> date | None:
+    """读取净值覆盖的最早日期，兼容旧的二元组测试数据。"""
+
+    if not value or len(value) < 3:
+        return None
+    return value[1]
+
+
+def _coverage_latest_nav_date(value: Any) -> date | None:
+    """读取净值覆盖的最新日期，兼容旧的二元组测试数据。"""
+
+    if not value:
+        return None
+    if len(value) >= 3:
+        return value[2]
+    if len(value) >= 2:
+        return value[1]
+    return None
+
+
+def _date_before(left: date | None, right: datetime | None) -> bool:
+    """安全判断日期是否早于 datetime 对应日期。"""
+
+    if left is None or right is None:
+        return False
+    return left < right.date()
+
+
+def _date_after(left: date | None, right: datetime | None) -> bool:
+    """安全判断日期是否晚于 datetime 对应日期。"""
+
+    if left is None or right is None:
+        return False
+    return left > right.date()
+
+
+def _year_coverage_has_missing_year(
+    year_coverage: dict[int, tuple[Any, ...]] | None,
+    *,
+    required_start_at: datetime,
+    required_end_at: datetime,
+) -> bool:
+    """判断起止年份之间是否存在整年覆盖缺口。"""
+
+    if required_start_at > required_end_at:
+        return False
+    coverage = year_coverage or {}
+    for year in range(required_start_at.year, required_end_at.year + 1):
+        if _coverage_bar_count(coverage.get(year)) <= 0:
+            return True
+    return False
 
 
 def _asset_requires_fund_bar_collection(
@@ -3260,6 +3488,7 @@ def _asset_requires_fund_bar_collection(
     stale_before: datetime | None,
     required_start_at: datetime | None = None,
     required_end_at: datetime | None = None,
+    year_coverage: dict[int, tuple[int, Any, Any]] | None = None,
 ) -> bool:
     """判断基金日 K 是否需要补采。"""
 
@@ -3277,6 +3506,16 @@ def _asset_requires_fund_bar_collection(
         return True
     if _datetime_before(latest_bar_at, required_end_at):
         return True
+    if (
+        required_start_at is not None
+        and required_end_at is not None
+        and _year_coverage_has_missing_year(
+            year_coverage,
+            required_start_at=required_start_at,
+            required_end_at=required_end_at,
+        )
+    ):
+        return True
     if stale_before is not None and latest_bar_at < stale_before:
         return True
     return False
@@ -3285,10 +3524,13 @@ def _asset_requires_fund_bar_collection(
 def _asset_requires_open_nav_collection(
     asset: Any,
     *,
-    coverage: dict[str, tuple[int, date | None]],
+    coverage: dict[str, tuple[Any, ...]],
     watermark: Any,
     now: datetime,
     stale_before: datetime | None,
+    required_start_at: datetime | None = None,
+    required_end_at: datetime | None = None,
+    year_coverage: dict[int, tuple[int, Any, Any]] | None = None,
 ) -> bool:
     """判断开放式基金净值是否需要补采。"""
 
@@ -3296,8 +3538,25 @@ def _asset_requires_open_nav_collection(
     next_retry_at = getattr(watermark, "next_retry_at", None) if watermark else None
     if status == "error" and (next_retry_at is None or next_retry_at <= now):
         return True
-    nav_count, latest_nav_date = coverage.get(asset.asset_id, (0, None))
+    coverage_value = coverage.get(asset.asset_id, (0, None))
+    nav_count = _coverage_bar_count(coverage_value)
+    earliest_nav_date = _coverage_earliest_nav_date(coverage_value)
+    latest_nav_date = _coverage_latest_nav_date(coverage_value)
     if nav_count <= 0 or latest_nav_date is None:
+        return True
+    if _date_after(earliest_nav_date, required_start_at):
+        return True
+    if _date_before(latest_nav_date, required_end_at):
+        return True
+    if (
+        required_start_at is not None
+        and required_end_at is not None
+        and _year_coverage_has_missing_year(
+            year_coverage,
+            required_start_at=required_start_at,
+            required_end_at=required_end_at,
+        )
+    ):
         return True
     if stale_before is not None and latest_nav_date < stale_before.date():
         return True
@@ -3335,6 +3594,22 @@ def batch_ashare_symbols(
             asset_ids,
             timeframe=timeframe,
         )
+        year_coverage: dict[str, dict[int, tuple[int, datetime | None, datetime | None]]] = {}
+        if required_start_at is not None and required_end_at is not None:
+            try:
+                year_coverage = _fetch_ashare_bar_year_coverage(
+                    session,
+                    asset_ids,
+                    timeframe=timeframe,
+                    start_at=required_start_at,
+                    end_at=required_end_at,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "A 股 K 线年度覆盖读取失败，本轮退回首尾水位判断 error=%s",
+                    exc,
+                    exc_info=True,
+                )
         try:
             watermarks = _fetch_data_sync_watermarks(
                 session,
@@ -3361,6 +3636,7 @@ def batch_ashare_symbols(
                     stale_before=stale_before,
                     required_start_at=required_start_at,
                     required_end_at=required_end_at,
+                    year_coverage=year_coverage.get(asset.asset_id),
                 )
             )
         ]
@@ -3639,6 +3915,81 @@ def _fetch_ashare_bar_coverage(
     return coverage
 
 
+def _fetch_ashare_bar_year_coverage(
+    session: Any,
+    asset_ids: list[str],
+    *,
+    timeframe: str,
+    start_at: datetime,
+    end_at: datetime,
+) -> dict[str, dict[int, tuple[int, datetime | None, datetime | None]]]:
+    """按自然年查询 A 股 K 线覆盖，用于 10 年初始化的缺口窗口规划。"""
+
+    if not asset_ids:
+        return {}
+    coverage: dict[str, dict[int, tuple[int, datetime | None, datetime | None]]] = {}
+    unique_asset_ids = list(dict.fromkeys(asset_ids))
+    year_expr = func.extract("year", MarketBarORM.timestamp).label("bar_year")
+    for offset in range(0, len(unique_asset_ids), ASHARE_BAR_COVERAGE_QUERY_CHUNK_SIZE):
+        chunk_asset_ids = unique_asset_ids[
+            offset : offset + ASHARE_BAR_COVERAGE_QUERY_CHUNK_SIZE
+        ]
+        statement = (
+            select(
+                MarketBarORM.asset_id,
+                year_expr,
+                func.count(MarketBarORM.timestamp),
+                func.min(MarketBarORM.timestamp),
+                func.max(MarketBarORM.timestamp),
+            )
+            .where(
+                MarketBarORM.market == "ashare",
+                MarketBarORM.timeframe == timeframe,
+                MarketBarORM.asset_id.in_(chunk_asset_ids),
+                MarketBarORM.timestamp >= start_at,
+                MarketBarORM.timestamp <= end_at,
+            )
+            .group_by(MarketBarORM.asset_id, year_expr)
+        )
+        for asset_id, bar_year, count, earliest, latest in session.execute(statement):
+            asset_coverage = coverage.setdefault(str(asset_id), {})
+            asset_coverage[int(bar_year)] = (int(count or 0), earliest, latest)
+    return coverage
+
+
+def plan_ashare_market_bar_backfill_windows(
+    session: Any,
+    symbols: list[str],
+    *,
+    timeframe: str,
+    required_start_at: datetime,
+    required_end_at: datetime,
+) -> dict[str, list[tuple[str, str]]]:
+    """为 10 年 A 股日 K 初始化规划实际需要请求的年度缺口窗口。"""
+
+    normalized_symbols: list[str] = []
+    for symbol in symbols:
+        normalized = normalize_ashare_symbol(str(symbol or ""))
+        if normalized:
+            normalized_symbols.append(normalized)
+    asset_ids = [f"ashare:{symbol}" for symbol in normalized_symbols]
+    year_coverage = _fetch_ashare_bar_year_coverage(
+        session,
+        asset_ids,
+        timeframe=timeframe,
+        start_at=required_start_at,
+        end_at=required_end_at,
+    )
+    return {
+        symbol: _ashare_bar_missing_year_windows(
+            year_coverage.get(f"ashare:{symbol}", {}),
+            required_start_at=required_start_at,
+            required_end_at=required_end_at,
+        )
+        for symbol in normalized_symbols
+    }
+
+
 def _fetch_data_sync_watermarks(
     session: Any,
     asset_ids: list[str],
@@ -3699,6 +4050,66 @@ def _watermark_covers_ashare_bar_request(
     return bool(start_token or end_token)
 
 
+def _ashare_bar_missing_year_windows(
+    year_coverage: dict[int, tuple[int, datetime | None, datetime | None]] | None,
+    *,
+    required_start_at: datetime,
+    required_end_at: datetime,
+    trust_leading_gap: bool = False,
+) -> list[tuple[str, str]]:
+    """根据年度覆盖情况生成需要请求的 A 股 K 线窗口。"""
+
+    if required_start_at > required_end_at:
+        return []
+    coverage = year_coverage or {}
+    covered_years = sorted(
+        year for year, value in coverage.items() if _coverage_bar_count(value) > 0
+    )
+    if not covered_years:
+        return [
+            (
+                _format_ashare_request_date(required_start_at) or "",
+                _format_ashare_request_date(required_end_at) or "",
+            )
+        ]
+
+    first_covered_year = covered_years[0]
+    windows: list[tuple[str, str]] = []
+    for year in range(required_start_at.year, required_end_at.year + 1):
+        window_start = datetime(year, 1, 1, tzinfo=UTC)
+        window_end = datetime(year, 12, 31, tzinfo=UTC)
+        if year == required_start_at.year:
+            window_start = max(window_start, _as_utc_datetime(required_start_at))
+        if year == required_end_at.year:
+            window_end = min(window_end, _as_utc_datetime(required_end_at))
+        if window_start > window_end:
+            continue
+
+        coverage_value = coverage.get(year)
+        if _coverage_bar_count(coverage_value) <= 0:
+            if trust_leading_gap and year < first_covered_year:
+                continue
+            windows.append(
+                (
+                    _format_ashare_request_date(window_start) or "",
+                    _format_ashare_request_date(window_end) or "",
+                )
+            )
+            continue
+
+        if year == required_end_at.year and _datetime_before(
+            _coverage_latest_bar_at(coverage_value),
+            window_end,
+        ):
+            windows.append(
+                (
+                    _format_ashare_request_date(window_start) or "",
+                    _format_ashare_request_date(window_end) or "",
+                )
+            )
+    return windows
+
+
 def _format_ashare_request_date(value: Any) -> str | None:
     """把请求日期统一成 YYYYMMDD 字符串，便于水位覆盖比较。"""
 
@@ -3721,6 +4132,7 @@ def _asset_requires_ashare_bar_collection(
     stale_before: datetime | None,
     required_start_at: datetime | None = None,
     required_end_at: datetime | None = None,
+    year_coverage: dict[int, tuple[int, datetime | None, datetime | None]] | None = None,
 ) -> bool:
     """判断资产是否需要被 revision/补漏任务重新采集。"""
 
@@ -3728,12 +4140,6 @@ def _asset_requires_ashare_bar_collection(
     next_retry_at = getattr(watermark, "next_retry_at", None) if watermark else None
     if status == "error" and (next_retry_at is None or next_retry_at <= now):
         return True
-    if _watermark_covers_ashare_bar_request(
-        watermark,
-        required_start_at=required_start_at,
-        required_end_at=required_end_at,
-    ):
-        return False
     coverage_value = coverage.get(asset.asset_id)
     bar_count = _coverage_bar_count(coverage_value)
     earliest_bar_at = _coverage_earliest_bar_at(coverage_value)
@@ -3742,6 +4148,25 @@ def _asset_requires_ashare_bar_collection(
         return True
     if required_end_at is not None and _datetime_before(latest_bar_at, required_end_at):
         return True
+    watermark_covers_request = _watermark_covers_ashare_bar_request(
+        watermark,
+        required_start_at=required_start_at,
+        required_end_at=required_end_at,
+    )
+    if (
+        required_start_at is not None
+        and required_end_at is not None
+        and year_coverage is not None
+        and _ashare_bar_missing_year_windows(
+            year_coverage,
+            required_start_at=required_start_at,
+            required_end_at=required_end_at,
+            trust_leading_gap=watermark_covers_request,
+        )
+    ):
+        return True
+    if watermark_covers_request:
+        return False
     if required_start_at is not None:
         if earliest_bar_at is None or _datetime_after(earliest_bar_at, required_start_at):
             return True
@@ -3881,6 +4306,68 @@ def _ashare_market_bar_watermark_metadata(result: Any) -> dict[str, Any]:
         if value is not None and value != "":
             metadata[key] = value
     return metadata
+
+
+def merge_ashare_market_bar_window_results(
+    results: list[CollectionTaskResult],
+    *,
+    windows: list[tuple[str | None, str | None]],
+) -> CollectionTaskResult:
+    """把同一标的多个年度缺口窗口的采集摘要合并为标的级结果。"""
+
+    if not results:
+        return CollectionTaskResult(
+            task="ashare_p0_ohlcv",
+            status="unavailable",
+            raw_record_id=None,
+            item_count=0,
+            error_message="没有年度缺口窗口采集结果",
+            payload={"backfill_windows": windows},
+        )
+
+    failed_windows: list[JsonDict] = []
+    completed_windows: list[JsonDict] = []
+    item_count = 0
+    actual_sources: list[Any] = []
+    error_messages: list[str] = []
+    for index, result in enumerate(results):
+        window = windows[index] if index < len(windows) else (None, None)
+        window_payload = {
+            "start": window[0],
+            "end": window[1],
+            "status": result_status_name(result),
+            "item_count": result_item_count(result),
+        }
+        if result_status_name(result) == "available":
+            item_count += result_item_count(result)
+            completed_windows.append(window_payload)
+            actual_source = getattr(result, "payload", {}).get("actual_source")
+            if actual_source:
+                actual_sources.append(actual_source)
+            continue
+        failed_windows.append(
+            window_payload | {"error_message": result_error_message(result)}
+        )
+        if result_error_message(result):
+            error_messages.append(str(result_error_message(result)))
+
+    status = "available" if not failed_windows else "error"
+    return CollectionTaskResult(
+        task="ashare_p0_ohlcv",
+        status=status,
+        raw_record_id=None,
+        item_count=item_count,
+        error_message=None if status == "available" else "; ".join(error_messages),
+        payload={
+            "actual_source": actual_sources[0] if len(actual_sources) == 1 else actual_sources,
+            "backfill_windows": [
+                {"start": start, "end": end} for start, end in windows
+            ],
+            "completed_windows": completed_windows,
+            "failed_windows": failed_windows,
+            "window_count": len(windows),
+        },
+    )
 
 
 def attach_ashare_market_bar_retry_payload(
@@ -4361,7 +4848,8 @@ def resolve_ashare_collection_symbols(session: Any, args: argparse.Namespace) ->
         timeframe = getattr(args, "ashare_timeframe", "1d")
         if timeframe != "1d":
             kwargs["timeframe"] = timeframe
-        if task_type_name(args) == "market_bars_full_history_backfill":
+        task_type = task_type_name(args)
+        if task_type in {"market_bars_full_history_backfill", "market_bars_close_final"}:
             kwargs["only_failed_or_stale"] = True
             kwargs["required_start_at"] = parse_ashare_datetime_or_none(
                 getattr(args, "ashare_start", None)
@@ -4426,14 +4914,17 @@ def resolve_fund_bar_collection_symbols(
             "asset_type": asset_type,
             "timeframe": getattr(args, "fund_timeframe", "1d"),
         }
-        if task_type_name(args) == "market_bars_full_history_backfill":
+        task_type = task_type_name(args)
+        if task_type in {"market_bars_full_history_backfill", "market_bars_close_final"}:
             kwargs["only_failed_or_stale"] = True
+            required_end_at = latest_ashare_trading_datetime(
+                session,
+                parse_ashare_datetime_or_none(getattr(args, "ashare_end", None)),
+            )
             kwargs["required_start_at"] = parse_ashare_datetime_or_none(
                 getattr(args, "ashare_start", None)
             )
-            kwargs["required_end_at"] = parse_ashare_datetime_or_none(
-                getattr(args, "ashare_end", None)
-            )
+            kwargs["required_end_at"] = required_end_at
         elif bool(getattr(args, "only_failed_or_stale", False)):
             kwargs["only_failed_or_stale"] = True
             kwargs["stale_before"] = parse_ashare_datetime_or_none(getattr(args, "ashare_start", None))
@@ -4455,7 +4946,12 @@ def resolve_fund_nav_collection_symbols(
         }
         if task_type_name(args) == "fund_nav_full_history_backfill":
             kwargs["only_failed_or_stale"] = True
-            kwargs["stale_before"] = parse_ashare_datetime_or_none(getattr(args, "ashare_start", None))
+            kwargs["required_start_at"] = parse_ashare_datetime_or_none(
+                getattr(args, "ashare_start", None)
+            )
+            kwargs["required_end_at"] = parse_ashare_datetime_or_none(
+                getattr(args, "ashare_end", None)
+            )
         elif bool(getattr(args, "only_failed_or_stale", False)):
             kwargs["only_failed_or_stale"] = True
             kwargs["stale_before"] = parse_ashare_datetime_or_none(getattr(args, "ashare_start", None))
@@ -4581,7 +5077,9 @@ def _record_fund_symbol_watermark(
             latest_at = payload_watermark_at
         elif data_domain == FUND_NAV_DATA_DOMAIN:
             coverage = _fetch_fund_nav_coverage(session, [asset_id])
-            latest_count, latest_at = coverage.get(asset_id, (0, None))
+            latest_coverage = coverage.get(asset_id)
+            latest_count = _coverage_bar_count(latest_coverage)
+            latest_at = _coverage_latest_nav_date(latest_coverage)
         else:
             coverage = _fetch_fund_bar_coverage(session, [asset_id], timeframe=timeframe)
             latest_coverage = coverage.get(asset_id)
@@ -4736,6 +5234,49 @@ def _fetch_recent_recommendation_symbols(session: Any, *, limit: int) -> list[st
         return []
 
 
+def _lookback_start_datetime_or_none(
+    value: str | None,
+    *,
+    now: datetime | None = None,
+) -> datetime | None:
+    """把 168h / 30d / 1y 这类 lookback 转为 UTC 起点时间。"""
+
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    try:
+        if text.endswith("h"):
+            delta = timedelta(hours=max(int(text[:-1]), 1))
+        elif text.endswith("d"):
+            delta = timedelta(days=max(int(text[:-1]), 1))
+        elif text.endswith("y"):
+            delta = timedelta(days=max(int(text[:-1]), 1) * 365)
+        else:
+            delta = timedelta(days=max(int(text), 1))
+    except ValueError:
+        return None
+    return (now or datetime.now(tz=UTC)) - delta
+
+
+def _asset_requires_crypto_bar_collection(
+    asset: Any,
+    *,
+    coverage: dict[str, tuple[int, datetime | None]],
+    stale_before: datetime | None,
+    min_bar_count: int | None,
+) -> bool:
+    """判断 Crypto K 线是否缺少最近窗口覆盖。"""
+
+    bar_count, latest_bar_at = coverage.get(asset.asset_id, (0, None))
+    if bar_count <= 0 or latest_bar_at is None:
+        return True
+    if min_bar_count is not None and bar_count < min_bar_count:
+        return True
+    if stale_before is not None and latest_bar_at < stale_before:
+        return True
+    return False
+
+
 def batch_crypto_symbols(
     session: Any,
     *,
@@ -4743,12 +5284,18 @@ def batch_crypto_symbols(
     timeframe: str,
     limit: int | None = None,
     fallback_symbol: str,
+    only_failed_or_stale: bool = False,
+    stale_before: datetime | None = None,
+    min_bar_count: int | None = None,
 ) -> list[str]:
     """按 K 线覆盖缺口选择数字货币补采标的。"""
 
+    selection_failed = False
+    has_candidate_assets = False
     try:
         repo = AssetRepository(session)
         assets = repo.find_by_market(market)
+        has_candidate_assets = bool(assets)
         coverage = _fetch_crypto_bar_coverage(
             session,
             [asset.asset_id for asset in assets],
@@ -4756,7 +5303,19 @@ def batch_crypto_symbols(
             market=market,
         )
         ranked_assets = sorted(
-            assets,
+            [
+                asset
+                for asset in assets
+                if (
+                    not only_failed_or_stale
+                    or _asset_requires_crypto_bar_collection(
+                        asset,
+                        coverage=coverage,
+                        stale_before=stale_before,
+                        min_bar_count=min_bar_count,
+                    )
+                )
+            ],
             key=lambda asset: (
                 coverage.get(asset.asset_id, (0, None))[0],
                 coverage.get(asset.asset_id, (0, None))[1] or datetime.min.replace(tzinfo=UTC),
@@ -4765,8 +5324,11 @@ def batch_crypto_symbols(
         )
         symbols = [asset.symbol for asset in ranked_assets]
     except Exception:
+        selection_failed = True
         symbols = []
     if not symbols:
+        if only_failed_or_stale and has_candidate_assets and not selection_failed:
+            return []
         symbols = [fallback_symbol]
     if limit:
         return symbols[:limit]
@@ -4813,13 +5375,24 @@ def resolve_crypto_collection_symbols(
 
     symbol_source = str(getattr(args, "symbol_source", "") or "").strip()
     if symbol_source in {"market_assets", "universe"}:
-        return batch_crypto_symbols(
-            session,
-            market=market,
-            timeframe=args.crypto_timeframe,
-            limit=None,
-            fallback_symbol=args.crypto_symbol,
-        )
+        only_failed_or_stale = bool(getattr(args, "only_failed_or_stale", False))
+        kwargs: JsonDict = {
+            "market": market,
+            "timeframe": args.crypto_timeframe,
+            "limit": None,
+            "fallback_symbol": args.crypto_symbol,
+        }
+        if only_failed_or_stale:
+            kwargs.update(
+                {
+                    "only_failed_or_stale": True,
+                    "stale_before": _lookback_start_datetime_or_none(
+                        getattr(args, "lookback", None)
+                    ),
+                    "min_bar_count": runtime_collection_limit(args),
+                }
+            )
+        return batch_crypto_symbols(session, **kwargs)
     return [args.crypto_symbol]
 
 

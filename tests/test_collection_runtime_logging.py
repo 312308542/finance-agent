@@ -144,6 +144,27 @@ def test_summarize_archive_merges_multiple_provider_archives() -> None:
     ]
 
 
+def test_summarize_archive_accepts_lightweight_single_archive_wrapper() -> None:
+    """内部日历任务的轻量归档包装应按单个 Provider 结果摘要处理。"""
+
+    class LightweightArchive:
+        def __init__(self) -> None:
+            self.result = ProviderResult(
+                provider_name="tool_trade_date_hist_sina",
+                status="available",
+                collected_at=datetime.now(tz=UTC),
+                payload={"actual_source": "akshare:tool_trade_date_hist_sina"},
+            )
+            self.raw_record_id = None
+
+    summary = summarize_archive("ashare_p0_calendar", LightweightArchive())
+
+    assert summary.status == "available"
+    assert summary.raw_record_id is None
+    assert summary.item_count == 0
+    assert summary.payload["actual_source"] == "akshare:tool_trade_date_hist_sina"
+
+
 def test_summarize_archive_includes_latest_timestamp_for_market_bars() -> None:
     """K 线摘要应携带最新时间，供水位写入在跨事务场景下断点续跑。"""
 

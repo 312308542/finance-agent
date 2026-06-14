@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from argparse import Namespace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -210,6 +210,44 @@ def test_fund_bar_full_history_symbol_resolution_enables_gap_filter(monkeypatch)
     assert captured["required_end_at"] == datetime(2026, 6, 12, tzinfo=UTC)
 
 
+def test_fund_bar_close_final_symbol_resolution_uses_latest_gap_filter(monkeypatch) -> None:
+    """基金收盘最终日 K 应按最近交易日缺口筛选，避免手工执行时全量重跑 ETF/LOF。"""
+
+    captured: dict = {}
+
+    def fake_batch_symbols(session, **kwargs):
+        captured.update(kwargs)
+        return ["160716"]
+
+    monkeypatch.setattr(collect_base_data, "batch_fund_bar_symbols", fake_batch_symbols)
+    monkeypatch.setattr(
+        collect_base_data,
+        "latest_ashare_trading_datetime",
+        lambda session, end_at: datetime(2026, 6, 12, tzinfo=UTC),
+        raising=False,
+    )
+
+    symbols = collect_base_data.resolve_fund_bar_collection_symbols(
+        object(),
+        Namespace(
+            sync_task_type="market_bars_close_final",
+            symbol_source="market_assets",
+            source_limit=None,
+            fund_symbol="160716",
+            fund_timeframe="1d",
+            only_failed_or_stale=True,
+            ashare_start="20251214",
+            ashare_end="20260614",
+        ),
+        asset_type="lof",
+    )
+
+    assert symbols == ["160716"]
+    assert captured["only_failed_or_stale"] is True
+    assert captured["required_start_at"] == datetime(2025, 12, 14, tzinfo=UTC)
+    assert captured["required_end_at"] == datetime(2026, 6, 12, tzinfo=UTC)
+
+
 def test_fund_bar_collection_range_check_uses_earliest_and_latest_coverage() -> None:
     """基金 10 年日 K 覆盖判断应同时检查起止日期，不能只看最新日期。"""
 
@@ -230,6 +268,36 @@ def test_fund_bar_collection_range_check_uses_earliest_and_latest_coverage() -> 
         stale_before=None,
         required_start_at=datetime(2016, 6, 12, tzinfo=UTC),
         required_end_at=datetime(2026, 6, 12, tzinfo=UTC),
+    )
+
+    assert requires_collection is True
+
+
+def test_fund_bar_collection_detects_middle_year_gap() -> None:
+    """基金 10 年日 K 覆盖判断应识别中间年份缺口，不能只看首尾日期。"""
+
+    asset = SimpleNamespace(asset_id="fund:lof:160716")
+    watermark = SimpleNamespace(status="available", next_retry_at=None)
+
+    requires_collection = collect_base_data._asset_requires_fund_bar_collection(
+        asset,
+        coverage={
+            "fund:lof:160716": (
+                1200,
+                datetime(2016, 6, 12, tzinfo=UTC),
+                datetime(2026, 6, 12, tzinfo=UTC),
+            )
+        },
+        watermark=watermark,
+        now=datetime(2026, 6, 12, 3, 30, tzinfo=UTC),
+        stale_before=None,
+        required_start_at=datetime(2016, 6, 12, tzinfo=UTC),
+        required_end_at=datetime(2026, 6, 12, tzinfo=UTC),
+        year_coverage={
+            2016: (120, datetime(2016, 6, 12, tzinfo=UTC), datetime(2016, 12, 30, tzinfo=UTC)),
+            2018: (240, datetime(2018, 1, 2, tzinfo=UTC), datetime(2018, 12, 28, tzinfo=UTC)),
+            2026: (110, datetime(2026, 1, 2, tzinfo=UTC), datetime(2026, 6, 12, tzinfo=UTC)),
+        },
     )
 
     assert requires_collection is True
@@ -286,7 +354,93 @@ def test_open_fund_nav_full_history_symbol_resolution_enables_gap_filter(monkeyp
 
     assert symbols == []
     assert captured["only_failed_or_stale"] is True
-    assert captured["stale_before"] == datetime(2016, 6, 12, tzinfo=UTC)
+    assert captured["required_start_at"] == datetime(2016, 6, 12, tzinfo=UTC)
+
+
+def test_open_fund_nav_full_history_symbol_resolution_passes_required_range(monkeypatch) -> None:
+    """开放式基金净值初始化应传入完整起止范围，避免只按最新净值误判完成。"""
+
+    captured: dict = {}
+
+    def fake_batch_symbols(session, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(collect_base_data, "batch_open_fund_nav_symbols", fake_batch_symbols)
+
+    collect_base_data.resolve_fund_nav_collection_symbols(
+        object(),
+        Namespace(
+            sync_task_type="fund_nav_full_history_backfill",
+            symbol_source="market_assets",
+            source_limit=20,
+            fund_symbol="000001",
+            only_failed_or_stale=False,
+            ashare_start="20160612",
+            ashare_end="20260612",
+        ),
+    )
+
+    assert captured["required_start_at"] == datetime(2016, 6, 12, tzinfo=UTC)
+    assert captured["required_end_at"] == datetime(2026, 6, 12, tzinfo=UTC)
+
+
+def test_open_fund_nav_collection_checks_earliest_latest_and_middle_years() -> None:
+    """开放式基金净值覆盖判断应同时检查起止日期和中间年份缺口。"""
+
+    asset = SimpleNamespace(asset_id="fund:open:000001")
+    watermark = SimpleNamespace(status="available", next_retry_at=None)
+
+    requires_collection = collect_base_data._asset_requires_open_nav_collection(
+        asset,
+        coverage={
+            "fund:open:000001": (
+                1200,
+                date(2016, 6, 12),
+                date(2026, 6, 12),
+            )
+        },
+        watermark=watermark,
+        now=datetime(2026, 6, 12, 3, 30, tzinfo=UTC),
+        stale_before=None,
+        required_start_at=datetime(2016, 6, 12, tzinfo=UTC),
+        required_end_at=datetime(2026, 6, 12, tzinfo=UTC),
+        year_coverage={
+            2016: (160, date(2016, 6, 12), date(2016, 12, 30)),
+            2018: (240, date(2018, 1, 2), date(2018, 12, 28)),
+            2026: (110, date(2026, 1, 2), date(2026, 6, 12)),
+        },
+    )
+
+    assert requires_collection is True
+
+
+def test_open_fund_nav_daily_symbol_resolution_enables_gap_filter(monkeypatch) -> None:
+    """开放式基金每日净值维护应只筛选最近窗口缺失或失败冷却已结束的基金。"""
+
+    captured: dict = {}
+
+    def fake_batch_symbols(session, **kwargs):
+        captured.update(kwargs)
+        return ["000001"]
+
+    monkeypatch.setattr(collect_base_data, "batch_open_fund_nav_symbols", fake_batch_symbols)
+
+    symbols = collect_base_data.resolve_fund_nav_collection_symbols(
+        object(),
+        Namespace(
+            sync_task_type="fund_nav_daily",
+            symbol_source="market_assets",
+            source_limit=None,
+            fund_symbol="000001",
+            only_failed_or_stale=True,
+            ashare_start="20260515",
+        ),
+    )
+
+    assert symbols == ["000001"]
+    assert captured["only_failed_or_stale"] is True
+    assert captured["stale_before"] == datetime(2026, 5, 15, tzinfo=UTC)
 
 
 def test_fund_success_watermark_uses_summary_latest_at_when_coverage_is_not_visible(monkeypatch) -> None:

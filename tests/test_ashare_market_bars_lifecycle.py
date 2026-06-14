@@ -482,6 +482,269 @@ def test_revision_symbol_selection_keeps_only_missing_stale_or_retryable_assets(
     assert symbols == ["000002", "000005", "000003"]
 
 
+def test_full_history_backfill_plans_only_missing_year_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """10 年历史日 K 补齐应只请求最新缺口和中间缺失年份。"""
+
+    collect_base_data = import_collection_module()
+    start_at = datetime(2024, 1, 1, tzinfo=UTC)
+    end_at = datetime(2026, 6, 12, tzinfo=UTC)
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_ashare_bar_year_coverage",
+        lambda session, asset_ids, timeframe, start_at, end_at: {
+            "ashare:000001": {
+                2024: (242, datetime(2024, 1, 2, tzinfo=UTC), datetime(2024, 12, 31, tzinfo=UTC)),
+                2025: (242, datetime(2025, 1, 2, tzinfo=UTC), datetime(2025, 12, 31, tzinfo=UTC)),
+            },
+            "ashare:000002": {
+                2024: (242, datetime(2024, 1, 2, tzinfo=UTC), datetime(2024, 12, 31, tzinfo=UTC)),
+                2026: (3, datetime(2026, 1, 2, tzinfo=UTC), datetime(2026, 1, 6, tzinfo=UTC)),
+            },
+            "ashare:000003": {},
+            "ashare:000004": {
+                2024: (242, datetime(2024, 1, 2, tzinfo=UTC), datetime(2024, 12, 31, tzinfo=UTC)),
+                2025: (242, datetime(2025, 1, 2, tzinfo=UTC), datetime(2025, 12, 31, tzinfo=UTC)),
+                2026: (100, datetime(2026, 1, 2, tzinfo=UTC), end_at),
+            },
+        },
+        raising=False,
+    )
+
+    windows = collect_base_data.plan_ashare_market_bar_backfill_windows(
+        object(),
+        ["000001", "000002", "000003", "000004"],
+        timeframe="1d",
+        required_start_at=start_at,
+        required_end_at=end_at,
+    )
+
+    assert windows == {
+        "000001": [("20260101", "20260612")],
+        "000002": [("20250101", "20251231"), ("20260101", "20260612")],
+        "000003": [("20240101", "20260612")],
+        "000004": [],
+    }
+
+
+def test_full_history_symbol_selection_detects_middle_year_gap_despite_watermark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """即使水位覆盖 10 年窗口，中间整年缺失也必须重新入队补齐。"""
+
+    collect_base_data = import_collection_module()
+    start_at = datetime(2024, 1, 1, tzinfo=UTC)
+    end_at = datetime(2026, 6, 12, tzinfo=UTC)
+
+    class FakeAssetRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def find_by_market(self, market: str, *, only_tradable: bool = True) -> list[Any]:
+            assert market == "ashare"
+            return [Namespace(asset_id="ashare:000001", symbol="000001")]
+
+    coverage = {
+        "ashare:000001": (300, datetime(2024, 1, 2, tzinfo=UTC), end_at),
+    }
+    watermarks = {
+        "ashare:000001": Namespace(
+            status="available",
+            next_retry_at=None,
+            payload={"requested_start": "20240101", "requested_end": "20260612"},
+        )
+    }
+    year_coverage = {
+        "ashare:000001": {
+            2024: (242, datetime(2024, 1, 2, tzinfo=UTC), datetime(2024, 12, 31, tzinfo=UTC)),
+            2026: (100, datetime(2026, 1, 2, tzinfo=UTC), end_at),
+        }
+    }
+
+    monkeypatch.setattr(collect_base_data, "AssetRepository", FakeAssetRepository)
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_ashare_bar_coverage",
+        lambda session, asset_ids, timeframe: coverage,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_ashare_bar_year_coverage",
+        lambda session, asset_ids, timeframe, start_at, end_at: year_coverage,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_data_sync_watermarks",
+        lambda session, asset_ids, data_domain, provider, timeframe: watermarks,
+        raising=False,
+    )
+
+    symbols = collect_base_data.batch_ashare_symbols(
+        object(),
+        fallback_symbol="000001",
+        only_failed_or_stale=True,
+        required_start_at=start_at,
+        required_end_at=end_at,
+    )
+
+    assert symbols == ["000001"]
+
+
+def test_close_final_symbol_selection_requires_latest_trading_day_despite_watermark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """收盘最终日 K 应以真实 K 线最新交易日为准，不能只依赖请求水位跳过。"""
+
+    collect_base_data = import_collection_module()
+    request_start = datetime(2026, 1, 1, tzinfo=UTC)
+    request_end = datetime(2026, 6, 12, tzinfo=UTC)
+
+    class FakeAssetRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def find_by_market(self, market: str, *, only_tradable: bool = True) -> list[Any]:
+            assert market == "ashare"
+            return [
+                Namespace(asset_id="ashare:000001", symbol="000001"),
+                Namespace(asset_id="ashare:000002", symbol="000002"),
+            ]
+
+    monkeypatch.setattr(collect_base_data, "AssetRepository", FakeAssetRepository)
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_ashare_bar_coverage",
+        lambda session, asset_ids, timeframe: {
+            "ashare:000001": (
+                120,
+                datetime(2026, 1, 2, tzinfo=UTC),
+                datetime(2026, 6, 11, tzinfo=UTC),
+            ),
+            "ashare:000002": (
+                121,
+                datetime(2026, 1, 2, tzinfo=UTC),
+                request_end,
+            ),
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_data_sync_watermarks",
+        lambda session, asset_ids, data_domain, provider, timeframe: {
+            "ashare:000001": Namespace(
+                status="available",
+                next_retry_at=None,
+                payload={
+                    "requested_start": "20260101",
+                    "requested_end": "20260612",
+                },
+            ),
+            "ashare:000002": Namespace(
+                status="available",
+                next_retry_at=None,
+                payload={
+                    "requested_start": "20260101",
+                    "requested_end": "20260612",
+                },
+            ),
+        },
+        raising=False,
+    )
+
+    symbols = collect_base_data.batch_ashare_symbols(
+        object(),
+        fallback_symbol="000001",
+        only_failed_or_stale=True,
+        required_start_at=request_start,
+        required_end_at=request_end,
+    )
+
+    assert symbols == ["000001"]
+
+
+def test_full_history_backfill_uses_planned_window_when_collecting_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """10 年初始化执行时应把单标的请求缩小到缺口年份窗口。"""
+
+    collect_base_data = import_collection_module()
+    runtime_parameters: list[dict[str, Any]] = []
+    collector_calls: list[dict[str, Any]] = []
+
+    class ExecutingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            if task == "ashare_p0_ohlcv":
+                runtime_parameters.append(parameters)
+                collect()
+            return Namespace(
+                task=task,
+                status="available",
+                raw_record_id=None,
+                item_count=1,
+                error_message=None,
+                payload={},
+            )
+
+    def fake_collect_ohlcv(self, **kwargs: Any) -> Any:
+        collector_calls.append(kwargs)
+        return Namespace(status="available", payload={})
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "should_refresh_asset_universe_before_incremental",
+        lambda session, market: False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "batch_ashare_symbols",
+        lambda *args, **kwargs: ["000001"],
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "plan_ashare_market_bar_backfill_windows",
+        lambda *args, **kwargs: {"000001": [("20260101", "20260612")]},
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_ashare_market_bar_watermark",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        collect_base_data.AshareP0Collector,
+        "collect_ohlcv",
+        fake_collect_ohlcv,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p0"],
+        sync_task_type="market_bars_full_history_backfill",
+        symbol_source="market_assets",
+        ashare_start="20240101",
+        ashare_end="20260612",
+        batch_size=1,
+    )
+
+    collect_base_data.run_ashare_p0(object(), args, ExecutingRuntime())
+
+    assert runtime_parameters[0]["start"] == "20260101"
+    assert runtime_parameters[0]["end"] == "20260612"
+    assert collector_calls[0]["start"] == "20260101"
+    assert collector_calls[0]["end"] == "20260612"
+
+
 def test_rate_limited_collection_records_source_success_and_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -588,6 +851,62 @@ def test_rate_limited_collection_updates_progress_source_rate_snapshot(
                 "disconnect_count": 1,
                 "effective_max_concurrency": 1,
                 "effective_min_interval_seconds": 2.0,
+            },
+            "ttl_seconds": None,
+        }
+    ]
+
+
+def test_ashare_kline_source_gate_reports_eastmoney_cookie_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 股东财 K 线源门禁应把 Cookie 健康状态写入任务监控。"""
+
+    collect_base_data = import_collection_module()
+    snapshots: list[dict[str, Any]] = []
+
+    class FakeProgress:
+        def source_rate_updated(
+            self,
+            *,
+            source_key: str,
+            snapshot: dict[str, Any],
+            ttl_seconds: int | None = None,
+        ) -> None:
+            snapshots.append(
+                {
+                    "source_key": source_key,
+                    "snapshot": snapshot,
+                    "ttl_seconds": ttl_seconds,
+                }
+            )
+
+    monkeypatch.setattr(collect_base_data, "COLLECTION_PROGRESS_RECORDER", FakeProgress())
+    monkeypatch.setattr(
+        collect_base_data,
+        "eastmoney_kline_cookie_health_status",
+        lambda: {
+            "state": "cooling",
+            "cooldown_remaining_seconds": 600,
+            "last_error_message": "curl: (56) Connection closed abruptly",
+        },
+    )
+
+    with pytest.raises(RuntimeError):
+        collect_base_data.ashare_kline_source_gate(
+            "eastmoney_kline",
+            lambda: (_ for _ in ()).throw(RuntimeError("eastmoney unavailable")),
+        )
+
+    assert snapshots == [
+        {
+            "source_key": "eastmoney_kline_cookie",
+            "snapshot": {
+                "state": "cooling",
+                "cooldown_remaining_seconds": 600,
+                "last_error_message": "curl: (56) Connection closed abruptly",
+                "failure_rate": 1.0,
+                "effective_max_concurrency": 0,
             },
             "ttl_seconds": None,
         }

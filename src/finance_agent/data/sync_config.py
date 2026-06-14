@@ -1448,7 +1448,11 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                             sources=["market_bars"],
                             data_packages=["market_bars"],
                             notes=["收盘后闭合日 K，作为指标、因子和推荐输入。"],
-                            extra_params={"is_closed": True, "status": "available"},
+                            extra_params={
+                                "is_closed": True,
+                                "status": "available",
+                                "only_failed_or_stale": True,
+                            },
                         ),
                         DataSyncTaskPreview(
                             task_key="ashare.bars.1d.revision",
@@ -1700,6 +1704,7 @@ def preview_crypto_tasks(market: str, config: MarketSyncConfig) -> list[DataSync
                     lookback=f"{config.lookback_hours}h",
                     sources=["ccxt_fetch_ohlcv"],
                     data_packages=["market_bars"],
+                    extra_params={"only_failed_or_stale": True},
                 )
             )
     if market == "crypto_future" and "derivatives" in config.data_packages:
@@ -1801,7 +1806,11 @@ def preview_fund_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                     lookback=f"{config.lookback_days}d",
                     sources=["fund_etf_hist_em", "fund_lof_hist_em"],
                     data_packages=["market_bars"],
-                    extra_params={"is_closed": True, "status": "available"},
+                    extra_params={
+                        "is_closed": True,
+                        "status": "available",
+                        "only_failed_or_stale": True,
+                    },
                     notes=["收盘后补齐 ETF/LOF 最近窗口内的最终日 K。"],
                 ),
             ]
@@ -1846,7 +1855,10 @@ def preview_fund_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                     lookback=f"{config.lookback_days}d",
                     sources=["fund_open_fund_daily_em", "fund_open_fund_info_em"],
                     data_packages=["fund_nav"],
-                    extra_params={"fund_asset_type": "open_fund"},
+                    extra_params={
+                        "fund_asset_type": "open_fund",
+                        "only_failed_or_stale": True,
+                    },
                     notes=["夜间刷新最新净值，并在次日凌晨补一次修正。"],
                 ),
             ]

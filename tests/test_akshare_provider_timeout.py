@@ -368,6 +368,7 @@ def test_eastmoney_curl_cffi_kline_uses_browser_cookie(monkeypatch) -> None:
 
         def json(self) -> dict:
             return {
+                "rc": 0,
                 "data": {
                     "klines": [
                         "2026-05-28,10.0,10.5,10.8,9.9,1000,10000,1.0,2.0,0.2,3.0"
@@ -533,6 +534,94 @@ def test_eastmoney_force_refresh_uses_singleflight_lock(monkeypatch, tmp_path) -
     assert len(results) == 5
     assert len(refresh_calls) == 1
     assert eastmoney_curl.eastmoney_headers()["Cookie"] == "qgqp_b_id=singleflight-cookie"
+
+
+def test_eastmoney_kline_cookie_probe_opens_cooldown_when_cookie_invalid(monkeypatch, tmp_path) -> None:
+    """K 线 Cookie 刷新后必须通过 push2his 探测；失败时进入冷却并快速跳过。"""
+
+    cookie_file = tmp_path / "eastmoney_cookie.json"
+    refresh_calls: list[Path] = []
+    probe_calls: list[dict] = []
+
+    def fake_refresh(*, output_path, headed=False, timeout_ms=45_000):
+        refresh_calls.append(output_path)
+        output_path.write_text('{"cookie": "qgqp_b_id=bad-cookie"}', encoding="utf-8")
+        return {"cookie_count": 1}
+
+    def fake_get(url, **kwargs):
+        probe_calls.append({"url": url, **kwargs})
+        raise RuntimeError("push2his disconnected")
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("FINANCE_AGENT_EASTMONEY_COOKIE", raising=False)
+    monkeypatch.setenv("FINANCE_AGENT_EASTMONEY_COOKIE_AUTO_REFRESH", "1")
+    monkeypatch.setenv("FINANCE_AGENT_EASTMONEY_COOKIE_FILE", str(cookie_file))
+    monkeypatch.setenv("FINANCE_AGENT_EASTMONEY_KLINE_COOKIE_COOLDOWN_SECONDS", "60")
+    monkeypatch.setattr(eastmoney_curl, "refresh_eastmoney_cookie_file", fake_refresh)
+    monkeypatch.setattr(eastmoney_curl.curl_requests, "get", fake_get)
+    eastmoney_curl.reset_eastmoney_kline_cookie_health_for_tests()
+
+    try:
+        try:
+            eastmoney_curl.ensure_eastmoney_kline_cookie(force=True)
+        except RuntimeError as exc:
+            assert "Cookie 校验失败" in str(exc)
+        else:  # pragma: no cover - 测试红灯保护
+            raise AssertionError("invalid kline cookie should fail")
+
+        try:
+            eastmoney_curl.ensure_eastmoney_kline_cookie()
+        except RuntimeError as exc:
+            assert "冷却中" in str(exc)
+        else:  # pragma: no cover - 测试红灯保护
+            raise AssertionError("cooling kline source should fail fast")
+
+        assert len(refresh_calls) == 1
+        assert len(probe_calls) == 1
+    finally:
+        eastmoney_curl.reset_eastmoney_kline_cookie_health_for_tests()
+
+
+def test_eastmoney_kline_cookie_probe_recovers_after_cooldown(monkeypatch, tmp_path) -> None:
+    """冷却到期后下一次探测成功，应自动恢复东方财富 K 线源。"""
+
+    cookie_file = tmp_path / "eastmoney_cookie.json"
+    cookie_file.write_text('{"cookie": "qgqp_b_id=good-cookie"}', encoding="utf-8")
+    now = [1_000.0]
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"rc": 0, "data": {"klines": ["2026-06-12,1,1,1,1,1,1"]}}
+
+    monkeypatch.delenv("FINANCE_AGENT_EASTMONEY_COOKIE", raising=False)
+    monkeypatch.setenv("FINANCE_AGENT_EASTMONEY_COOKIE_FILE", str(cookie_file))
+    monkeypatch.setenv("FINANCE_AGENT_EASTMONEY_KLINE_COOKIE_COOLDOWN_SECONDS", "30")
+    monkeypatch.setenv("FINANCE_AGENT_EASTMONEY_KLINE_COOKIE_PROBE_TTL_SECONDS", "300")
+    monkeypatch.setattr(eastmoney_curl.time, "time", lambda: now[0])
+    monkeypatch.setattr(eastmoney_curl.curl_requests, "get", lambda *args, **kwargs: FakeResponse())
+    eastmoney_curl.reset_eastmoney_kline_cookie_health_for_tests()
+
+    try:
+        eastmoney_curl.mark_eastmoney_kline_cookie_unavailable("previous failure")
+        try:
+            eastmoney_curl.ensure_eastmoney_kline_cookie()
+        except RuntimeError as exc:
+            assert "冷却中" in str(exc)
+        else:  # pragma: no cover - 测试红灯保护
+            raise AssertionError("source should still be cooling before cooldown expires")
+
+        now[0] += 31
+        status = eastmoney_curl.ensure_eastmoney_kline_cookie()
+
+        assert status["available"] is True
+        assert status["source"] == "file"
+        assert status["probe_ok"] is True
+        assert eastmoney_curl.eastmoney_kline_cookie_health_status()["state"] == "healthy"
+    finally:
+        eastmoney_curl.reset_eastmoney_kline_cookie_health_for_tests()
 
 
 def test_tencent_direct_kline_uses_external_two_year_windows(monkeypatch) -> None:

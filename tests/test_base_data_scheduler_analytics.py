@@ -1680,6 +1680,42 @@ def test_scheduler_converts_fund_ten_year_bootstrap_lookback_to_collection_dates
     assert args.symbol_source == "market_assets"
 
 
+def test_scheduler_converts_fund_nav_lookback_to_collection_dates() -> None:
+    """基金净值初始化和日常维护也应把 lookback 转成筛选窗口，供断点续跑使用。"""
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="fund.open.nav.daily",
+                job_type="collection",
+                group="fund",
+                interval_seconds=24 * 60 * 60,
+                limit=None,
+                market="fund",
+                params={
+                    "sync_task_type": "fund_nav_daily",
+                    "lookback": "30d",
+                    "symbol_source": "market_assets",
+                    "fund_asset_type": "open_fund",
+                    "only_failed_or_stale": True,
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+    )
+
+    args = scheduler.build_collection_args(config.jobs[0])
+
+    start_date = datetime.strptime(args.ashare_start, "%Y%m%d").replace(tzinfo=UTC)
+    end_date = datetime.strptime(args.ashare_end, "%Y%m%d").replace(tzinfo=UTC)
+    assert (end_date - start_date).days == 30
+    assert args.only_failed_or_stale is True
+
+
 def test_scheduler_job_max_retries_overrides_global_retry_count() -> None:
     """单任务 max_retries=0 时，任务级失败只记录一次，不走全局自动重试。"""
 
@@ -4649,6 +4685,41 @@ def test_resolve_ashare_collection_symbols_uses_last_trading_day_for_full_histor
     assert captured["required_end_at"] == datetime(2026, 6, 5, tzinfo=UTC)
 
 
+def test_resolve_ashare_collection_symbols_uses_gap_filter_for_close_final(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """收盘最终日 K 应按最新交易日缺口筛选标的，避免每次手动执行全市场重跑。"""
+
+    collect_base_data = import_collection_module()
+    captured: dict[str, Any] = {}
+
+    def fake_batch_ashare_symbols(session: Any, **kwargs: Any) -> list[str]:
+        captured.update(kwargs)
+        return ["000001"]
+
+    monkeypatch.setattr(collect_base_data, "batch_ashare_symbols", fake_batch_ashare_symbols)
+    monkeypatch.setattr(
+        collect_base_data,
+        "latest_ashare_trading_datetime",
+        lambda session, end_at: datetime(2026, 6, 5, tzinfo=UTC),
+        raising=False,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p0"],
+        sync_task_type="market_bars_close_final",
+        symbol_source="market_assets",
+        ashare_start="20251208",
+        ashare_end="20260607",
+        only_failed_or_stale=True,
+    )
+
+    assert collect_base_data.resolve_ashare_collection_symbols(object(), args) == ["000001"]
+    assert captured["only_failed_or_stale"] is True
+    assert captured["required_start_at"] == datetime(2025, 12, 8, tzinfo=UTC)
+    assert captured["required_end_at"] == datetime(2026, 6, 5, tzinfo=UTC)
+
+
 def test_ashare_kline_source_gate_uses_queue_workers_without_source_limiter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5702,6 +5773,90 @@ def test_parse_collect_base_data_args_includes_crypto_lookback(
 
     assert hasattr(args, "lookback")
     assert args.lookback is None
+
+
+def test_resolve_crypto_collection_symbols_enables_recent_gap_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Crypto 小时线任务应把 lookback 和单次条数传给缺口筛选，避免每轮全量轮转。"""
+
+    collect_base_data = import_collection_module()
+    captured: dict[str, Any] = {}
+
+    def fake_batch_crypto_symbols(session: Any, **kwargs: Any) -> list[str]:
+        captured.update(kwargs)
+        return ["BTCUSDT"]
+
+    monkeypatch.setattr(collect_base_data, "batch_crypto_symbols", fake_batch_crypto_symbols)
+
+    args = collect_base_data.default_collection_args(
+        group=["crypto"],
+        sync_task_type="market_bars_backfill",
+        symbol_source="market_assets",
+        crypto_market_type="spot",
+        crypto_timeframe="1h",
+        crypto_symbol="BTCUSDT",
+        lookback="168h",
+        limit=150,
+        only_failed_or_stale=True,
+    )
+
+    symbols = collect_base_data.resolve_crypto_collection_symbols(
+        object(),
+        args,
+        market="crypto_spot",
+    )
+
+    assert symbols == ["BTCUSDT"]
+    assert captured["only_failed_or_stale"] is True
+    assert captured["min_bar_count"] == 150
+    assert captured["stale_before"] is not None
+
+
+def test_batch_crypto_symbols_skips_recently_covered_assets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Crypto 小时线筛选应跳过最近窗口已覆盖且条数足够的交易对。"""
+
+    collect_base_data = import_collection_module()
+
+    assets = [
+        Namespace(asset_id="crypto_spot:BTCUSDT", symbol="BTCUSDT"),
+        Namespace(asset_id="crypto_spot:ETHUSDT", symbol="ETHUSDT"),
+        Namespace(asset_id="crypto_spot:SOLUSDT", symbol="SOLUSDT"),
+    ]
+
+    class FakeAssetRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def find_by_market(self, market: str) -> list[Any]:
+            assert market == "crypto_spot"
+            return assets
+
+    coverage = {
+        "crypto_spot:BTCUSDT": (180, datetime(2026, 6, 14, 3, 0, tzinfo=UTC)),
+        "crypto_spot:ETHUSDT": (20, datetime(2026, 6, 13, 3, 0, tzinfo=UTC)),
+    }
+
+    monkeypatch.setattr(collect_base_data, "AssetRepository", FakeAssetRepository)
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_crypto_bar_coverage",
+        lambda session, asset_ids, *, timeframe, market: coverage,
+    )
+
+    symbols = collect_base_data.batch_crypto_symbols(
+        object(),
+        market="crypto_spot",
+        timeframe="1h",
+        fallback_symbol="BTCUSDT",
+        only_failed_or_stale=True,
+        stale_before=datetime(2026, 6, 14, 0, 0, tzinfo=UTC),
+        min_bar_count=150,
+    )
+
+    assert symbols == ["SOLUSDT", "ETHUSDT"]
 
 
 def test_crypto_market_bars_backfill_runs_all_market_assets_in_batches(
