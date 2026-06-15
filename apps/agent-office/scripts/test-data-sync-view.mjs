@@ -15,6 +15,8 @@ const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toStrin
 const {
   summarizeSchedulerStatus,
   pickEnabledMarkets,
+  marketsForPreset,
+  filterPreviewTasksByMarkets,
   processingStatusLabel,
   schedulerStartFeedback,
   summarizeSchedulerWritePolicy,
@@ -30,6 +32,23 @@ assert.deepEqual(
     },
   }),
   ["ashare", "crypto_future"],
+);
+
+assert.deepEqual(marketsForPreset("ashare-comprehensive"), ["ashare"]);
+assert.deepEqual(marketsForPreset("crypto-comprehensive"), ["crypto_spot", "crypto_future"]);
+assert.deepEqual(marketsForPreset("unknown-preset"), ["ashare", "fund", "crypto_spot", "crypto_future"]);
+
+assert.deepEqual(
+  filterPreviewTasksByMarkets(
+    [
+      { task_key: "ashare.bars.1d", market: "ashare" },
+      { task_key: "fund.nav", market: "fund" },
+      { task_key: "crypto_spot.bars.1h", market: "crypto_spot" },
+      { task_key: "quality.global" },
+    ],
+    ["ashare"],
+  ).map((task) => task.task_key),
+  ["ashare.bars.1d", "quality.global"],
 );
 
 assert.deepEqual(

@@ -3,7 +3,7 @@ import { Database } from "lucide-react";
 import { saveDataSyncConfig, startDataScheduler, stopDataScheduler } from "../api";
 import type { ConsolePageProps } from "../consoleTypes";
 import { DataTable, MetricBlock, Panel, TaskQueueList } from "../components/consoleCommon";
-import { pickEnabledMarkets, processingStatusLabel, schedulerStartFeedback, type SchedulerStartFeedback, summarizeProcessingPlan, summarizeSchedulerQueue, summarizeSchedulerStatus, summarizeSchedulerWritePolicy } from "../dataSyncView";
+import { filterPreviewTasksByMarkets, marketsForPreset, pickEnabledMarkets, processingStatusLabel, schedulerStartFeedback, type SchedulerStartFeedback, summarizeProcessingPlan, summarizeSchedulerQueue, summarizeSchedulerStatus, summarizeSchedulerWritePolicy } from "../dataSyncView";
 
 function clampSchedulerConcurrency(value: unknown): number {
   const parsed = Number(value);
@@ -46,7 +46,9 @@ export function DataSyncControlPanel({
   const [saveStatus, setSaveStatus] = React.useState("未保存");
   const [schedulerStartFeedbackState, setSchedulerStartFeedbackState] =
     React.useState<SchedulerStartFeedback | null>(null);
-  const currentSchedulerFeedback = schedulerStartFeedbackState ?? persistedWritePolicy;
+  const currentSchedulerFeedback = schedulerStartFeedbackState ?? persistedWritePolicy;
+
+  const visibleTasks = filterPreviewTasksByMarkets(tasks, markets);
 
   React.useEffect(() => {
     setPreset(config.preset ?? "personal-comprehensive");
@@ -76,7 +78,17 @@ export function DataSyncControlPanel({
     );
   };
 
-  const saveConfig = async () => {
+  const changePreset = (nextPreset: string) => {
+
+    setPreset(nextPreset);
+
+    setMarkets(marketsForPreset(nextPreset));
+
+  };
+
+
+
+  const saveConfig = async () => {
     setSaving(true);
     try {
       const result = await saveDataSyncConfig({
@@ -130,9 +142,9 @@ export function DataSyncControlPanel({
   return (
     <Panel title="数据同步控制台" subtitle="配置、预览、启动与停止本地基础数据调度器" icon={<Database size={16} />}>
       <div className="portfolio-strip">
-        <MetricBlock label="配置预设" value={config.preset ?? "personal-comprehensive"} />
-        <MetricBlock label="已启用市场" value={enabledMarkets.length} />
-        <MetricBlock label="任务数" value={validation.task_count ?? tasks.length ?? 0} />
+        <MetricBlock label="配置预设" value={preset} />
+        <MetricBlock label="已启用市场" value={markets.length} />
+        <MetricBlock label="任务数" value={visibleTasks.length} />
         <MetricBlock label="调度状态" value={schedulerSummary.label} />
         <MetricBlock label="加工状态" value={processingSummary.analyticsLabel} />
         <MetricBlock label="写库策略" value={currentSchedulerFeedback.writePolicy} />
@@ -151,7 +163,7 @@ export function DataSyncControlPanel({
           <h3>配置项</h3>
           <label>
             <span>预设</span>
-            <select value={preset} onChange={(event) => setPreset(event.target.value)}>
+            <select value={preset} onChange={(event) => changePreset(event.target.value)}>
               <option value="personal-comprehensive">personal-comprehensive</option>
               <option value="ashare-comprehensive">ashare-comprehensive</option>
               <option value="crypto-comprehensive">crypto-comprehensive</option>
@@ -288,7 +300,7 @@ export function DataSyncControlPanel({
           <h3>任务预览</h3>
           <DataTable
             columns={["任务", "市场", "模式", "间隔", "说明"]}
-            rows={tasks.slice(0, 12).map((task: any) => [
+            rows={visibleTasks.slice(0, 12).map((task: any) => [
               task.title,
               task.market,
               task.mode,

@@ -17,6 +17,12 @@ export type SchedulerQueueSummary = {
 };
 
 const marketOrder = ["ashare", "fund", "crypto_spot", "crypto_future"];
+const presetMarketDefaults: Record<string, string[]> = {
+  "personal-comprehensive": ["ashare", "fund", "crypto_spot", "crypto_future"],
+  "ashare-comprehensive": ["ashare"],
+  "crypto-comprehensive": ["crypto_spot", "crypto_future"],
+  lightweight: ["ashare", "fund", "crypto_spot"],
+};
 const processingStatusText: Record<string, string> = {
   active_with_collection: "随采集执行",
   implemented_not_scheduled: "已实现未调度",
@@ -46,6 +52,23 @@ function normalizeJobNames(value: unknown): string[] {
 export function pickEnabledMarkets(config: Record<string, any> | undefined): string[] {
   const markets = config?.markets ?? {};
   return marketOrder.filter((market) => markets[market]?.enabled);
+}
+
+export function marketsForPreset(preset: string | undefined): string[] {
+  return [
+    ...(presetMarketDefaults[preset ?? ""] ?? presetMarketDefaults["personal-comprehensive"]),
+  ];
+}
+
+export function filterPreviewTasksByMarkets<T extends Record<string, any>>(
+  tasks: T[],
+  markets: string[],
+): T[] {
+  const enabledMarkets = new Set(markets);
+  return tasks.filter((task) => {
+    const market = String(task.market ?? "").trim();
+    return !market || enabledMarkets.has(market);
+  });
 }
 
 export function summarizeSchedulerStatus(status: Record<string, any> | null | undefined): SchedulerSummary {
