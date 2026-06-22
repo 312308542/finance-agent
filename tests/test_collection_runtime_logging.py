@@ -2,7 +2,12 @@ from datetime import UTC, datetime
 import logging
 
 from finance_agent.cache.null_cache import NullCacheClient
-from finance_agent.data.collection_runtime import CollectionRuntime, summarize_archive
+from finance_agent.data.collection_runtime import (
+    CollectionRuntime,
+    ProviderCircuitPolicy,
+    provider_state_key,
+    summarize_archive,
+)
 from finance_agent.data.collectors import ArchivedProviderResult
 from finance_agent.data.models import (
     AssetData,
@@ -13,6 +18,19 @@ from finance_agent.data.models import (
     ProviderResult,
     RiskFindingsResult,
 )
+
+
+class RecordingRuntimeCache(NullCacheClient):
+    """记录运行时 Provider 状态，便于验证熔断计数。"""
+
+    def __init__(self) -> None:
+        self.values = {}
+
+    def get_json(self, key):
+        return self.values.get(key)
+
+    def set_json(self, key, value, *, ttl_seconds=None) -> None:
+        self.values[key] = value
 
 
 def test_collection_runtime_logs_console_progress(caplog) -> None:
@@ -50,6 +68,42 @@ def test_collection_runtime_logs_console_progress(caplog) -> None:
         and "raw_record_id=raw:unit" in message
         for message in messages
     )
+
+
+def test_collection_runtime_does_not_open_circuit_for_unavailable_empty_window() -> None:
+    """K 线早期年度无数据属于空窗口，不应累计 Provider 熔断失败次数。"""
+
+    cache = RecordingRuntimeCache()
+    provider_key = "stock_zh_a_hist_tx:603915"
+    runtime = CollectionRuntime(
+        cache=cache,
+        locks=NullCacheClient(),
+        circuit_policy=ProviderCircuitPolicy(failure_threshold=1),
+    )
+
+    def collect() -> ArchivedProviderResult:
+        return ArchivedProviderResult(
+            result=ProviderResult(
+                provider_name="unit-provider",
+                status="unavailable",
+                collected_at=datetime.now(tz=UTC),
+                error_message=None,
+                payload={"actual_source": "tencent:direct:kline"},
+            ),
+            raw_record_id="raw:empty-window",
+        )
+
+    result = runtime.run_task(
+        task="ashare_p0_ohlcv",
+        provider_key=provider_key,
+        parameters={"symbol": "603915", "start": "20160101", "end": "20161231"},
+        collect=collect,
+    )
+
+    assert result.status == "unavailable"
+    provider_state = cache.values[provider_state_key(provider_key)]
+    assert provider_state["status"] == "closed"
+    assert provider_state["failure_count"] == 0
 
 
 def test_summarize_archive_merges_multiple_provider_archives() -> None:

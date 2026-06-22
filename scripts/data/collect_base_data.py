@@ -13,7 +13,7 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -56,6 +56,7 @@ from finance_agent.data.source_rate_limiter import (
 )
 from finance_agent.scheduler.base_data_progress import BaseDataTaskProgressRecorder
 from finance_agent.storage.db import create_session_factory, session_scope
+from finance_agent.storage.event_retention import DEFAULT_ARTICLE_FULL_TEXT_RETENTION_DAYS
 from finance_agent.storage.orm import (
     AssetRecommendationORM,
     DataSyncWatermarkORM,
@@ -68,6 +69,7 @@ from finance_agent.storage.orm import (
 from finance_agent.storage.repositories import (
     AssetRepository,
     DataSyncWatermarkRepository,
+    EventRepository,
     MarketCalendarRepository,
 )
 
@@ -125,6 +127,8 @@ COLLECTION_ARG_DEFAULTS: JsonDict = {
     "max_workers": 4,
     "source_limit": None,
     "priority_symbol_limit": None,
+    "news_scope": "priority",
+    "article_retention_days": DEFAULT_ARTICLE_FULL_TEXT_RETENTION_DAYS,
     "progress_job_name": None,
     "progress_run_id": None,
     "progress_ttl_seconds": None,
@@ -368,6 +372,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=COLLECTION_ARG_DEFAULTS["priority_symbol_limit"],
         help="逐股新闻等重点资产任务的标的数量上限；默认使用 batch_size",
+    )
+    parser.add_argument(
+        "--news-scope",
+        choices=["priority", "full_tradeable"],
+        default=COLLECTION_ARG_DEFAULTS["news_scope"],
+        help="逐股新闻采集范围：priority=盘中重点池，full_tradeable=盘后可交易资产池全量",
+    )
+    parser.add_argument(
+        "--article-retention-days",
+        type=int,
+        default=COLLECTION_ARG_DEFAULTS["article_retention_days"],
+        help="新闻/公告事件热存保留天数；维护任务会删除更早的事件和证据行",
     )
     parser.add_argument(
         "--lookback",
@@ -664,12 +680,44 @@ def run_ashare_p0(
             )
             if required_start_at is not None and required_end_at is not None:
                 try:
+                    normalized_backfill_symbols = [
+                        symbol
+                        for symbol in (
+                            normalize_ashare_symbol(str(item or "")) for item in symbols
+                        )
+                        if symbol
+                    ]
+                    trusted_leading_gap_symbols: set[str] = set()
+                    try:
+                        backfill_watermarks = _fetch_data_sync_watermarks(
+                            session,
+                            [f"ashare:{symbol}" for symbol in normalized_backfill_symbols],
+                            data_domain=ASHARE_MARKET_BAR_DATA_DOMAIN,
+                            provider=ASHARE_MARKET_BAR_WATERMARK_PROVIDER,
+                            timeframe=args.ashare_timeframe,
+                        )
+                        trusted_leading_gap_symbols = {
+                            symbol
+                            for symbol in normalized_backfill_symbols
+                            if _watermark_covers_request(
+                                backfill_watermarks.get(f"ashare:{symbol}"),
+                                required_start_at=required_start_at,
+                                required_end_at=required_end_at,
+                            )
+                        }
+                    except Exception as exc:
+                        logger.debug(
+                            "A 股 K 线水位读取失败，回退到原始窗口规划 symbol_count=%s error=%s",
+                            len(normalized_backfill_symbols),
+                            exc,
+                        )
                     backfill_windows_by_symbol = plan_ashare_market_bar_backfill_windows(
                         session,
                         symbols,
                         timeframe=args.ashare_timeframe,
                         required_start_at=required_start_at,
                         required_end_at=required_end_at,
+                        trusted_leading_gap_symbols=trusted_leading_gap_symbols,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -716,6 +764,13 @@ def run_ashare_p0(
             )
             def collect_symbol(symbol: str) -> CollectionTaskResult:
                 wait_for_runtime_scheduler_job_resume(args)
+                should_skip, skip_result = should_skip_ashare_market_bar_for_open_circuit(
+                    runtime,
+                    symbol,
+                    force=args.force_provider,
+                )
+                if should_skip and skip_result is not None:
+                    return skip_result
                 ohlcv_limit = ashare_market_bar_source_limit(args)
                 planned_windows = backfill_windows_by_symbol.get(symbol)
                 if planned_windows is not None and not planned_windows:
@@ -1069,12 +1124,53 @@ def run_ashare_p1(
             runtime,
             session_factory=session_factory,
         )
+    if task_type == "event_article_retention":
+        return [run_event_article_retention(session, args)]
     return build_ashare_p1_default_tasks(
         session,
         collector,
         args,
         runtime,
         session_factory=session_factory,
+    )
+
+
+def run_event_article_retention(
+    session: Any,
+    args: argparse.Namespace,
+) -> CollectionTaskResult:
+    """删除过期新闻/公告事件和证据整行，保留原始审计记录。"""
+
+    retention_days = int(
+        getattr(args, "article_retention_days", DEFAULT_ARTICLE_FULL_TEXT_RETENTION_DAYS)
+        or DEFAULT_ARTICLE_FULL_TEXT_RETENTION_DAYS
+    )
+    if retention_days <= 0:
+        raise ValueError("article_retention_days 必须大于 0")
+
+    cutoff = datetime.now(tz=UTC) - timedelta(days=retention_days)
+    result = EventRepository(session).delete_expired_article_events(cutoff=cutoff)
+    item_count = int(result.get("total") or 0)
+    payload: JsonDict = {
+        **result,
+        "cutoff": cutoff.isoformat(),
+        "article_retention_days": retention_days,
+    }
+    logger.info(
+        "过期新闻/公告事件清理完成 cutoff=%s retention_days=%s event_records=%s evidence=%s total=%s",
+        cutoff.isoformat(),
+        retention_days,
+        result.get("event_records", 0),
+        result.get("evidence", 0),
+        item_count,
+    )
+    return CollectionTaskResult(
+        task="ashare_p1_news_retention",
+        status="available",
+        raw_record_id=None,
+        item_count=item_count,
+        error_message=None,
+        payload=payload,
     )
 
 
@@ -1086,20 +1182,101 @@ def build_ashare_p1_universe_tasks(
     """按目录自动展开 A 股 P1 的 universe_refresh 任务。"""
 
     tasks: list[CollectionTaskResult] = []
-    index_sources = fetch_catalog_entries(
-        collector.sector_provider.fetch_index_catalog(limit=positive_limit(args.index_catalog_limit)),
+    progress, job_name, run_id = collection_progress_context(args)
+    catalog_stage_key = "ashare_p1_catalog_discovery"
+    catalog_batch_count = 3
+    if progress is not None and job_name and run_id:
+        progress.stage_planned(
+            job_name=job_name,
+            run_id=run_id,
+            stage_key=catalog_stage_key,
+            total_items=catalog_batch_count,
+        )
+
+    def record_catalog_started(*, symbol: str, batch_index: int) -> None:
+        if progress is None or not job_name or not run_id:
+            return
+        progress.batch_started(
+            job_name=job_name,
+            run_id=run_id,
+            stage_key=catalog_stage_key,
+            total_items=catalog_batch_count,
+            batch_index=batch_index,
+            batch_count=catalog_batch_count,
+            batch_size=1,
+        )
+
+    def record_catalog_completed(
+        *,
+        symbol: str,
+        status: str,
+        item_count: int,
+        batch_index: int,
+        error_message: str | None = None,
+    ) -> None:
+        if progress is None or not job_name or not run_id:
+            return
+        progress.symbol_completed(
+            job_name=job_name,
+            run_id=run_id,
+            stage_key=catalog_stage_key,
+            symbol=symbol,
+            status=status,
+            item_count=item_count,
+            batch_index=batch_index,
+            batch_count=catalog_batch_count,
+            error_message=error_message,
+        )
+
+    def fetch_catalog_with_progress(
+        *,
+        symbol: str,
+        batch_index: int,
+        fetch: Any,
+        key: str,
+        default: list[Any],
+    ) -> list[Any]:
+        record_catalog_started(symbol=symbol, batch_index=batch_index)
+        try:
+            entries = fetch_catalog_entries(fetch(), key=key, default=default)
+        except Exception as exc:
+            record_catalog_completed(
+                symbol=symbol,
+                status="failed",
+                item_count=0,
+                batch_index=batch_index,
+                error_message=str(exc),
+            )
+            raise
+        record_catalog_completed(
+            symbol=symbol,
+            status="available",
+            item_count=len(entries),
+            batch_index=batch_index,
+        )
+        return entries
+    index_sources = fetch_catalog_with_progress(
+        symbol="index_catalog",
+        batch_index=1,
+        fetch=lambda: collector.sector_provider.fetch_index_catalog(
+            limit=positive_limit(args.index_catalog_limit)
+        ),
         key="indexes",
         default=[{"code": "000300", "name": "沪深300"}],
     )
-    industry_sources = fetch_catalog_entries(
-        collector.sector_provider.fetch_industry_names(
+    industry_sources = fetch_catalog_with_progress(
+        symbol="industry_catalog",
+        batch_index=2,
+        fetch=lambda: collector.sector_provider.fetch_industry_names(
             limit=positive_limit(args.industry_catalog_limit)
         ),
         key="names",
         default=[args.industry],
     )
-    concept_sources = fetch_catalog_entries(
-        collector.sector_provider.fetch_concept_names(
+    concept_sources = fetch_catalog_with_progress(
+        symbol="concept_catalog",
+        batch_index=3,
+        fetch=lambda: collector.sector_provider.fetch_concept_names(
             limit=positive_limit(args.concept_catalog_limit)
         ),
         key="names",
@@ -1107,12 +1284,81 @@ def build_ashare_p1_universe_tasks(
     )
     member_limit = normalize_member_limit(args.catalog_member_limit)
     source_limit = list_source_limit(args)
+    index_progress_items = [
+        item for item in index_sources if str(item.get("code") or "").strip()
+    ]
+    industry_progress_items = [
+        item for item in industry_sources if str(item).strip()
+    ]
+    concept_progress_items = [
+        item for item in concept_sources if str(item).strip()
+    ]
+    if progress is not None and job_name and run_id:
+        for stage_key, total_items in [
+            ("ashare_p1_index_members", len(index_progress_items)),
+            ("ashare_p1_industry_members", len(industry_progress_items)),
+            ("ashare_p1_concept_members", len(concept_progress_items)),
+            ("ashare_p1_flow_rank", 1),
+        ]:
+            progress.stage_planned(
+                job_name=job_name,
+                run_id=run_id,
+                stage_key=stage_key,
+                total_items=total_items,
+            )
 
-    for item in index_sources:
+    def record_p1_stage_started(
+        *,
+        stage_key: str,
+        batch_index: int,
+        batch_count: int,
+    ) -> None:
+        if progress is None or not job_name or not run_id:
+            return
+        progress.batch_started(
+            job_name=job_name,
+            run_id=run_id,
+            stage_key=stage_key,
+            total_items=batch_count,
+            batch_index=batch_index,
+            batch_count=batch_count,
+            batch_size=1,
+        )
+
+    def record_p1_stage_result(
+        *,
+        stage_key: str,
+        symbol: str,
+        result: CollectionTaskResult,
+        batch_index: int,
+        batch_count: int,
+    ) -> None:
+        if progress is None or not job_name or not run_id:
+            return
+        emit_symbol_progress(
+            progress,
+            job_name=job_name,
+            run_id=run_id,
+            stage_key=stage_key,
+            symbol=symbol,
+            result=result,
+            batch_index=batch_index,
+            batch_count=batch_count,
+        )
+
+    for index, item in enumerate(index_sources, start=1):
         index_code = str(item.get("code") or "").strip()
         index_name = str(item.get("name") or index_code).strip()
         if not index_code:
+            record_risk_stage_result(symbol=task, result=results[-1], batch_index=batch_index)
             continue
+        stage_key = "ashare_p1_index_members"
+        batch_count = len(index_progress_items)
+        record_p1_stage_started(
+            stage_key=stage_key,
+            batch_index=index,
+            batch_count=batch_count,
+        )
         tasks.append(
             runtime.run_task(
                 task=f"ashare_p1_index_members:{index_code}",
@@ -1135,11 +1381,25 @@ def build_ashare_p1_universe_tasks(
                 ),
             )
         )
+        record_p1_stage_result(
+            stage_key=stage_key,
+            symbol=index_code,
+            result=tasks[-1],
+            batch_index=index,
+            batch_count=batch_count,
+        )
 
-    for industry_name in industry_sources:
+    for index, industry_name in enumerate(industry_sources, start=1):
         normalized_name = str(industry_name).strip()
         if not normalized_name:
             continue
+        stage_key = "ashare_p1_industry_members"
+        batch_count = len(industry_progress_items)
+        record_p1_stage_started(
+            stage_key=stage_key,
+            batch_index=index,
+            batch_count=batch_count,
+        )
         tasks.append(
             runtime.run_task(
                 task=f"ashare_p1_industry_members:{normalized_name}",
@@ -1155,11 +1415,25 @@ def build_ashare_p1_universe_tasks(
                 ),
             )
         )
+        record_p1_stage_result(
+            stage_key=stage_key,
+            symbol=normalized_name,
+            result=tasks[-1],
+            batch_index=index,
+            batch_count=batch_count,
+        )
 
-    for concept_name in concept_sources:
+    for index, concept_name in enumerate(concept_sources, start=1):
         normalized_name = str(concept_name).strip()
         if not normalized_name:
             continue
+        stage_key = "ashare_p1_concept_members"
+        batch_count = len(concept_progress_items)
+        record_p1_stage_started(
+            stage_key=stage_key,
+            batch_index=index,
+            batch_count=batch_count,
+        )
         tasks.append(
             runtime.run_task(
                 task=f"ashare_p1_concept_members:{normalized_name}",
@@ -1175,7 +1449,16 @@ def build_ashare_p1_universe_tasks(
                 ),
             )
         )
+        record_p1_stage_result(
+            stage_key=stage_key,
+            symbol=normalized_name,
+            result=tasks[-1],
+            batch_index=index,
+            batch_count=batch_count,
+        )
 
+    stage_key = "ashare_p1_flow_rank"
+    record_p1_stage_started(stage_key=stage_key, batch_index=1, batch_count=1)
     tasks.append(
         runtime.run_task(
             task="ashare_p1_flow_rank",
@@ -1187,6 +1470,13 @@ def build_ashare_p1_universe_tasks(
                 limit=source_limit,
             ),
         )
+    )
+    record_p1_stage_result(
+        stage_key=stage_key,
+        symbol=str(args.flow_window or "capital_flow"),
+        result=tasks[-1],
+        batch_index=1,
+        batch_count=1,
     )
     return tasks
 
@@ -1244,7 +1534,7 @@ def build_ashare_stock_news_tasks(
 
     source_limit = list_source_limit(args)
     tasks: list[CollectionTaskResult] = []
-    symbols = resolve_ashare_priority_news_symbols(session, args)
+    symbols = resolve_ashare_stock_news_symbols(session, args)
 
     batches = split_symbol_batches(symbols, batch_size=collection_batch_size(args))
     max_workers = collection_max_workers(args) if session_factory is not None else 1
@@ -1741,6 +2031,7 @@ def run_ashare_risk(
 
     collector = AshareRiskSentimentCollector(session)
     source_limit = list_source_limit(args)
+    progress, job_name, run_id = collection_progress_context(args)
     if task_type_name(args) == "restricted_release_refresh":
         provider_key = "stock_restricted_release_detail_em"
         parameters = {
@@ -1927,10 +2218,53 @@ def run_ashare_risk(
         },
     ]
     results: list[CollectionTaskResult] = []
-    for source_task in source_tasks:
+    stage_key = "ashare_risk_sentiment_sources"
+    batch_count = len(source_tasks)
+    if progress is not None and job_name and run_id:
+        progress.stage_planned(
+            job_name=job_name,
+            run_id=run_id,
+            stage_key=stage_key,
+            total_items=batch_count,
+        )
+
+    def record_risk_stage_started(*, batch_index: int) -> None:
+        if progress is None or not job_name or not run_id:
+            return
+        progress.batch_started(
+            job_name=job_name,
+            run_id=run_id,
+            stage_key=stage_key,
+            total_items=batch_count,
+            batch_index=batch_index,
+            batch_count=batch_count,
+            batch_size=1,
+        )
+
+    def record_risk_stage_result(
+        *,
+        symbol: str,
+        result: CollectionTaskResult,
+        batch_index: int,
+    ) -> None:
+        if progress is None or not job_name or not run_id:
+            return
+        emit_symbol_progress(
+            progress,
+            job_name=job_name,
+            run_id=run_id,
+            stage_key=stage_key,
+            symbol=symbol,
+            result=result,
+            batch_index=batch_index,
+            batch_count=batch_count,
+        )
+
+    for batch_index, source_task in enumerate(source_tasks, start=1):
         task = str(source_task["task"])
         provider_key = str(source_task["provider_key"])
         parameters = dict(source_task["parameters"])
+        record_risk_stage_started(batch_index=batch_index)
         timeframe = ashare_risk_sentiment_watermark_timeframe(
             task=task,
             provider=provider_key,
@@ -1955,6 +2289,7 @@ def run_ashare_risk(
                     },
                 )
             )
+            record_risk_stage_result(symbol=task, result=results[-1], batch_index=batch_index)
             continue
         result = runtime.run_task(
             task=task,
@@ -1971,6 +2306,7 @@ def run_ashare_risk(
             result=result,
         )
         results.append(result)
+        record_risk_stage_result(symbol=task, result=result, batch_index=batch_index)
     return results
 
 
@@ -2738,6 +3074,57 @@ def ashare_ohlcv_provider_key(symbol: str) -> str:
     return f"stock_zh_a_hist_tx:{symbol}"
 
 
+def ashare_market_bar_circuit_skip_result(
+    symbol: str,
+    *,
+    provider_key: str | None = None,
+    circuit_state: Mapping[str, Any] | None = None,
+) -> CollectionTaskResult:
+    """构造 A 股 K 线 Provider 熔断冷却跳过结果。"""
+
+    key = provider_key or ashare_ohlcv_provider_key(symbol)
+    return CollectionTaskResult(
+        task="ashare_p0_ohlcv",
+        status="skipped",
+        raw_record_id=None,
+        item_count=0,
+        error_message="Provider 熔断冷却中，等待后续批次重跑。",
+        payload={
+            "symbol": symbol,
+            "provider_key": key,
+            "circuit_state": dict(circuit_state or {}),
+        },
+    )
+
+
+def should_skip_ashare_market_bar_for_open_circuit(
+    runtime: Any,
+    symbol: str,
+    *,
+    force: bool = False,
+) -> tuple[bool, CollectionTaskResult | None]:
+    """派发单标的年度窗口前，先判断运行时熔断是否仍处于打开状态。"""
+
+    if force:
+        return False, None
+    provider_key = ashare_ohlcv_provider_key(symbol)
+    get_provider_state = getattr(runtime, "get_provider_state", None)
+    is_circuit_open = getattr(runtime, "is_circuit_open", None)
+    if not callable(get_provider_state) or not callable(is_circuit_open):
+        return False, None
+    try:
+        state = get_provider_state(provider_key)
+        if is_circuit_open(state):
+            return True, ashare_market_bar_circuit_skip_result(
+                symbol,
+                provider_key=provider_key,
+                circuit_state=state if isinstance(state, Mapping) else {},
+            )
+    except Exception as exc:
+        logger.debug("A 股 K 线熔断状态预检查失败，继续按正常流程采集 symbol=%s error=%s", symbol, exc)
+    return False, None
+
+
 def ashare_kline_source_gate(source_key: str, collect: Callable[[], Any]) -> Any:
     """按真实 K 线数据源拆分限流和进度状态。"""
 
@@ -3467,14 +3854,21 @@ def _year_coverage_has_missing_year(
     *,
     required_start_at: datetime,
     required_end_at: datetime,
+    trust_leading_gap: bool = False,
 ) -> bool:
     """判断起止年份之间是否存在整年覆盖缺口。"""
 
     if required_start_at > required_end_at:
         return False
     coverage = year_coverage or {}
+    covered_years = sorted(
+        year for year, value in coverage.items() if _coverage_bar_count(value) > 0
+    )
+    first_covered_year = covered_years[0] if covered_years else None
     for year in range(required_start_at.year, required_end_at.year + 1):
         if _coverage_bar_count(coverage.get(year)) <= 0:
+            if trust_leading_gap and first_covered_year is not None and year < first_covered_year:
+                continue
             return True
     return False
 
@@ -3494,15 +3888,22 @@ def _asset_requires_fund_bar_collection(
 
     status = str(getattr(watermark, "status", "") or "").lower() if watermark else ""
     next_retry_at = getattr(watermark, "next_retry_at", None) if watermark else None
-    if status == "error" and (next_retry_at is None or next_retry_at <= now):
+    watermark_covers_request = _watermark_covers_request(
+        watermark,
+        required_start_at=required_start_at,
+        required_end_at=required_end_at,
+    )
+    if (
+        status == "error"
+        and (next_retry_at is None or next_retry_at <= now)
+        and not watermark_covers_request
+    ):
         return True
     latest_coverage = coverage.get(asset.asset_id)
     bar_count = _coverage_bar_count(latest_coverage)
     earliest_bar_at = _coverage_earliest_bar_at(latest_coverage)
     latest_bar_at = _coverage_latest_bar_at(latest_coverage)
     if bar_count <= 0 or latest_bar_at is None:
-        return True
-    if _datetime_after(earliest_bar_at, required_start_at):
         return True
     if _datetime_before(latest_bar_at, required_end_at):
         return True
@@ -3513,8 +3914,13 @@ def _asset_requires_fund_bar_collection(
             year_coverage,
             required_start_at=required_start_at,
             required_end_at=required_end_at,
+            trust_leading_gap=watermark_covers_request,
         )
     ):
+        return True
+    if watermark_covers_request:
+        return False
+    if _datetime_after(earliest_bar_at, required_start_at):
         return True
     if stale_before is not None and latest_bar_at < stale_before:
         return True
@@ -3536,15 +3942,22 @@ def _asset_requires_open_nav_collection(
 
     status = str(getattr(watermark, "status", "") or "").lower() if watermark else ""
     next_retry_at = getattr(watermark, "next_retry_at", None) if watermark else None
-    if status == "error" and (next_retry_at is None or next_retry_at <= now):
+    watermark_covers_request = _watermark_covers_request(
+        watermark,
+        required_start_at=required_start_at,
+        required_end_at=required_end_at,
+    )
+    if (
+        status == "error"
+        and (next_retry_at is None or next_retry_at <= now)
+        and not watermark_covers_request
+    ):
         return True
     coverage_value = coverage.get(asset.asset_id, (0, None))
     nav_count = _coverage_bar_count(coverage_value)
     earliest_nav_date = _coverage_earliest_nav_date(coverage_value)
     latest_nav_date = _coverage_latest_nav_date(coverage_value)
     if nav_count <= 0 or latest_nav_date is None:
-        return True
-    if _date_after(earliest_nav_date, required_start_at):
         return True
     if _date_before(latest_nav_date, required_end_at):
         return True
@@ -3555,8 +3968,13 @@ def _asset_requires_open_nav_collection(
             year_coverage,
             required_start_at=required_start_at,
             required_end_at=required_end_at,
+            trust_leading_gap=watermark_covers_request,
         )
     ):
+        return True
+    if watermark_covers_request:
+        return False
+    if _date_after(earliest_nav_date, required_start_at):
         return True
     if stale_before is not None and latest_nav_date < stale_before.date():
         return True
@@ -3964,6 +4382,7 @@ def plan_ashare_market_bar_backfill_windows(
     timeframe: str,
     required_start_at: datetime,
     required_end_at: datetime,
+    trusted_leading_gap_symbols: Collection[str] | None = None,
 ) -> dict[str, list[tuple[str, str]]]:
     """为 10 年 A 股日 K 初始化规划实际需要请求的年度缺口窗口。"""
 
@@ -3973,6 +4392,10 @@ def plan_ashare_market_bar_backfill_windows(
         if normalized:
             normalized_symbols.append(normalized)
     asset_ids = [f"ashare:{symbol}" for symbol in normalized_symbols]
+    trusted_symbols = {
+        normalize_ashare_symbol(str(symbol or ""))
+        for symbol in (trusted_leading_gap_symbols or ())
+    }
     year_coverage = _fetch_ashare_bar_year_coverage(
         session,
         asset_ids,
@@ -3985,6 +4408,7 @@ def plan_ashare_market_bar_backfill_windows(
             year_coverage.get(f"ashare:{symbol}", {}),
             required_start_at=required_start_at,
             required_end_at=required_end_at,
+            trust_leading_gap=symbol in trusted_symbols,
         )
         for symbol in normalized_symbols
     }
@@ -4023,6 +4447,35 @@ def _watermark_allows_collection(watermark: Any, *, now: datetime) -> bool:
     return next_retry_at <= now
 
 
+def _watermark_covers_request(
+    watermark: Any,
+    *,
+    required_start_at: datetime | None,
+    required_end_at: datetime | None,
+) -> bool:
+    """判断水位 payload 是否能证明本次请求窗口曾经被完整验证。"""
+
+    if watermark is None:
+        return False
+    payload = getattr(watermark, "payload", None)
+    if not isinstance(payload, dict):
+        return False
+    start_token = _format_ashare_request_date(required_start_at)
+    end_token = _format_ashare_request_date(required_end_at)
+    status = str(getattr(watermark, "status", "") or "").lower()
+    if status in {"available", "completed", "success"}:
+        payload_start = str(payload.get("requested_start") or "").strip()
+        payload_end = str(payload.get("requested_end") or "").strip()
+    else:
+        payload_start = str(payload.get("verified_requested_start") or "").strip()
+        payload_end = str(payload.get("verified_requested_end") or "").strip()
+    if start_token and (not payload_start or payload_start > start_token):
+        return False
+    if end_token and (not payload_end or payload_end < end_token):
+        return False
+    return bool(start_token or end_token)
+
+
 def _watermark_covers_ashare_bar_request(
     watermark: Any,
     *,
@@ -4036,18 +4489,11 @@ def _watermark_covers_ashare_bar_request(
     status = str(getattr(watermark, "status", "") or "").lower()
     if status not in {"available", "completed", "success"}:
         return False
-    payload = getattr(watermark, "payload", None)
-    if not isinstance(payload, dict):
-        return False
-    start_token = _format_ashare_request_date(required_start_at)
-    end_token = _format_ashare_request_date(required_end_at)
-    payload_start = str(payload.get("requested_start") or "").strip()
-    payload_end = str(payload.get("requested_end") or "").strip()
-    if start_token and (not payload_start or payload_start > start_token):
-        return False
-    if end_token and (not payload_end or payload_end < end_token):
-        return False
-    return bool(start_token or end_token)
+    return _watermark_covers_request(
+        watermark,
+        required_start_at=required_start_at,
+        required_end_at=required_end_at,
+    )
 
 
 def _ashare_bar_missing_year_windows(
@@ -4138,7 +4584,16 @@ def _asset_requires_ashare_bar_collection(
 
     status = str(getattr(watermark, "status", "") or "").lower() if watermark else ""
     next_retry_at = getattr(watermark, "next_retry_at", None) if watermark else None
-    if status == "error" and (next_retry_at is None or next_retry_at <= now):
+    watermark_covers_request = _watermark_covers_request(
+        watermark,
+        required_start_at=required_start_at,
+        required_end_at=required_end_at,
+    )
+    if (
+        status == "error"
+        and (next_retry_at is None or next_retry_at <= now)
+        and not watermark_covers_request
+    ):
         return True
     coverage_value = coverage.get(asset.asset_id)
     bar_count = _coverage_bar_count(coverage_value)
@@ -4148,11 +4603,6 @@ def _asset_requires_ashare_bar_collection(
         return True
     if required_end_at is not None and _datetime_before(latest_bar_at, required_end_at):
         return True
-    watermark_covers_request = _watermark_covers_ashare_bar_request(
-        watermark,
-        required_start_at=required_start_at,
-        required_end_at=required_end_at,
-    )
     if (
         required_start_at is not None
         and required_end_at is not None
@@ -4276,10 +4726,46 @@ def _record_ashare_market_bar_watermark(
         return
 
     error_message = result_error_message(result)
+    try:
+        previous_watermark = _fetch_data_sync_watermarks(
+            session,
+            [asset_id],
+            data_domain=ASHARE_MARKET_BAR_DATA_DOMAIN,
+            provider=ASHARE_MARKET_BAR_WATERMARK_PROVIDER,
+            timeframe=timeframe,
+        ).get(asset_id)
+    except Exception as exc:
+        previous_watermark = None
+        logger.debug("读取 A 股 K 线既有水位失败，失败记录不携带已验证窗口 symbol=%s error=%s", symbol, exc)
     failure_payload = {
         "status": status,
         "item_count": result_item_count(result),
     } | _ashare_market_bar_watermark_metadata(result)
+    if previous_watermark is not None:
+        previous_payload = getattr(previous_watermark, "payload", None)
+        if isinstance(previous_payload, dict):
+            previous_task_type = previous_payload.get("sync_task_type")
+            if previous_task_type not in (None, ""):
+                failure_payload.setdefault("sync_task_type", previous_task_type)
+            if _watermark_covers_request(
+                previous_watermark,
+                required_start_at=parse_ashare_datetime_or_none(failure_payload.get("requested_start")),
+                required_end_at=parse_ashare_datetime_or_none(failure_payload.get("requested_end")),
+            ):
+                verified_start = (
+                    failure_payload.get("requested_start")
+                    or previous_payload.get("verified_requested_start")
+                    or previous_payload.get("requested_start")
+                )
+                verified_end = (
+                    failure_payload.get("requested_end")
+                    or previous_payload.get("verified_requested_end")
+                    or previous_payload.get("requested_end")
+                )
+                if verified_start not in (None, ""):
+                    failure_payload.setdefault("verified_requested_start", verified_start)
+                if verified_end not in (None, ""):
+                    failure_payload.setdefault("verified_requested_end", verified_end)
     repository.record_failure(
         asset_id=asset_id,
         symbol=symbol,
@@ -4327,44 +4813,76 @@ def merge_ashare_market_bar_window_results(
 
     failed_windows: list[JsonDict] = []
     completed_windows: list[JsonDict] = []
+    skipped_windows: list[JsonDict] = []
+    empty_windows: list[JsonDict] = []
     item_count = 0
     actual_sources: list[Any] = []
-    error_messages: list[str] = []
+    error_message_counts: dict[str, int] = {}
     for index, result in enumerate(results):
         window = windows[index] if index < len(windows) else (None, None)
+        window_status = result_status_name(result)
         window_payload = {
             "start": window[0],
             "end": window[1],
-            "status": result_status_name(result),
+            "status": window_status,
             "item_count": result_item_count(result),
         }
-        if result_status_name(result) == "available":
+        if window_status in {"available", "completed"}:
             item_count += result_item_count(result)
             completed_windows.append(window_payload)
             actual_source = getattr(result, "payload", {}).get("actual_source")
             if actual_source:
                 actual_sources.append(actual_source)
             continue
+        if window_status in {"skipped", "locked"}:
+            skipped_windows.append(window_payload | {"error_message": result_error_message(result)})
+            if result_error_message(result):
+                message = str(result_error_message(result))
+                error_message_counts[message] = error_message_counts.get(message, 0) + 1
+            continue
+        if window_status == "failed" and result_error_message(result) is None:
+            empty_windows.append(
+                window_payload
+                | {
+                    "status": str(getattr(result, "status", "") or "unavailable"),
+                    "raw_record_id": getattr(result, "raw_record_id", None),
+                }
+            )
+            continue
         failed_windows.append(
             window_payload | {"error_message": result_error_message(result)}
         )
         if result_error_message(result):
-            error_messages.append(str(result_error_message(result)))
+            message = str(result_error_message(result))
+            error_message_counts[message] = error_message_counts.get(message, 0) + 1
 
-    status = "available" if not failed_windows else "error"
+    distinct_error_messages = list(error_message_counts)
+
+    status = "available"
+    if failed_windows:
+        status = "error"
+    elif skipped_windows:
+        status = "skipped"
+    elif empty_windows:
+        status = "skipped"
     return CollectionTaskResult(
         task="ashare_p0_ohlcv",
         status=status,
         raw_record_id=None,
         item_count=item_count,
-        error_message=None if status == "available" else "; ".join(error_messages),
+        error_message=None
+        if status == "available"
+        else "; ".join(distinct_error_messages),
         payload={
             "actual_source": actual_sources[0] if len(actual_sources) == 1 else actual_sources,
             "backfill_windows": [
                 {"start": start, "end": end} for start, end in windows
             ],
             "completed_windows": completed_windows,
+            "skipped_windows": skipped_windows,
+            "empty_windows": empty_windows,
             "failed_windows": failed_windows,
+            "error_message_counts": error_message_counts,
             "window_count": len(windows),
         },
     )
@@ -5181,6 +5699,48 @@ def resolve_ashare_priority_news_symbols(
     if not symbols:
         return [getattr(args, "ashare_symbol", COLLECTION_ARG_DEFAULTS["ashare_symbol"])]
     return symbols[:max_symbols]
+
+
+def resolve_ashare_stock_news_symbols(
+    session: Any | None,
+    args: argparse.Namespace,
+) -> list[str]:
+    """根据新闻任务范围解析逐股新闻标的。"""
+
+    news_scope = str(getattr(args, "news_scope", "priority") or "priority").strip()
+    if news_scope == "full_tradeable":
+        return resolve_ashare_full_tradeable_news_symbols(session, args)
+    return resolve_ashare_priority_news_symbols(session, args)
+
+
+def resolve_ashare_full_tradeable_news_symbols(
+    session: Any | None,
+    args: argparse.Namespace,
+) -> list[str]:
+    """解析盘后全量新闻补采标的：仅覆盖可交易 A 股主板资产。"""
+
+    max_symbols = positive_limit(getattr(args, "priority_symbol_limit", None))
+    symbols: list[str] = []
+    if session is not None:
+        try:
+            repo = AssetRepository(session)
+            eligibility = TradeableAssetEligibilityService()
+            assets = eligibility.filter_tradeable_assets(repo.find_by_market("ashare"))
+            for asset in sorted(
+                assets,
+                key=lambda item: normalize_ashare_symbol(
+                    str(getattr(item, "symbol", "") or "")
+                ),
+            ):
+                _append_unique_ashare_symbol(symbols, getattr(asset, "symbol", ""))
+                if max_symbols is not None and len(symbols) >= max_symbols:
+                    break
+        except Exception as exc:
+            logger.warning("解析盘后全量新闻标的失败，回退样例代码 error=%s", exc, exc_info=True)
+    _append_unique_ashare_symbol(symbols, getattr(args, "ashare_symbol", ""))
+    if not symbols:
+        return [getattr(args, "ashare_symbol", COLLECTION_ARG_DEFAULTS["ashare_symbol"])]
+    return symbols[:max_symbols] if max_symbols is not None else symbols
 
 
 def _append_unique_ashare_symbol(symbols: list[str], symbol: Any) -> None:

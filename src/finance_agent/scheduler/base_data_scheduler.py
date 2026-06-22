@@ -18,7 +18,7 @@ import threading
 import time
 import traceback
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -62,6 +62,9 @@ TRADING_DAY_POLICIES = {
 DEFAULT_JOB_TIMEOUT_SECONDS = 6 * 60 * 60
 DEFAULT_HEALTH_STALE_SECONDS = 300
 DEFAULT_MAX_CONCURRENT_JOBS = 4
+DEFAULT_THREAD_POOL_MAX_WORKERS = 16
+DEFAULT_JOB_PRIORITY = 100
+DEFAULT_JOB_RESOURCE_POOL = "default"
 STATUS_REPLACE_MAX_ATTEMPTS = 5
 STATUS_REPLACE_RETRY_SECONDS = 0.05
 
@@ -84,6 +87,9 @@ class BaseDataSchedulerJob:
     trading_day_policy: str = "any_day"
     depends_on: tuple[str, ...] = ()
     max_retries: int | None = None
+    mutex_key: str | None = None
+    priority: int = DEFAULT_JOB_PRIORITY
+    resource_pool: str = DEFAULT_JOB_RESOURCE_POOL
 
 
 @dataclass(frozen=True)
@@ -102,6 +108,7 @@ class BaseDataSchedulerConfig:
     job_timeout_seconds: int = DEFAULT_JOB_TIMEOUT_SECONDS
     health_stale_seconds: int = DEFAULT_HEALTH_STALE_SECONDS
     max_concurrent_jobs: int = DEFAULT_MAX_CONCURRENT_JOBS
+    resource_pools: JsonDict = field(default_factory=dict)
     rate_policies: JsonDict = field(default_factory=dict)
     jobs: tuple[BaseDataSchedulerJob, ...] = ()
 
@@ -158,6 +165,74 @@ def filter_due_states_by_market_universe(
         else:
             runnable.append(state)
     return runnable, blocked
+
+
+def scheduler_job_mutex_key(job: BaseDataSchedulerJob) -> str | None:
+    """返回任务互斥键；未配置时不参与互斥。"""
+
+    mutex_key = str(job.mutex_key or "").strip()
+    return mutex_key or None
+
+
+def filter_due_states_by_mutex_key(
+    due_states: list[ScheduledJobState],
+    *,
+    active_states: list[ScheduledJobState],
+) -> tuple[list[ScheduledJobState], list[ScheduledJobState]]:
+    """同一互斥键的任务串行执行，避免重复抓取或并发写同一资源。"""
+
+    reserved_keys = {
+        mutex_key
+        for state in active_states
+        if (mutex_key := scheduler_job_mutex_key(state.job)) is not None
+    }
+    if not reserved_keys and not any(scheduler_job_mutex_key(state.job) for state in due_states):
+        return due_states, []
+
+    runnable: list[ScheduledJobState] = []
+    blocked: list[ScheduledJobState] = []
+    for state in due_states:
+        mutex_key = scheduler_job_mutex_key(state.job)
+        if mutex_key is not None and mutex_key in reserved_keys:
+            blocked.append(state)
+            continue
+        runnable.append(state)
+        if mutex_key is not None:
+            reserved_keys.add(mutex_key)
+    return runnable, blocked
+
+
+def scheduler_job_resource_pool(job: BaseDataSchedulerJob) -> str:
+    """返回任务资源池；缺省任务归入 default 池。"""
+
+    return str(job.resource_pool or DEFAULT_JOB_RESOURCE_POOL).strip() or DEFAULT_JOB_RESOURCE_POOL
+
+
+def scheduler_resource_pool_limit(
+    config: BaseDataSchedulerConfig,
+    pool_name: str,
+) -> int:
+    """返回资源池并发额度；未知资源池按 default 池或全局并发兜底。"""
+
+    pools = config.resource_pools or {}
+    pool_payload = pools.get(pool_name) or pools.get(DEFAULT_JOB_RESOURCE_POOL) or {}
+    if isinstance(pool_payload, Mapping):
+        value = pool_payload.get("max_concurrent_jobs")
+    else:
+        value = None
+    if value is None:
+        return max(1, config.max_concurrent_jobs)
+    return as_positive_int(value, field_name=f"resource_pools.{pool_name}.max_concurrent_jobs")
+
+
+def scheduler_resource_pool_counts(states: list[ScheduledJobState]) -> dict[str, int]:
+    """统计运行中任务占用的资源池槽位。"""
+
+    counts: dict[str, int] = {}
+    for state in states:
+        pool_name = scheduler_job_resource_pool(state.job)
+        counts[pool_name] = counts.get(pool_name, 0) + 1
+    return counts
 
 
 def next_run_at_for_job(job: BaseDataSchedulerJob, *, now: datetime) -> datetime | None:
@@ -259,6 +334,36 @@ def trigger_after_success_dependents(
         if state.running or state.queued:
             continue
         state.next_run_at = triggered_at
+
+
+def merge_scheduler_runtime_states(
+    existing_states: Sequence[ScheduledJobState],
+    new_config: BaseDataSchedulerConfig,
+    *,
+    now: datetime,
+) -> list[ScheduledJobState]:
+    """把热重载后的配置合并到运行态，不打断已运行任务。"""
+
+    existing_by_name = {state.job.name: state for state in existing_states}
+    merged: list[ScheduledJobState] = []
+    for new_job in new_config.jobs:
+        previous = existing_by_name.get(new_job.name)
+        if previous is None:
+            merged.append(
+                ScheduledJobState(
+                    job=new_job,
+                    next_run_at=next_run_at_for_job(new_job, now=now),
+                )
+            )
+            continue
+        if previous.running:
+            merged.append(previous)
+            continue
+        if not new_job.enabled:
+            continue
+        previous.job = new_job
+        merged.append(previous)
+    return merged
 
 
 def default_scheduler_payload() -> JsonDict:
@@ -469,6 +574,19 @@ def parse_scheduler_config(payload: Mapping[str, Any]) -> BaseDataSchedulerConfi
         raise ValueError("调度配置必须包含 jobs 数组")
 
     jobs = tuple(parse_scheduler_job(item, index=index) for index, item in enumerate(jobs_payload))
+    max_concurrent_jobs = as_positive_int(
+        payload.get("max_concurrent_jobs", DEFAULT_MAX_CONCURRENT_JOBS),
+        field_name="max_concurrent_jobs",
+    )
+    resource_pools = parse_scheduler_resource_pools(
+        payload.get("resource_pools"),
+        max_concurrent_jobs=max_concurrent_jobs,
+    )
+    warn_on_resource_pool_misconfiguration(
+        jobs=jobs,
+        resource_pools=resource_pools,
+        max_concurrent_jobs=max_concurrent_jobs,
+    )
     return BaseDataSchedulerConfig(
         enabled=as_bool(payload.get("enabled", True), field_name="enabled"),
         cache_backend=as_choice(
@@ -509,13 +627,88 @@ def parse_scheduler_config(payload: Mapping[str, Any]) -> BaseDataSchedulerConfi
             payload.get("health_stale_seconds", DEFAULT_HEALTH_STALE_SECONDS),
             field_name="health_stale_seconds",
         ),
-        max_concurrent_jobs=as_positive_int(
-            payload.get("max_concurrent_jobs", DEFAULT_MAX_CONCURRENT_JOBS),
-            field_name="max_concurrent_jobs",
-        ),
+        max_concurrent_jobs=max_concurrent_jobs,
+        resource_pools=resource_pools,
         rate_policies=parse_json_object(payload.get("rate_policies"), field_name="rate_policies"),
         jobs=jobs,
     )
+
+
+def parse_scheduler_resource_pools(value: Any, *, max_concurrent_jobs: int) -> JsonDict:
+    """解析调度资源池配置；旧配置缺省时生成 default 池。"""
+
+    if value is None:
+        return {
+            DEFAULT_JOB_RESOURCE_POOL: {
+                "max_concurrent_jobs": max_concurrent_jobs,
+                "description": "默认调度资源池",
+            }
+        }
+    if not isinstance(value, Mapping):
+        raise ValueError("resource_pools 必须是对象")
+    parsed: JsonDict = {}
+    for key, item in value.items():
+        pool_name = str(key).strip()
+        if not pool_name:
+            raise ValueError("resource_pools 的资源池名称不能为空")
+        if not isinstance(item, Mapping):
+            raise ValueError(f"resource_pools.{pool_name} 必须是对象")
+        pool_payload = dict(item)
+        pool_payload["max_concurrent_jobs"] = as_positive_int(
+            pool_payload.get("max_concurrent_jobs", 1),
+            field_name=f"resource_pools.{pool_name}.max_concurrent_jobs",
+        )
+        parsed[pool_name] = pool_payload
+    parsed.setdefault(
+        DEFAULT_JOB_RESOURCE_POOL,
+        {
+            "max_concurrent_jobs": max_concurrent_jobs,
+            "description": "默认调度资源池",
+        },
+    )
+    return parsed
+
+
+def warn_on_resource_pool_misconfiguration(
+    *,
+    jobs: Sequence[BaseDataSchedulerJob],
+    resource_pools: Mapping[str, Any],
+    max_concurrent_jobs: int,
+) -> None:
+    """对资源池配置中的常见易错点输出告警，但不阻断调度。
+
+    两类告警：
+    1. 任务引用了未在 ``resource_pools`` 声明的资源池名称（多为拼写错误）。
+       运行期会兜底到 default 池或全局并发，但额度可能与预期不符。
+    2. 各资源池额度之和超过全局 ``max_concurrent_jobs``。运行期全局闸门仍会
+       压住实际并发，但部分资源池将永远拿不到声明的额度，配置含义会让人误解。
+    """
+
+    known_pools = set(resource_pools)
+    referenced = {scheduler_job_resource_pool(job) for job in jobs}
+    unknown = sorted(name for name in referenced if name not in known_pools)
+    if unknown:
+        logger.warning(
+            "调度任务引用了未声明的资源池 %s，运行期将兜底到 default 池或全局并发，"
+            "请确认是否为资源池名称拼写错误。",
+            unknown,
+        )
+
+    pool_sum = 0
+    for pool_name in known_pools:
+        pool_payload = resource_pools.get(pool_name)
+        if isinstance(pool_payload, Mapping):
+            limit = pool_payload.get("max_concurrent_jobs")
+            pool_sum += int(limit) if isinstance(limit, int) else max_concurrent_jobs
+        else:
+            pool_sum += max_concurrent_jobs
+    if pool_sum > max_concurrent_jobs:
+        logger.info(
+            "资源池额度之和 %s 超过全局 max_concurrent_jobs %s，全局闸门仍会压住实际并发，"
+            "部分资源池将无法同时达到各自声明的额度。",
+            pool_sum,
+            max_concurrent_jobs,
+        )
 
 
 def parse_scheduler_job(payload: Any, *, index: int) -> BaseDataSchedulerJob:
@@ -566,6 +759,7 @@ def parse_scheduler_job(payload: Any, *, index: int) -> BaseDataSchedulerJob:
     depends_on = as_string_tuple(payload.get("depends_on", ()), field_name=f"{name}.depends_on")
     if schedule_type == "after_success" and not depends_on:
         raise ValueError(f"{name}.depends_on 不能为空")
+    mutex_key = str(payload.get("mutex_key") or "").strip() or None
     limit = payload.get("limit")
     if limit is not None:
         limit = as_positive_int(limit, field_name=f"{name}.limit")
@@ -604,6 +798,13 @@ def parse_scheduler_job(payload: Any, *, index: int) -> BaseDataSchedulerJob:
             if payload.get("max_retries") is not None
             else None
         ),
+        mutex_key=mutex_key,
+        priority=as_non_negative_int(
+            payload.get("priority", DEFAULT_JOB_PRIORITY),
+            field_name=f"{name}.priority",
+        ),
+        resource_pool=str(payload.get("resource_pool") or DEFAULT_JOB_RESOURCE_POOL).strip()
+        or DEFAULT_JOB_RESOURCE_POOL,
     )
 
 
@@ -790,6 +991,11 @@ class BaseDataScheduler:
         executed: list[JsonDict] = []
         running: dict[Future[JsonDict], ScheduledJobState] = {}
         queued: list[ScheduledJobState] = []
+        scheduler_config_mtime_ns = (
+            self.scheduler_config_file.stat().st_mtime_ns
+            if self.scheduler_config_file and self.scheduler_config_file.exists()
+            else None
+        )
 
         def running_job_names() -> list[str]:
             return [state.job.name for state in running.values()]
@@ -797,9 +1003,50 @@ class BaseDataScheduler:
         def queued_job_names() -> list[str]:
             return [state.job.name for state in queued]
 
+        def reload_runtime_config_if_changed() -> None:
+            """调度循环中热重载资源池、全局并发和任务配置。"""
+
+            nonlocal states, queued, scheduler_config_mtime_ns
+            if self.scheduler_config_file is None or not self.scheduler_config_file.exists():
+                return
+            current_mtime_ns = self.scheduler_config_file.stat().st_mtime_ns
+            if scheduler_config_mtime_ns == current_mtime_ns:
+                return
+            try:
+                new_config = load_scheduler_config(self.scheduler_config_file)
+            except Exception as exc:  # noqa: BLE001 - 配置文件可能正处于保存替换窗口
+                logger.warning("调度配置热重载失败，将保留当前配置并在下一轮重试：%s", exc)
+                return
+            if not new_config.enabled:
+                logger.info("调度配置已热重载且全局禁用，当前 loop 将等待现有任务自然结束。")
+            states = merge_scheduler_runtime_states(
+                states,
+                new_config,
+                now=datetime.now(tz=UTC),
+            )
+            queued = [state for state in states if state.queued]
+            self.config = new_config
+            scheduler_config_mtime_ns = current_mtime_ns
+            logger.info(
+                "调度配置已热重载 max_concurrent_jobs=%s resource_pools=%s enabled_jobs=%s",
+                self.config.max_concurrent_jobs,
+                sorted(self.config.resource_pools),
+                len(self.enabled_jobs()),
+            )
+
         def fill_worker_slots(executor: ThreadPoolExecutor) -> None:
             while queued and len(running) < self.config.max_concurrent_jobs:
-                state = queued.pop(0)
+                pool_counts = scheduler_resource_pool_counts(list(running.values()))
+                selected_index: int | None = None
+                for index, candidate in enumerate(queued):
+                    pool_name = scheduler_job_resource_pool(candidate.job)
+                    pool_limit = scheduler_resource_pool_limit(self.config, pool_name)
+                    if pool_counts.get(pool_name, 0) < pool_limit:
+                        selected_index = index
+                        break
+                if selected_index is None:
+                    break
+                state = queued.pop(selected_index)
                 state.queued = False
                 state.running = True
                 running[executor.submit(self.run_job, state.job, dry_run=dry_run)] = state
@@ -817,7 +1064,7 @@ class BaseDataScheduler:
             )
         try:
             with ThreadPoolExecutor(
-                max_workers=max(1, self.config.max_concurrent_jobs),
+                max_workers=max(DEFAULT_THREAD_POOL_MAX_WORKERS, self.config.max_concurrent_jobs),
                 thread_name_prefix="base-data-job",
             ) as executor:
                 while states:
@@ -865,6 +1112,7 @@ class BaseDataScheduler:
                             }
                         )
 
+                    reload_runtime_config_if_changed()
                     fill_worker_slots(executor)
 
                     if max_cycles is not None and cycles >= max_cycles and not running:
@@ -905,6 +1153,17 @@ class BaseDataScheduler:
                             [state.job.name for state in blocked_due_states],
                             [state.job.name for state in [*running.values(), *queued]],
                         )
+                    due_states, mutex_blocked_states = filter_due_states_by_mutex_key(
+                        due_states,
+                        active_states=[*running.values(), *queued],
+                    )
+                    if mutex_blocked_states:
+                        blocked_due_states.extend(mutex_blocked_states)
+                        logger.info(
+                            "同一互斥键任务正在运行或排队，暂缓本轮调度 blocked_jobs=%s active_jobs=%s",
+                            [state.job.name for state in mutex_blocked_states],
+                            [state.job.name for state in [*running.values(), *queued]],
+                        )
                     if blocked_due_states and not due_states:
                         write_loop_status()
                         if running or queued:
@@ -939,6 +1198,11 @@ class BaseDataScheduler:
                         continue
 
                     cycles += 1
+                    due_states = sorted(
+                        due_states,
+                        key=lambda state: state.job.priority,
+                        reverse=True,
+                    )
                     for state in due_states:
                         state.queued = True
                         queued.append(state)
@@ -951,6 +1215,7 @@ class BaseDataScheduler:
                             queued_job_names(),
                             running_job_names(),
                         )
+                    reload_runtime_config_if_changed()
                     fill_worker_slots(executor)
                     write_loop_status()
         except KeyboardInterrupt:
@@ -969,6 +1234,28 @@ class BaseDataScheduler:
             self.stop_scheduler(result=result, state="interrupted")
             logger.warning(
                 "基础数据调度器被中断 mode=loop cycles=%s running_jobs=%s queued_jobs=%s",
+                cycles,
+                running_job_names(),
+                queued_job_names(),
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001 - 调度器主循环边界需要落盘失败状态
+            result = {
+                "mode": "loop",
+                "started_at": started_at.isoformat(),
+                "finished_at": datetime.now(tz=UTC).isoformat(),
+                "enabled": True,
+                "dry_run": dry_run,
+                "failed": True,
+                "error_message": str(exc),
+                "cycles": cycles,
+                "jobs": executed,
+                "running_jobs": running_job_names(),
+                "queued_jobs": queued_job_names(),
+            }
+            self.stop_scheduler(result=result, state="failed")
+            logger.exception(
+                "基础数据调度器异常退出 mode=loop cycles=%s running_jobs=%s queued_jobs=%s",
                 cycles,
                 running_job_names(),
                 queued_job_names(),

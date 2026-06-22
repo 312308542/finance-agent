@@ -15,6 +15,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from finance_agent.ports.cache import CacheClient
+from finance_agent.storage.event_retention import (
+    DEFAULT_EVENT_SIGNAL_LOOKBACK_DAYS,
+    event_signal_cutoff,
+)
 from finance_agent.storage.orm import (
     AssetORM,
     CapitalFlowSnapshotORM,
@@ -37,10 +41,12 @@ class AgentContextBuilder:
         cache: CacheClient,
         *,
         ttl_seconds: int = 900,
+        event_lookback_days: int | None = DEFAULT_EVENT_SIGNAL_LOOKBACK_DAYS,
     ) -> None:
         self.session = session
         self.cache = cache
         self.ttl_seconds = ttl_seconds
+        self.event_lookback_days = event_lookback_days
 
     def build_asset_context(
         self,
@@ -66,6 +72,7 @@ class AgentContextBuilder:
             bar_limit=bar_limit,
             evidence_limit=evidence_limit,
             event_limit=event_limit,
+            event_lookback_days=self.event_lookback_days,
         )
         if use_cache:
             cached = self.cache.get_json(cache_key)
@@ -108,13 +115,15 @@ class AgentContextBuilder:
         bar_limit: int,
         evidence_limit: int,
         event_limit: int,
+        event_lookback_days: int | None = DEFAULT_EVENT_SIGNAL_LOOKBACK_DAYS,
     ) -> str:
         """生成 Agent 上下文缓存键。"""
 
+        event_window = "all" if event_lookback_days is None else f"{event_lookback_days}d"
         return (
             "agent_context:"
             f"{asset_id}:{horizon}:{timeframe}:bars{bar_limit}:events{event_limit}:"
-            f"evidence{evidence_limit}"
+            f"eventWindow{event_window}:evidence{evidence_limit}"
         )
 
     def _load_asset(self, asset_id: str) -> JsonDict | None:
@@ -249,6 +258,15 @@ class AgentContextBuilder:
             )
             .limit(limit)
         )
+        cutoff = event_signal_cutoff(self.event_lookback_days)
+        if cutoff is not None:
+            statement = statement.where(
+                (EventRecordORM.published_at >= cutoff)
+                | (
+                    EventRecordORM.published_at.is_(None)
+                    & (EventRecordORM.collected_at >= cutoff)
+                )
+            )
         return [
             {
                 "event_id": row.event_id,

@@ -1,6 +1,7 @@
 from decimal import Decimal
 from types import SimpleNamespace
 
+from finance_agent.factors import service as factor_service_module
 from finance_agent.factors.service import build_capital_flow_group, infer_symbol_market
 
 
@@ -61,3 +62,78 @@ def test_infer_symbol_market_uses_fallback_market_for_fundamental_snapshot() -> 
 
     assert symbol == "000001"
     assert market == "ashare"
+
+
+def test_factor_service_uses_default_event_signal_window(monkeypatch) -> None:
+    """因子计算消费事件时应走默认时效窗口，而不是无时间限制 latest N。"""
+
+    captured: dict[str, object] = {}
+
+    class _Indicators:
+        def __init__(self, _session):
+            pass
+
+        def get_latest_indicator_frame(self, **_kwargs):
+            return None
+
+    class _Frames:
+        def __init__(self, _session):
+            pass
+
+        def upsert_factor_frame(self, **kwargs):
+            return SimpleNamespace(
+                status=kwargs["status"],
+                factor_frame_id=kwargs["factor_frame_id"],
+                asset_id=kwargs["asset_id"],
+                symbol=kwargs["symbol"],
+                market=kwargs["market"],
+                horizon=kwargs["horizon"],
+                total_available_groups=kwargs["total_available_groups"],
+                missing_groups=kwargs["missing_groups"],
+            )
+
+    class _Fundamentals:
+        def __init__(self, _session):
+            pass
+
+        def list_recent_snapshots(self, **_kwargs):
+            return []
+
+    class _Flows(_Fundamentals):
+        pass
+
+    class _Derivatives(_Fundamentals):
+        pass
+
+    class _Events:
+        def __init__(self, _session):
+            pass
+
+        def list_recent_events(self, **kwargs):
+            captured.update(kwargs)
+            return []
+
+    class _Risks:
+        def __init__(self, _session):
+            pass
+
+        def list_recent_risks(self, **_kwargs):
+            return []
+
+    monkeypatch.setattr(factor_service_module, "IndicatorFrameRepository", _Indicators)
+    monkeypatch.setattr(factor_service_module, "FactorFrameRepository", _Frames)
+    monkeypatch.setattr(factor_service_module, "FundamentalDataRepository", _Fundamentals)
+    monkeypatch.setattr(factor_service_module, "CapitalFlowRepository", _Flows)
+    monkeypatch.setattr(factor_service_module, "DerivativeDataRepository", _Derivatives)
+    monkeypatch.setattr(factor_service_module, "EventRepository", _Events)
+    monkeypatch.setattr(factor_service_module, "RiskRepository", _Risks)
+
+    factor_service_module.FactorService(object()).compute_for_asset(
+        asset_id="ashare:600519",
+        fallback_symbol="600519",
+        fallback_market="ashare",
+    )
+
+    assert captured["asset_id"] == "ashare:600519"
+    assert captured["limit"] == 20
+    assert captured["max_age_days"] == 90

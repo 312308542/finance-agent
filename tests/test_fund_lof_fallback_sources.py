@@ -273,6 +273,38 @@ def test_fund_bar_collection_range_check_uses_earliest_and_latest_coverage() -> 
     assert requires_collection is True
 
 
+def test_fund_bar_collection_trusts_verified_leading_gap() -> None:
+    """已由全量请求验证过的基金成立前空窗，不应继续触发历史补采。"""
+
+    asset = SimpleNamespace(asset_id="fund:lof:160716")
+    watermark = SimpleNamespace(
+        status="available",
+        next_retry_at=None,
+        payload={"requested_start": "20160612", "requested_end": "20260612"},
+    )
+
+    requires_collection = collect_base_data._asset_requires_fund_bar_collection(
+        asset,
+        coverage={
+            "fund:lof:160716": (
+                84,
+                datetime(2026, 2, 3, tzinfo=UTC),
+                datetime(2026, 6, 12, tzinfo=UTC),
+            )
+        },
+        watermark=watermark,
+        now=datetime(2026, 6, 12, 3, 30, tzinfo=UTC),
+        stale_before=None,
+        required_start_at=datetime(2016, 6, 12, tzinfo=UTC),
+        required_end_at=datetime(2026, 6, 12, tzinfo=UTC),
+        year_coverage={
+            2026: (84, datetime(2026, 2, 3, tzinfo=UTC), datetime(2026, 6, 12, tzinfo=UTC)),
+        },
+    )
+
+    assert requires_collection is False
+
+
 def test_fund_bar_collection_detects_middle_year_gap() -> None:
     """基金 10 年日 K 覆盖判断应识别中间年份缺口，不能只看首尾日期。"""
 
@@ -301,6 +333,38 @@ def test_fund_bar_collection_detects_middle_year_gap() -> None:
     )
 
     assert requires_collection is True
+
+
+def test_open_fund_nav_collection_trusts_verified_leading_gap() -> None:
+    """已由全量请求验证过的开放式基金成立前空窗，不应继续触发净值补采。"""
+
+    asset = SimpleNamespace(asset_id="fund:open:000001")
+    watermark = SimpleNamespace(
+        status="available",
+        next_retry_at=None,
+        payload={"requested_start": "20160612", "requested_end": "20260612"},
+    )
+
+    requires_collection = collect_base_data._asset_requires_open_nav_collection(
+        asset,
+        coverage={
+            "fund:open:000001": (
+                84,
+                date(2026, 2, 3),
+                date(2026, 6, 12),
+            )
+        },
+        watermark=watermark,
+        now=datetime(2026, 6, 12, 3, 30, tzinfo=UTC),
+        stale_before=None,
+        required_start_at=datetime(2016, 6, 12, tzinfo=UTC),
+        required_end_at=datetime(2026, 6, 12, tzinfo=UTC),
+        year_coverage={
+            2026: (84, date(2026, 2, 3), date(2026, 6, 12)),
+        },
+    )
+
+    assert requires_collection is False
 
 
 def test_open_fund_nav_symbol_resolution_uses_source_limit(monkeypatch) -> None:

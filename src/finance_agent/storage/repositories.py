@@ -18,6 +18,11 @@ from sqlalchemy import Select, String, delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+from finance_agent.storage.event_retention import (
+    DEFAULT_EVENT_SIGNAL_LOOKBACK_DAYS,
+    NEWS_ARTICLE_EVENT_TYPES,
+    event_signal_cutoff,
+)
 from finance_agent.storage.orm import (
     AgentWorkflowEventORM,
     AgentWorkflowRunORM,
@@ -217,6 +222,34 @@ def _article_payload_update_statement(
         )
         FROM (VALUES {values_clause}) AS source(event_id, article_payload)
         WHERE target.{match_column} = source.event_id
+        """
+    ).bindparams(**params)
+
+
+def _expired_article_delete_statement(
+    *,
+    table_name: str,
+    type_column: str,
+    time_column: str,
+    event_types: Sequence[str],
+    cutoff: datetime,
+) -> Any:
+    """构造过期新闻/公告整行删除语句。"""
+
+    params: dict[str, Any] = {"cutoff": cutoff}
+    type_placeholders: list[str] = []
+    for index, event_type in enumerate(event_types):
+        param_name = f"event_type_{index}"
+        params[param_name] = event_type
+        type_placeholders.append(f":{param_name}")
+    return text(
+        f"""
+        DELETE FROM {table_name}
+        WHERE {type_column} IN ({", ".join(type_placeholders)})
+          AND (
+            ({time_column} IS NOT NULL AND {time_column} < :cutoff)
+            OR ({time_column} IS NULL AND collected_at < :cutoff)
+          )
         """
     ).bindparams(**params)
 
@@ -5289,8 +5322,19 @@ class EventRepository:
             ),
         )
 
-    def list_recent_events(self, *, asset_id: str, limit: int = 20) -> list[EventRecordORM]:
-        """查询单标的最近事件。"""
+    def list_recent_events(
+        self,
+        *,
+        asset_id: str,
+        limit: int = 20,
+        max_age_days: int | None = DEFAULT_EVENT_SIGNAL_LOOKBACK_DAYS,
+        now: datetime | None = None,
+    ) -> list[EventRecordORM]:
+        """查询单标的最近事件。
+
+        默认只返回 90 天内事件作为当前信号；审计场景可传入
+        `max_age_days=None` 关闭时间窗口。
+        """
 
         statement = (
             select(EventRecordORM)
@@ -5301,7 +5345,51 @@ class EventRepository:
             )
             .limit(limit)
         )
+        cutoff = event_signal_cutoff(max_age_days, now=now)
+        if cutoff is not None:
+            statement = statement.where(
+                or_(
+                    EventRecordORM.published_at >= cutoff,
+                    (
+                        EventRecordORM.published_at.is_(None)
+                        & (EventRecordORM.collected_at >= cutoff)
+                    ),
+                )
+            )
         return list(self.session.scalars(statement))
+
+    def delete_expired_article_events(
+        self,
+        *,
+        cutoff: datetime,
+        event_types: Sequence[str] = NEWS_ARTICLE_EVENT_TYPES,
+    ) -> JsonDict:
+        """删除过期新闻/公告事件和证据整行，保留 raw_records 原始审计。"""
+
+        event_statement = _expired_article_delete_statement(
+            table_name=EventRecordORM.__tablename__,
+            type_column="event_type",
+            time_column="published_at",
+            event_types=event_types,
+            cutoff=cutoff,
+        )
+        evidence_statement = _expired_article_delete_statement(
+            table_name=EvidenceORM.__tablename__,
+            type_column="evidence_type",
+            time_column="as_of",
+            event_types=event_types,
+            cutoff=cutoff,
+        )
+        event_result = self.session.execute(event_statement)
+        evidence_result = self.session.execute(evidence_statement)
+        self.session.flush()
+        event_count = int(event_result.rowcount or 0)
+        evidence_count = int(evidence_result.rowcount or 0)
+        return {
+            "event_records": event_count,
+            "evidence": evidence_count,
+            "total": event_count + evidence_count,
+        }
 
 
 class RiskRepository:

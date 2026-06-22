@@ -67,12 +67,19 @@ export type ModelRoutePayload = {
   is_enabled: boolean;
 };
 
+export type DataSyncResourcePoolPayload = {
+  max_concurrent_jobs: number;
+  description?: string;
+  [key: string]: unknown;
+};
+
 export type DataSyncConfigPayload = {
   preset: string;
   markets: string[];
   enabled: boolean;
   cache_backend: string;
   max_concurrent_jobs: number;
+  resource_pools?: Record<string, DataSyncResourcePoolPayload>;
 };
 
 export type DataSchedulerStartPayload = {

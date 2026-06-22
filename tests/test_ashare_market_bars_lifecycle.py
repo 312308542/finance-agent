@@ -529,6 +529,189 @@ def test_full_history_backfill_plans_only_missing_year_windows(
     }
 
 
+def test_full_history_backfill_trusts_verified_leading_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """已由全量请求验证过的上市前空窗，不应继续拆成年份窗口反复采集。"""
+
+    collect_base_data = import_collection_module()
+    start_at = datetime(2016, 6, 16, tzinfo=UTC)
+    end_at = datetime(2026, 6, 12, tzinfo=UTC)
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_ashare_bar_year_coverage",
+        lambda session, asset_ids, timeframe, start_at, end_at: {
+            "ashare:001220": {
+                2026: (84, datetime(2026, 2, 3, tzinfo=UTC), end_at),
+            },
+            "ashare:603507": {
+                2026: (84, datetime(2026, 2, 3, tzinfo=UTC), end_at),
+            },
+        },
+        raising=False,
+    )
+
+    windows = collect_base_data.plan_ashare_market_bar_backfill_windows(
+        object(),
+        ["001220", "603507"],
+        timeframe="1d",
+        required_start_at=start_at,
+        required_end_at=end_at,
+        trusted_leading_gap_symbols={"001220"},
+    )
+
+    assert windows["001220"] == []
+    assert windows["603507"][0] == ("20160616", "20161231")
+
+
+def test_merge_ashare_market_bar_window_results_deduplicates_circuit_messages() -> None:
+    """同一标的多个年度窗口都被熔断跳过时，任务日志不应重复拼接同一条错误。"""
+
+    collect_base_data = import_collection_module()
+    message = "Provider 熔断中，跳过本次采集"
+    results = [
+        collect_base_data.CollectionTaskResult(
+            task="ashare_p0_ohlcv",
+            status="skipped",
+            raw_record_id=None,
+            item_count=0,
+            error_message=message,
+            payload={"provider_key": "stock_zh_a_hist_tx:001220"},
+        )
+        for _ in range(3)
+    ]
+
+    result = collect_base_data.merge_ashare_market_bar_window_results(
+        results,
+        windows=[
+            ("20160101", "20161231"),
+            ("20170101", "20171231"),
+            ("20180101", "20181231"),
+        ],
+    )
+
+    assert result.status == "skipped"
+    assert result.error_message == message
+    assert result.payload["error_message_counts"] == {message: 3}
+
+
+def test_merge_ashare_market_bar_window_results_keeps_partial_window_failure() -> None:
+    """只要有窗口真实失败，多窗口合并仍应保留失败状态。"""
+
+    collect_base_data = import_collection_module()
+    results = [
+        collect_base_data.CollectionTaskResult(
+            task="ashare_p0_ohlcv",
+            status="available",
+            raw_record_id="raw:ok",
+            item_count=120,
+            error_message=None,
+            payload={"actual_source": "tencent_kline"},
+        ),
+        collect_base_data.CollectionTaskResult(
+            task="ashare_p0_ohlcv",
+            status="error",
+            raw_record_id=None,
+            item_count=0,
+            error_message="curl: (56) Connection closed abruptly",
+            payload={"provider_key": "stock_zh_a_hist_tx:001220"},
+        ),
+    ]
+
+    result = collect_base_data.merge_ashare_market_bar_window_results(
+        results,
+        windows=[
+            ("20240101", "20241231"),
+            ("20250101", "20251231"),
+        ],
+    )
+
+    assert result.status == "error"
+    assert result.error_message == "curl: (56) Connection closed abruptly"
+
+
+def test_merge_ashare_market_bar_window_results_treats_empty_windows_as_skipped() -> None:
+    """上市前年度空窗口不应和熔断跳过一起合并成失败，避免新股历史补齐被误判。"""
+
+    collect_base_data = import_collection_module()
+    circuit_message = "Provider 熔断中，跳过本次采集"
+    results = [
+        collect_base_data.CollectionTaskResult(
+            task="ashare_p0_ohlcv",
+            status="unavailable",
+            raw_record_id="raw:empty",
+            item_count=0,
+            error_message=None,
+            payload={"actual_source": "tencent:direct:kline"},
+        ),
+        collect_base_data.CollectionTaskResult(
+            task="ashare_p0_ohlcv",
+            status="skipped",
+            raw_record_id=None,
+            item_count=0,
+            error_message=circuit_message,
+            payload={"provider_key": "stock_zh_a_hist_tx:603915"},
+        ),
+    ]
+
+    result = collect_base_data.merge_ashare_market_bar_window_results(
+        results,
+        windows=[
+            ("20160101", "20161231"),
+            ("20170101", "20171231"),
+        ],
+    )
+
+    assert result.status == "skipped"
+    assert result.error_message == circuit_message
+    assert result.payload["empty_windows"][0] == {
+        "start": "20160101",
+        "end": "20161231",
+        "status": "unavailable",
+        "item_count": 0,
+        "raw_record_id": "raw:empty",
+    }
+
+
+def test_merge_ashare_market_bar_window_results_sums_available_windows() -> None:
+    """多个年度窗口都成功时，应合并为可用结果并累计条数。"""
+
+    collect_base_data = import_collection_module()
+    results = [
+        collect_base_data.CollectionTaskResult(
+            task="ashare_p0_ohlcv",
+            status="available",
+            raw_record_id="raw:2024",
+            item_count=240,
+            error_message=None,
+            payload={"actual_source": "tencent_kline"},
+        ),
+        collect_base_data.CollectionTaskResult(
+            task="ashare_p0_ohlcv",
+            status="available",
+            raw_record_id="raw:2025",
+            item_count=242,
+            error_message=None,
+            payload={"actual_source": "tencent_kline"},
+        ),
+    ]
+
+    result = collect_base_data.merge_ashare_market_bar_window_results(
+        results,
+        windows=[
+            ("20240101", "20241231"),
+            ("20250101", "20251231"),
+        ],
+    )
+
+    assert result.status == "available"
+    assert result.item_count == 482
+    assert result.error_message is None
+    assert len(result.payload["completed_windows"]) == 2
+    assert result.payload["failed_windows"] == []
+
+
 def test_full_history_symbol_selection_detects_middle_year_gap_despite_watermark(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

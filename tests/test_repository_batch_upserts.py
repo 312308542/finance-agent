@@ -5,6 +5,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
+from sqlalchemy.dialects import postgresql
+
 from finance_agent.storage.orm import AssetUniverseORM
 from finance_agent.storage.repositories import (
     AssetRepository,
@@ -50,6 +52,25 @@ class _FakeSession:
         if model is AssetUniverseORM:
             return SimpleNamespace(universe_id=key, market="ashare")
         return SimpleNamespace(key=key)
+
+
+class _RowCountResult:
+    def __init__(self, rowcount: int) -> None:
+        self.rowcount = rowcount
+
+
+class _RowCountSession(_FakeSession):
+    def __init__(self, rowcounts: list[int]) -> None:
+        super().__init__()
+        self.rowcounts = rowcounts
+
+    def execute(self, statement: Any) -> _RowCountResult:
+        self.executed.append(statement)
+        return _RowCountResult(self.rowcounts.pop(0))
+
+
+def _compiled(statement: Any) -> str:
+    return str(statement.compile(dialect=postgresql.dialect()))
 
 
 def _assert_chunked_batch(session: _FakeSession, *, row_count: int) -> None:
@@ -339,3 +360,61 @@ def test_event_repository_article_payload_updates_write_in_chunks() -> None:
     session = _FakeSession()
     row_count = EventRepository(session).update_evidence_article_payloads_by_events(rows)
     _assert_chunked_batch(session, row_count=row_count)
+
+
+def test_event_repository_recent_events_filters_by_default_signal_window() -> None:
+    """最近事件默认只返回 90 天内的新闻/公告信号，避免旧新闻污染当前判断。"""
+
+    now = datetime(2026, 6, 16, 12, 0, tzinfo=UTC)
+    session = _FakeSession()
+
+    EventRepository(session).list_recent_events(
+        asset_id="ashare:600519",
+        limit=5,
+        now=now,
+    )
+
+    statement = session.scalars_statements[0]
+    sql = _compiled(statement)
+    params = statement.compile(dialect=postgresql.dialect()).params
+
+    assert "event_records.published_at >=" in sql
+    assert "event_records.published_at IS NULL" in sql
+    assert "event_records.collected_at >=" in sql
+    assert now - timedelta(days=90) in params.values()
+
+
+def test_event_repository_recent_events_can_disable_signal_window() -> None:
+    """审计或排查场景可以显式关闭事件时间窗口。"""
+
+    session = _FakeSession()
+
+    EventRepository(session).list_recent_events(
+        asset_id="ashare:600519",
+        limit=5,
+        max_age_days=None,
+    )
+
+    sql = _compiled(session.scalars_statements[0])
+
+    assert "event_records.published_at >=" not in sql
+    assert "event_records.collected_at >=" not in sql
+
+
+def test_event_repository_deletes_expired_article_events() -> None:
+    """过期新闻/公告应删除事件和证据整行，但保留 raw_records 审计。"""
+
+    cutoff = datetime(2026, 3, 18, tzinfo=UTC)
+    session = _RowCountSession(rowcounts=[2, 3])
+
+    result = EventRepository(session).delete_expired_article_events(cutoff=cutoff)
+
+    sql_text = "\n".join(str(statement) for statement in session.executed)
+
+    assert result == {"event_records": 2, "evidence": 3, "total": 5}
+    assert len(session.executed) == 2
+    assert "DELETE FROM event_records" in sql_text
+    assert "DELETE FROM evidence" in sql_text
+    assert "payload #>" not in sql_text
+    assert "raw_records" not in sql_text
+    assert session.flush_count == 1

@@ -12,10 +12,42 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from finance_agent.storage.event_retention import DEFAULT_ARTICLE_FULL_TEXT_RETENTION_DAYS
+
 JsonDict = dict[str, Any]
 DEFAULT_SCHEDULER_JOB_TIMEOUT_SECONDS = 6 * 60 * 60
 DEFAULT_SCHEDULER_HEALTH_STALE_SECONDS = 300
 DEFAULT_SCHEDULER_MAX_CONCURRENT_JOBS = 4
+DEFAULT_SCHEDULER_RESOURCE_POOLS: JsonDict = {
+    "realtime": {
+        "max_concurrent_jobs": 1,
+        "description": "盘中实时行情、风险情绪和触发器等轻量高优先级任务。",
+    },
+    "collection_heavy": {
+        "max_concurrent_jobs": 2,
+        "description": "K 线、基本面、资金流、新闻列表等外部数据采集任务。",
+    },
+    "article_enrichment": {
+        "max_concurrent_jobs": 1,
+        "description": "新闻正文二次补抓，避免慢任务占用主采集资源。",
+    },
+    "analytics": {
+        "max_concurrent_jobs": 1,
+        "description": "技术初筛、候选池合并、数据质量和推荐计算。",
+    },
+    "agent": {
+        "max_concurrent_jobs": 1,
+        "description": "Agent 事件消费和高风险复核，避免模型调用并发放大。",
+    },
+    "maintenance": {
+        "max_concurrent_jobs": 1,
+        "description": "回测、到期复盘等低频维护任务。",
+    },
+    "default": {
+        "max_concurrent_jobs": DEFAULT_SCHEDULER_MAX_CONCURRENT_JOBS,
+        "description": "未分类任务兜底资源池。",
+    },
+}
 ASHARE_BOOTSTRAP_LOOKBACK = "10y"
 ASHARE_BOOTSTRAP_BATCH_SIZE = 50
 FUND_BOOTSTRAP_LOOKBACK = "10y"
@@ -111,6 +143,7 @@ class DataSyncConfig:
     circuit_cooldown_seconds: int = 900
     loop_idle_seconds: int = 5
     max_concurrent_jobs: int = DEFAULT_SCHEDULER_MAX_CONCURRENT_JOBS
+    resource_pools: JsonDict = field(default_factory=dict)
     rate_policies: JsonDict = field(default_factory=dict)
 
     def to_dict(self) -> JsonDict:
@@ -135,6 +168,7 @@ class DataSyncTaskPreview:
     timezone: str | None = None
     trading_day_policy: str | None = None
     depends_on: list[str] = field(default_factory=list)
+    mutex_key: str | None = None
     batch_size: int | None = None
     max_workers: int | None = None
     max_retries: int | None = None
@@ -195,6 +229,7 @@ def build_preset_config(
         cache_backend="redis",
         resource_profile="全面但限流友好",
         markets=market_configs,
+        resource_pools=default_scheduler_resource_pools(),
         rate_policies=default_source_rate_policies(),
     )
 
@@ -239,6 +274,12 @@ def parse_data_sync_config(payload: JsonDict) -> DataSyncConfig:
         if raw_rate_policies is None
         else parse_json_object(raw_rate_policies, field_name="rate_policies")
     )
+    raw_resource_pools = payload.get("resource_pools")
+    resource_pools = (
+        default_scheduler_resource_pools()
+        if raw_resource_pools is None
+        else parse_json_object(raw_resource_pools, field_name="resource_pools")
+    )
     return DataSyncConfig(
         schema_version=str(payload.get("schema_version") or "1.0"),
         preset=str(payload.get("preset") or "custom"),
@@ -259,9 +300,19 @@ def parse_data_sync_config(payload: JsonDict) -> DataSyncConfig:
             payload.get("max_concurrent_jobs"),
             default=DEFAULT_SCHEDULER_MAX_CONCURRENT_JOBS,
         ),
+        resource_pools=resource_pools,
         rate_policies=rate_policies,
         markets=markets,
     )
+
+
+def default_scheduler_resource_pools() -> JsonDict:
+    """返回调度器默认资源池配置。"""
+
+    return {
+        name: dict(payload)
+        for name, payload in DEFAULT_SCHEDULER_RESOURCE_POOLS.items()
+    }
 
 
 def default_source_rate_policies() -> JsonDict:
@@ -675,6 +726,15 @@ def export_scheduler_payload(config: DataSyncConfig) -> JsonDict:
     """
 
     tasks = preview_data_sync_tasks(config)
+    jobs = [
+        *[build_scheduler_job(task) for task in tasks],
+        *build_data_quality_scheduler_jobs(config),
+        *build_technical_screening_scheduler_jobs(config),
+        *build_universe_preparation_scheduler_jobs(config),
+        *build_recommendation_scheduler_jobs(config),
+        *build_backtest_scheduler_jobs(config),
+        *build_trigger_scheduler_jobs(config),
+    ]
     return {
         "schema_version": "data-sync-scheduler-v1",
         "enabled": config.enabled,
@@ -688,16 +748,9 @@ def export_scheduler_payload(config: DataSyncConfig) -> JsonDict:
         "job_timeout_seconds": DEFAULT_SCHEDULER_JOB_TIMEOUT_SECONDS,
         "health_stale_seconds": DEFAULT_SCHEDULER_HEALTH_STALE_SECONDS,
         "max_concurrent_jobs": config.max_concurrent_jobs,
+        "resource_pools": config.resource_pools or default_scheduler_resource_pools(),
         "rate_policies": config.rate_policies,
-        "jobs": [
-            *[build_scheduler_job(task) for task in tasks],
-            *build_data_quality_scheduler_jobs(config),
-            *build_technical_screening_scheduler_jobs(config),
-            *build_universe_preparation_scheduler_jobs(config),
-            *build_recommendation_scheduler_jobs(config),
-            *build_backtest_scheduler_jobs(config),
-            *build_trigger_scheduler_jobs(config),
-        ],
+        "jobs": [apply_scheduler_execution_policy(job) for job in jobs],
         "processing": preview_data_processing_plan(config, tasks=tasks),
         "notes": [
             "该计划由数据同步配置向导生成，不要求用户手填股票代码。",
@@ -720,6 +773,8 @@ def build_scheduler_job(task: DataSyncTaskPreview) -> JsonDict:
         "fund_nav_full_history_backfill",
         "fund_nav_daily",
     }:
+        history_limit = None
+    if task.task_key == "ashare.events.full":
         history_limit = None
     params = {
         "sync_task_type": task.task_type,
@@ -750,10 +805,9 @@ def build_scheduler_job(task: DataSyncTaskPreview) -> JsonDict:
         "interval_seconds": task.interval_seconds,
         "limit": history_limit,
         "market": task.market,
+        "schedule_type": task.schedule_type,
         "params": params,
     }
-    if task.schedule_type != "interval":
-        job["schedule_type"] = task.schedule_type
     if task.run_at:
         job["run_at"] = task.run_at
     if task.timezone:
@@ -762,9 +816,92 @@ def build_scheduler_job(task: DataSyncTaskPreview) -> JsonDict:
         job["trading_day_policy"] = task.trading_day_policy
     if task.depends_on:
         job["depends_on"] = task.depends_on
+    if task.mutex_key:
+        job["mutex_key"] = task.mutex_key
     if task.max_retries is not None:
         job["max_retries"] = task.max_retries
     return job
+
+
+def apply_scheduler_execution_policy(job: JsonDict) -> JsonDict:
+    """为调度任务补充资源池和优先级，保持导出计划可直接运行。"""
+
+    enriched = dict(job)
+    enriched.setdefault("resource_pool", scheduler_job_resource_pool(enriched))
+    enriched.setdefault("priority", scheduler_job_priority(enriched))
+    return enriched
+
+
+def scheduler_job_resource_pool(job: JsonDict) -> str:
+    """根据任务类型和名称返回资源池。"""
+
+    name = str(job.get("name") or "")
+    job_type = str(job.get("job_type") or "")
+    if name == "ashare.news_retention":
+        return "maintenance"
+    if name == "ashare.news_articles":
+        return "article_enrichment"
+    if name in {"ashare.realtime_quotes", "ashare.risk_sentiment", "analytics.triggers.evaluate.intraday"}:
+        return "realtime"
+    if job_type == "collection":
+        return "collection_heavy"
+    if job_type in {
+        "recommendation_pipeline",
+        "data_quality_refresh",
+        "technical_screening_refresh",
+        "trigger_evaluation",
+        "universe_merge",
+        "universe_avoid_pool_rebuild",
+    }:
+        return "analytics"
+    if job_type in {"agent_loop_consume", "high_risk_reviews"}:
+        return "agent"
+    if job_type in {"backtest_run", "reviews_due"}:
+        return "maintenance"
+    return "default"
+
+
+def scheduler_job_priority(job: JsonDict) -> int:
+    """根据任务类型和名称返回默认调度优先级。"""
+
+    name = str(job.get("name") or "")
+    job_type = str(job.get("job_type") or "")
+    schedule_type = str(job.get("schedule_type") or "interval")
+    if schedule_type == "manual":
+        return 900
+    if name in {"ashare.realtime_quotes", "analytics.triggers.evaluate.intraday"}:
+        return 800
+    if name == "ashare.risk_sentiment":
+        return 700
+    if name == "ashare.bars.1d.close_final":
+        return 650
+    if name in {"ashare.capital_flow", "ashare.events"}:
+        return 600
+    if job_type in {
+        "recommendation_pipeline",
+        "data_quality_refresh",
+        "technical_screening_refresh",
+        "trigger_evaluation",
+        "universe_merge",
+        "universe_avoid_pool_rebuild",
+    }:
+        return 550
+    if name in {"ashare.fundamentals", "agent.loop.consume.after_trigger", "agent.loop.consume.sweep"}:
+        return 500
+    if job_type == "high_risk_reviews":
+        return 500
+    if name == "ashare.news_articles":
+        return 400
+    if name in {
+        "ashare.universe.all",
+        "ashare.bars.1d.revision",
+        "ashare.restricted_release",
+        "ashare.pledge",
+    }:
+        return 300
+    if job_type in {"backtest_run", "reviews_due"}:
+        return 100
+    return 100
 
 
 def build_recommendation_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
@@ -1089,8 +1226,9 @@ def build_trigger_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
                     "name": "analytics.triggers.evaluate.intraday",
                     "job_type": "trigger_evaluation",
                     "group": "analytics",
-                    "enabled": False,
+                    "enabled": True,
                     "interval_seconds": 15 * 60,
+                    "schedule_type": "interval",
                     "trading_day_policy": "ashare",
                     "params": {
                         "sync_task_type": "analytics.triggers.evaluate",
@@ -1266,6 +1404,7 @@ def collection_group_for_task(task: DataSyncTaskPreview) -> str | tuple[str, ...
             "northbound_flow_refresh": "ashare-p1",
             "event_refresh": "ashare-p1",
             "event_article_enrichment": "ashare-p1",
+            "event_article_retention": "ashare-p1",
             "restricted_release_refresh": "ashare-risk",
             "pledge_risk_refresh": "ashare-risk",
             "risk_sentiment_refresh": "ashare-risk",
@@ -1306,10 +1445,13 @@ def build_ashare_collection_params(task: DataSyncTaskPreview) -> JsonDict:
         params["source_limit"] = task.batch_size
     if task.task_type == "event_refresh":
         params["group"] = ["ashare-p1"]
-        params["priority_symbol_limit"] = task.batch_size
+        if task.extra_params.get("news_scope") != "full_tradeable":
+            params["priority_symbol_limit"] = task.batch_size
     if task.task_type == "event_article_enrichment":
         params["group"] = ["ashare-p1"]
         params["priority_symbol_limit"] = task.batch_size
+    if task.task_type == "event_article_retention":
+        params["group"] = ["ashare-p1"]
     if task.task_type == "risk_sentiment_refresh":
         params["group"] = ["ashare-risk"]
     if task.task_type == "restricted_release_refresh":
@@ -1383,6 +1525,10 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 title="刷新 A 股 Universe 来源",
                 interval_seconds=config.interval_seconds.get("universe_refresh", 24 * 60 * 60),
                 mode="full_universe_refresh",
+                schedule_type="daily_time",
+                run_at=["04:30"],
+                timezone="Asia/Shanghai",
+                trading_day_policy="trading_day_only",
                 batch_size=config.batch_size,
                 sources=config.universe_sources,
                 data_packages=["assets", "asset_universes", "asset_universe_members"],
@@ -1506,6 +1652,8 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 interval_seconds=config.interval_seconds.get("realtime_quotes", 5 * 60),
                 mode="incremental_snapshot",
                 batch_size=config.batch_size,
+                schedule_type="interval",
+                trading_day_policy="trading_day_only",
                 sources=["stock_zh_a_spot"],
                 data_packages=["realtime_quotes"],
                 notes=["复用 A 股实时行情资产接口刷新价格和交易状态快照。"],
@@ -1541,6 +1689,8 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 title="刷新 A 股资金流",
                 interval_seconds=config.interval_seconds.get("capital_flow", 30 * 60),
                 mode="incremental_snapshot",
+                schedule_type="interval",
+                trading_day_policy="trading_day_only",
                 batch_size=config.batch_size,
                 lookback=f"{config.lookback_days}d",
                 sources=["individual_fund_flow_rank"],
@@ -1578,11 +1728,41 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                     ASHARE_TIMELY_EVENT_INTERVAL_SECONDS,
                 ),
                 mode="incremental_event_sync",
+                schedule_type="interval",
+                trading_day_policy="any_day",
+                mutex_key="ashare.event_records",
                 batch_size=config.batch_size,
                 max_workers=config.max_workers,
                 lookback=f"{config.lookback_days}d",
                 sources=["stock_news", "notice_report"],
                 data_packages=["events"],
+                extra_params={"news_scope": "priority"},
+                notes=["盘中只采集事件重点池、候选池和最近推荐中的可交易主板标的。"],
+            )
+        )
+        tasks.append(
+            DataSyncTaskPreview(
+                task_key="ashare.events.full",
+                market="ashare",
+                task_type="event_refresh",
+                title="盘后补采 A 股全量新闻",
+                interval_seconds=24 * 60 * 60,
+                mode="daily_full_event_sync",
+                schedule_type="daily_time",
+                run_at=["18:20"],
+                timezone="Asia/Shanghai",
+                trading_day_policy="trading_day_only",
+                mutex_key="ashare.event_records",
+                batch_size=config.batch_size,
+                max_workers=max(1, min(config.max_workers, 2)),
+                lookback=f"{config.lookback_days}d",
+                sources=["stock_news", "notice_report"],
+                data_packages=["events"],
+                extra_params={
+                    "news_scope": "full_tradeable",
+                    "priority_symbol_limit": 0,
+                },
+                notes=["盘后按可交易 A 股主板资产池补采逐股新闻，避免盘中高频扫全量。"],
             )
         )
         tasks.append(
@@ -1597,12 +1777,36 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 ),
                 mode="async_article_enrichment",
                 schedule_type="after_success",
-                depends_on=["ashare.events"],
+                depends_on=["ashare.events", "ashare.events.full"],
+                mutex_key="ashare.event_records",
                 batch_size=config.batch_size,
                 max_workers=1,
                 lookback=f"{config.lookback_days}d",
                 sources=["stock_news_article"],
                 data_packages=["events"],
+            )
+        )
+        tasks.append(
+            DataSyncTaskPreview(
+                task_key="ashare.news_retention",
+                market="ashare",
+                task_type="event_article_retention",
+                title="清理 A 股过期新闻事件",
+                interval_seconds=24 * 60 * 60,
+                mode="daily_article_retention",
+                schedule_type="daily_time",
+                run_at=["19:10"],
+                timezone="Asia/Shanghai",
+                trading_day_policy="any_day",
+                mutex_key="ashare.event_records",
+                batch_size=config.batch_size,
+                lookback=f"{DEFAULT_ARTICLE_FULL_TEXT_RETENTION_DAYS}d",
+                sources=["event_records", "evidence"],
+                data_packages=["events"],
+                extra_params={
+                    "article_retention_days": DEFAULT_ARTICLE_FULL_TEXT_RETENTION_DAYS,
+                },
+                notes=["删除过期新闻/公告事件和证据整行，保留 raw_records 原始审计。"],
             )
         )
     if "risk_sentiment" in config.data_packages:
@@ -1661,6 +1865,8 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                     ASHARE_TIMELY_EVENT_INTERVAL_SECONDS,
                 ),
                 mode="incremental_snapshot",
+                schedule_type="interval",
+                trading_day_policy="trading_day_only",
                 batch_size=config.batch_size,
                 lookback=f"{config.lookback_days}d",
                 sources=["stop_list", "hot_rank", "zt_pool", "lhb", "block_trade", "margin"],

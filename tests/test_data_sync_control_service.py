@@ -134,6 +134,211 @@ def test_attach_running_manual_scheduler_log_forwarders_adopts_existing_task(
     assert started_threads[0]["kwargs"]["start_at_end"] is True
 
 
+def test_read_scheduler_progress_includes_recent_manual_analytics_job(
+    tmp_path: Path,
+) -> None:
+    """手工 analytics 任务没有 Redis 逐标的进度时，也应在任务监控中展示最近运行状态。"""
+
+    scheduler_config_file = tmp_path / "base_data_scheduler.json"
+    manual_dir = tmp_path / "manual_runs"
+    manual_dir.mkdir()
+    job_name = "analytics.universe.rebuild_avoid_pool.ashare"
+    scheduler_config_file.write_text(
+        json.dumps(
+            {
+                "schema_version": "data-sync-scheduler-v1",
+                "enabled": True,
+                "cache_backend": "redis",
+                "jobs": [
+                    {
+                        "name": job_name,
+                        "job_type": "universe_avoid_pool_rebuild",
+                        "group": "analytics",
+                        "enabled": True,
+                        "interval_seconds": 0,
+                        "schedule_type": "after_success",
+                        "depends_on": ["ashare.risk_sentiment"],
+                        "market": "ashare",
+                        "params": {
+                            "sync_task_type": "analytics.universe.rebuild_avoid_pool",
+                            "name": "A 股系统回避池",
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    safe_job_name = "analytics_universe_rebuild_avoid_pool_ashare"
+    status_file = manual_dir / f"{safe_job_name}_20260614T193417Z.status.json"
+    event_log_file = manual_dir / f"{safe_job_name}_20260614T193417Z.events.jsonl"
+    process_log_file = manual_dir / f"{safe_job_name}_20260614T193417Z.log"
+    event_log_file.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event": "job_start",
+                        "job": job_name,
+                        "timestamp": "2026-06-14T19:34:24+00:00",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "event": "job_success",
+                        "job": job_name,
+                        "summary": {"status": "available"},
+                        "timestamp": "2026-06-14T19:34:37+00:00",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    process_log_file.write_text(
+        "调度任务开始 job=analytics.universe.rebuild_avoid_pool.ashare\n"
+        "调度任务完成 job=analytics.universe.rebuild_avoid_pool.ashare status=executed\n",
+        encoding="utf-8",
+    )
+    status_file.write_text(
+        json.dumps(
+            {
+                "service": "base_data_scheduler",
+                "state": "completed",
+                "mode": "run_once",
+                "job_name": job_name,
+                "last_job": job_name,
+                "last_job_status": "executed",
+                "started_at": "2026-06-14T19:34:24+00:00",
+                "updated_at": "2026-06-14T19:34:37+00:00",
+                "finished_at": "2026-06-14T19:34:37+00:00",
+                "event_log_file": str(event_log_file),
+                "process_log_file": str(process_log_file),
+                "pid": 66924,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = DataSyncControlService().read_scheduler_progress(
+        event_limit=20,
+        cache=control_service.NullCacheClient(),
+        cache_backend="redis",
+        scheduler_config_file=scheduler_config_file,
+        manual_run_dir=manual_dir,
+    )
+
+    assert result["status"] == "ok"
+    tasks = {task["job_name"]: task for task in result["data"]["tasks"]}
+    assert job_name in tasks
+    task = tasks[job_name]
+    assert task["status"] == "completed"
+    assert task["title"] == "A 股系统回避池"
+    assert task["summary"]["total_items"] == 1
+    assert task["summary"]["completed_items"] == 1
+    assert task["summary"]["progress_ratio"] == 1.0
+    assert [event["event_type"] for event in task["recent_events"]] == [
+        "job_start",
+        "job_success",
+    ]
+    waiting_names = {item["job_name"] for item in result["data"]["waiting"]}
+    assert job_name not in waiting_names
+
+
+def test_read_scheduler_progress_includes_manual_job_when_redis_degraded(
+    tmp_path: Path,
+) -> None:
+    """Redis 降级时仍应合并手工任务状态，避免页面点击后看不到运行结果。"""
+
+    scheduler_config_file = tmp_path / "base_data_scheduler.json"
+    manual_dir = tmp_path / "manual_runs"
+    manual_dir.mkdir()
+    job_name = "analytics.universe.rebuild_avoid_pool.ashare"
+    scheduler_config_file.write_text(
+        json.dumps(
+            {
+                "schema_version": "data-sync-scheduler-v1",
+                "enabled": True,
+                "cache_backend": "redis",
+                "jobs": [
+                    {
+                        "name": job_name,
+                        "job_type": "universe_avoid_pool_rebuild",
+                        "group": "analytics",
+                        "enabled": True,
+                        "interval_seconds": 0,
+                        "schedule_type": "manual",
+                        "market": "ashare",
+                        "params": {
+                            "sync_task_type": "analytics.universe.rebuild_avoid_pool",
+                            "name": "A 股回避池重建",
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    safe_job_name = "analytics_universe_rebuild_avoid_pool_ashare"
+    event_log_file = manual_dir / f"{safe_job_name}_20260615T010203Z.events.jsonl"
+    process_log_file = manual_dir / f"{safe_job_name}_20260615T010203Z.log"
+    status_file = manual_dir / f"{safe_job_name}_20260615T010203Z.status.json"
+    event_log_file.write_text(
+        json.dumps(
+            {
+                "event": "job_start",
+                "job": job_name,
+                "timestamp": "2026-06-15T01:02:03+00:00",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    process_log_file.write_text(
+        "调度任务开始 job=analytics.universe.rebuild_avoid_pool.ashare\n",
+        encoding="utf-8",
+    )
+    status_file.write_text(
+        json.dumps(
+            {
+                "service": "base_data_scheduler",
+                "state": "running",
+                "mode": "run_once",
+                "job_name": job_name,
+                "last_job": job_name,
+                "last_job_status": "running",
+                "started_at": "2026-06-15T01:02:03+00:00",
+                "updated_at": "2026-06-15T01:02:03+00:00",
+                "event_log_file": str(event_log_file),
+                "process_log_file": str(process_log_file),
+                "pid": 12345,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = DataSyncControlService().read_scheduler_progress(
+        event_limit=20,
+        cache=control_service.NullCacheClient(),
+        cache_backend="null",
+        scheduler_config_file=scheduler_config_file,
+        manual_run_dir=manual_dir,
+    )
+
+    assert result["status"] == "degraded"
+    tasks = {task["job_name"]: task for task in result["data"]["tasks"]}
+    assert tasks[job_name]["status"] == "running"
+    assert tasks[job_name]["title"] == "A 股回避池重建"
+    waiting_names = {item["job_name"] for item in result["data"]["waiting"]}
+    assert job_name not in waiting_names
+
+
 def test_start_scheduler_refreshes_existing_scheduler_config(
     monkeypatch,
     tmp_path: Path,
@@ -267,6 +472,40 @@ def test_save_config_persists_scheduler_concurrency(tmp_path: Path) -> None:
     assert result["data"]["scheduler_payload"]["max_concurrent_jobs"] == 6
 
 
+def test_save_config_persists_scheduler_resource_pools(tmp_path: Path) -> None:
+    """保存前端配置时，应把资源池额度同步到数据配置和调度器配置。"""
+
+    data_sync_config_file = tmp_path / "data_sync_config.json"
+    scheduler_config_file = tmp_path / "base_data_scheduler.json"
+    resource_pools = {
+        "realtime": {"max_concurrent_jobs": 2, "description": "盘中轻量任务"},
+        "collection_heavy": {"max_concurrent_jobs": 3, "description": "外部重采集"},
+        "default": {"max_concurrent_jobs": 4, "description": "默认兜底"},
+    }
+
+    result = DataSyncControlService().save_config(
+        preset="personal-comprehensive",
+        markets=["ashare", "fund"],
+        enabled=True,
+        cache_backend="redis",
+        max_concurrent_jobs=6,
+        resource_pools=resource_pools,
+        config_file=data_sync_config_file,
+        scheduler_config_file=scheduler_config_file,
+    )
+
+    saved_config = json.loads(data_sync_config_file.read_text(encoding="utf-8"))
+    scheduler_payload = json.loads(scheduler_config_file.read_text(encoding="utf-8"))
+
+    assert result["status"] == "ok"
+    assert saved_config["resource_pools"]["collection_heavy"]["max_concurrent_jobs"] == 3
+    assert scheduler_payload["resource_pools"]["collection_heavy"]["max_concurrent_jobs"] == 3
+    assert result["data"]["config"]["resource_pools"]["realtime"]["max_concurrent_jobs"] == 2
+    assert result["data"]["scheduler_payload"]["resource_pools"]["default"][
+        "max_concurrent_jobs"
+    ] == 4
+
+
 def test_read_scheduler_jobs_returns_visual_task_catalog(tmp_path: Path) -> None:
     """前端应能读取可执行、可配置的调度任务目录。"""
 
@@ -332,6 +571,8 @@ def test_read_scheduler_jobs_returns_visual_task_catalog(tmp_path: Path) -> None
             "timezone": "UTC",
             "trading_day_policy": "any_day",
             "depends_on": [],
+            "priority": 100,
+            "resource_pool": "default",
             "params": {
                 "sync_task_type": "event_refresh",
                 "batch_size": 20,
@@ -357,6 +598,8 @@ def test_read_scheduler_jobs_returns_visual_task_catalog(tmp_path: Path) -> None
             "timezone": "UTC",
             "trading_day_policy": "any_day",
             "depends_on": [],
+            "priority": 100,
+            "resource_pool": "default",
             "params": {
                 "sync_task_type": "market_bars_backfill",
                 "batch_size": 200,
@@ -369,6 +612,166 @@ def test_read_scheduler_jobs_returns_visual_task_catalog(tmp_path: Path) -> None
                 "overrides": {},
             },
         }
+    ]
+
+
+def test_read_scheduler_jobs_exposes_priority_and_resource_pool(tmp_path: Path) -> None:
+    """任务目录应暴露优先级和资源池，便于前端解释调度顺序。"""
+
+    scheduler_config_file = tmp_path / "base_data_scheduler.json"
+    scheduler_config_file.write_text(
+        json.dumps(
+            {
+                "schema_version": "data-sync-scheduler-v1",
+                "enabled": True,
+                "cache_backend": "redis",
+                "max_concurrent_jobs": 3,
+                "resource_pools": {
+                    "realtime": {"max_concurrent_jobs": 1},
+                    "default": {"max_concurrent_jobs": 3},
+                },
+                "jobs": [
+                    {
+                        "name": "ashare.realtime_quotes",
+                        "group": "ashare-p0",
+                        "enabled": True,
+                        "interval_seconds": 300,
+                        "priority": 800,
+                        "resource_pool": "realtime",
+                        "market": "ashare",
+                        "params": {"sync_task_type": "realtime_quote_refresh"},
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = DataSyncControlService().read_scheduler_jobs(
+        scheduler_config_file=scheduler_config_file,
+    )
+
+    assert result["status"] == "ok"
+    assert result["data"]["config"]["resource_pools"]["realtime"]["max_concurrent_jobs"] == 1
+    assert result["data"]["jobs"][0]["priority"] == 800
+    assert result["data"]["jobs"][0]["resource_pool"] == "realtime"
+
+
+def test_scheduler_progress_exposes_global_and_pool_concurrency(tmp_path: Path) -> None:
+    """任务进度接口应输出全局并发和资源池摘要，但 Redis 降级时不虚构等待队列。"""
+
+    scheduler_config_file = tmp_path / "base_data_scheduler.json"
+    scheduler_config_file.write_text(
+        json.dumps(
+            {
+                "schema_version": "data-sync-scheduler-v1",
+                "enabled": True,
+                "cache_backend": "null",
+                "max_concurrent_jobs": 4,
+                "resource_pools": {
+                    "collection_heavy": {"max_concurrent_jobs": 2},
+                    "realtime": {"max_concurrent_jobs": 1},
+                    "default": {"max_concurrent_jobs": 4},
+                },
+                "jobs": [
+                    {
+                        "name": "ashare.capital_flow",
+                        "group": "ashare-p1",
+                        "enabled": True,
+                        "interval_seconds": 1800,
+                        "resource_pool": "collection_heavy",
+                        "priority": 600,
+                        "market": "ashare",
+                        "params": {"sync_task_type": "capital_flow_refresh"},
+                    },
+                    {
+                        "name": "ashare.realtime_quotes",
+                        "group": "ashare-p0",
+                        "enabled": True,
+                        "interval_seconds": 300,
+                        "resource_pool": "realtime",
+                        "priority": 800,
+                        "market": "ashare",
+                        "params": {"sync_task_type": "realtime_quote_refresh"},
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = DataSyncControlService().read_scheduler_progress(
+        cache=control_service.NullCacheClient(),
+        cache_backend="null",
+        scheduler_config_file=scheduler_config_file,
+    )
+
+    assert result["status"] == "degraded"
+    assert result["data"]["global_concurrency"] == {"running": 0, "limit": 4}
+    assert result["data"]["resource_pools"]["collection_heavy"] == {
+        "running": 0,
+        "queued": 0,
+        "limit": 2,
+    }
+    assert result["data"]["resource_pools"]["realtime"] == {
+        "running": 0,
+        "queued": 0,
+        "limit": 1,
+    }
+
+
+def test_read_scheduler_jobs_merges_missing_regenerable_jobs(tmp_path: Path) -> None:
+    """旧版运行时调度 JSON 应自动补入可从数据同步配置再生成的新任务。"""
+
+    data_sync_config_file = tmp_path / "data_sync_config.json"
+    scheduler_config_file = tmp_path / "base_data_scheduler.json"
+    save_data_sync_config(build_preset_config("personal-comprehensive"), data_sync_config_file)
+    scheduler_config_file.write_text(
+        json.dumps(
+            {
+                "schema_version": "data-sync-scheduler-v1",
+                "enabled": True,
+                "cache_backend": "redis",
+                "max_concurrent_jobs": 3,
+                "jobs": [
+                    {
+                        "name": "analytics.recommendations.ashare.all_a",
+                        "job_type": "recommendation_pipeline",
+                        "group": "analytics",
+                        "enabled": False,
+                        "interval_seconds": 3600,
+                        "market": "ashare",
+                        "params": {
+                            "sync_task_type": "analytics.recommendations",
+                            "universe_id": "universe:merged:ashare:recommendation",
+                        },
+                    }
+                ],
+                "processing": {},
+                "notes": ["旧版运行时调度文件"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = DataSyncControlService().read_scheduler_jobs(
+        data_sync_config_file=data_sync_config_file,
+        scheduler_config_file=scheduler_config_file,
+    )
+
+    saved_payload = json.loads(scheduler_config_file.read_text(encoding="utf-8"))
+    jobs = {job["name"]: job for job in saved_payload["jobs"]}
+    returned_jobs = {job["name"]: job for job in result["data"]["jobs"]}
+    assert result["status"] == "ok"
+    assert jobs["analytics.recommendations.ashare.all_a"]["enabled"] is False
+    assert "analytics.universe.merge.ashare.recommendation" in jobs
+    assert "analytics.universe.merge.ashare.recommendation" in returned_jobs
+    assert jobs["analytics.universe.merge.ashare.recommendation"]["params"]["name"] == "A 股推荐合并候选池"
+    assert jobs["analytics.recommendations.ashare.all_a"]["depends_on"] == [
+        "analytics.universe.merge.ashare.recommendation"
     ]
 
 

@@ -175,19 +175,13 @@ class BaseDataTaskProgressRecorder:
             updated_at=now,
             total_items=total_items,
         )
-        snapshot["total_items"] = max(int(snapshot.get("total_items") or 0), total_items)
-        completed_items = int(snapshot.get("completed_items") or 0)
-        failed_items = int(snapshot.get("failed_items") or 0)
-        pending_items = max(
+        stage_pending_items = max(
             0,
-            int(snapshot.get("total_items") or total_items) - completed_items - failed_items,
+            int(stage.get("total_items") or total_items)
+            - int(stage.get("completed_items") or 0)
+            - int(stage.get("failed_items") or 0),
         )
-        running_items = min(max(int(batch_size), 0), pending_items)
-        snapshot["running_items"] = running_items
-        snapshot["remaining_items"] = max(
-            0,
-            int(snapshot.get("total_items") or total_items) - completed_items - failed_items,
-        )
+        running_items = min(max(int(batch_size), 0), stage_pending_items)
         snapshot["updated_at"] = now.isoformat()
         snapshot["status"] = "running"
         snapshot["batch_index"] = batch_index
@@ -197,6 +191,7 @@ class BaseDataTaskProgressRecorder:
             snapshot["max_workers"] = max(int(max_workers), 1)
         stage["running_items"] = running_items
         snapshot["stages"] = self._replace_stage(snapshot.get("stages"), stage)
+        self._refresh_aggregate_from_stages(snapshot)
         self._refresh_metrics(snapshot, now=now)
         self._save_snapshot(job_name, run_id, snapshot, ttl_seconds=ttl_seconds)
         self._append_event(
@@ -213,6 +208,45 @@ class BaseDataTaskProgressRecorder:
                 "batch_size": batch_size,
                 "max_workers": max_workers,
             },
+        )
+
+    def stage_planned(
+        self,
+        *,
+        job_name: str,
+        run_id: str | None,
+        stage_key: str,
+        total_items: int,
+    ) -> None:
+        """预先登记阶段总量，用于多阶段任务展示完整总进度。"""
+
+        if self._disabled or not run_id or total_items <= 0:
+            return
+        now = self._now()
+        snapshot = self._load_snapshot(job_name, run_id)
+        if not snapshot:
+            return
+        ttl_seconds = self._snapshot_ttl(snapshot)
+        stage = self._stage_entry(
+            snapshot,
+            stage_key=stage_key,
+            status="waiting",
+            updated_at=now,
+            total_items=total_items,
+        )
+        stage["running_items"] = 0
+        snapshot["stages"] = self._replace_stage(snapshot.get("stages"), stage)
+        self._refresh_aggregate_from_stages(snapshot)
+        snapshot["updated_at"] = now.isoformat()
+        self._refresh_metrics(snapshot, now=now)
+        self._save_snapshot(job_name, run_id, snapshot, ttl_seconds=ttl_seconds)
+        self._append_event(
+            job_name=job_name,
+            run_id=run_id,
+            event_type="stage_planned",
+            created_at=now,
+            ttl_seconds=ttl_seconds,
+            payload={"stage_key": stage_key, "total_items": total_items},
         )
 
     def symbol_started(
@@ -333,10 +367,12 @@ class BaseDataTaskProgressRecorder:
                 stage_key=stage_key,
                 status=stage_status,
                 updated_at=now,
+                delta_running=-1,
                 delta_completed=1 if stage_status == "completed" else 0,
                 delta_failed=1 if stage_status == "failed" else 0,
             ),
         )
+        self._refresh_aggregate_from_stages(snapshot)
         self._refresh_metrics(snapshot, now=now)
         self._save_snapshot(job_name, run_id, snapshot, ttl_seconds=ttl_seconds)
         self._append_event(
@@ -898,6 +934,26 @@ class BaseDataTaskProgressRecorder:
         if not replaced:
             items.append(stage)
         return items
+
+    def _refresh_aggregate_from_stages(self, snapshot: JsonDict) -> None:
+        stages = [dict(item) for item in snapshot.get("stages") or [] if isinstance(item, dict)]
+        if not stages:
+            total = int(snapshot.get("total_items") or 0)
+            completed = int(snapshot.get("completed_items") or 0)
+            failed = int(snapshot.get("failed_items") or 0)
+            snapshot["remaining_items"] = max(total - completed - failed, 0)
+            snapshot["progress_ratio"] = self._progress_ratio(total, completed, failed)
+            return
+        total = sum(max(int(stage.get("total_items") or 0), 0) for stage in stages)
+        completed = sum(max(int(stage.get("completed_items") or 0), 0) for stage in stages)
+        failed = sum(max(int(stage.get("failed_items") or 0), 0) for stage in stages)
+        running = sum(max(int(stage.get("running_items") or 0), 0) for stage in stages)
+        snapshot["total_items"] = total
+        snapshot["completed_items"] = completed
+        snapshot["failed_items"] = failed
+        snapshot["running_items"] = running
+        snapshot["remaining_items"] = max(total - completed - failed, 0)
+        snapshot["progress_ratio"] = self._progress_ratio(total, completed, failed)
 
     def _refresh_metrics(self, snapshot: JsonDict, *, now: datetime) -> None:
         started_at = parse_iso_datetime(snapshot.get("started_at")) or now

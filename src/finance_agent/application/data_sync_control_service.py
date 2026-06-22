@@ -36,6 +36,7 @@ from finance_agent.scheduler import (
     read_scheduler_health,
     write_scheduler_status_file,
 )
+from finance_agent.scheduler.base_data_scheduler import parse_scheduler_resource_pools
 from finance_agent.scheduler.base_data_progress import (
     BaseDataTaskProgressRecorder,
     build_progress_snapshot_response,
@@ -55,6 +56,7 @@ DEFAULT_PROCESS_FILE = SCHEDULER_DIR / "process.json"
 DEFAULT_PROCESS_LOG_FILE = SCHEDULER_DIR / "process.log"
 DEFAULT_FAILED_RERUN_DIR = SCHEDULER_DIR / "failed_reruns"
 MANUAL_RUN_START_LOCK_STALE_SECONDS = 300
+MANUAL_RUN_PROGRESS_MAX_AGE_SECONDS = 300
 PROCESS_TERMINATION_VERIFY_TIMEOUT_SECONDS = 5.0
 PROCESS_TERMINATION_VERIFY_INTERVAL_SECONDS = 0.2
 ASHARE_MARKET_BAR_RERUN_TASK_TYPES = {
@@ -287,6 +289,7 @@ class DataSyncControlService:
         enabled: bool,
         cache_backend: str,
         max_concurrent_jobs: int = 4,
+        resource_pools: JsonDict | None = None,
         config_payload: JsonDict | None = None,
         config_file: Path = DEFAULT_DATA_SYNC_CONFIG,
         scheduler_config_file: Path = DEFAULT_SCHEDULER_CONFIG,
@@ -302,6 +305,14 @@ class DataSyncControlService:
             enabled=enabled,
             cache_backend=cache_backend,
             max_concurrent_jobs=max_concurrent_jobs,
+            resource_pools=(
+                parse_scheduler_resource_pools(
+                    resource_pools,
+                    max_concurrent_jobs=max_concurrent_jobs,
+                )
+                if resource_pools is not None
+                else config.resource_pools
+            ),
         )
         validation = validate_data_sync_config(config)
         if not validation.valid:
@@ -317,11 +328,7 @@ class DataSyncControlService:
 
         save_data_sync_config(config, config_file)
         scheduler_payload = export_scheduler_payload(config)
-        scheduler_config_file.parent.mkdir(parents=True, exist_ok=True)
-        scheduler_config_file.write_text(
-            json.dumps(scheduler_payload, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        write_scheduler_payload(scheduler_config_file, scheduler_payload)
         return {
             "status": "ok",
             "data": build_config_response(
@@ -356,6 +363,7 @@ class DataSyncControlService:
         cache: Any | None = None,
         cache_backend: str = "auto",
         scheduler_config_file: Path = DEFAULT_SCHEDULER_CONFIG,
+        manual_run_dir: Path | None = None,
         redis_error_message: str | None = None,
     ) -> JsonDict:
         """读取 Redis 中的基础数据调度器运行态进度。"""
@@ -372,6 +380,7 @@ class DataSyncControlService:
                 cache = NullCacheClient()
                 cache_backend = "null"
                 cache_error = cache_error or str(exc)
+        scheduler_config = None
         scheduler_jobs = ()
         try:
             scheduler_config = load_scheduler_config(scheduler_config_file)
@@ -379,7 +388,7 @@ class DataSyncControlService:
         except Exception as exc:
             logger.warning("读取调度器配置失败，进度页将不显示等待队列：%s", exc)
         if cache_backend != "redis":
-            return {
+            response = {
                 "status": "degraded",
                 "message": "Redis 不可用，无法读取实时进度。",
                 "data": {
@@ -388,8 +397,16 @@ class DataSyncControlService:
                     "waiting": [],
                 },
             }
+            merge_manual_run_progress(
+                response,
+                scheduler_jobs=scheduler_jobs,
+                manual_run_dir=manual_run_dir or (SCHEDULER_DIR / "manual_runs"),
+                event_limit=event_limit,
+            )
+            enrich_scheduler_progress_concurrency(response, scheduler_config=scheduler_config)
+            return response
         if cache_status is not None and getattr(cache_status, "status", "available") != "available":
-            return {
+            response = {
                 "status": "degraded",
                 "message": "Redis 不可用，无法读取实时进度。",
                 "data": {
@@ -398,13 +415,29 @@ class DataSyncControlService:
                     "waiting": [],
                 },
             }
-        return build_progress_snapshot_response(
+            merge_manual_run_progress(
+                response,
+                scheduler_jobs=scheduler_jobs,
+                manual_run_dir=manual_run_dir or (SCHEDULER_DIR / "manual_runs"),
+                event_limit=event_limit,
+            )
+            enrich_scheduler_progress_concurrency(response, scheduler_config=scheduler_config)
+            return response
+        response = build_progress_snapshot_response(
             cache=cache,
             cache_backend=cache_backend,
             scheduler_jobs=scheduler_jobs,
             event_limit=event_limit,
             redis_error_message=cache_error,
         )
+        merge_manual_run_progress(
+            response,
+            scheduler_jobs=scheduler_jobs,
+            manual_run_dir=manual_run_dir or (SCHEDULER_DIR / "manual_runs"),
+            event_limit=event_limit,
+        )
+        enrich_scheduler_progress_concurrency(response, scheduler_config=scheduler_config)
+        return response
 
     def read_scheduler_jobs(
         self,
@@ -436,6 +469,7 @@ class DataSyncControlService:
                     "job_timeout_seconds": config.job_timeout_seconds,
                     "max_job_retries": config.max_job_retries,
                     "retry_backoff_seconds": config.retry_backoff_seconds,
+                    "resource_pools": config.resource_pools,
                 },
                 "jobs": serialized_jobs,
             },
@@ -1086,6 +1120,19 @@ def ensure_scheduler_payload(
     if scheduler_config_file.exists():
         payload = json.loads(scheduler_config_file.read_text(encoding="utf-8-sig"))
         parse_scheduler_config(payload)
+        if should_merge_regenerable_scheduler_jobs(
+            data_sync_config_file=data_sync_config_file,
+            scheduler_config_file=scheduler_config_file,
+        ):
+            try:
+                config = load_data_sync_config(data_sync_config_file)
+                regenerated_payload = export_scheduler_payload(config)
+            except Exception as exc:  # pragma: no cover - 旧配置仍应可读，迁移失败只降级
+                logger.warning("补齐可再生成调度任务失败，继续使用现有运行时配置：%s", exc)
+            else:
+                if merge_regenerable_scheduler_jobs(payload, regenerated_payload):
+                    parse_scheduler_config(payload)
+                    write_scheduler_payload(scheduler_config_file, payload)
         return payload
 
     config = (
@@ -1098,14 +1145,457 @@ def ensure_scheduler_payload(
     return payload
 
 
+def should_merge_regenerable_scheduler_jobs(
+    *,
+    data_sync_config_file: Path,
+    scheduler_config_file: Path,
+) -> bool:
+    """判断是否应把数据同步配置中新生成的任务补入运行时调度 JSON。"""
+
+    if not data_sync_config_file.exists():
+        return False
+    try:
+        default_scheduler = DEFAULT_SCHEDULER_CONFIG.resolve()
+        scheduler_path = scheduler_config_file.resolve()
+        data_config_parent = data_sync_config_file.resolve().parent
+        scheduler_parent = scheduler_path.parent
+    except OSError:
+        return False
+    if scheduler_path == default_scheduler:
+        return True
+    return data_config_parent == scheduler_parent or data_config_parent in scheduler_parent.parents
+
+
+def merge_regenerable_scheduler_jobs(payload: JsonDict, regenerated_payload: JsonDict) -> bool:
+    """只补齐可再生成任务和缺失依赖，保留现有任务的启停、批次和热控制配置。"""
+
+    jobs = payload.get("jobs")
+    regenerated_jobs = regenerated_payload.get("jobs")
+    if not isinstance(jobs, list) or not isinstance(regenerated_jobs, list):
+        return False
+    changed = False
+    for index, regenerated_job in enumerate(regenerated_jobs):
+        if not isinstance(regenerated_job, dict):
+            continue
+        job_name = str(regenerated_job.get("name") or "")
+        if not job_name:
+            continue
+        existing_job = find_scheduler_job_payload(payload, job_name)
+        if existing_job is not None:
+            changed = merge_scheduler_job_dependencies(existing_job, regenerated_job) or changed
+            continue
+        insert_at = next_existing_generated_job_index(
+            jobs=jobs,
+            regenerated_jobs=regenerated_jobs[index + 1 :],
+        )
+        jobs.insert(insert_at, deepcopy(regenerated_job))
+        changed = True
+    return changed
+
+
+def merge_scheduler_job_dependencies(
+    existing_job: JsonDict,
+    regenerated_job: JsonDict,
+) -> bool:
+    """把新增任务带来的依赖补到已有任务上，不覆盖用户可编辑字段。"""
+
+    regenerated_depends_on = regenerated_job.get("depends_on")
+    if not isinstance(regenerated_depends_on, list) or not regenerated_depends_on:
+        return False
+    current_depends_on = existing_job.get("depends_on")
+    if not isinstance(current_depends_on, list):
+        current_depends_on = []
+    merged_depends_on = [str(item) for item in current_depends_on]
+    changed = False
+    for dependency in regenerated_depends_on:
+        dependency_name = str(dependency)
+        if dependency_name not in merged_depends_on:
+            merged_depends_on.append(dependency_name)
+            changed = True
+    if changed:
+        existing_job["depends_on"] = merged_depends_on
+    return changed
+
+
+def next_existing_generated_job_index(
+    *,
+    jobs: list[Any],
+    regenerated_jobs: list[Any],
+) -> int:
+    """返回下一个已存在再生成任务的位置，用于把缺失任务插回相近顺序。"""
+
+    for regenerated_job in regenerated_jobs:
+        if not isinstance(regenerated_job, dict):
+            continue
+        job_name = str(regenerated_job.get("name") or "")
+        if not job_name:
+            continue
+        for index, job in enumerate(jobs):
+            if isinstance(job, dict) and str(job.get("name") or "") == job_name:
+                return index
+    return len(jobs)
+
+
 def write_scheduler_payload(path: Path, payload: JsonDict) -> None:
     """写入运行时调度配置。"""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    temp_path = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
+    temp_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    temp_path.replace(path)
+
+
+def merge_manual_run_progress(
+    response: JsonDict,
+    *,
+    scheduler_jobs: list[Any] | tuple[Any, ...],
+    manual_run_dir: Path,
+    event_limit: int,
+) -> None:
+    """把手工 run-once 状态文件合并到进度响应，覆盖无 Redis 快照的 analytics 任务。"""
+
+    data = response.get("data")
+    if not isinstance(data, dict):
+        return
+    tasks = data.get("tasks")
+    waiting = data.get("waiting")
+    if not isinstance(tasks, list) or not isinstance(waiting, list):
+        return
+    existing_jobs = {
+        str(task.get("job_name") or "")
+        for task in tasks
+        if isinstance(task, dict) and str(task.get("job_name") or "")
+    }
+    manual_tasks = read_recent_manual_run_tasks(
+        manual_run_dir=manual_run_dir,
+        scheduler_jobs=scheduler_jobs,
+        event_limit=event_limit,
+    )
+    for task in manual_tasks:
+        job_name = str(task.get("job_name") or "")
+        if not job_name or job_name in existing_jobs:
+            continue
+        tasks.append(task)
+        existing_jobs.add(job_name)
+    data["waiting"] = [
+        item
+        for item in waiting
+        if not isinstance(item, dict) or str(item.get("job_name") or "") not in existing_jobs
+    ]
+    metrics = data.get("metrics")
+    if isinstance(metrics, dict):
+        metrics["running_count"] = sum(
+            1 for task in tasks if isinstance(task, dict) and task.get("status") == "running"
+        )
+        metrics["failed_count"] = sum(
+            1 for task in tasks if isinstance(task, dict) and task.get("status") == "failed"
+        )
+        metrics["completed_recent_count"] = sum(
+            1 for task in tasks if isinstance(task, dict) and task.get("status") == "completed"
+        )
+        metrics["waiting_count"] = len(data["waiting"])
+
+
+def read_recent_manual_run_tasks(
+    *,
+    manual_run_dir: Path,
+    scheduler_jobs: list[Any] | tuple[Any, ...],
+    event_limit: int,
+) -> list[JsonDict]:
+    """读取每个手工任务最近一次运行状态，转换为任务监控可展示结构。"""
+
+    if not manual_run_dir.exists():
+        return []
+    now = datetime.now(tz=UTC)
+    job_by_name = {str(getattr(job, "name", "") or ""): job for job in scheduler_jobs}
+    latest_by_job: dict[str, tuple[float, JsonDict]] = {}
+    for status_file in manual_run_dir.glob("*.status.json"):
+        try:
+            if now.timestamp() - status_file.stat().st_mtime > MANUAL_RUN_PROGRESS_MAX_AGE_SECONDS:
+                continue
+        except OSError:
+            continue
+        try:
+            payload = json.loads(status_file.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        job_name = str(payload.get("job_name") or payload.get("last_job") or "").strip()
+        if not job_name:
+            continue
+        job = job_by_name.get(job_name)
+        if job is None:
+            continue
+        task = build_manual_run_task_view(
+            status_payload=payload,
+            status_file=status_file,
+            scheduler_job=job,
+            event_limit=event_limit,
+        )
+        current = latest_by_job.get(job_name)
+        modified_time = status_file.stat().st_mtime
+        if current is None or modified_time > current[0]:
+            latest_by_job[job_name] = (modified_time, task)
+    return [
+        task
+        for _, task in sorted(
+            latest_by_job.values(),
+            key=lambda item: str(item[1].get("updated_at") or ""),
+            reverse=True,
+        )
+    ]
+
+
+def build_manual_run_task_view(
+    *,
+    status_payload: JsonDict,
+    status_file: Path,
+    scheduler_job: Any,
+    event_limit: int,
+) -> JsonDict:
+    """把单个手工任务状态文件转成任务监控项。"""
+
+    job_name = str(status_payload.get("job_name") or status_payload.get("last_job") or "")
+    state = str(status_payload.get("state") or "").lower()
+    last_job_status = str(status_payload.get("last_job_status") or "").lower()
+    status = manual_run_task_status(state=state, last_job_status=last_job_status)
+    started_at = str(status_payload.get("started_at") or "")
+    updated_at = str(status_payload.get("updated_at") or status_payload.get("finished_at") or started_at)
+    finished_at = str(status_payload.get("finished_at") or "")
+    title = manual_run_task_title(scheduler_job=scheduler_job, job_name=job_name)
+    total_items, completed_items, running_items, failed_items = manual_run_summary_counts(status)
+    duration_seconds = manual_run_duration_seconds(started_at=started_at, updated_at=updated_at)
+    process_log_file = Path(str(status_payload.get("process_log_file") or "")) if status_payload.get("process_log_file") else None
+    event_log_file = Path(str(status_payload.get("event_log_file") or "")) if status_payload.get("event_log_file") else None
+    events = read_manual_run_events(
+        event_log_file=event_log_file,
+        process_log_file=process_log_file,
+        job_name=job_name,
+        run_id=status_file.stem,
+        limit=event_limit,
+    )
+    return {
+        "job_name": job_name,
+        "run_id": status_file.stem,
+        "title": title,
+        "market": getattr(scheduler_job, "market", None),
+        "task_type": str((getattr(scheduler_job, "params", {}) or {}).get("sync_task_type") or ""),
+        "status": status,
+        "interval_seconds": int(getattr(scheduler_job, "interval_seconds", 0) or 0),
+        "started_at": started_at,
+        "updated_at": updated_at,
+        "finished_at": finished_at,
+        "batch_index": None,
+        "batch_count": None,
+        "batch_size": int((getattr(scheduler_job, "params", {}) or {}).get("batch_size") or 0),
+        "max_workers": int((getattr(scheduler_job, "params", {}) or {}).get("max_workers") or 0),
+        "throughput_per_minute": 0.0,
+        "summary": {
+            "total_items": total_items,
+            "completed_items": completed_items,
+            "running_items": running_items,
+            "failed_items": failed_items,
+            "retry_items": 0,
+            "remaining_items": running_items,
+            "progress_ratio": 1.0 if status in {"completed", "failed"} else 0.0,
+        },
+        "stages": [
+            {
+                "stage_key": "manual_run",
+                "title": "手工任务执行",
+                "status": status,
+                "total_items": total_items,
+                "completed_items": completed_items,
+                "failed_items": failed_items,
+                "running_items": running_items,
+                "progress_ratio": 1.0 if status in {"completed", "failed"} else 0.0,
+                "updated_at": updated_at,
+            }
+        ],
+        "recent_events": events,
+        "metrics": {
+            "duration_seconds": duration_seconds,
+            "error_rate": 1.0 if status == "failed" else 0.0,
+            "max_workers": int((getattr(scheduler_job, "params", {}) or {}).get("max_workers") or 0),
+            "throughput_per_minute": 0.0,
+            "node": "local",
+            "cache_backend": "status_file",
+        },
+        "error_message": str(status_payload.get("last_error") or status_payload.get("last_error_message") or ""),
+    }
+
+
+def manual_run_task_status(*, state: str, last_job_status: str) -> str:
+    """把调度器状态字段转换为任务监控状态。"""
+
+    if state in {"running", "starting"} or last_job_status in {"running", "starting"}:
+        return "running"
+    if state in {"cancelled", "failed", "error"} or last_job_status in {"failed", "error", "cancelled"}:
+        return "failed"
+    if state == "completed" or last_job_status in {"executed", "ok", "success"}:
+        return "completed"
+    return "unknown"
+
+
+def manual_run_summary_counts(status: str) -> tuple[int, int, int, int]:
+    """为非逐标的手工任务生成 1 个逻辑步骤的汇总计数。"""
+
+    if status == "running":
+        return 1, 0, 1, 0
+    if status == "failed":
+        return 1, 0, 0, 1
+    if status == "completed":
+        return 1, 1, 0, 0
+    return 1, 0, 0, 0
+
+
+def manual_run_task_title(*, scheduler_job: Any, job_name: str) -> str:
+    """优先使用任务参数中的中文名称作为手工任务标题。"""
+
+    params = getattr(scheduler_job, "params", {}) or {}
+    return str(
+        params.get("name")
+        or params.get("title")
+        or getattr(scheduler_job, "title", None)
+        or job_name
+    )
+
+
+def manual_run_duration_seconds(*, started_at: str, updated_at: str) -> int:
+    """计算手工任务运行时长。"""
+
+    started = parse_iso_datetime_or_none(started_at)
+    updated = parse_iso_datetime_or_none(updated_at)
+    if started is None or updated is None:
+        return 0
+    return max(0, int((updated - started).total_seconds()))
+
+
+def parse_iso_datetime_or_none(value: Any) -> datetime | None:
+    """解析 ISO 时间字符串，无法解析时返回 None。"""
+
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def read_manual_run_events(
+    *,
+    event_log_file: Path | None,
+    process_log_file: Path | None,
+    job_name: str,
+    run_id: str,
+    limit: int,
+) -> list[JsonDict]:
+    """读取手工任务事件，优先使用 JSONL 事件，缺失时用进程日志兜底。"""
+
+    events = read_manual_run_json_events(
+        event_log_file=event_log_file,
+        job_name=job_name,
+        run_id=run_id,
+        limit=limit,
+    )
+    if events:
+        return events
+    return read_manual_run_log_events(
+        process_log_file=process_log_file,
+        job_name=job_name,
+        run_id=run_id,
+        limit=limit,
+    )
+
+
+def read_manual_run_json_events(
+    *,
+    event_log_file: Path | None,
+    job_name: str,
+    run_id: str,
+    limit: int,
+) -> list[JsonDict]:
+    """读取手工任务 JSONL 事件。"""
+
+    if event_log_file is None or not event_log_file.exists():
+        return []
+    events: list[JsonDict] = []
+    try:
+        lines = event_log_file.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return []
+    for line in lines[-max(1, limit) :]:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        events.append(
+            {
+                "event_type": str(item.get("event") or "manual_run_event"),
+                "job_name": str(item.get("job") or job_name),
+                "run_id": run_id,
+                "created_at": str(item.get("timestamp") or ""),
+                "status": manual_event_status(str(item.get("event") or "")),
+                "error_message": str(item.get("error_message") or item.get("error") or ""),
+                "item_count": int((item.get("summary") or {}).get("item_count") or 0)
+                if isinstance(item.get("summary"), dict)
+                else 0,
+            }
+        )
+    return events
+
+
+def read_manual_run_log_events(
+    *,
+    process_log_file: Path | None,
+    job_name: str,
+    run_id: str,
+    limit: int,
+) -> list[JsonDict]:
+    """把手工任务进程日志转换为可点击查看的最近事件。"""
+
+    if process_log_file is None or not process_log_file.exists():
+        return []
+    try:
+        lines = [line.strip() for line in process_log_file.read_text(encoding="utf-8", errors="replace").splitlines()]
+    except OSError:
+        return []
+    events: list[JsonDict] = []
+    for line in lines[-max(1, limit) :]:
+        if not line:
+            continue
+        events.append(
+            {
+                "event_type": "manual_run_log",
+                "job_name": job_name,
+                "run_id": run_id,
+                "created_at": "",
+                "status": "failed" if "失败" in line or "ERROR" in line else "completed",
+                "error_message": line if "失败" in line or "ERROR" in line else "",
+                "message": line,
+            }
+        )
+    return events
+
+
+def manual_event_status(event_type: str) -> str:
+    """把手工任务事件类型转换为前端事件状态。"""
+
+    normalized = event_type.lower()
+    if "fail" in normalized or "error" in normalized:
+        return "failed"
+    if "start" in normalized:
+        return "running"
+    return "completed"
 
 
 def find_scheduler_job_payload(payload: JsonDict, job_name: str) -> JsonDict | None:
@@ -1164,6 +1654,55 @@ def update_scheduler_job_control(
     return current
 
 
+def enrich_scheduler_progress_concurrency(
+    response: JsonDict,
+    *,
+    scheduler_config: Any | None,
+) -> None:
+    """为进度响应补充全局并发和资源池占用摘要。"""
+
+    data = response.setdefault("data", {})
+    if scheduler_config is None:
+        data.setdefault("global_concurrency", {"running": 0, "limit": 0})
+        data.setdefault("resource_pools", {})
+        return
+    tasks = data.get("tasks") if isinstance(data.get("tasks"), list) else []
+    waiting = data.get("waiting") if isinstance(data.get("waiting"), list) else []
+    running_job_names = {
+        str(task.get("job_name") or "")
+        for task in tasks
+        if isinstance(task, dict) and task.get("status") == "running"
+    }
+    waiting_job_names = {
+        str(item.get("job_name") or "")
+        for item in waiting
+        if isinstance(item, dict)
+    }
+    jobs_by_name = {str(job.name): job for job in scheduler_config.jobs}
+    data["global_concurrency"] = {
+        "running": len(running_job_names),
+        "limit": int(getattr(scheduler_config, "max_concurrent_jobs", 0) or 0),
+    }
+    pool_summary: JsonDict = {}
+    resource_pools = dict(getattr(scheduler_config, "resource_pools", {}) or {})
+    for pool_name, pool_payload in resource_pools.items():
+        limit = 0
+        if isinstance(pool_payload, dict):
+            limit = int(pool_payload.get("max_concurrent_jobs") or 0)
+        pool_summary[str(pool_name)] = {"running": 0, "queued": 0, "limit": limit}
+    for job_name in running_job_names:
+        job = jobs_by_name.get(job_name)
+        pool_name = str(getattr(job, "resource_pool", "default") or "default") if job else "default"
+        pool_summary.setdefault(pool_name, {"running": 0, "queued": 0, "limit": 0})
+        pool_summary[pool_name]["running"] += 1
+    for job_name in waiting_job_names:
+        job = jobs_by_name.get(job_name)
+        pool_name = str(getattr(job, "resource_pool", "default") or "default") if job else "default"
+        pool_summary.setdefault(pool_name, {"running": 0, "queued": 0, "limit": 0})
+        pool_summary[pool_name]["queued"] += 1
+    data["resource_pools"] = pool_summary
+
+
 def serialize_scheduler_job(job: Any) -> JsonDict:
     """把调度任务 dataclass 转为前端可编辑结构。"""
 
@@ -1180,6 +1719,8 @@ def serialize_scheduler_job(job: Any) -> JsonDict:
         "timezone": job.timezone,
         "trading_day_policy": job.trading_day_policy,
         "depends_on": list(job.depends_on),
+        "priority": job.priority,
+        "resource_pool": job.resource_pool,
         "params": job.params,
     }
 

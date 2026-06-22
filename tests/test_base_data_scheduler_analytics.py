@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 from argparse import Namespace
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +18,7 @@ from finance_agent.scheduler import (
     BaseDataScheduler,
     BaseDataSchedulerConfig,
     BaseDataSchedulerJob,
+    load_scheduler_config,
     parse_scheduler_config,
 )
 from finance_agent.scheduler import base_data_scheduler as scheduler_module
@@ -383,6 +385,85 @@ def test_parse_scheduler_config_accepts_calendar_schedule_fields() -> None:
     assert bootstrap.interval_seconds == 0
     assert quality.schedule_type == "after_success"
     assert quality.depends_on == ("ashare.bars.1d.close_final",)
+
+
+def test_parse_scheduler_config_accepts_mutex_key() -> None:
+    """调度配置应能声明任务互斥键，避免同一资源链路并发写入。"""
+
+    config = parse_scheduler_config(
+        {
+            "enabled": True,
+            "jobs": [
+                {
+                    "name": "ashare.events",
+                    "job_type": "collection",
+                    "group": "ashare-p1",
+                    "enabled": True,
+                    "interval_seconds": 300,
+                    "market": "ashare",
+                    "mutex_key": "ashare.event_records",
+                    "params": {"sync_task_type": "event_refresh"},
+                }
+            ],
+        }
+    )
+
+    assert config.jobs[0].mutex_key == "ashare.event_records"
+
+
+def test_parse_scheduler_config_accepts_job_priority_and_resource_pool() -> None:
+    """调度任务应能声明优先级和资源池，供 loop 排队时做资源隔离。"""
+
+    config = parse_scheduler_config(
+        {
+            "enabled": True,
+            "resource_pools": {
+                "realtime": {"max_concurrent_jobs": 1, "description": "盘中轻任务"},
+            },
+            "jobs": [
+                {
+                    "name": "ashare.realtime_quotes",
+                    "job_type": "collection",
+                    "group": "ashare-p0",
+                    "enabled": True,
+                    "interval_seconds": 300,
+                    "market": "ashare",
+                    "priority": 800,
+                    "resource_pool": "realtime",
+                    "params": {"sync_task_type": "realtime_quote_refresh"},
+                }
+            ],
+        }
+    )
+
+    assert config.resource_pools["realtime"]["max_concurrent_jobs"] == 1
+    assert config.jobs[0].priority == 800
+    assert config.jobs[0].resource_pool == "realtime"
+
+
+def test_parse_scheduler_config_defaults_resource_pool_and_priority() -> None:
+    """旧版任务配置缺少资源池字段时应落到 default 池和默认优先级。"""
+
+    config = parse_scheduler_config(
+        {
+            "enabled": True,
+            "jobs": [
+                {
+                    "name": "ashare.capital_flow",
+                    "job_type": "collection",
+                    "group": "ashare-p1",
+                    "enabled": True,
+                    "interval_seconds": 1800,
+                    "market": "ashare",
+                    "params": {"sync_task_type": "capital_flow_refresh"},
+                }
+            ],
+        }
+    )
+
+    assert config.resource_pools["default"]["max_concurrent_jobs"] == config.max_concurrent_jobs
+    assert config.jobs[0].priority == 100
+    assert config.jobs[0].resource_pool == "default"
 
 
 def test_scheduler_passes_rate_policies_to_collection_args() -> None:
@@ -1896,6 +1977,352 @@ def test_scheduler_loop_runs_due_jobs_concurrently() -> None:
     assert time.perf_counter() - started_at < 1.5
 
 
+def test_scheduler_respects_resource_pool_limit() -> None:
+    """同一资源池达到上限时应跳过队首同池任务，先执行其它可用资源池任务。"""
+
+    started: list[str] = []
+    overlaps: list[str] = []
+    collection_running = threading.Event()
+    realtime_started = threading.Event()
+
+    def collect_base_data(args: Namespace) -> dict[str, Any]:
+        started.append(args.name)
+        if args.name == "collection.slow":
+            collection_running.set()
+            realtime_started.wait(timeout=1.5)
+            collection_running.clear()
+        elif args.name == "collection.second" and collection_running.is_set():
+            overlaps.append(args.name)
+        elif args.name == "realtime.quote":
+            realtime_started.set()
+        return {"status": "ok", "name": args.name}
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        max_concurrent_jobs=2,
+        loop_idle_seconds=0.01,
+        resource_pools={
+            "collection_heavy": {"max_concurrent_jobs": 1},
+            "realtime": {"max_concurrent_jobs": 1},
+        },
+        jobs=(
+            BaseDataSchedulerJob(
+                name="collection.slow",
+                group="ashare-p0",
+                interval_seconds=60,
+                resource_pool="collection_heavy",
+                params={"name": "collection.slow"},
+            ),
+            BaseDataSchedulerJob(
+                name="collection.second",
+                group="ashare-p1",
+                interval_seconds=60,
+                resource_pool="collection_heavy",
+                params={"name": "collection.second"},
+            ),
+            BaseDataSchedulerJob(
+                name="realtime.quote",
+                group="ashare-p2",
+                interval_seconds=60,
+                resource_pool="realtime",
+                params={"name": "realtime.quote"},
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        sleep_func=lambda _: None,
+    )
+
+    result = scheduler.run_loop(max_cycles=1)
+
+    assert result["cycles"] == 1
+    assert started[:2] == ["collection.slow", "realtime.quote"]
+    assert overlaps == []
+
+
+def test_scheduler_keeps_global_concurrency_limit_across_resource_pools() -> None:
+    """不同资源池的任务仍受全局任务并发限制。"""
+
+    started: list[str] = []
+    overlaps: list[str] = []
+    running = 0
+    lock = threading.Lock()
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    def collect_base_data(args: Namespace) -> dict[str, Any]:
+        nonlocal running
+        with lock:
+            running += 1
+            if running > 1:
+                overlaps.append(args.name)
+        started.append(args.name)
+        if args.name == "realtime.quote":
+            first_started.set()
+            release_first.wait(timeout=1.5)
+        with lock:
+            running -= 1
+        return {"status": "ok", "name": args.name}
+
+    def sleep(_: float) -> None:
+        if first_started.wait(timeout=1.5):
+            release_first.set()
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        max_concurrent_jobs=1,
+        loop_idle_seconds=0.01,
+        resource_pools={
+            "realtime": {"max_concurrent_jobs": 1},
+            "analytics": {"max_concurrent_jobs": 1},
+        },
+        jobs=(
+            BaseDataSchedulerJob(
+                name="realtime.quote",
+                group="ashare-p0",
+                interval_seconds=60,
+                resource_pool="realtime",
+                params={"name": "realtime.quote"},
+            ),
+            BaseDataSchedulerJob(
+                name="analytics.trigger",
+                group="ashare-p1",
+                interval_seconds=60,
+                resource_pool="analytics",
+                params={"name": "analytics.trigger"},
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        sleep_func=sleep,
+    )
+
+    result = scheduler.run_loop(max_cycles=1)
+
+    assert result["cycles"] == 1
+    assert started == ["realtime.quote", "analytics.trigger"]
+    assert overlaps == []
+
+
+def test_scheduler_queues_due_jobs_by_priority() -> None:
+    """同一轮到期任务应按 priority 降序入队。"""
+
+    started: list[str] = []
+
+    def collect_base_data(args: Namespace) -> dict[str, Any]:
+        started.append(args.name)
+        return {"status": "ok", "name": args.name}
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        max_concurrent_jobs=1,
+        loop_idle_seconds=0.01,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="low",
+                group="ashare-p0",
+                interval_seconds=60,
+                priority=100,
+                params={"name": "low"},
+            ),
+            BaseDataSchedulerJob(
+                name="high",
+                group="ashare-p1",
+                interval_seconds=60,
+                priority=800,
+                params={"name": "high"},
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        sleep_func=lambda _: None,
+    )
+
+    result = scheduler.run_loop(max_cycles=1)
+
+    assert result["cycles"] == 1
+    assert started == ["high", "low"]
+
+
+def test_scheduler_preserves_config_order_when_priority_ties() -> None:
+    """同优先级任务应保持配置顺序，避免同一轮调度顺序抖动。"""
+
+    started: list[str] = []
+
+    def collect_base_data(args: Namespace) -> dict[str, Any]:
+        started.append(args.name)
+        return {"status": "ok", "name": args.name}
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        max_concurrent_jobs=1,
+        loop_idle_seconds=0.01,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="first",
+                group="ashare-p0",
+                interval_seconds=60,
+                priority=500,
+                params={"name": "first"},
+            ),
+            BaseDataSchedulerJob(
+                name="second",
+                group="ashare-p1",
+                interval_seconds=60,
+                priority=500,
+                params={"name": "second"},
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        sleep_func=lambda _: None,
+    )
+
+    result = scheduler.run_loop(max_cycles=1)
+
+    assert result["cycles"] == 1
+    assert started == ["first", "second"]
+
+
+def test_scheduler_reloads_resource_pools_before_selecting_next_job(
+    tmp_path: Path,
+) -> None:
+    """loop 运行中修改资源池配置后，下一轮选 job 应读取新额度。"""
+
+    started: list[str] = []
+    collection_running = threading.Event()
+    release_collection = threading.Event()
+    config_file = tmp_path / "scheduler.json"
+
+    config_file.write_text(
+        json.dumps(
+                {
+                    "enabled": True,
+                    "cache_backend": "null",
+                    "loop_idle_seconds": 1,
+                    "max_job_retries": 0,
+                    "max_concurrent_jobs": 1,
+                    "resource_pools": {
+                        "collection_heavy": {"max_concurrent_jobs": 1},
+                        "realtime": {"max_concurrent_jobs": 1},
+                    },
+                    "jobs": [
+                        {
+                            "name": "collection.slow",
+                            "job_type": "data_quality_refresh",
+                            "group": "analytics",
+                            "enabled": True,
+                            "interval_seconds": 60,
+                            "resource_pool": "collection_heavy",
+                            "params": {
+                                "horizon": "collection.slow",
+                                "market": "ashare",
+                                "data_domains": ["bars"],
+                            },
+                        },
+                        {
+                            "name": "collection.second",
+                            "job_type": "data_quality_refresh",
+                            "group": "analytics",
+                            "enabled": True,
+                            "interval_seconds": 60,
+                            "resource_pool": "collection_heavy",
+                            "params": {
+                                "horizon": "collection.second",
+                                "market": "ashare",
+                                "data_domains": ["bars"],
+                            },
+                        },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    def write_hot_config() -> None:
+        payload = {
+            "enabled": True,
+            "cache_backend": "null",
+            "loop_idle_seconds": 1,
+            "max_job_retries": 0,
+            "max_concurrent_jobs": 2,
+            "resource_pools": {
+                "collection_heavy": {"max_concurrent_jobs": 2},
+                "realtime": {"max_concurrent_jobs": 1},
+            },
+            "jobs": [
+                {
+                    "name": "collection.slow",
+                    "job_type": "data_quality_refresh",
+                    "group": "analytics",
+                    "enabled": True,
+                    "interval_seconds": 60,
+                    "resource_pool": "collection_heavy",
+                    "params": {
+                        "horizon": "collection.slow",
+                        "market": "ashare",
+                        "data_domains": ["bars"],
+                    },
+                },
+                {
+                    "name": "collection.second",
+                    "job_type": "data_quality_refresh",
+                    "group": "analytics",
+                    "enabled": True,
+                    "interval_seconds": 60,
+                    "resource_pool": "collection_heavy",
+                    "params": {
+                        "horizon": "collection.second",
+                        "market": "ashare",
+                        "data_domains": ["bars"],
+                    },
+                },
+            ],
+        }
+        temp_file = config_file.with_suffix(".tmp")
+        temp_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temp_file.replace(config_file)
+
+    def run_data_quality_refresh(**kwargs: Any) -> dict[str, Any]:
+        job_name = kwargs.get("horizon")
+        started.append(str(job_name))
+        if job_name == "collection.slow":
+            collection_running.set()
+            write_hot_config()
+            release_collection.wait(timeout=1.5)
+            collection_running.clear()
+        elif job_name == "collection.second":
+            assert collection_running.is_set()
+            release_collection.set()
+        return {"status": "ok", "name": job_name}
+
+    config = replace(load_scheduler_config(config_file), job_timeout_seconds=0)
+    scheduler = BaseDataScheduler(
+        config,
+        run_data_quality_refresh_func=run_data_quality_refresh,
+        scheduler_config_file=config_file,
+        sleep_func=lambda _: None,
+    )
+
+    result = scheduler.run_loop(max_cycles=1)
+
+    assert result["cycles"] == 1
+    assert started[:2] == ["collection.slow", "collection.second"]
+
+
 def test_scheduler_loop_runs_market_universe_before_asset_dependents() -> None:
     """同一市场的资产池刷新应先于依赖资产池的采集任务执行，避免并发抢写资产主表。"""
 
@@ -1943,6 +2370,101 @@ def test_scheduler_loop_runs_market_universe_before_asset_dependents() -> None:
 
     assert result["cycles"] == 1
     assert started == ["ashare.universe.all"]
+
+
+def test_scheduler_loop_defers_same_mutex_key_jobs_until_active_job_finishes() -> None:
+    """同一互斥键的任务不能在已有运行任务时再次入队，避免新闻链路抢写 event_records。"""
+
+    started: list[str] = []
+    overlaps: list[str] = []
+    news_started = threading.Event()
+    release_news = threading.Event()
+    news_running = threading.Event()
+
+    def collect_base_data(args: Namespace) -> dict[str, Any]:
+        started.append(args.name)
+        if args.name == "ashare.events" and news_running.is_set():
+            overlaps.append(args.name)
+        if args.name == "ashare.news_articles":
+            news_running.set()
+            news_started.set()
+            release_news.wait(timeout=1.5)
+            news_running.clear()
+        return {"status": "ok", "name": args.name}
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        max_concurrent_jobs=2,
+        loop_idle_seconds=0.05,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="ashare.events",
+                group="ashare-p1",
+                interval_seconds=1,
+                market="ashare",
+                mutex_key="ashare.event_records",
+                params={
+                    "name": "ashare.events",
+                    "sync_task_type": "event_refresh",
+                },
+            ),
+            BaseDataSchedulerJob(
+                name="ashare.news_articles",
+                group="ashare-p1",
+                interval_seconds=0,
+                market="ashare",
+                schedule_type="after_success",
+                depends_on=("ashare.events",),
+                mutex_key="ashare.event_records",
+                params={
+                    "name": "ashare.news_articles",
+                    "sync_task_type": "event_article_enrichment",
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        sleep_func=lambda _: None,
+    )
+
+    try:
+        result = scheduler.run_loop(max_cycles=3)
+    finally:
+        release_news.set()
+
+    assert result["cycles"] == 3
+    assert started.count("ashare.events") == 2
+    assert started.count("ashare.news_articles") == 1
+    assert overlaps == []
+
+
+def test_scheduler_loop_records_failed_state_on_unexpected_error() -> None:
+    """loop 主循环出现未预期异常时应写入失败结果，而不是留下陈旧 running 状态。"""
+
+    def sleep(_: float) -> None:
+        raise RuntimeError("loop sleep failed")
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        loop_idle_seconds=1,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="manual.only",
+                group="ashare-p0",
+                interval_seconds=0,
+                schedule_type="manual",
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(config, sleep_func=sleep)
+
+    result = scheduler.run_loop(max_cycles=1)
+
+    assert result["failed"] is True
+    assert result["error_message"] == "loop sleep failed"
 
 
 def test_scheduler_loop_triggers_after_success_dependents() -> None:
@@ -3600,6 +4122,125 @@ def test_ashare_event_refresh_runs_stock_news_for_priority_assets_in_batches(
     assert notice_call["parameters"]["limit"] is None
 
 
+def test_ashare_event_refresh_full_scope_uses_tradeable_market_assets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """盘后全量新闻应从可交易资产池取标的，不走盘中重点池解析。"""
+
+    collect_base_data = import_collection_module()
+
+    calls: list[dict[str, Any]] = []
+    assets = [
+        Namespace(asset_id="ashare:000001", symbol="000001", market="ashare", asset_type="stock"),
+        Namespace(asset_id="ashare:600519", symbol="600519", market="ashare", asset_type="stock"),
+        Namespace(asset_id="ashare:300750", symbol="300750", market="ashare", asset_type="stock"),
+    ]
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            calls.append(
+                {
+                    "task": task,
+                    "provider_key": provider_key,
+                    "parameters": parameters,
+                    "force": force,
+                }
+            )
+            return Namespace(
+                task=task,
+                status="planned",
+                raw_record_id=None,
+                item_count=0,
+                error_message=None,
+                payload={},
+            )
+
+    class FakeAssetRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def find_by_market(self, market: str, *, only_tradable: bool = True) -> list[Any]:
+            assert market == "ashare"
+            return assets
+
+    monkeypatch.setattr(collect_base_data, "AssetRepository", FakeAssetRepository)
+    monkeypatch.setattr(
+        collect_base_data,
+        "resolve_ashare_priority_news_symbols",
+        lambda session, args: (_ for _ in ()).throw(
+            AssertionError("盘后全量新闻不应调用重点池解析器")
+        ),
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "should_refresh_asset_universe_before_incremental",
+        lambda session, *, market, min_asset_count=None: False,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p1"],
+        sync_task_type="event_refresh",
+        news_scope="full_tradeable",
+        symbol_source="market_assets",
+        batch_size=2,
+        priority_symbol_limit=0,
+    )
+
+    collect_base_data.run_ashare_p1(object(), args, RecordingRuntime())
+
+    news_calls = [item for item in calls if item["task"] == "ashare_p1_stock_news"]
+    assert [item["parameters"]["symbol"] for item in news_calls] == ["000001", "600519"]
+
+
+def test_ashare_news_retention_deletes_expired_article_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """新闻保留后台任务应删除过期新闻/公告事件和证据整行。"""
+
+    collect_base_data = import_collection_module()
+    calls: list[dict[str, Any]] = []
+
+    class FakeEventRepository:
+        def __init__(self, session: Any) -> None:
+            calls.append({"session": session})
+
+        def delete_expired_article_events(self, *, cutoff: datetime) -> dict[str, int]:
+            calls.append({"cutoff": cutoff})
+            return {"event_records": 2, "evidence": 3, "total": 5}
+
+    monkeypatch.setattr(collect_base_data, "EventRepository", FakeEventRepository, raising=False)
+    monkeypatch.setattr(
+        collect_base_data,
+        "build_ashare_p1_default_tasks",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("新闻保留任务不应落入 P1 默认采集包")
+        ),
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p1"],
+        sync_task_type="event_article_retention",
+        article_retention_days=90,
+    )
+
+    results = collect_base_data.run_ashare_p1(object(), args, object())
+
+    assert results[0].task == "ashare_p1_news_retention"
+    assert results[0].status == "available"
+    assert results[0].item_count == 5
+    assert results[0].payload["event_records"] == 2
+    assert results[0].payload["evidence"] == 3
+    assert datetime.now(tz=UTC) - calls[1]["cutoff"] >= timedelta(days=89)
+
+
 def test_ashare_priority_news_symbols_use_event_priority_resolver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4343,6 +4984,109 @@ def test_ashare_market_bars_uses_symbol_scoped_provider_circuit(
         "stock_zh_a_hist_tx:000001",
         "stock_zh_a_hist_tx:600519",
     ]
+
+
+def test_ashare_market_bars_skips_symbols_with_open_runtime_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 股 K 线运行时熔断已打开的标的，不应继续进入年度窗口请求。"""
+
+    collect_base_data = import_collection_module()
+    calls: list[dict[str, Any]] = []
+
+    class RecordingRuntime:
+        def run_task(
+            self,
+            *,
+            task: str,
+            provider_key: str,
+            parameters: dict[str, Any],
+            collect: Any,
+            force: bool = False,
+        ) -> Any:
+            calls.append(
+                {
+                    "task": task,
+                    "provider_key": provider_key,
+                    "parameters": parameters,
+                    "force": force,
+                }
+            )
+            return Namespace(
+                task=task,
+                status="available",
+                raw_record_id=None,
+                item_count=1,
+                error_message=None,
+                payload={},
+            )
+
+        def get_provider_state(self, provider_key: str) -> dict[str, Any]:
+            if provider_key == "stock_zh_a_hist_tx:001220":
+                return {
+                    "status": "open",
+                    "opened_until": datetime(2026, 6, 4, 10, 15, tzinfo=UTC).isoformat(),
+                }
+            return {}
+
+        def is_circuit_open(self, state: dict[str, Any]) -> bool:
+            return state.get("status") == "open"
+
+    monkeypatch.setattr(
+        collect_base_data,
+        "batch_ashare_symbols",
+        lambda session, limit, fallback_symbol, **kwargs: ["001220", "600519"],
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "should_refresh_asset_universe_before_incremental",
+        lambda session, market: False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "plan_ashare_market_bar_backfill_windows",
+        lambda session, symbols, **kwargs: {
+            "001220": [("20240101", "20241231"), ("20250101", "20251231")],
+            "600519": [("20240101", "20241231")],
+        },
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_data_sync_watermarks",
+        lambda *args, **kwargs: {},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "latest_ashare_trading_datetime",
+        lambda session, value: value,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "record_ashare_market_bar_watermark",
+        lambda *args, **kwargs: None,
+        raising=False,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p0"],
+        sync_task_type="market_bars_full_history_backfill",
+        symbol_source="market_assets",
+        limit=2,
+        batch_size=2,
+        ashare_start="20240101",
+        ashare_end="20251231",
+    )
+
+    results = collect_base_data.run_ashare_p0(object(), args, RecordingRuntime())
+
+    ohlcv_calls = [item for item in calls if item["task"] == "ashare_p0_ohlcv"]
+    assert [item["parameters"]["symbol"] for item in ohlcv_calls] == ["600519"]
+    skipped = [item for item in results if getattr(item, "payload", {}).get("symbol") == "001220"]
+    assert skipped
+    assert skipped[0].status == "skipped"
+    assert skipped[0].error_message == "Provider 熔断冷却中，等待后续批次重跑。"
 
 
 def test_batch_ashare_symbols_prefers_assets_with_less_market_bar_coverage(

@@ -1136,6 +1136,7 @@ def save_data_sync_config(
             enabled=request.enabled,
             cache_backend=request.cache_backend,
             max_concurrent_jobs=request.max_concurrent_jobs,
+            resource_pools=request.resource_pools,
             config_payload=request.config,
         )
     except Exception as exc:

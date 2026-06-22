@@ -171,7 +171,7 @@ class CollectionRuntime:
                 "last_error_message": None,
                 "updated_at": now.isoformat(),
             }
-        elif result.status in {"error", "unavailable"}:
+        elif result.status == "error":
             failure_count = int(state.get("failure_count") or 0) + 1
             next_state = {
                 "status": "closed",
@@ -190,7 +190,11 @@ class CollectionRuntime:
                 ).isoformat()
         else:
             next_state = state | {
+                "status": "closed",
+                "failure_count": int(state.get("failure_count") or 0),
                 "last_status": result.status,
+                "last_raw_record_id": result.raw_record_id,
+                "last_error_message": result.error_message,
                 "updated_at": now.isoformat(),
             }
 

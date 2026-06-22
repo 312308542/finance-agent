@@ -143,6 +143,7 @@ class DataSyncConfigUpdateRequest(BaseModel):
     enabled: bool = True
     cache_backend: str = "redis"
     max_concurrent_jobs: int = Field(4, ge=1, le=16)
+    resource_pools: JsonDict | None = None
     config: JsonDict | None = None
 
 

@@ -31,6 +31,7 @@ from finance_agent.storage.orm import (
     IndicatorFrameORM,
     RiskFindingORM,
 )
+from finance_agent.storage.event_retention import DEFAULT_EVENT_SIGNAL_LOOKBACK_DAYS
 from finance_agent.storage.repositories import (
     CapitalFlowRepository,
     DerivativeDataRepository,
@@ -112,7 +113,11 @@ class FactorService:
         valuation = valuation_history[-1] if valuation_history else None
         capital_flow = capital_flow_history[-1] if capital_flow_history else None
         derivative = derivative_history[-1] if derivative_history else None
-        events = self.events.list_recent_events(asset_id=asset_id, limit=20)
+        events = self.events.list_recent_events(
+            asset_id=asset_id,
+            limit=20,
+            max_age_days=DEFAULT_EVENT_SIGNAL_LOOKBACK_DAYS,
+        )
         risks = self.risks.list_recent_risks(asset_id=asset_id, limit=20)
 
         symbol, market = infer_symbol_market(

@@ -320,7 +320,19 @@ class FinanceAgentChatSession:
                 error_message = str(exc)
                 break
             model_audit.append(response.to_audit_dict() | {"iteration": iteration})
-            assistant_message = normalize_assistant_message_for_history(response)
+            requested_tools = normalize_openai_chat_tool_calls(
+                response.tool_calls,
+                tool_catalog=tool_catalog,
+                tool_name_map=tool_name_map,
+                owner_id=self.owner_id,
+                remaining=self.max_model_tool_calls - tool_call_count,
+            )
+            assistant_message = filter_assistant_tool_calls_for_history(
+                normalize_assistant_message_for_history(response),
+                allowed_tool_call_ids={
+                    str(request.get("tool_call_id") or "") for request in requested_tools
+                },
+            )
             messages.append(assistant_message)
             self._emit_event(
                 "model_result",
@@ -330,13 +342,6 @@ class FinanceAgentChatSession:
                     "tool_call_count": len(response.tool_calls),
                     "message": f"模型完成第 {iteration} 轮输出",
                 },
-            )
-            requested_tools = normalize_openai_chat_tool_calls(
-                response.tool_calls,
-                tool_catalog=tool_catalog,
-                tool_name_map=tool_name_map,
-                owner_id=self.owner_id,
-                remaining=self.max_model_tool_calls - tool_call_count,
             )
             if requested_tools:
                 for request in requested_tools:
@@ -948,6 +953,35 @@ def normalize_assistant_message_for_history(response: Any) -> JsonDict:
     if "content" not in message:
         message = {**message, "content": None}
     return dict(message)
+
+
+def filter_assistant_tool_calls_for_history(
+    assistant_message: JsonDict,
+    *,
+    allowed_tool_call_ids: set[str],
+) -> JsonDict:
+    """只保留后续会回填 tool 结果的 assistant tool_calls，避免模型协议断链。"""
+
+    message = dict(assistant_message)
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return message
+
+    filtered = [
+        tool_call
+        for tool_call in tool_calls
+        if isinstance(tool_call, dict) and str(tool_call.get("id") or "") in allowed_tool_call_ids
+    ]
+    if filtered:
+        message["tool_calls"] = filtered
+        if "content" not in message:
+            message["content"] = None
+        return message
+
+    message.pop("tool_calls", None)
+    if message.get("content") is None:
+        message["content"] = ""
+    return message
 
 
 def build_openai_tool_result_message(observation: JsonDict) -> JsonDict:

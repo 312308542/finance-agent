@@ -419,6 +419,13 @@ function TaskDetailView({
   const sourceRateStates = selectSourceRateStates(task, model.sourceRateStates);
   const workerValue = schedulerJob?.params?.max_workers || task.maxWorkers || task.metrics?.max_workers || "-";
   const effectiveSourceConcurrency = formatEffectiveSourceConcurrency(sourceRateStates);
+  const globalConcurrencyValue =
+    model.globalConcurrency.limit > 0
+      ? `${formatCompactNumber(model.globalConcurrency.running)} / ${formatCompactNumber(model.globalConcurrency.limit)}`
+      : "-";
+  const resourcePoolState = model.resourcePools[task.resourcePool];
+  const resourcePoolValue = formatResourcePoolRuntime(task.resourcePool, resourcePoolState);
+  const taskPriorityValue = Number.isFinite(task.priority) ? String(task.priority) : "-";
   const abnormalEvents = task.events.filter(
     (event) =>
       event.status === "failed" ||
@@ -684,6 +691,8 @@ function TaskDetailView({
             <span>任务 ID：{task.jobName || "未命名 job"}</span>
             <span>开始于 {formatDateTime(task.startedAt) || "--"}</span>
             <span>{task.isRealtime ? "实时快照" : "等待队列"}</span>
+            <span>资源池：{task.resourcePool || "default"}</span>
+            <span>优先级 {taskPriorityValue}</span>
           </div>
           {task.description ? <p className="task-detail-description">{task.description}</p> : null}
         </div>
@@ -962,6 +971,7 @@ function TaskDetailView({
           <div className="source-rate-list">
             {sourceRateStates.map((state) => {
               const tone = sourceRateTone(state);
+              const isEastmoneyCookie = state.sourceKey === "eastmoney_kline_cookie";
               return (
                 <article key={state.sourceKey} className={`source-rate-item tone-${tone}`}>
                   <span className="source-rate-icon">
@@ -969,21 +979,36 @@ function TaskDetailView({
                   </span>
                   <div className="source-rate-main">
                     <div className="source-rate-head">
-                      <strong>{state.sourceKey || "unknown_source"}</strong>
+                      <strong>{sourceRateTitle(state)}</strong>
                       <em>{sourceRateLabel(state)}</em>
                     </div>
-                    <div className="source-rate-metrics">
-                      <span>源有效并发 {state.effectiveMaxConcurrency || "-"}</span>
-                      <span>间隔 {formatRateInterval(state.effectiveMinIntervalSeconds)}</span>
-                      <span>失败率 {formatPercent(state.failureRate)}</span>
-                      <span>异常 {formatCompactNumber(sourceRateErrorCount(state))}</span>
-                    </div>
-                    <div className="source-rate-footer">
-                      <span>超时 {formatCompactNumber(state.timeoutCount)}</span>
-                      <span>断连 {formatCompactNumber(state.disconnectCount)}</span>
-                      <span>限流 {formatCompactNumber(state.rateLimitedCount)}</span>
-                      <span>恢复 {formatDateTime(state.nextRecoverAt)}</span>
-                    </div>
+                    {isEastmoneyCookie ? (
+                      <>
+                        <div className="source-rate-metrics">
+                          <span>冷却 {state.cooldownRemainingSeconds > 0 ? formatDuration(state.cooldownRemainingSeconds) : "-"}</span>
+                          <span>探测 {state.probeOk ? "通过" : state.state === "healthy" ? "通过" : "待验证"}</span>
+                          <span>有效 {state.effectiveMaxConcurrency > 0 ? "是" : "否"}</span>
+                        </div>
+                        <div className="source-rate-footer">
+                          <span title={state.lastErrorMessage || "暂无错误"}>{state.lastErrorMessage ? `上次错误 ${state.lastErrorMessage}` : "暂无 Cookie 校验错误"}</span>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="source-rate-metrics">
+                          <span>源有效并发 {state.effectiveMaxConcurrency || "-"}</span>
+                          <span>间隔 {formatRateInterval(state.effectiveMinIntervalSeconds)}</span>
+                          <span>失败率 {formatPercent(state.failureRate)}</span>
+                          <span>异常 {formatCompactNumber(sourceRateErrorCount(state))}</span>
+                        </div>
+                        <div className="source-rate-footer">
+                          <span>超时 {formatCompactNumber(state.timeoutCount)}</span>
+                          <span>断连 {formatCompactNumber(state.disconnectCount)}</span>
+                          <span>限流 {formatCompactNumber(state.rateLimitedCount)}</span>
+                          <span>恢复 {formatDateTime(state.nextRecoverAt)}</span>
+                        </div>
+                      </>
+                    )}
                   </div>
                 </article>
               );
@@ -1108,8 +1133,11 @@ function TaskDetailView({
 
       <footer className="task-runtime-grid">
         <MetricBlock label="执行节点" value={nodeValue} />
-        <MetricBlock label="任务配置并发" value={workerValue} />
+        <MetricBlock label="全局任务并发" value={globalConcurrencyValue} />
+        <MetricBlock label="资源池占用" value={resourcePoolValue} />
+        <MetricBlock label="任务 worker" value={workerValue} />
         <MetricBlock label="源有效并发" value={effectiveSourceConcurrency} />
+        <MetricBlock label="任务优先级" value={taskPriorityValue} />
         <MetricBlock label="吞吐量" value={`${formatCompactNumber(task.throughputPerMinute)} 条/分钟`} />
         <MetricBlock label="运行时长" value={formatDuration(durationSeconds)} />
         <MetricBlock label="错误数" value={task.summary.failedItems} />
@@ -1147,11 +1175,39 @@ function formatEffectiveSourceConcurrency(states: TaskMonitorSourceRateState[]):
   return [...new Set(values)].join(" / ");
 }
 
+function formatResourcePoolRuntime(
+  poolName: string,
+  state: { running: number; queued: number; limit: number } | undefined,
+): string {
+  const name = poolName || "default";
+  if (!state) {
+    return name;
+  }
+  const queued = state.queued > 0 ? `，排队 ${formatCompactNumber(state.queued)}` : "";
+  return `${name} ${formatCompactNumber(state.running)} / ${formatCompactNumber(state.limit)}${queued}`;
+}
+
 function sourceRateErrorCount(state: TaskMonitorSourceRateState): number {
   return state.failureCount + state.timeoutCount + state.disconnectCount + state.rateLimitedCount;
 }
 
+function sourceRateTitle(state: TaskMonitorSourceRateState): string {
+  if (state.sourceKey === "eastmoney_kline_cookie") {
+    return "东方财富 K 线 Cookie";
+  }
+  return state.sourceKey || "unknown_source";
+}
+
 function sourceRateTone(state: TaskMonitorSourceRateState): "green" | "amber" | "red" {
+  if (state.sourceKey === "eastmoney_kline_cookie") {
+    if (state.state === "cooling") {
+      return "red";
+    }
+    if (state.state === "healthy") {
+      return "green";
+    }
+    return "amber";
+  }
   if (state.rateLimitedCount > 0 || state.failureRate >= 0.2) {
     return "red";
   }
@@ -1162,6 +1218,15 @@ function sourceRateTone(state: TaskMonitorSourceRateState): "green" | "amber" | 
 }
 
 function sourceRateLabel(state: TaskMonitorSourceRateState): string {
+  if (state.sourceKey === "eastmoney_kline_cookie") {
+    if (state.state === "cooling") {
+      return "Cookie 冷却中";
+    }
+    if (state.state === "healthy") {
+      return "Cookie 可用";
+    }
+    return "等待 Cookie 探测";
+  }
   const tone = sourceRateTone(state);
   if (tone === "red") {
     return "退避中";

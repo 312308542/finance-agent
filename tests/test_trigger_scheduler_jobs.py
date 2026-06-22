@@ -53,7 +53,8 @@ def test_build_trigger_scheduler_jobs_exports_evaluate_and_consume_jobs() -> Non
 
     intraday = jobs["analytics.triggers.evaluate.intraday"]
     assert intraday["job_type"] == "trigger_evaluation"
-    assert intraday["enabled"] is False
+    assert intraday["enabled"] is True
+    assert intraday["schedule_type"] == "interval"
     assert intraday["interval_seconds"] == 15 * 60
     assert intraday["trading_day_policy"] == "ashare"
     assert intraday["params"]["trigger_groups"] == ["intraday_volatility", "position"]
@@ -105,8 +106,8 @@ def test_build_trigger_scheduler_jobs_exports_evaluate_and_consume_jobs() -> Non
     assert reviews_due["params"]["limit"] == 20
 
 
-def test_scheduler_payload_includes_trigger_jobs_with_intraday_disabled() -> None:
-    """导出的调度计划应包含触发任务，且盘中任务默认禁用。"""
+def test_scheduler_payload_includes_trigger_jobs_with_intraday_enabled() -> None:
+    """导出的调度计划应默认启用盘中触发评估，形成盘中观察闭环。"""
 
     config = build_preset_config("personal-comprehensive")
 
@@ -117,7 +118,8 @@ def test_scheduler_payload_includes_trigger_jobs_with_intraday_disabled() -> Non
     assert jobs["analytics.triggers.evaluate.daily"]["depends_on"] == [
         "ashare.bars.1d.close_final"
     ]
-    assert jobs["analytics.triggers.evaluate.intraday"]["enabled"] is False
+    assert jobs["analytics.triggers.evaluate.intraday"]["enabled"] is True
+    assert jobs["analytics.triggers.evaluate.intraday"]["schedule_type"] == "interval"
     assert jobs["agent.loop.consume.after_trigger"]["depends_on"] == [
         "analytics.triggers.evaluate.daily",
         "analytics.triggers.evaluate.intraday",

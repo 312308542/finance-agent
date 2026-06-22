@@ -7,6 +7,7 @@ const source = await readFile(new URL("../src/taskMonitorView.ts", import.meta.u
 const styleSource = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
 const appSource = await readFile(new URL("../src/pages/TaskMonitorPage.tsx", import.meta.url), "utf8");
 const apiSource = await readFile(new URL("../src/api.ts", import.meta.url), "utf8");
+const dataSyncPanelSource = await readFile(new URL("../src/pages/DataSyncControlPanel.tsx", import.meta.url), "utf8");
 const { outputText } = ts.transpileModule(source, {
   compilerOptions: {
     module: ts.ModuleKind.ES2022,
@@ -126,7 +127,32 @@ const progress = buildTaskMonitorModel({
         next_recover_at: "2026-06-03T15:50:12+08:00",
         updated_at: "2026-06-03T15:35:14+08:00",
       },
+      {
+        source_key: "eastmoney_kline_cookie",
+        state: "cooling",
+        cooldown_remaining_seconds: 600,
+        last_error_message: "curl: (56) Connection closed abruptly",
+        failure_rate: 1,
+        effective_max_concurrency: 0,
+        updated_at: "2026-06-03T15:35:15+08:00",
+      },
     ],
+    global_concurrency: {
+      running: 2,
+      limit: 4,
+    },
+    resource_pools: {
+      collection_heavy: {
+        running: 1,
+        queued: 2,
+        limit: 2,
+      },
+      realtime: {
+        running: 1,
+        queued: 0,
+        limit: 1,
+      },
+    },
     metrics: {
       running_count: 1,
       waiting_count: 1,
@@ -208,9 +234,39 @@ assert.deepEqual(progress.sourceRateStates, [
     effectiveMinIntervalSeconds: 2,
     nextRecoverAt: "2026-06-03T15:50:12+08:00",
     updatedAt: "2026-06-03T15:35:14+08:00",
+    state: "",
+    cooldownRemainingSeconds: 0,
+    lastErrorMessage: "",
+    probeOk: false,
+  },
+  {
+    sourceKey: "eastmoney_kline_cookie",
+    successCount: 0,
+    failureCount: 0,
+    timeoutCount: 0,
+    disconnectCount: 0,
+    rateLimitedCount: 0,
+    failureRate: 1,
+    effectiveMaxConcurrency: 0,
+    effectiveMinIntervalSeconds: 0,
+    nextRecoverAt: "",
+    updatedAt: "2026-06-03T15:35:15+08:00",
+    state: "cooling",
+    cooldownRemainingSeconds: 600,
+    lastErrorMessage: "curl: (56) Connection closed abruptly",
+    probeOk: false,
   },
 ]);
+assert.match(appSource, /东方财富 K 线 Cookie/);
+assert.match(appSource, /Cookie 冷却中/);
 assert.equal(progress.metrics.runningCount, 1);
+assert.deepEqual(progress.globalConcurrency, { running: 2, limit: 4 });
+assert.deepEqual(progress.resourcePools.collection_heavy, {
+  name: "collection_heavy",
+  running: 1,
+  queued: 2,
+  limit: 2,
+});
 assert.equal(statusTone("running"), "blue");
 assert.equal(statusTone("completed"), "green");
 assert.equal(statusTone("failed"), "red");
@@ -222,6 +278,8 @@ const schedulerCatalogTasks = extractSchedulerJobTasks({
         enabled: false,
         schedule_type: "manual",
         interval_seconds: 0,
+        priority: 900,
+        resource_pool: "collection_heavy",
       },
       {
         name: "disabled.interval.job",
@@ -235,6 +293,10 @@ const schedulerCatalogTasks = extractSchedulerJobTasks({
 assert.deepEqual(
   schedulerCatalogTasks.map((item) => item.job_name),
   ["ashare.bars.1d.bootstrap"],
+);
+assert.deepEqual(
+  schedulerCatalogTasks.map((item) => [item.job_name, item.priority, item.resource_pool]),
+  [["ashare.bars.1d.bootstrap", 900, "collection_heavy"]],
 );
 const progressWithCatalog = buildTaskMonitorModel(
   {
@@ -286,9 +348,8 @@ const completeButStillRunning = buildTaskMonitorModel({
     ],
   },
 });
-assert.equal(completeButStillRunning.items[0].status, "completed");
-assert.equal(completeButStillRunning.items[0].statusLabel, "已完成");
-assert.equal(completeButStillRunning.items[0].tone, "green");
+assert.equal(completeButStillRunning.items[0].status, "running");
+assert.equal(completeButStillRunning.items[0].tone, "blue");
 assert.equal(completeButStillRunning.items[0].progressRatio, 1);
 assert.match(
   styleSource,
@@ -335,7 +396,10 @@ assert.match(appSource, /<pre>{logDetail\.content}<\/pre>/);
 assert.match(appSource, /title={logLine}/);
 assert.match(appSource, /sourceRateStates = selectSourceRateStates\(task, model\.sourceRateStates\)/);
 assert.match(appSource, /effectiveSourceConcurrency/);
-assert.match(appSource, /label="任务配置并发"/);
+assert.match(appSource, /label="全局任务并发"/);
+assert.match(appSource, /label="资源池占用"/);
+assert.match(appSource, /label="任务 worker"/);
+assert.match(appSource, /label="任务优先级"/);
 assert.match(appSource, /label="源有效并发"/);
 assert.match(appSource, /数据源限频与退避/);
 assert.match(appSource, /source-rate-list/);
@@ -364,6 +428,11 @@ assert.match(apiSource, /runDataSchedulerJob/);
 assert.match(apiSource, /rerunFailedDataSchedulerJob/);
 assert.match(apiSource, /\/rerun-failed/);
 assert.match(apiSource, /updateDataSchedulerJob/);
+assert.match(apiSource, /resource_pools\?: Record<string, DataSyncResourcePoolPayload>/);
+assert.match(dataSyncPanelSource, /资源池配置/);
+assert.match(dataSyncPanelSource, /resourcePools/);
+assert.match(dataSyncPanelSource, /setResourcePoolLimit/);
+assert.match(dataSyncPanelSource, /resource_pools: resourcePools/);
 assert.match(styleSource, /\.task-log-popover\s*{[\s\S]*?position:\s*absolute;/);
 assert.match(styleSource, /\.task-log-popover pre\s*{[\s\S]*?white-space:\s*pre-wrap;/);
 assert.match(styleSource, /\.task-config-drawer\s*{/);
@@ -390,6 +459,10 @@ assert.deepEqual(
   ["ashare.bars.1d", "crypto_future.bars.1h"],
 );
 assert.deepEqual(
+  filterTaskMonitorItems(progress.items, "all", "market_bars").map((item) => item.jobName),
+  ["ashare.bars.1d", "crypto_future.bars.1h"],
+);
+assert.deepEqual(
   filterTaskMonitorItems(progress.items, "waiting", "ashare").map((item) => item.jobName),
   ["quality.ashare"],
 );
@@ -397,6 +470,13 @@ assert.deepEqual(
 assert.equal(
   formatTaskLogLine(progress.items[0].events[0]),
   "[15:35:12] 完成 600519 贵州茅台 · 批次 18/27",
+);
+assert.equal(
+  formatTaskLogLine({
+    ...progress.items[0].events[0],
+    status: "skipped",
+  }),
+  "[15:35:12] 跳过 600519 贵州茅台 · 批次 18/27",
 );
 assert.equal(
   formatTaskLogLine(progress.items[0].events[1]),
@@ -442,6 +522,18 @@ assert.deepEqual(describeSchedulerJob("quality.crypto_future"), {
 assert.deepEqual(describeSchedulerJob("analytics.recommendations.ashare.all_a"), {
   title: "A 股全市场推荐计算",
   description: "基于最新行情、因子、风险和数据质量生成 A 股候选池评分与推荐结果。",
+});
+assert.deepEqual(describeSchedulerJob("analytics.technical_screening.ashare.main_board"), {
+  title: "A 股主板技术初筛",
+  description: "基于最新日 K 计算技术指标并写入 indicator_frames，为主板股票生成技术初筛结果。",
+});
+assert.deepEqual(describeSchedulerJob("analytics.universe.merge.ashare.recommendation"), {
+  title: "A 股推荐候选池合并",
+  description: "合并技术初筛、研究池和回避池规则，生成推荐流水线使用的 A 股候选 Universe。",
+});
+assert.deepEqual(describeSchedulerJob("analytics.triggers.evaluate.daily"), {
+  title: "每日触发事件评估",
+  description: "读取推荐、风险、观察池和数据质量变化，生成需要 Agent 消费的触发事件。",
 });
 assert.equal(
   describeSchedulerJob("custom.future.task").description,

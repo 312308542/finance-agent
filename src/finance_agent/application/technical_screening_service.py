@@ -22,6 +22,7 @@ from finance_agent.storage.repositories import (
     AssetRepository,
     MarketDataRepository,
     ScreeningRepository,
+    UniverseRepository,
 )
 
 JsonDict = dict[str, Any]
@@ -79,6 +80,7 @@ class TechnicalScreeningService:
         assets: AssetRepository | None = None,
         market_data: MarketDataRepository | None = None,
         screenings: ScreeningRepository | None = None,
+        universes: UniverseRepository | None = None,
         eligibility: TradeableAssetEligibilityService | None = None,
     ) -> None:
         self.session = session
@@ -89,6 +91,7 @@ class TechnicalScreeningService:
         self.screenings = screenings or (
             ScreeningRepository(session) if session is not None else None
         )
+        self.universes = universes or (UniverseRepository(session) if session is not None else None)
         self.eligibility = eligibility or TradeableAssetEligibilityService()
 
     def screen_ashare(
@@ -280,6 +283,76 @@ class TechnicalScreeningService:
         )
         for candidate in result.candidates:
             self._upsert_candidate(result=result, candidate=candidate)
+        self._persist_universe(
+            result=result,
+            as_of=as_of,
+            timeframe=timeframe,
+            min_bars=min_bars,
+        )
+
+    def _persist_universe(
+        self,
+        *,
+        result: TechnicalScreeningRunResult,
+        as_of: datetime,
+        timeframe: str,
+        min_bars: int,
+    ) -> None:
+        """把技术初筛快照同步成候选池，供合并和推荐链路复用。"""
+
+        if self.universes is None:
+            return
+        self.universes.upsert_universe(
+            universe_id=result.universe_id,
+            name=build_technical_universe_name(result.market),
+            source=f"internal:{TECHNICAL_SCREENING_SOURCE_TYPE}",
+            market=result.market,
+            strategy_context=result.strategy,
+            as_of=as_of,
+            total_before_filter=result.candidate_count,
+            total_after_filter=result.accepted_count,
+            filters={
+                "rule_version": result.strategy,
+                "timeframe": timeframe,
+                "min_bars": min_bars,
+                "ttl_days": DEFAULT_TECHNICAL_SCREENING_TTL_DAYS,
+            },
+            payload={
+                "schema_version": "1.0",
+                "source_type": TECHNICAL_SCREENING_SOURCE_TYPE,
+                "screening_id": result.screening_id,
+                "accepted_count": result.accepted_count,
+                "rejected_count": result.rejected_count,
+                "skipped_count": result.skipped_count,
+                "rule_hits": result.rule_hits,
+                "recommendation_semantics": "not_buy_signal",
+            },
+        )
+        ordered_candidates = sorted(
+            result.candidates,
+            key=lambda item: (not item.passed, -item.technical_score, item.symbol),
+        )
+        self.universes.replace_members(
+            universe_id=result.universe_id,
+            members=[
+                {
+                    "member_id": f"universe_member:{result.universe_id}:{candidate.asset_id}",
+                    "asset_id": candidate.asset_id,
+                    "symbol": candidate.symbol,
+                    "market": candidate.market,
+                    "as_of": candidate.as_of,
+                    "included": candidate.passed,
+                    "removed_reason": candidate.removed_reason,
+                    "rank_hint": index,
+                    "payload": {
+                        **candidate.payload,
+                        "source_type": TECHNICAL_SCREENING_SOURCE_TYPE,
+                        "screening_id": result.screening_id,
+                    },
+                }
+                for index, candidate in enumerate(ordered_candidates, start=1)
+            ],
+        )
 
     def _upsert_candidate(
         self,
@@ -474,6 +547,16 @@ def build_technical_screening_id(*, market: str, as_of: datetime) -> str:
     if market == "ashare":
         return f"screen:technical:ashare:main_board:{normalized}"
     return f"screen:technical:{market}:{normalized}"
+
+
+def build_technical_universe_name(market: str) -> str:
+    """生成技术初筛候选池的中文名称。"""
+
+    if market == "ashare":
+        return "A 股技术初筛候选池"
+    if market == "fund":
+        return "基金技术初筛候选池"
+    return f"{market} 技术初筛候选池"
 
 
 def normalize_datetime(value: datetime) -> datetime:

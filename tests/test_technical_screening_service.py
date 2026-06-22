@@ -8,6 +8,7 @@ from typing import Any
 from finance_agent.application.technical_screening_service import (
     TECHNICAL_SCREENING_SOURCE_TYPE,
     TECHNICAL_SCREENING_STRATEGY,
+    TECHNICAL_SCREENING_UNIVERSE_ID,
     TechnicalScreeningService,
 )
 
@@ -114,6 +115,40 @@ def test_technical_screening_persists_screening_result_items() -> None:
     assert fake_screenings.items[0]["payload"]["expires_at"] == candidate_iso(result)
 
 
+def test_technical_screening_persists_universe_members_for_merge_source() -> None:
+    """技术初筛结果应同步成候选池，供后续推荐候选池合并任务读取。"""
+
+    as_of = datetime(2026, 6, 9, 15, 30, tzinfo=UTC)
+    fake_screenings = FakeScreeningRepository()
+    fake_universes = FakeUniverseRepository()
+    service = TechnicalScreeningService(
+        session=None,
+        screenings=fake_screenings,
+        universes=fake_universes,
+    )
+
+    result = service.screen_assets(
+        assets=[asset("ashare:600519", "600519"), asset("ashare:000001", "000001")],
+        bars_by_asset_id={
+            "ashare:600519": rising_bars("600519", as_of=as_of, count=260),
+            "ashare:000001": rising_bars("000001", as_of=as_of, count=120),
+        },
+        as_of=as_of,
+        min_bars=250,
+        persist=True,
+    )
+
+    assert fake_universes.universes[0]["universe_id"] == TECHNICAL_SCREENING_UNIVERSE_ID
+    assert fake_universes.universes[0]["total_before_filter"] == 2
+    assert fake_universes.universes[0]["total_after_filter"] == 1
+    assert fake_universes.universes[0]["payload"]["screening_id"] == result.screening_id
+    members = fake_universes.members[TECHNICAL_SCREENING_UNIVERSE_ID]
+    assert [item["asset_id"] for item in members if item["included"]] == ["ashare:600519"]
+    assert [item["asset_id"] for item in members if not item["included"]] == ["ashare:000001"]
+    assert members[0]["payload"]["screening_id"] == result.screening_id
+    assert members[0]["payload"]["source_type"] == TECHNICAL_SCREENING_SOURCE_TYPE
+
+
 class FakeScreeningRepository:
     def __init__(self) -> None:
         self.results: list[dict[str, Any]] = []
@@ -127,6 +162,20 @@ class FakeScreeningRepository:
         self.items.append(kwargs)
         payload = dict(kwargs.get("payload") or {})
         return SimpleNamespace(source_type=payload.get("source_type"), **kwargs)
+
+
+class FakeUniverseRepository:
+    def __init__(self) -> None:
+        self.universes: list[dict[str, Any]] = []
+        self.members: dict[str, list[dict[str, Any]]] = {}
+
+    def upsert_universe(self, **kwargs: Any) -> SimpleNamespace:
+        self.universes.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    def replace_members(self, *, universe_id: str, members: list[dict[str, Any]]) -> list[Any]:
+        self.members[universe_id] = list(members)
+        return [SimpleNamespace(**member) for member in members]
 
 
 class FakeAssetRepository:

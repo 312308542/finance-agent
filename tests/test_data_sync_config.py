@@ -30,6 +30,46 @@ def test_scheduler_exports_timely_ashare_event_tasks_every_five_minutes() -> Non
     assert job_intervals["ashare.risk_sentiment"] == 5 * 60
 
 
+def test_scheduler_exports_intraday_ashare_jobs_with_explicit_policies() -> None:
+    """盘中持续任务需要显式导出 interval 类型和交易日策略，避免依赖隐式默认值。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+
+    assert jobs["ashare.realtime_quotes"]["schedule_type"] == "interval"
+    assert jobs["ashare.realtime_quotes"]["trading_day_policy"] == "trading_day_only"
+    assert jobs["ashare.realtime_quotes"]["interval_seconds"] == 5 * 60
+
+    assert jobs["ashare.capital_flow"]["schedule_type"] == "interval"
+    assert jobs["ashare.capital_flow"]["trading_day_policy"] == "trading_day_only"
+    assert jobs["ashare.capital_flow"]["interval_seconds"] == 30 * 60
+
+    assert jobs["ashare.events"]["schedule_type"] == "interval"
+    assert jobs["ashare.events"]["trading_day_policy"] == "any_day"
+    assert jobs["ashare.events"]["interval_seconds"] == 5 * 60
+
+    assert jobs["ashare.risk_sentiment"]["schedule_type"] == "interval"
+    assert jobs["ashare.risk_sentiment"]["trading_day_policy"] == "trading_day_only"
+    assert jobs["ashare.risk_sentiment"]["interval_seconds"] == 5 * 60
+
+
+def test_scheduler_exports_ashare_universe_as_early_morning_calendar_job() -> None:
+    """A 股资产池刷新不应在 loop 每次重启时立刻运行，避免盘中阻塞实时任务。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+    universe_job = jobs["ashare.universe.all"]
+
+    assert universe_job["schedule_type"] == "daily_time"
+    assert universe_job["run_at"] == ["04:30"]
+    assert universe_job["timezone"] == "Asia/Shanghai"
+    assert universe_job["trading_day_policy"] == "trading_day_only"
+
+
 def test_preview_exposes_cleaning_and_scheduled_analytics_processing_plan() -> None:
     config = build_preset_config("personal-comprehensive")
 
@@ -333,6 +373,44 @@ def test_scheduler_payload_exports_source_rate_policies() -> None:
     assert policies["stock_zh_a_hist_tx"]["backoff"]["cooldown_seconds"] == 900
 
 
+def test_scheduler_payload_exports_default_resource_pools() -> None:
+    """调度计划应导出默认资源池，让 loop 能隔离高频轻任务和重采集任务。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    pools = scheduler_payload["resource_pools"]
+
+    assert pools["realtime"]["max_concurrent_jobs"] == 1
+    assert pools["collection_heavy"]["max_concurrent_jobs"] == 2
+    assert pools["article_enrichment"]["max_concurrent_jobs"] == 1
+    assert pools["analytics"]["max_concurrent_jobs"] == 1
+    assert pools["agent"]["max_concurrent_jobs"] == 1
+    assert pools["maintenance"]["max_concurrent_jobs"] == 1
+
+
+def test_ashare_scheduler_jobs_export_priority_and_resource_pool() -> None:
+    """A 股关键任务应带有明确资源池和优先级，避免长任务挤压盘中任务。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+
+    assert jobs["ashare.realtime_quotes"]["resource_pool"] == "realtime"
+    assert jobs["ashare.realtime_quotes"]["priority"] == 800
+    assert jobs["ashare.risk_sentiment"]["resource_pool"] == "realtime"
+    assert jobs["ashare.risk_sentiment"]["priority"] == 700
+    assert jobs["ashare.bars.1d.close_final"]["resource_pool"] == "collection_heavy"
+    assert jobs["ashare.bars.1d.close_final"]["priority"] == 650
+    assert jobs["ashare.news_articles"]["resource_pool"] == "article_enrichment"
+    assert jobs["ashare.news_articles"]["priority"] == 400
+    assert jobs["analytics.recommendations.ashare.all_a"]["resource_pool"] == "analytics"
+    assert jobs["analytics.recommendations.ashare.all_a"]["priority"] == 550
+    assert jobs["analytics.triggers.evaluate.intraday"]["resource_pool"] == "realtime"
+    assert jobs["analytics.triggers.evaluate.intraday"]["priority"] == 800
+
+
 def test_parse_data_sync_config_backfills_default_source_rate_policies() -> None:
     """旧版运行时配置缺少 rate_policies 时，应自动补齐默认源级限频策略。"""
 
@@ -425,6 +503,30 @@ def test_scheduler_payload_limits_priority_stock_news_symbols() -> None:
 
     assert event_params["priority_symbol_limit"] == 200
     assert "source_limit" not in event_params
+
+
+def test_scheduler_payload_splits_intraday_and_full_stock_news_jobs() -> None:
+    """盘中新闻只采集重点池，盘后新闻再按可交易资产池做全量补采。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+
+    intraday = jobs["ashare.events"]
+    full = jobs["ashare.events.full"]
+
+    assert intraday["schedule_type"] == "interval"
+    assert intraday["params"]["news_scope"] == "priority"
+    assert intraday["params"]["priority_symbol_limit"] == 200
+    assert intraday["params"]["symbol_source"] == "market_assets"
+
+    assert full["schedule_type"] == "daily_time"
+    assert full["run_at"] == ["18:20"]
+    assert full["trading_day_policy"] == "trading_day_only"
+    assert full["params"]["news_scope"] == "full_tradeable"
+    assert full["params"]["priority_symbol_limit"] == 0
+    assert full["limit"] is None
 
 
 def test_scheduler_payload_uses_timeout_long_enough_for_full_market_bar_batches() -> None:
@@ -550,10 +652,41 @@ def test_scheduler_payload_splits_stock_news_article_enrichment_task() -> None:
     assert article_job["job_type"] == "collection"
     assert article_job["group"] == "ashare-p1"
     assert article_job["schedule_type"] == "after_success"
-    assert article_job["depends_on"] == ["ashare.events"]
+    assert article_job["depends_on"] == ["ashare.events", "ashare.events.full"]
     assert article_job["params"]["sync_task_type"] == "event_article_enrichment"
     assert article_job["params"]["sources"] == ["stock_news_article"]
     assert article_job["params"]["max_workers"] == 1
+
+
+def test_scheduler_payload_exports_news_retention_maintenance_job() -> None:
+    """过期新闻/公告事件清理应作为低频后台维护任务定时执行。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+
+    retention_job = jobs["ashare.news_retention"]
+    assert retention_job["job_type"] == "collection"
+    assert retention_job["group"] == "ashare-p1"
+    assert retention_job["schedule_type"] == "daily_time"
+    assert retention_job["run_at"] == ["19:10"]
+    assert retention_job["resource_pool"] == "maintenance"
+    assert retention_job["mutex_key"] == "ashare.event_records"
+    assert retention_job["params"]["sync_task_type"] == "event_article_retention"
+    assert retention_job["params"]["article_retention_days"] == 90
+
+
+def test_scheduler_payload_serializes_news_event_mutex_key() -> None:
+    """新闻列表和正文补抓应声明同一互斥键，避免 loop 中并发写 event_records。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    scheduler_payload = export_scheduler_payload(config)
+    jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
+
+    assert jobs["ashare.events"]["mutex_key"] == "ashare.event_records"
+    assert jobs["ashare.news_articles"]["mutex_key"] == "ashare.event_records"
 
 
 def test_recommendation_jobs_enable_default_watchlist_intake() -> None:

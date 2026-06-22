@@ -5,7 +5,54 @@ import type { ConsolePageProps } from "../consoleTypes";
 import { DataTable, MetricBlock, Panel, TaskQueueList } from "../components/consoleCommon";
 import { filterPreviewTasksByMarkets, marketsForPreset, pickEnabledMarkets, processingStatusLabel, schedulerStartFeedback, type SchedulerStartFeedback, summarizeProcessingPlan, summarizeSchedulerQueue, summarizeSchedulerStatus, summarizeSchedulerWritePolicy } from "../dataSyncView";
 
-function clampSchedulerConcurrency(value: unknown): number {
+type ResourcePoolConfig = {
+  max_concurrent_jobs: number;
+  description?: string;
+  [key: string]: unknown;
+};
+
+const resourcePoolOrder = [
+  "realtime",
+  "collection_heavy",
+  "article_enrichment",
+  "analytics",
+  "agent",
+  "maintenance",
+  "default",
+];
+
+const resourcePoolLabels: Record<string, { title: string; fallbackDescription: string }> = {
+  realtime: {
+    title: "盘中实时池",
+    fallbackDescription: "盘中行情、风险情绪和触发器等轻量高优先级任务。",
+  },
+  collection_heavy: {
+    title: "重采集池",
+    fallbackDescription: "K 线、基本面、资金流、新闻列表等外部数据采集任务。",
+  },
+  article_enrichment: {
+    title: "正文补抓池",
+    fallbackDescription: "新闻正文二次补抓，避免慢任务占用主采集资源。",
+  },
+  analytics: {
+    title: "分析计算池",
+    fallbackDescription: "技术初筛、候选池合并、数据质量和推荐计算。",
+  },
+  agent: {
+    title: "Agent 池",
+    fallbackDescription: "Agent 事件消费和高风险复核，避免模型调用并发放大。",
+  },
+  maintenance: {
+    title: "维护任务池",
+    fallbackDescription: "回测、到期复盘等低频维护任务。",
+  },
+  default: {
+    title: "默认兜底池",
+    fallbackDescription: "未分类任务的兜底资源池。",
+  },
+};
+
+function clampSchedulerConcurrency(value: unknown): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) {
     return 4;
@@ -13,7 +60,32 @@ function clampSchedulerConcurrency(value: unknown): number {
   return Math.min(16, Math.max(1, Math.round(parsed)));
 }
 
-export function DataSyncControlPanel({
+function normalizeResourcePools(
+  value: unknown,
+  fallbackMaxConcurrentJobs: number,
+): Record<string, ResourcePoolConfig> {
+  const raw = value && typeof value === "object" ? (value as Record<string, any>) : {};
+  const normalized: Record<string, ResourcePoolConfig> = {};
+  const names = Array.from(new Set([...resourcePoolOrder, ...Object.keys(raw)]));
+  names.forEach((name) => {
+    const payload = raw[name] && typeof raw[name] === "object" ? raw[name] : {};
+    normalized[name] = {
+      ...payload,
+      max_concurrent_jobs: clampSchedulerConcurrency(
+        payload.max_concurrent_jobs ?? (name === "default" ? fallbackMaxConcurrentJobs : 1),
+      ),
+      description: String(
+        payload.description
+          ?? resourcePoolLabels[name]?.fallbackDescription
+          ?? "自定义调度资源池。",
+      ),
+    };
+  });
+  return normalized;
+}
+
+
+export function DataSyncControlPanel({
   dataSyncConfig,
   dataSchedulerStatus,
   refreshDataSync,
@@ -33,7 +105,11 @@ export function DataSyncControlPanel({
   const configuredMaxConcurrentJobs = clampSchedulerConcurrency(
     config.max_concurrent_jobs ?? preview.max_concurrent_jobs ?? schedulerPayload.max_concurrent_jobs ?? 4,
   );
-  const queueSummary = summarizeSchedulerQueue(dataSchedulerStatus, configuredMaxConcurrentJobs);
+  const queueSummary = summarizeSchedulerQueue(dataSchedulerStatus, configuredMaxConcurrentJobs);
+  const configuredResourcePools = normalizeResourcePools(
+    config.resource_pools ?? schedulerPayload.resource_pools,
+    configuredMaxConcurrentJobs,
+  );
   const [preset, setPreset] = React.useState(config.preset ?? "personal-comprehensive");
   const [cacheBackend, setCacheBackend] = React.useState(config.cache_backend ?? "redis");
   const [enabled, setEnabled] = React.useState(config.enabled ?? true);
@@ -41,7 +117,9 @@ export function DataSyncControlPanel({
   const [maxConcurrentJobs, setMaxConcurrentJobs] = React.useState(
     clampSchedulerConcurrency(configuredMaxConcurrentJobs),
   );
-  const [saving, setSaving] = React.useState(false);
+  const [resourcePools, setResourcePools] = React.useState(configuredResourcePools);
+
+  const [saving, setSaving] = React.useState(false);
   const [running, setRunning] = React.useState(false);
   const [saveStatus, setSaveStatus] = React.useState("未保存");
   const [schedulerStartFeedbackState, setSchedulerStartFeedbackState] =
@@ -55,13 +133,17 @@ export function DataSyncControlPanel({
     setCacheBackend(config.cache_backend ?? "redis");
     setEnabled(config.enabled ?? true);
     setMarkets(pickEnabledMarkets(config));
-    setMaxConcurrentJobs(clampSchedulerConcurrency(configuredMaxConcurrentJobs));
+    setMaxConcurrentJobs(clampSchedulerConcurrency(configuredMaxConcurrentJobs));
+
+    setResourcePools(configuredResourcePools);
   }, [
     config.preset,
     config.cache_backend,
     config.enabled,
     enabledMarkets.join(","),
-    configuredMaxConcurrentJobs,
+    configuredMaxConcurrentJobs,
+
+    JSON.stringify(configuredResourcePools),
   ]);
 
   React.useEffect(() => {
@@ -86,6 +168,16 @@ export function DataSyncControlPanel({
 
   };
 
+  const setResourcePoolLimit = (poolName: string, value: unknown) => {
+    setResourcePools((current) => ({
+      ...current,
+      [poolName]: {
+        ...(current[poolName] ?? {}),
+        max_concurrent_jobs: clampSchedulerConcurrency(value),
+      },
+    }));
+  };
+
 
 
   const saveConfig = async () => {
@@ -96,7 +188,8 @@ export function DataSyncControlPanel({
         markets,
         enabled,
         cache_backend: cacheBackend,
-        max_concurrent_jobs: maxConcurrentJobs,
+        max_concurrent_jobs: maxConcurrentJobs,
+        resource_pools: resourcePools,
       });
       setSaveStatus(result.status === "ok" ? "配置已保存" : result.message ?? "保存失败");
       await refreshDataSync?.();
@@ -191,7 +284,36 @@ export function DataSyncControlPanel({
               }
             />
           </label>
-          <div className="concurrency-strip">
+          <div className="resource-pool-config">
+            <div className="resource-pool-config-head">
+              <strong>资源池配置</strong>
+              <span>保存后调度器下一轮选任务前热生效，运行中的任务不会被中断。</span>
+            </div>
+            <div className="resource-pool-grid">
+              {Object.entries(resourcePools).map(([poolName, pool]) => {
+                const label = resourcePoolLabels[poolName];
+                return (
+                  <label key={poolName} className="resource-pool-card">
+                    <span title={pool.description || label?.fallbackDescription}>
+                      {label?.title ?? poolName}
+                    </span>
+                    <em>{poolName}</em>
+                    <input
+                      type="number"
+                      min={1}
+                      max={16}
+                      step={1}
+                      value={pool.max_concurrent_jobs}
+                      onChange={(event) => setResourcePoolLimit(poolName, event.target.value)}
+                      title={`${label?.title ?? poolName} 最大并发任务数`}
+                    />
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="concurrency-strip">
             <span>运行 {queueSummary.runningJobs.length} / {queueSummary.maxConcurrentJobs}</span>
             <span>排队 {queueSummary.queuedJobs.length}</span>
           </div>

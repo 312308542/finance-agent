@@ -2400,6 +2400,77 @@ tbody tr:last-child td {
   background: #0b111b;
 }
 
+.resource-pool-config {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0b111b;
+}
+
+.resource-pool-config-head {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.resource-pool-config-head strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.resource-pool-config-head span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.resource-pool-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.resource-pool-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 68px;
+  gap: 3px 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  background: #0d1420;
+}
+
+.resource-pool-card span {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.resource-pool-card em {
+  grid-column: 1;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.resource-pool-card input {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  min-height: 34px;
+  padding: 0 8px;
+  text-align: center;
+}
+
 .scheduler-queue-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -4847,6 +4918,7 @@ tbody tr:last-child td {
   .workflow-chip-list,
   .task-metric-grid,
   .task-runtime-grid,
+  .resource-pool-grid,
   .stage-row,
   .openai-model-console,
   .endpoint-form-grid,

@@ -411,12 +411,14 @@ def test_scheduler_progress_includes_source_rate_states() -> None:
     assert state["updated_at"]
 
 
-def test_scheduler_progress_degrades_when_redis_is_unavailable() -> None:
+def test_scheduler_progress_degrades_when_redis_is_unavailable(tmp_path: Path) -> None:
     """Redis 不可用时接口返回 degraded，且不尝试从 PostgreSQL 补进度。"""
 
     response = DataSyncControlService().read_scheduler_progress(
         cache=NullCacheClient(),
         cache_backend="null",
+        scheduler_config_file=tmp_path / "missing_scheduler.json",
+        manual_run_dir=tmp_path / "empty_manual_runs",
         redis_error_message="Redis unavailable",
     )
 
@@ -427,6 +429,8 @@ def test_scheduler_progress_degrades_when_redis_is_unavailable() -> None:
             "cache_backend": "null",
             "tasks": [],
             "waiting": [],
+            "global_concurrency": {"running": 0, "limit": 0},
+            "resource_pools": {},
         },
     }
 
@@ -659,6 +663,251 @@ def test_ashare_full_asset_refresh_emits_progress_events(monkeypatch) -> None:
     assert events[-1]["item_count"] == 5530
     snapshot = cache.values[f"base_data:task:{job_name}:run:{run_id}:snapshot"]
     assert snapshot["stages"][0]["stage_key"] == "ashare_p0_assets"
+
+
+def test_ashare_universe_p1_progress_extends_total_after_p0(monkeypatch) -> None:
+    """A 股 Universe P1 成员采集应纳入同一任务总进度，不能让 P0 完成后总进度误报 100%。"""
+
+    from finance_agent.scheduler.base_data_progress import BaseDataTaskProgressRecorder
+
+    collect_base_data = import_collection_module()
+
+    cache = RecordingCache()
+    job_name = "ashare.universe.all"
+    recorder = BaseDataTaskProgressRecorder(cache=cache, cache_backend="redis")
+    run_id = recorder.job_started(
+        job_name=job_name,
+        title=job_name,
+        market="ashare",
+        task_type="universe_refresh",
+        interval_seconds=86400,
+    )
+
+    class AssetRuntime:
+        def run_task(self, *, task, provider_key, parameters, collect, force=False):
+            return CollectionTaskResult(
+                task=task,
+                status="available",
+                raw_record_id="raw-assets",
+                item_count=5528,
+                error_message=None,
+                payload={},
+            )
+
+    args = collect_base_data.default_collection_args(
+        progress_job_name=job_name,
+        progress_run_id=run_id,
+        index_catalog_limit=0,
+        industry_catalog_limit=0,
+        concept_catalog_limit=0,
+    )
+    monkeypatch.setattr(collect_base_data, "COLLECTION_PROGRESS_RECORDER", recorder)
+
+    collect_base_data.build_ashare_full_asset_refresh_task(
+        collector=object(),
+        args=args,
+        runtime=AssetRuntime(),
+    )
+
+    observed_during_catalog_fetch: dict[str, Any] = {}
+
+    class FakeSectorProvider:
+        def fetch_index_catalog(self, limit=None):
+            snapshot = cache.values[f"base_data:task:{job_name}:run:{run_id}:snapshot"]
+            observed_during_catalog_fetch.update(
+                total_items=snapshot["total_items"],
+                completed_items=snapshot["completed_items"],
+                running_items=snapshot["running_items"],
+                progress_ratio=snapshot["progress_ratio"],
+                stages=[stage["stage_key"] for stage in snapshot["stages"]],
+            )
+            return {"indexes": [{"code": "000300", "name": "沪深300"}]}
+
+        def fetch_industry_names(self, limit=None):
+            return {"names": ["银行"]}
+
+        def fetch_concept_names(self, limit=None):
+            return {"names": ["融资融券"]}
+
+    class FakeP1Collector:
+        sector_provider = FakeSectorProvider()
+
+        def collect_index_members(self, **kwargs):
+            return None
+
+        def collect_industry_members(self, **kwargs):
+            return None
+
+        def collect_concept_members(self, **kwargs):
+            return None
+
+        def collect_flow_rank(self, **kwargs):
+            return None
+
+    observed_before_first_p1: dict[str, Any] = {}
+
+    class P1Runtime:
+        def run_task(self, *, task, provider_key, parameters, collect, force=False):
+            if task.startswith("ashare_p1_index_members") and not observed_before_first_p1:
+                snapshot = cache.values[f"base_data:task:{job_name}:run:{run_id}:snapshot"]
+                observed_before_first_p1.update(
+                    total_items=snapshot["total_items"],
+                    completed_items=snapshot["completed_items"],
+                    progress_ratio=snapshot["progress_ratio"],
+                    stages=[stage["stage_key"] for stage in snapshot["stages"]],
+                )
+            return CollectionTaskResult(
+                task=task,
+                status="available",
+                raw_record_id=f"raw-{task}",
+                item_count=1,
+                error_message=None,
+                payload={},
+            )
+
+    collect_base_data.build_ashare_p1_universe_tasks(
+        collector=FakeP1Collector(),
+        args=args,
+        runtime=P1Runtime(),
+    )
+
+    assert observed_during_catalog_fetch["total_items"] == 4
+    assert observed_during_catalog_fetch["completed_items"] == 1
+    assert observed_during_catalog_fetch["running_items"] == 1
+    assert observed_during_catalog_fetch["progress_ratio"] == 0.25
+    assert observed_during_catalog_fetch["stages"] == [
+        "ashare_p0_assets",
+        "ashare_p1_catalog_discovery",
+    ]
+    assert observed_before_first_p1["total_items"] == 8
+    assert observed_before_first_p1["completed_items"] == 4
+    assert observed_before_first_p1["progress_ratio"] == 0.5
+    assert observed_before_first_p1["stages"] == [
+        "ashare_p0_assets",
+        "ashare_p1_catalog_discovery",
+        "ashare_p1_index_members",
+        "ashare_p1_industry_members",
+        "ashare_p1_concept_members",
+        "ashare_p1_flow_rank",
+    ]
+    snapshot = cache.values[f"base_data:task:{job_name}:run:{run_id}:snapshot"]
+    assert snapshot["total_items"] == 8
+    assert snapshot["completed_items"] == 8
+    assert snapshot["progress_ratio"] == 1.0
+
+
+def test_ashare_universe_risk_progress_extends_total_after_p1(monkeypatch) -> None:
+    """A 股 Universe 风险情绪采集应纳入同一任务总进度，避免 P1 后误报 100%。"""
+
+    from finance_agent.scheduler.base_data_progress import BaseDataTaskProgressRecorder
+
+    collect_base_data = import_collection_module()
+
+    cache = RecordingCache()
+    job_name = "ashare.universe.all"
+    recorder = BaseDataTaskProgressRecorder(cache=cache, cache_backend="redis")
+    run_id = recorder.job_started(
+        job_name=job_name,
+        title=job_name,
+        market="ashare",
+        task_type="universe_refresh",
+        interval_seconds=86400,
+    )
+    for stage_key in [
+        "ashare_p0_assets",
+        "ashare_p1_catalog_discovery",
+        "ashare_p1_index_members",
+        "ashare_p1_industry_members",
+        "ashare_p1_concept_members",
+        "ashare_p1_flow_rank",
+    ]:
+        total_items = 3 if stage_key == "ashare_p1_catalog_discovery" else 1
+        recorder.stage_planned(
+            job_name=job_name,
+            run_id=run_id,
+            stage_key=stage_key,
+            total_items=total_items,
+        )
+        for index in range(total_items):
+            recorder.symbol_completed(
+                job_name=job_name,
+                run_id=run_id,
+                stage_key=stage_key,
+                symbol=f"{stage_key}:{index}",
+                status="available",
+                item_count=1,
+                batch_index=index + 1,
+                batch_count=total_items,
+            )
+
+    class FakeRiskCollector:
+        def __init__(self, session):
+            pass
+
+        def collect_stop_list(self, **kwargs):
+            return None
+
+        def collect_hot_rank(self, **kwargs):
+            return None
+
+        def collect_zt_pool(self, **kwargs):
+            return None
+
+        def collect_lhb_detail(self, **kwargs):
+            return None
+
+        def collect_block_trades(self, **kwargs):
+            return None
+
+        def collect_margin_sse(self, **kwargs):
+            return None
+
+        def collect_margin_szse(self, **kwargs):
+            return None
+
+    observed_before_first_risk: dict[str, Any] = {}
+
+    class RiskRuntime:
+        def run_task(self, *, task, provider_key, parameters, collect, force=False):
+            if not observed_before_first_risk:
+                snapshot = cache.values[f"base_data:task:{job_name}:run:{run_id}:snapshot"]
+                observed_before_first_risk.update(
+                    total_items=snapshot["total_items"],
+                    completed_items=snapshot["completed_items"],
+                    running_items=snapshot["running_items"],
+                    progress_ratio=snapshot["progress_ratio"],
+                    stages=[stage["stage_key"] for stage in snapshot["stages"]],
+                )
+            return CollectionTaskResult(
+                task=task,
+                status="available",
+                raw_record_id=f"raw-{task}",
+                item_count=1,
+                error_message=None,
+                payload={},
+            )
+
+    monkeypatch.setattr(collect_base_data, "COLLECTION_PROGRESS_RECORDER", recorder)
+    monkeypatch.setattr(collect_base_data, "AshareRiskSentimentCollector", FakeRiskCollector)
+    monkeypatch.setattr(collect_base_data, "record_ashare_risk_sentiment_watermark", lambda *args, **kwargs: None)
+
+    args = collect_base_data.default_collection_args(
+        progress_job_name=job_name,
+        progress_run_id=run_id,
+        sync_task_type="universe_refresh",
+        force_provider=True,
+    )
+    collect_base_data.run_ashare_risk(object(), args, RiskRuntime())
+
+    assert observed_before_first_risk["total_items"] == 15
+    assert observed_before_first_risk["completed_items"] == 8
+    assert observed_before_first_risk["running_items"] == 1
+    assert observed_before_first_risk["progress_ratio"] == 0.533
+    assert observed_before_first_risk["stages"][-1] == "ashare_risk_sentiment_sources"
+    snapshot = cache.values[f"base_data:task:{job_name}:run:{run_id}:snapshot"]
+    assert snapshot["total_items"] == 15
+    assert snapshot["completed_items"] == 15
+    assert snapshot["progress_ratio"] == 1.0
 
 
 def test_api_registers_scheduler_progress_route() -> None:
