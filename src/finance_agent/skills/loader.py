@@ -57,6 +57,19 @@ P2_METHODOLOGY_SKILL_NAMES: tuple[str, ...] = (
     "chanlun-interpret",
 )
 
+P3_METHODOLOGY_SKILL_NAMES: tuple[str, ...] = (
+    "elliott-wave",
+    "harmonic",
+    "smc",
+    "seasonal",
+    "credit-analysis",
+    "geopolitical-risk",
+    "hedging-strategy",
+    "cross-market-strategy",
+    "onchain-analysis",
+    "defi-yield",
+)
+
 
 @dataclass(frozen=True)
 class MethodologySkill:
