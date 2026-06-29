@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+from copy import copy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -15,6 +16,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from finance_agent.application.market_context_service import adjust_buy_percentile_threshold
 from finance_agent.storage.orm import AssetScoreORM, RiskFindingORM, SignalSnapshotORM
 from finance_agent.storage.repositories import (
     AssetRepository,
@@ -53,6 +55,8 @@ class RecommendationDecisionContext:
     rank: int
     total: int
     style_tendency: JsonDict | None = None
+    market_regime: JsonDict | None = None
+    tradability: JsonDict | None = None
     absolute_floor: float = 45.0
 
     @property
@@ -75,6 +79,36 @@ class RecommendationDecisionContext:
         if value_weight >= 0.65:
             return 0.08
         return 0.12
+
+    @property
+    def adjusted_buy_percentile_threshold(self) -> float:
+        """叠加大盘环境和择时姿态后的买入分位阈值。"""
+
+        regime = str((self.market_regime or {}).get("regime") or "range")
+        timing_posture = str((self.style_tendency or {}).get("timing_posture") or "balanced")
+        return adjust_buy_percentile_threshold(
+            base_threshold=self.buy_percentile_threshold,
+            regime=regime,
+            timing_posture=timing_posture,
+        )
+
+
+@dataclass(frozen=True)
+class MemoryRankingAdjustment:
+    """Finance Memory 对推荐排序的可审计调整。"""
+
+    asset_id: str
+    adjustment: float
+    reasons: tuple[str, ...]
+
+    def to_dict(self) -> JsonDict:
+        """转换为推荐 payload 可保存的结构。"""
+
+        return {
+            "asset_id": self.asset_id,
+            "adjustment": self.adjustment,
+            "reasons": list(self.reasons),
+        }
 
 
 class RecommendationService:
@@ -99,6 +133,8 @@ class RecommendationService:
         rule_version: str = RULE_VERSION,
         audit_payload: JsonDict | None = None,
         profile_style_tendency: JsonDict | None = None,
+        market_regime: JsonDict | None = None,
+        memory_ranking_adjustments: dict[str, MemoryRankingAdjustment] | None = None,
     ) -> RecommendationRunResult:
         """读取一次初筛的评分结果并生成推荐榜单。"""
 
@@ -111,7 +147,8 @@ class RecommendationService:
             horizon=horizon,
             started_at=started_at,
         )
-        scores = self.scores.list_scores_for_screening(screening_id)[:limit]
+        raw_scores = self.scores.list_scores_for_screening(screening_id)[:limit]
+        scores = apply_memory_ranking_adjustments(raw_scores, memory_ranking_adjustments or {})
         ensure_scores_match_market(scores=scores, market=screening.market)
         backtest_strategy_id = resolve_backtest_strategy_id(scores=scores, fallback=strategy)
         backtests = getattr(self, "backtests", None)
@@ -153,6 +190,7 @@ class RecommendationService:
                 rank=rank,
                 total=len(scores),
                 style_tendency=profile_style_tendency,
+                market_regime=market_regime,
             )
             recommendation = build_recommendation_payload(
                 score=score,
@@ -213,6 +251,8 @@ class RecommendationService:
         }
         if profile_style_tendency:
             run_payload["profile_style_tendency"] = profile_style_tendency
+        if market_regime:
+            run_payload["market_regime"] = market_regime
         if audit_payload:
             run_payload.update(audit_payload)
         self.recommendations.upsert_run(
@@ -276,7 +316,20 @@ def build_recommendation_payload(
     missing_data = list(score.payload.get("missing_groups") or [])
     reasons = build_reasons(score=score, signal=signal)
     risk_rebuttals = build_risk_rebuttals(score=score, signal=signal, risks=risks)
+    append_context_reasons(
+        reasons=reasons,
+        decision_context=decision_context,
+    )
+    append_context_rebuttals(
+        risk_rebuttals=risk_rebuttals,
+        tradability=decision_context.tradability if decision_context else None,
+        memory_adjustment=score.payload.get("memory_ranking_adjustment"),
+    )
     watch_conditions = build_watch_conditions(signal=signal, score=score)
+    append_tradability_watch_condition(
+        watch_conditions=watch_conditions,
+        tradability=decision_context.tradability if decision_context else None,
+    )
     invalid_if = build_invalid_if(signal=signal, risks=risks)
     summary = build_asset_summary(
         symbol=score.symbol,
@@ -317,6 +370,8 @@ def build_recommendation_payload(
         "score_strategy_id": score.payload.get("strategy_id"),
         "score_weight_snapshot": score.payload.get("weight_snapshot"),
         "backtest_evidence": backtest_evidence,
+        "tradability": decision_context.tradability if decision_context else None,
+        "memory_ranking_adjustment": score.payload.get("memory_ranking_adjustment"),
         "decision_context": decision_context_payload(decision_context),
     }
 
@@ -331,8 +386,11 @@ def decision_context_payload(context: RecommendationDecisionContext | None) -> J
         "total": context.total,
         "percentile": round(context.percentile, 6),
         "buy_percentile_threshold": context.buy_percentile_threshold,
+        "adjusted_buy_percentile_threshold": context.adjusted_buy_percentile_threshold,
         "absolute_floor": context.absolute_floor,
         "style_tendency": context.style_tendency or {},
+        "market_regime": context.market_regime or {},
+        "tradability": context.tradability or {},
     }
 
 
@@ -348,6 +406,29 @@ def resolve_backtest_strategy_id(
         if strategy_id:
             return str(strategy_id)
     return fallback
+
+
+def apply_memory_ranking_adjustments(
+    scores: list[AssetScoreORM],
+    adjustments: dict[str, MemoryRankingAdjustment],
+) -> list[AssetScoreORM]:
+    """按记忆回流调整呈现排序，不修改确定性 `total_score`。"""
+
+    adjusted_scores: list[tuple[float, int, AssetScoreORM]] = []
+    for original_index, score in enumerate(scores):
+        adjustment = adjustments.get(score.asset_id)
+        item = copy(score)
+        payload = dict(score.payload or {})
+        if adjustment is not None:
+            payload["memory_ranking_adjustment"] = adjustment.to_dict()
+        item.payload = payload
+        adjusted_rank_score = float(score.total_score) + (adjustment.adjustment if adjustment else 0.0)
+        adjusted_scores.append((adjusted_rank_score, original_index, item))
+
+    ranked = [item for _, _, item in sorted(adjusted_scores, key=lambda row: (-row[0], row[1]))]
+    for rank, item in enumerate(ranked, start=1):
+        item.rank = rank
+    return ranked
 
 
 def build_backtest_evidence(
@@ -495,12 +576,14 @@ def decide_action(
     confidence = float(score.confidence)
     direction = signal.direction if signal else "neutral"
     if decision_context is not None:
+        if is_tradability_blocked(decision_context.tradability):
+            return "watch"
         if direction == "bearish" or total_score < 40:
             return "avoid"
         if total_score < decision_context.absolute_floor:
             return "watch"
         if (
-            decision_context.percentile <= decision_context.buy_percentile_threshold
+            decision_context.percentile <= decision_context.adjusted_buy_percentile_threshold
             and direction in {"bullish", "mixed"}
         ):
             return "buy_candidate"
@@ -512,6 +595,66 @@ def decide_action(
     if direction == "bearish" or total_score < 40:
         return "avoid"
     return "watch"
+
+
+def is_tradability_blocked(tradability: JsonDict | None) -> bool:
+    """判断可买入性上下文是否阻断买入候选。"""
+
+    if not isinstance(tradability, dict):
+        return False
+    return tradability.get("tradable") is False or tradability.get("blocking_level") == "blocked"
+
+
+def append_tradability_watch_condition(
+    *,
+    watch_conditions: JsonDict,
+    tradability: JsonDict | None,
+) -> None:
+    """把可买入性限制补充到观察条件。"""
+
+    if not is_tradability_blocked(tradability):
+        return
+    reasons = tradability.get("reasons") if isinstance(tradability, dict) else None
+    reason_text = "、".join(str(reason) for reason in reasons) if isinstance(reasons, list) else "未知"
+    conditions = watch_conditions.setdefault("conditions", [])
+    if isinstance(conditions, list):
+        conditions.append(f"当前可买入性受限：{reason_text}。")
+
+
+def append_context_reasons(
+    *,
+    reasons: list[str],
+    decision_context: RecommendationDecisionContext | None,
+) -> None:
+    """把大盘环境等上下文补充到推荐理由。"""
+
+    if decision_context is None or not decision_context.market_regime:
+        return
+    regime = decision_context.market_regime.get("regime", "unknown")
+    strength = decision_context.market_regime.get("strength", "unknown")
+    reasons.append(
+        "大盘环境 "
+        f"{regime}/{strength}，买入分位阈值从 "
+        f"{decision_context.buy_percentile_threshold:.2%} 调整为 "
+        f"{decision_context.adjusted_buy_percentile_threshold:.2%}。"
+    )
+
+
+def append_context_rebuttals(
+    *,
+    risk_rebuttals: list[str],
+    tradability: JsonDict | None,
+    memory_adjustment: JsonDict | None,
+) -> None:
+    """把可买入性和记忆回流补充到风险反驳。"""
+
+    if is_tradability_blocked(tradability):
+        reasons = tradability.get("reasons") if isinstance(tradability, dict) else None
+        reason_text = "、".join(str(reason) for reason in reasons) if isinstance(reasons, list) else "未知"
+        risk_rebuttals.append(f"当前买入受限：{reason_text}，不应直接升级为买入执行。")
+    if isinstance(memory_adjustment, dict):
+        for reason in memory_adjustment.get("reasons") or []:
+            risk_rebuttals.append(f"记忆回流提示：{reason}")
 
 
 def decide_conviction(score: AssetScoreORM) -> str:

@@ -84,6 +84,7 @@ class UniverseRecommendationPipeline:
         technical_screening_strategy: str = TECHNICAL_SCREENING_STRATEGY,
         avoid_universe_id: str | None = None,
         strategy_id: str | None = None,
+        market_regime: JsonDict | None = None,
     ) -> UniverseRecommendationRunResult:
         """执行一次候选池推荐流水线。"""
 
@@ -245,6 +246,7 @@ class UniverseRecommendationPipeline:
                 audit_payload=audit_payload,
                 strategy_id=strategy_id,
             ),
+            market_regime=market_regime,
         )
         status = run_status(
             universe=universe,

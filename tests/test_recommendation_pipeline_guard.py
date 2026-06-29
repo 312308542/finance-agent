@@ -104,7 +104,11 @@ class _Signals:
 
 
 class _Recommendations:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
     def rank_from_screening(self, **kwargs: Any) -> SimpleNamespace:
+        self.calls.append(kwargs)
         return SimpleNamespace(
             recommendation_count=0,
             run_id=None,
@@ -265,3 +269,29 @@ def test_recommendation_pipeline_passes_strategy_id_to_scoring_service() -> None
             "strategy_id": "strategy:ashare:short_swing",
         }
     ]
+
+
+def test_recommendation_pipeline_passes_market_regime_to_recommendation_service() -> None:
+    """流水线应把大盘环境上下文传入推荐裁决，但不改变评分结果。"""
+
+    pipeline = UniverseRecommendationPipeline.__new__(UniverseRecommendationPipeline)
+    pipeline.universes = _Universes([_Member(asset_id="ashare:000001", symbol="000001")])
+    pipeline.indicators = _Indicators(available_asset_ids={"ashare:000001"})
+    pipeline.factors = _Factors()
+    pipeline.screenings = _Screenings()
+    pipeline.scoring = _Scoring()
+    pipeline.signals = _Signals()
+    recommendations = _Recommendations()
+    pipeline.recommendations = recommendations
+
+    market_regime = {"regime": "bear", "strength": "high"}
+    pipeline.run_for_universe(
+        universe_id="universe:test:ashare",
+        horizon="swing",
+        timeframe="1d",
+        min_indicator_coverage_ratio=0.5,
+        min_factor_coverage_ratio=0.0,
+        market_regime=market_regime,
+    )
+
+    assert recommendations.calls[0]["market_regime"] == market_regime

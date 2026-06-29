@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from finance_agent.recommendations.service import (
+    MemoryRankingAdjustment,
     RecommendationDecisionContext,
     RecommendationService,
     decide_action,
@@ -90,6 +91,45 @@ def test_rank_from_screening_passes_percentile_context_to_recommendations() -> N
     assert first_payload["decision_context"]["percentile"] == 0.1
     assert first_payload["decision_context"]["buy_percentile_threshold"] == 0.2
     assert fourth_payload["action"] == "watch"
+
+
+def test_rank_from_screening_applies_memory_ranking_adjustments_without_mutating_score() -> None:
+    recommendations = _RecommendationStore()
+    service = RecommendationService.__new__(RecommendationService)
+    service.assets = _AssetStore()
+    service.screenings = _ScreeningStore()
+    service.scores = _ScoreStore()
+    service.signals = _SignalStore()
+    service.risks = _RiskStore()
+    service.recommendations = recommendations
+
+    service.rank_from_screening(
+        screening_id="screen:percentile",
+        strategy="balanced_swing_v1",
+        horizon="swing",
+        limit=10,
+        memory_ranking_adjustments={
+            "ashare:000001": MemoryRankingAdjustment(
+                asset_id="ashare:000001",
+                adjustment=-8,
+                reasons=("历史复盘：追高亏损，下调排序。",),
+            ),
+            "ashare:000010": MemoryRankingAdjustment(
+                asset_id="ashare:000010",
+                adjustment=5,
+                reasons=("用户偏好同类低波动资产，上调排序。",),
+            ),
+        },
+    )
+
+    first_payload = recommendations.asset_payloads[0]["payload"]
+    last_payload = recommendations.asset_payloads[-1]["payload"]
+    assert first_payload["asset_id"] == "ashare:000010"
+    assert first_payload["rank"] == 1
+    assert first_payload["total_score"] == 58.0
+    assert first_payload["memory_ranking_adjustment"]["adjustment"] == 5
+    assert last_payload["asset_id"] == "ashare:000001"
+    assert last_payload["total_score"] == 58.9
 
 
 def score(*, total_score: float, confidence: float) -> SimpleNamespace:
