@@ -32,6 +32,31 @@ P1_METHODOLOGY_SKILL_NAMES: tuple[str, ...] = (
     "perp-funding-basis",
 )
 
+P2_METHODOLOGY_SKILL_NAMES: tuple[str, ...] = (
+    "ichimoku",
+    "minute-analysis",
+    "market-microstructure",
+    "pair-trading",
+    "correlation-analysis",
+    "quant-statistics",
+    "performance-attribution",
+    "earnings-forecast",
+    "earnings-revision",
+    "dividend-analysis",
+    "macro-analysis",
+    "global-macro",
+    "regulatory-knowledge",
+    "asset-allocation",
+    "etf-analysis",
+    "fund-analysis",
+    "convertible-bond",
+    "liquidation-heatmap",
+    "social-media-intelligence",
+    "stablecoin-flow",
+    "token-unlock-treasury",
+    "chanlun-interpret",
+)
+
 
 @dataclass(frozen=True)
 class MethodologySkill:
