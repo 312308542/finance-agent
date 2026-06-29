@@ -78,6 +78,7 @@ class ScoringService:
             payload = {
                 "schema_version": "1.0",
                 "score_groups": score_payload["score_groups"],
+                "data_confidence": score_payload["data_confidence"],
                 "missing_groups": factor.missing_groups,
                 "partial_groups": factor.payload.get("partial_groups", []),
                 "source_ids": factor.source_ids,
@@ -184,14 +185,28 @@ def compute_asset_score(factor: FactorFrameORM, *, strategy: Any | None = None) 
 
     base_score = weighted_sum / used_weight if used_weight > 0 else 0.0
     risk_penalty = compute_risk_penalty(groups.get("risk"))
-    missing_penalty = len(factor.missing_groups) * missing_penalty_config[
+    partial_groups = factor.payload.get("partial_groups") or []
+    missing_penalty = 0.0
+    legacy_missing_penalty = len(factor.missing_groups) * missing_penalty_config[
         "per_missing_group"
-    ] + len(
-        factor.payload.get("partial_groups") or []
-    ) * missing_penalty_config["per_partial_group"]
-    total_score = clamp(base_score - missing_penalty - risk_penalty, 0, 100)
-    confidence = clamp(used_weight / sum(weights.values()) - missing_penalty / 100 * 0.4, 0.05, 1)
-    status = "available" if factor.status == "available" and confidence >= 0.6 else "partial"
+    ] + len(partial_groups) * missing_penalty_config["per_partial_group"]
+    total_score = clamp(base_score - risk_penalty, 0, 100)
+    data_confidence = clamp(
+        used_weight / sum(weights.values()) - legacy_missing_penalty / 100 * 0.4,
+        0.05,
+        1,
+    )
+    confidence = data_confidence
+    status = (
+        "available"
+        if (
+            factor.status == "available"
+            and confidence >= 0.6
+            and not factor.missing_groups
+            and not partial_groups
+        )
+        else "partial"
+    )
     if used_weight == 0:
         status = "unavailable"
 
@@ -199,6 +214,7 @@ def compute_asset_score(factor: FactorFrameORM, *, strategy: Any | None = None) 
         "status": status,
         "total_score": total_score,
         "confidence": confidence,
+        "data_confidence": data_confidence,
         "risk_penalty": risk_penalty,
         "missing_penalty": missing_penalty,
         "group_scores": group_scores,

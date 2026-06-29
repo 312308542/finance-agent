@@ -8,8 +8,10 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -21,6 +23,7 @@ from finance_agent.agents.runtime import (
     OpenAICompatibleModelClient,
     preview_model_routes,
 )
+from finance_agent.recommendations.readiness import evaluate_recommendation_readiness
 from finance_agent.storage.repositories import ChatMemoryRepository
 
 JsonDict = dict[str, Any]
@@ -151,6 +154,12 @@ class FinanceAgentChatSession:
                 intent=intent,
                 task_kind="recommendation_decision",
             )
+        elif intent == "asset_deep_analysis":
+            assistant = self._answer_model_chat(
+                content,
+                intent=intent,
+                task_kind="asset_deep_analysis",
+            )
         else:
             assistant = self._answer_model_chat(content)
 
@@ -276,6 +285,10 @@ class FinanceAgentChatSession:
             )
 
         tool_catalog = self._load_tool_catalog()
+        workflow_context = self._preload_chat_workflow_context(
+            content=content,
+            task_kind=task_kind,
+        )
         openai_tools = build_openai_chat_tools(tool_catalog)
         tool_name_map = build_openai_tool_name_map(tool_catalog)
         messages = build_chat_model_messages(
@@ -285,6 +298,7 @@ class FinanceAgentChatSession:
             task_kind=task_kind,
             tool_catalog=tool_catalog,
             restored_messages=self.restored_messages,
+            workflow_context=workflow_context,
         )
         observations: list[JsonDict] = []
         model_audit: list[JsonDict] = []
@@ -382,10 +396,131 @@ class FinanceAgentChatSession:
                 "model": config.to_safe_dict(),
                 "model_audit": model_audit,
                 "tool_observations": observations,
+                "workflow_context": workflow_context,
                 "final_payload": final_payload,
                 "error_message": error_message,
             },
         )
+
+    def _preload_chat_workflow_context(
+        self,
+        *,
+        content: str,
+        task_kind: str,
+    ) -> JsonDict | None:
+        """为聊天选股类问题预加载 Workflow 深度结果。"""
+
+        if not hasattr(self.interface, "run_workflow"):
+            return None
+        if task_kind == "recommendation_decision":
+            return self._preload_recommendation_decision_workflow(content=content)
+        if task_kind == "asset_deep_analysis":
+            asset_id = extract_ashare_asset_id(content)
+            if not asset_id:
+                return {
+                    "status": "skipped",
+                    "workflow_type": "asset_deep_analysis",
+                    "reason": "未识别到 6 位 A 股代码，暂不触发单标的深度分析 Workflow。",
+                }
+            return self._run_chat_workflow(
+                workflow_type="asset_deep_analysis",
+                asset_id=asset_id,
+                asset_ids=[asset_id],
+                initial_state={
+                    "chat_question": content,
+                    "chat_task_kind": "asset_deep_analysis",
+                },
+            )
+        return None
+
+    def _preload_recommendation_decision_workflow(self, *, content: str) -> JsonDict:
+        """读取最新推荐运行并触发推荐决策 Workflow。"""
+
+        try:
+            latest = self.interface.call_tool(
+                name="recommendation.get_latest",
+                arguments={"limit": 20, "market": "ashare"},
+            ).to_dict()
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "workflow_type": "recommendation_decision",
+                "stage": "recommendation.get_latest",
+                "error": str(exc),
+            }
+
+        result = latest.get("data", {}).get("result", {})
+        active_run = result.get("active_run") if isinstance(result, dict) else None
+        run_id = active_run.get("run_id") if isinstance(active_run, dict) else None
+        market = active_run.get("market") if isinstance(active_run, dict) else "ashare"
+        recommendations = result.get("recommendations") if isinstance(result, dict) else []
+        readiness = evaluate_recommendation_readiness(
+            run=dict_to_namespace(active_run) if isinstance(active_run, dict) else None,
+            recommendations=[
+                dict_to_namespace(item)
+                for item in recommendations
+                if isinstance(item, dict)
+            ],
+        )
+        if not run_id:
+            return {
+                "status": "skipped",
+                "workflow_type": "recommendation_decision",
+                "reason": "暂无可用推荐运行，无法触发推荐决策 Workflow。",
+                "latest_recommendations": result,
+                "readiness": readiness.to_dict(),
+            }
+
+        workflow_context = self._run_chat_workflow(
+            workflow_type="recommendation_decision",
+            portfolio_id=default_chat_portfolio_id(owner_id=self.owner_id),
+            watchlist_id=default_chat_research_watchlist_id(
+                owner_id=self.owner_id,
+                market=str(market or "ashare"),
+            ),
+            recommendation_run_id=str(run_id),
+            initial_state={
+                "chat_question": content,
+                "chat_task_kind": "recommendation_decision",
+                "latest_recommendations": result,
+            },
+        )
+        workflow_context["readiness"] = readiness.to_dict()
+        return workflow_context
+
+    def _run_chat_workflow(self, **kwargs: Any) -> JsonDict:
+        """运行聊天预加载 Workflow，并把异常变成模型可见上下文。"""
+
+        workflow_type = str(kwargs["workflow_type"])
+        self._emit_event(
+            "workflow_step",
+            {
+                "node": "workflow_preload",
+                "workflow_type": workflow_type,
+                "message": f"聊天入口预加载 Workflow：{workflow_type}",
+            },
+        )
+        try:
+            result = self.interface.run_workflow(
+                owner_id=self.owner_id,
+                trigger_type="chat",
+                trigger_ref=self.chat_session_id,
+                horizon="swing",
+                timeframe="1d",
+                recommendation_limit=20,
+                **kwargs,
+            ).to_dict()
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "workflow_type": workflow_type,
+                "error": str(exc),
+            }
+        return {
+            "status": result.get("status", "ok"),
+            "workflow_type": workflow_type,
+            "data": result.get("data", {}),
+        }
 
     def _load_tool_catalog(self) -> dict[str, JsonDict]:
         """读取 CLI 聊天可用的只读事实工具。"""
@@ -581,6 +716,11 @@ def detect_chat_intent(content: str) -> str:
         return "route_preview"
     if any(keyword in normalized for keyword in ("/history", "history", "历史", "聊天记录")):
         return "history"
+    if extract_ashare_asset_id(content) and any(
+        keyword in normalized
+        for keyword in ("分析", "买不买", "值得买", "继续观察", "风险", "deep analysis")
+    ):
+        return "asset_deep_analysis"
     if any(
         keyword in normalized
         for keyword in (
@@ -595,6 +735,34 @@ def detect_chat_intent(content: str) -> str:
     ):
         return "recommendation_lookup"
     return "model_chat"
+
+
+def extract_ashare_asset_id(content: str) -> str | None:
+    """从聊天文本中提取 A 股 6 位股票代码。"""
+
+    match = re.search(r"(?<!\d)([0368]\d{5})(?!\d)", content)
+    if match is None:
+        return None
+    symbol = match.group(1)
+    return f"ashare:{symbol}"
+
+
+def default_chat_portfolio_id(*, owner_id: str) -> str:
+    """返回聊天 Workflow 默认组合 ID。"""
+
+    return f"portfolio:{owner_id}:default"
+
+
+def default_chat_research_watchlist_id(*, owner_id: str, market: str) -> str:
+    """返回聊天 Workflow 默认系统研究跟踪池 ID。"""
+
+    return f"watchlist:{owner_id}:{market}:research"
+
+
+def dict_to_namespace(value: JsonDict) -> SimpleNamespace:
+    """把工具返回的字典浅转换为属性对象，复用推荐闸门逻辑。"""
+
+    return SimpleNamespace(**value)
 
 
 def summarize_chat_tool_observation(observation: JsonDict) -> str:
@@ -644,6 +812,7 @@ def build_chat_model_messages(
     task_kind: str,
     tool_catalog: dict[str, JsonDict],
     restored_messages: list[ChatMessage],
+    workflow_context: JsonDict | None = None,
 ) -> list[JsonDict]:
     """构建 OpenAI Chat Completions 工具调用消息。"""
 
@@ -655,12 +824,22 @@ def build_chat_model_messages(
         "task_kind": task_kind,
         "recent_chat_history": history,
         "available_tools": list(tool_catalog.values()),
+        "workflow_context": workflow_context,
         "agent_rules": [
             "必须由模型自主规划需要调用的事实工具，并使用 Chat Completions tools 发起调用。",
             "不能编造实时行情、买入建议或工具结果；事实不足时要明确说明不足。",
             (
                 "推荐决策类问题应优先考虑 recommendation.get_latest，"
-                "然后按候选情况自主选择因子、信号风险、记忆等工具。"
+                "并优先基于 workflow_context 中的推荐决策 Workflow 深度结果作答；"
+                "如 workflow_context 不可用，再按候选情况自主选择因子、信号风险、记忆等工具。"
+            ),
+            (
+                "推荐/单标的结论必须目标导向输出：排序 + 每只为什么 + "
+                "还差什么才升级 + 风险反驳 + 确认边界。"
+            ),
+            (
+                "如果 workflow_context.readiness.status 为 blocked，开头必须说明数据闸门"
+                "未通过，不能把该结果称为当前可执行买入清单，只能作为待刷新后的参考。"
             ),
             (
                 "如果推荐数据看起来是 smoke、样例、过期或非实时数据，"

@@ -46,6 +46,37 @@ class RecommendationRunResult:
     top_recommendation_id: str | None
 
 
+@dataclass(frozen=True)
+class RecommendationDecisionContext:
+    """推荐动作裁决的候选池上下文。"""
+
+    rank: int
+    total: int
+    style_tendency: JsonDict | None = None
+    absolute_floor: float = 45.0
+
+    @property
+    def percentile(self) -> float:
+        """返回候选池内排名分位，越小越靠前。"""
+
+        if self.total <= 0:
+            return 1.0
+        return max(self.rank, 1) / self.total
+
+    @property
+    def buy_percentile_threshold(self) -> float:
+        """按画像决定买入候选分位阈值。"""
+
+        style = self.style_tendency or {}
+        theme_weight = float(style.get("theme") or 0)
+        value_weight = float(style.get("value") or 0)
+        if theme_weight >= 0.65:
+            return 0.20
+        if value_weight >= 0.65:
+            return 0.08
+        return 0.12
+
+
 class RecommendationService:
     """把评分、信号和风险组织成可查询的推荐结果。"""
 
@@ -67,6 +98,7 @@ class RecommendationService:
         limit: int = 20,
         rule_version: str = RULE_VERSION,
         audit_payload: JsonDict | None = None,
+        profile_style_tendency: JsonDict | None = None,
     ) -> RecommendationRunResult:
         """读取一次初筛的评分结果并生成推荐榜单。"""
 
@@ -117,6 +149,11 @@ class RecommendationService:
         for rank, score in enumerate(scores, start=1):
             signal = self.signals.get_latest_signal(asset_id=score.asset_id, horizon=horizon)
             risks = self.risks.list_recent_risks(asset_id=score.asset_id, limit=10)
+            decision_context = RecommendationDecisionContext(
+                rank=rank,
+                total=len(scores),
+                style_tendency=profile_style_tendency,
+            )
             recommendation = build_recommendation_payload(
                 score=score,
                 signal=signal,
@@ -126,6 +163,7 @@ class RecommendationService:
                 run_id=run_id,
                 rule_version=rule_version,
                 backtest_evidence=backtest_evidence,
+                decision_context=decision_context,
             )
             saved = self.recommendations.upsert_asset_recommendation(
                 recommendation_id=recommendation["recommendation_id"],
@@ -173,6 +211,8 @@ class RecommendationService:
             },
             "backtest_evidence": backtest_evidence,
         }
+        if profile_style_tendency:
+            run_payload["profile_style_tendency"] = profile_style_tendency
         if audit_payload:
             run_payload.update(audit_payload)
         self.recommendations.upsert_run(
@@ -219,10 +259,16 @@ def build_recommendation_payload(
     run_id: str,
     rule_version: str,
     backtest_evidence: JsonDict | None = None,
+    decision_context: RecommendationDecisionContext | None = None,
 ) -> JsonDict:
     """构建单标的推荐 payload。"""
 
-    action = decide_action(score=score, signal=signal, risks=risks)
+    action = decide_action(
+        score=score,
+        signal=signal,
+        risks=risks,
+        decision_context=decision_context,
+    )
     conviction = decide_conviction(score=score)
     signal_ids = [signal.signal_id] if signal else []
     risk_ids = [risk.risk_id for risk in risks]
@@ -271,6 +317,22 @@ def build_recommendation_payload(
         "score_strategy_id": score.payload.get("strategy_id"),
         "score_weight_snapshot": score.payload.get("weight_snapshot"),
         "backtest_evidence": backtest_evidence,
+        "decision_context": decision_context_payload(decision_context),
+    }
+
+
+def decision_context_payload(context: RecommendationDecisionContext | None) -> JsonDict | None:
+    """输出推荐动作裁决上下文，便于推荐结果解释和审计。"""
+
+    if context is None:
+        return None
+    return {
+        "rank": context.rank,
+        "total": context.total,
+        "percentile": round(context.percentile, 6),
+        "buy_percentile_threshold": context.buy_percentile_threshold,
+        "absolute_floor": context.absolute_floor,
+        "style_tendency": context.style_tendency or {},
     }
 
 
@@ -423,6 +485,7 @@ def decide_action(
     score: AssetScoreORM,
     signal: SignalSnapshotORM | None,
     risks: list[RiskFindingORM],
+    decision_context: RecommendationDecisionContext | None = None,
 ) -> str:
     """根据分数、信号和风险决定推荐动作。"""
 
@@ -431,6 +494,17 @@ def decide_action(
     total_score = float(score.total_score)
     confidence = float(score.confidence)
     direction = signal.direction if signal else "neutral"
+    if decision_context is not None:
+        if direction == "bearish" or total_score < 40:
+            return "avoid"
+        if total_score < decision_context.absolute_floor:
+            return "watch"
+        if (
+            decision_context.percentile <= decision_context.buy_percentile_threshold
+            and direction in {"bullish", "mixed"}
+        ):
+            return "buy_candidate"
+        return "watch"
     if total_score >= 75 and confidence >= 0.65 and direction in {"bullish", "mixed"}:
         return "buy_candidate"
     if total_score >= 60 and confidence >= 0.45:
