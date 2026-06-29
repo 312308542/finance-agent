@@ -720,6 +720,37 @@ OPENAI_CHAT_TOOL_SCHEMAS: dict[str, JsonDict] = {
         },
         "required": ["run_id"],
     },
+    "profile.get": {
+        "properties": {
+            "owner_id": {"type": "string", "description": "用户/租户 ID。"},
+        },
+        "required": ["owner_id"],
+    },
+    "profile.upsert": {
+        "properties": {
+            "owner_id": {"type": "string", "description": "用户/租户 ID。"},
+            "updates": {
+                "type": "object",
+                "description": "需要写入的画像维度，例如 risk_appetite、horizon、style_tendency。",
+            },
+            "source": {
+                "type": "object",
+                "description": "每个画像维度的来源，例如 elicited、inferred。",
+            },
+            "evidence": {
+                "type": "array",
+                "description": "画像写入证据链，例如聊天轮次、决策或复盘 ID。",
+                "items": {"type": "object"},
+            },
+        },
+        "required": ["owner_id", "updates", "source", "evidence"],
+    },
+    "advice.suggest_style": {
+        "properties": {
+            "owner_id": {"type": "string", "description": "用户/租户 ID。"},
+        },
+        "required": ["owner_id"],
+    },
     "factor.get_asset_factor_context": {
         "properties": {
             "asset_id": {"type": "string", "description": "标准资产 ID，例如 ashare:600519。"},
@@ -922,7 +953,11 @@ def sanitize_chat_tool_arguments(
     schema = OPENAI_CHAT_TOOL_SCHEMAS.get(tool_name, {"properties": {}})
     allowed = set((schema.get("properties") or {}).keys())
     sanitized = {key: value for key, value in arguments.items() if key in allowed}
-    if tool_name.startswith("memory.") and "owner_id" in allowed and "owner_id" not in sanitized:
+    if (
+        tool_name.startswith(("memory.", "profile.", "advice."))
+        and "owner_id" in allowed
+        and "owner_id" not in sanitized
+    ):
         sanitized["owner_id"] = owner_id
     if tool_name == "watchlist.get_active_items" and "owner_id" not in sanitized:
         sanitized["owner_id"] = owner_id

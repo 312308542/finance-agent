@@ -15,19 +15,27 @@ from typing import Any
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm import Session
 
-from finance_agent.application import MemoryService, PortfolioService, WatchlistService
+from finance_agent.application import (
+    MemoryService,
+    PortfolioService,
+    ProfileAdviceService,
+    UserInvestmentProfileService,
+    WatchlistService,
+)
 from finance_agent.graph import GraphSyncService, create_graph_store
 from finance_agent.graph.stores import MemoryGraphStore
 from finance_agent.storage.orm import (
     AssetScoreORM,
     AssistantMemoryORM,
     DataQualitySnapshotORM,
+    DecisionLogORM,
     EvidenceORM,
     FactorFrameORM,
     IndicatorFrameORM,
     PortfolioORM,
     PositionORM,
     RecommendationRunORM,
+    ReviewTaskORM,
     RiskFindingORM,
     SignalSnapshotORM,
     WatchlistItemORM,
@@ -42,6 +50,7 @@ from finance_agent.storage.repositories import (
     RecommendationRepository,
     RiskRepository,
     SignalSnapshotRepository,
+    UserInvestmentProfileRepository,
 )
 
 JsonDict = dict[str, Any]
@@ -56,6 +65,8 @@ class FinanceTool:
     description: str
     handler: ToolHandler
     read_only: bool = True
+    requires_review: bool = False
+    write_scope: str | None = None
 
 
 class FinanceToolRuntime:
@@ -75,6 +86,12 @@ class FinanceToolRuntime:
         self.risks = RiskRepository(session)
         self.memories = MemoryRepository(session)
         self.memory_service = MemoryService(session)
+        self.profile_repository = UserInvestmentProfileRepository(session)
+        self.profile_service = UserInvestmentProfileService(self.profile_repository)
+        self.profile_advice = ProfileAdviceService(
+            profile_service=self.profile_service,
+            store=ProfileSignalHistoryStore(session),
+        )
         self.data_quality = DataQualityRepository(session)
         self._tools: dict[str, FinanceTool] = {}
         self._register_builtin_tools()
@@ -207,6 +224,35 @@ class FinanceToolRuntime:
                 handler=self.list_workflows,
             )
         )
+        self._register_profile_tools()
+
+    def _register_profile_tools(self) -> None:
+        """注册用户投资画像工具。"""
+
+        self.register(
+            FinanceTool(
+                name="profile.get",
+                description="读取用户投资画像，缺失时返回默认画像和低置信度来源。",
+                handler=self.get_profile,
+            )
+        )
+        self.register(
+            FinanceTool(
+                name="profile.upsert",
+                description="写入用户投资画像维度，必须携带来源和证据链。",
+                handler=self.upsert_profile,
+                read_only=False,
+                requires_review=True,
+                write_scope="investment_profile",
+            )
+        )
+        self.register(
+            FinanceTool(
+                name="advice.suggest_style",
+                description="根据历史反馈和复盘给出可审计的风格/择时建议。",
+                handler=self.suggest_profile_style,
+            )
+        )
 
     def get_portfolio_snapshot(self, *, portfolio_id: str) -> JsonDict:
         """读取组合和持仓快照。"""
@@ -225,6 +271,33 @@ class FinanceToolRuntime:
             "portfolio": serialize_portfolio(snapshot.portfolio),
             "positions": [serialize_position(position) for position in snapshot.positions],
         }
+
+    def get_profile(self, *, owner_id: str) -> JsonDict:
+        """读取用户投资画像。"""
+
+        return self.profile_service.get_profile(owner_id=owner_id)
+
+    def upsert_profile(
+        self,
+        *,
+        owner_id: str,
+        updates: JsonDict,
+        source: JsonDict,
+        evidence: list[JsonDict],
+    ) -> JsonDict:
+        """写入用户投资画像，要求来源和证据链。"""
+
+        return self.profile_service.upsert_profile(
+            owner_id=owner_id,
+            updates=updates,
+            source=source,
+            evidence=evidence,
+        )
+
+    def suggest_profile_style(self, *, owner_id: str) -> JsonDict:
+        """返回画像驱动的风格/择时建议。"""
+
+        return self.profile_advice.suggest_style(owner_id=owner_id)
 
     def get_active_watchlist_items(
         self,
@@ -589,6 +662,49 @@ class FinanceToolRuntime:
         return {"workflows": workflows}
 
 
+class ProfileSignalHistoryStore:
+    """画像推断读取的历史反馈/复盘只读适配器。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def list_recent_decision_feedback(
+        self,
+        *,
+        owner_id: str,
+        limit: int = 50,
+    ) -> list[JsonDict]:
+        """读取近期用户决策反馈，供画像建议服务做确定性推断。"""
+
+        from sqlalchemy import select
+
+        statement = (
+            select(DecisionLogORM)
+            .where(DecisionLogORM.owner_id == owner_id)
+            .order_by(DecisionLogORM.created_at.desc())
+            .limit(limit)
+        )
+        return [serialize_decision_feedback(row) for row in self.session.scalars(statement)]
+
+    def list_recent_review_outcomes(
+        self,
+        *,
+        owner_id: str,
+        limit: int = 50,
+    ) -> list[JsonDict]:
+        """读取近期复盘结果，供画像建议服务做确定性推断。"""
+
+        from sqlalchemy import select
+
+        statement = (
+            select(ReviewTaskORM)
+            .where(ReviewTaskORM.owner_id == owner_id)
+            .order_by(ReviewTaskORM.due_at.desc())
+            .limit(limit)
+        )
+        return [serialize_review_outcome(row) for row in self.session.scalars(statement)]
+
+
 def json_value(value: Any) -> Any:
     """把 ORM 字段转换为 JSON 友好的值。"""
 
@@ -882,6 +998,42 @@ def serialize_memory(memory: AssistantMemoryORM) -> JsonDict:
         "status": memory.status,
         "updated_at": json_value(memory.updated_at),
         "payload": json_value(memory.payload or {}),
+    }
+
+
+def serialize_decision_feedback(decision: DecisionLogORM) -> JsonDict:
+    """序列化画像推断需要的决策反馈。"""
+
+    payload = json_value(decision.payload or {})
+    style = payload.get("style") or payload.get("strategy_style")
+    if isinstance(payload.get("profile_signal"), dict):
+        style = payload["profile_signal"].get("style", style)
+    return {
+        "decision_id": decision.decision_id,
+        "action": decision.user_action,
+        "style": style,
+        "decision_type": decision.decision_type,
+        "asset_id": decision.asset_id,
+        "created_at": json_value(decision.created_at),
+        "payload": payload,
+    }
+
+
+def serialize_review_outcome(review: ReviewTaskORM) -> JsonDict:
+    """序列化画像推断需要的复盘结果。"""
+
+    payload = json_value(review.payload or {})
+    outcome_payload = payload.get("execution_outcome") if isinstance(payload, dict) else None
+    return {
+        "review_task_id": review.review_task_id,
+        "outcome": payload.get("outcome") or (outcome_payload or {}).get("outcome"),
+        "tags": payload.get("tags") or [],
+        "reason": payload.get("reason") or payload.get("result_reason"),
+        "realized_return": payload.get("realized_return")
+        or (outcome_payload or {}).get("holding_return_pct"),
+        "asset_id": review.asset_id,
+        "status": review.status,
+        "payload": payload,
     }
 
 

@@ -119,13 +119,16 @@ Hermes 给用户的金融回答必须保持固定结构：
 
 ## 6. 工具权限边界
 
-Hermes 可见工具必须是只读事实查询或受控 Workflow 调用：
+Hermes 可见工具必须是只读事实查询、受控投资画像写入或受控 Workflow 调用：
 
 - `portfolio.*`
 - `watchlist.*`
 - `factor.*`
 - `signal_risk.*`
 - `memory.*`
+- `profile.get`：只读读取用户投资画像。
+- `profile.upsert`：唯一允许的受控画像写工具，只能写风险偏好、周期、风格倾向、择时姿态等画像维度，必须携带 `source` 和 `evidence`。
+- `advice.suggest_style`：只读读取历史反馈/复盘并给出风格与择时建议。
 - `graph.*`
 - `data_quality.*`
 - 推荐、报告、Workflow 查询类工具
@@ -136,6 +139,25 @@ Hermes 可见工具必须是只读事实查询或受控 Workflow 调用：
 - 直接访问券商、交易所或外部行情网页。
 - 直接修改评分、信号、风险标记。
 - 绕过 Workflow 和审计链路写入金融结论。
+
+## 6.1 投资画像引导协议
+
+Hermes 是“嘴和耳”，`finance-agent` 是“脑和账本”。用户画像必须落在 `finance-agent` 的 `user_investment_profiles` 和 `assistant_memories(memory_type=investment_profile)` 中，Hermes 只负责自然语言引导与确认。
+
+使用规则：
+
+1. 用户提出选股、买入、换股、仓位、择时类问题前，先调用 `profile.get`。
+2. 如果画像缺失、状态为 `stale`，或关键维度置信度很低，先调用 `advice.suggest_style` 看是否能从历史反馈/复盘推断，能推断就用人话请用户确认。
+3. 必须追问时，一次最多问 1~2 个真正影响建议的问题，不把对话变成问卷。
+4. 用户明确确认或修正后，才调用 `profile.upsert`，并且必须带：
+   - `updates`：本次更新的画像维度。
+   - `source`：每个维度来自 `elicited`（问出来）或 `inferred`（从行为推断）。
+   - `evidence`：聊天轮次、决策 ID、复盘 ID 等可审计证据。
+5. `advice.suggest_style` 的结论只能用于表达建议或请求确认，不能直接改 `asset_scores.total_score`、信号方向或风险标记。
+
+示例表达：
+
+> “我看你最近连续拒绝题材型建议，复盘里也有追高亏损记录。初步建议当前先偏价值、择时偏防守。这个画像我先按‘推断待确认’记录，还是你想改成更进取？”
 
 ## 7. MCP 注册参考
 
@@ -166,7 +188,7 @@ Hermes 或其他 MCP 客户端应注册为：
 
 - 已确认项目路径和 venv Python 存在。
 - `workflows list` 能返回 6 个金融团队 Workflow。
-- `tools list` 没有交易、下单、执行类写工具。
+- `tools list` 没有交易、下单、执行类写工具；`profile.upsert` 如出现，必须带 `read_only=false`、`requires_review=true`、`write_scope=investment_profile`。
 - 中文报告输出不是乱码。
 - MCP 能 initialize 并 list tools。
 - 模型不可用时仍有确定性 fallback。

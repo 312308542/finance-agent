@@ -1572,6 +1572,44 @@ class ExecutionRecordORM(Base):
     )
 
 
+class UserInvestmentProfileORM(Base):
+    """用户投资画像表，保存可审计、可演化的风险偏好和风格偏好。"""
+
+    __tablename__ = "user_investment_profiles"
+    __table_args__ = (
+        Index("idx_user_investment_profiles_owner_status", "owner_id", "status"),
+        Index("idx_user_investment_profiles_updated", "updated_at"),
+    )
+
+    profile_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    risk_appetite: Mapped[str] = mapped_column(String(32), nullable=False)
+    horizon: Mapped[str] = mapped_column(String(32), nullable=False)
+    capital_scale: Mapped[str] = mapped_column(String(64), nullable=False)
+    style_tendency: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    timing_posture: Mapped[str] = mapped_column(String(32), nullable=False)
+    dimension_confidence: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    source: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'active'"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
 class AssistantMemoryORM(Base):
     """Finance Memory 长期记忆表，不保存 Hermes 通用对话记忆。"""
 

@@ -70,6 +70,8 @@ class FinanceAgentInterface:
                 "name": name,
                 "description": self.tool_runtime.get_tool(name).description,
                 "read_only": self.tool_runtime.get_tool(name).read_only,
+                "requires_review": self.tool_runtime.get_tool(name).requires_review,
+                "write_scope": self.tool_runtime.get_tool(name).write_scope,
             }
             for name in self.tool_runtime.list_tools()
         ]

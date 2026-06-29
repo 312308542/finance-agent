@@ -76,6 +76,7 @@ from finance_agent.storage.orm import (
     ScreeningResultItemORM,
     ScreeningResultORM,
     SignalSnapshotORM,
+    UserInvestmentProfileORM,
     WatchlistItemEventORM,
     WatchlistItemORM,
     WatchlistORM,
@@ -4543,6 +4544,284 @@ class MemoryRepository:
                 ).limit(limit)
             )
         )
+
+
+DEFAULT_PROFILE_STYLE_TENDENCY = {"value": 0.6, "theme": 0.4}
+DEFAULT_PROFILE_CONFIDENCE = {
+    "risk_appetite": 0.1,
+    "horizon": 0.1,
+    "capital_scale": 0.1,
+    "style_tendency": 0.1,
+    "timing_posture": 0.1,
+}
+DEFAULT_PROFILE_SOURCE = {
+    "risk_appetite": "default",
+    "horizon": "default",
+    "capital_scale": "default",
+    "style_tendency": "default",
+    "timing_posture": "default",
+}
+
+
+class UserInvestmentProfileRepository:
+    """用户投资画像仓储，负责结构化画像与 Finance Memory 审计同步。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    @staticmethod
+    def profile_id_for(owner_id: str) -> str:
+        """按用户 ID 生成稳定画像主键。"""
+
+        return f"profile:{owner_id}"
+
+    @staticmethod
+    def memory_id_for(owner_id: str) -> str:
+        """按用户 ID 生成画像审计记忆主键。"""
+
+        return f"memory:investment_profile:{owner_id}"
+
+    def get_profile(self, *, owner_id: str) -> UserInvestmentProfileORM | None:
+        """读取已落库画像。"""
+
+        return self.session.get(UserInvestmentProfileORM, self.profile_id_for(owner_id))
+
+    def get_or_default(self, *, owner_id: str) -> UserInvestmentProfileORM:
+        """读取画像；冷启动时返回不落库的默认画像。"""
+
+        profile = self.get_profile(owner_id=owner_id)
+        if profile is not None:
+            return profile
+        now = datetime.now().astimezone()
+        return UserInvestmentProfileORM(
+            profile_id=self.profile_id_for(owner_id),
+            owner_id=owner_id,
+            risk_appetite="balanced",
+            horizon="swing",
+            capital_scale="unknown",
+            style_tendency=dict(DEFAULT_PROFILE_STYLE_TENDENCY),
+            timing_posture="neutral",
+            dimension_confidence=dict(DEFAULT_PROFILE_CONFIDENCE),
+            source=dict(DEFAULT_PROFILE_SOURCE),
+            status="active",
+            created_at=now,
+            updated_at=now,
+            payload={"status": "default"},
+        )
+
+    def upsert_profile(
+        self,
+        *,
+        owner_id: str,
+        risk_appetite: str | None = None,
+        horizon: str | None = None,
+        capital_scale: str | None = None,
+        style_tendency: JsonDict | None = None,
+        timing_posture: str | None = None,
+        source: JsonDict | None = None,
+        evidence: Sequence[JsonDict] | None = None,
+        confidence_delta: Decimal = Decimal("0.20"),
+        updated_at: datetime | None = None,
+        payload: JsonDict | None = None,
+    ) -> UserInvestmentProfileORM:
+        """幂等写入画像，并同步一条 investment_profile Finance Memory。"""
+
+        now = updated_at or datetime.now().astimezone()
+        current = self.get_or_default(owner_id=owner_id)
+        changed_dimensions = self._changed_dimensions(
+            risk_appetite=risk_appetite,
+            horizon=horizon,
+            capital_scale=capital_scale,
+            style_tendency=style_tendency,
+            timing_posture=timing_posture,
+            source=source,
+        )
+        confidence = self._merge_confidence(
+            current.dimension_confidence,
+            changed_dimensions=changed_dimensions,
+            confidence_delta=confidence_delta,
+        )
+        merged_source = dict(current.source or DEFAULT_PROFILE_SOURCE)
+        for key, value in (source or {}).items():
+            if value:
+                merged_source[key] = value
+        profile_payload = {
+            **(current.payload or {}),
+            **(payload or {}),
+            "evidence": _json_safe(list(evidence or [])),
+            "updated_by": "profile.upsert",
+        }
+        values = {
+            "profile_id": self.profile_id_for(owner_id),
+            "owner_id": owner_id,
+            "risk_appetite": risk_appetite or current.risk_appetite,
+            "horizon": horizon or current.horizon,
+            "capital_scale": capital_scale or current.capital_scale,
+            "style_tendency": _json_safe(style_tendency or current.style_tendency),
+            "timing_posture": timing_posture or current.timing_posture,
+            "dimension_confidence": _json_safe(confidence),
+            "source": _json_safe(merged_source),
+            "status": "active",
+            "updated_at": now,
+            "payload": _json_safe(profile_payload),
+        }
+        statement = insert(UserInvestmentProfileORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "profile_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[UserInvestmentProfileORM.profile_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        profile = self.session.get_one(UserInvestmentProfileORM, values["profile_id"])
+        self.session.refresh(profile)
+        self._upsert_profile_memory(profile=profile, evidence=list(evidence or []))
+        return profile
+
+    def apply_confidence_decay(
+        self,
+        *,
+        owner_id: str,
+        as_of: datetime | None = None,
+        half_life_days: int = 90,
+        stale_threshold: Decimal = Decimal("0.05"),
+    ) -> UserInvestmentProfileORM | None:
+        """按半衰期衰减画像置信度，低于阈值时标记 stale。"""
+
+        profile = self.get_profile(owner_id=owner_id)
+        if profile is None:
+            return None
+        now = as_of or datetime.now().astimezone()
+        elapsed_days = max((now - profile.updated_at).total_seconds() / 86400, 0)
+        factor = 0.5 ** (elapsed_days / max(half_life_days, 1))
+        decayed = {
+            key: round(float(value) * factor, 6)
+            for key, value in (profile.dimension_confidence or {}).items()
+        }
+        max_confidence = max(decayed.values(), default=0.0)
+        status = "stale" if Decimal(str(max_confidence)) < stale_threshold else "active"
+        values = {
+            "profile_id": profile.profile_id,
+            "owner_id": profile.owner_id,
+            "risk_appetite": profile.risk_appetite,
+            "horizon": profile.horizon,
+            "capital_scale": profile.capital_scale,
+            "style_tendency": _json_safe(profile.style_tendency),
+            "timing_posture": profile.timing_posture,
+            "dimension_confidence": _json_safe(decayed),
+            "source": _json_safe(profile.source),
+            "status": status,
+            "updated_at": now,
+            "payload": _json_safe({**(profile.payload or {}), "confidence_decayed_at": now.isoformat()}),
+        }
+        statement = insert(UserInvestmentProfileORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "profile_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[UserInvestmentProfileORM.profile_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        refreshed = self.session.get_one(UserInvestmentProfileORM, profile.profile_id)
+        self.session.refresh(refreshed)
+        return refreshed
+
+    @staticmethod
+    def _changed_dimensions(
+        *,
+        risk_appetite: str | None,
+        horizon: str | None,
+        capital_scale: str | None,
+        style_tendency: JsonDict | None,
+        timing_posture: str | None,
+        source: JsonDict | None,
+    ) -> set[str]:
+        changed = {
+            key
+            for key, value in {
+                "risk_appetite": risk_appetite,
+                "horizon": horizon,
+                "capital_scale": capital_scale,
+                "style_tendency": style_tendency,
+                "timing_posture": timing_posture,
+            }.items()
+            if value is not None
+        }
+        changed.update(key for key, value in (source or {}).items() if value)
+        return changed
+
+    @staticmethod
+    def _merge_confidence(
+        current: JsonDict | None,
+        *,
+        changed_dimensions: set[str],
+        confidence_delta: Decimal,
+    ) -> JsonDict:
+        merged = dict(DEFAULT_PROFILE_CONFIDENCE)
+        merged.update(current or {})
+        delta = float(confidence_delta)
+        for dimension in changed_dimensions:
+            merged[dimension] = round(min(float(merged.get(dimension, 0.1)) + delta, 1.0), 6)
+        return merged
+
+    def _upsert_profile_memory(
+        self,
+        *,
+        profile: UserInvestmentProfileORM,
+        evidence: Sequence[JsonDict],
+    ) -> None:
+        confidence_values = [
+            Decimal(str(value)) for value in (profile.dimension_confidence or {}).values()
+        ]
+        confidence = max(confidence_values, default=Decimal("0.10"))
+        values = {
+            "memory_id": self.memory_id_for(profile.owner_id),
+            "owner_id": profile.owner_id,
+            "memory_type": "investment_profile",
+            "scope": "owner",
+            "asset_id": None,
+            "source_decision_id": self._first_evidence_id(evidence, "decision"),
+            "source_review_task_id": self._first_evidence_id(evidence, "review"),
+            "content": (
+                f"用户投资画像：风险偏好={profile.risk_appetite}，"
+                f"周期={profile.horizon}，择时={profile.timing_posture}。"
+            ),
+            "embedding_ref": None,
+            "confidence": confidence,
+            "status": profile.status,
+            "payload": _json_safe(
+                {
+                    "profile_id": profile.profile_id,
+                    "risk_appetite": profile.risk_appetite,
+                    "horizon": profile.horizon,
+                    "capital_scale": profile.capital_scale,
+                    "style_tendency": profile.style_tendency,
+                    "timing_posture": profile.timing_posture,
+                    "dimension_confidence": profile.dimension_confidence,
+                    "source": profile.source,
+                    "evidence": list(evidence),
+                }
+            ),
+            "updated_at": profile.updated_at,
+        }
+        statement = insert(AssistantMemoryORM).values(**values)
+        update_values = {key: statement.excluded[key] for key in values if key != "memory_id"}
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[AssistantMemoryORM.memory_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+
+    @staticmethod
+    def _first_evidence_id(evidence: Sequence[JsonDict], evidence_type: str) -> str | None:
+        for item in evidence:
+            if item.get("type") == evidence_type and item.get("id"):
+                return str(item["id"])
+        return None
 
 
 class ChatMemoryRepository:

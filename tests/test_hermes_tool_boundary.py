@@ -22,6 +22,8 @@ ALLOWED_TOOL_PREFIXES = (
     "factor.",
     "signal_risk.",
     "memory.",
+    "profile.",
+    "advice.",
     "graph.",
     "data_quality.",
     "recommendation.",
@@ -29,6 +31,7 @@ ALLOWED_TOOL_PREFIXES = (
 )
 
 FORBIDDEN_TOOL_KEYWORDS = ("order", "trade", "execute", "broker", "place")
+CONTROLLED_WRITE_TOOLS = {"profile.upsert": "investment_profile"}
 
 
 @pytest.fixture()
@@ -38,8 +41,10 @@ def interface() -> FinanceAgentInterface:
     return FinanceAgentInterface(object())  # type: ignore[arg-type]
 
 
-def test_hermes_visible_tools_are_read_only(interface: FinanceAgentInterface) -> None:
-    """Hermes 可见工具必须明确声明只读，且不得出现交易写入类工具。"""
+def test_hermes_visible_tools_are_read_only_or_controlled_profile_writes(
+    interface: FinanceAgentInterface,
+) -> None:
+    """Hermes 可见工具必须只读；画像 upsert 是唯一受控写白名单。"""
 
     result = interface.list_tools().to_dict()
 
@@ -49,9 +54,16 @@ def test_hermes_visible_tools_are_read_only(interface: FinanceAgentInterface) ->
 
     for tool in tools:
         name = tool["name"]
-        assert tool.get("read_only") is True
         assert name.startswith(ALLOWED_TOOL_PREFIXES)
         assert not any(keyword in name.lower() for keyword in FORBIDDEN_TOOL_KEYWORDS)
+        if name in CONTROLLED_WRITE_TOOLS:
+            assert tool.get("read_only") is False
+            assert tool.get("requires_review") is True
+            assert tool.get("write_scope") == CONTROLLED_WRITE_TOOLS[name]
+        else:
+            assert tool.get("read_only") is True
+            assert tool.get("requires_review") is False
+            assert tool.get("write_scope") is None
 
 
 def test_hermes_workflow_whitelist_is_fixed(interface: FinanceAgentInterface) -> None:

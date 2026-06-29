@@ -3,7 +3,11 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from finance_agent.agents.chat import FinanceAgentChatSession, to_openai_tool_name
+from finance_agent.agents.chat import (
+    FinanceAgentChatSession,
+    OPENAI_CHAT_TOOL_SCHEMAS,
+    to_openai_tool_name,
+)
 from finance_agent.agents.interfaces import AgentInterfaceResult
 from finance_agent.agents.runtime.model_client import ModelClientResponse
 from finance_agent.agents.runtime.model_config import ModelEndpointConfig, ModelRegistry
@@ -153,3 +157,17 @@ def test_chat_model_history_only_keeps_answered_tool_calls_when_budget_truncates
     assert [call["id"] for call in assistant_tool_messages[-1]["tool_calls"]] == ["call_keep"]
     assert [message["tool_call_id"] for message in tool_result_messages] == ["call_keep"]
     assert "call_drop" not in json.dumps(second_messages, ensure_ascii=False)
+
+
+def test_chat_tool_schemas_include_profile_tools_with_audit_requirements() -> None:
+    """模型工具协议必须暴露画像工具，并要求 profile.upsert 携带审计来源和证据。"""
+
+    assert "profile.get" in OPENAI_CHAT_TOOL_SCHEMAS
+    assert "profile.upsert" in OPENAI_CHAT_TOOL_SCHEMAS
+    assert "advice.suggest_style" in OPENAI_CHAT_TOOL_SCHEMAS
+    assert OPENAI_CHAT_TOOL_SCHEMAS["profile.upsert"]["required"] == [
+        "owner_id",
+        "updates",
+        "source",
+        "evidence",
+    ]
