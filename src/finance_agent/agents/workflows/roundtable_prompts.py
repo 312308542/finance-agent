@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from finance_agent.skills.loader import MethodologySkillRegistry
+
 ROLE_PROMPTS: dict[str, str] = {
     "technical_analyst": (
         "你是技术分析师，只基于输入中的趋势、量价、K 线和风险上下文解释技术面。"
@@ -50,7 +55,35 @@ OUTPUT_SCHEMA_PROMPT = """
 """.strip()
 
 
-def role_prompt(role: str) -> str:
+def role_prompt(role: str, *, skill_registry: "MethodologySkillRegistry | None" = None) -> str:
     """按角色返回圆桌模型提示词。"""
 
-    return ROLE_PROMPTS.get(role, DEFAULT_ROLE_PROMPT)
+    prompt = ROLE_PROMPTS.get(role, DEFAULT_ROLE_PROMPT)
+    registry = skill_registry or load_default_skill_registry()
+    if registry is None:
+        return prompt
+    skills = registry.for_role(role)
+    if not skills:
+        return prompt
+    skill_text = "\n\n".join(skill.prompt_excerpt() for skill in skills)
+    return (
+        f"{prompt}\n\n"
+        "## 可加载方法论技能\n"
+        "以下技能只提供解读口径，不能产生新事实；计算型结构必须来自确定性引擎输出。\n"
+        f"{skill_text}\n\n"
+        "## 方法论红线\n"
+        "- 不得自己计算笔/中枢/浪型/形态，只能引用已入库或引擎输出。\n"
+        "- 不得引用入库数据之外的事实。\n"
+        "- 不得给目标价，不得修改系统分数、信号方向、风险标记或动作枚举。"
+    )
+
+
+def load_default_skill_registry() -> "MethodologySkillRegistry | None":
+    """加载默认方法论技能；失败时保持旧 Prompt 可用。"""
+
+    try:
+        from finance_agent.skills.loader import load_all_methodology_skills
+
+        return load_all_methodology_skills()
+    except Exception:  # noqa: BLE001 - Prompt 注入失败不能阻断圆桌 fallback
+        return None
