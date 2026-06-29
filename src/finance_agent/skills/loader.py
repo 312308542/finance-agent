@@ -77,9 +77,13 @@ class MethodologySkillRegistry:
 def load_all_methodology_skills() -> MethodologySkillRegistry:
     """加载所有 P1 高频方法论技能。"""
 
-    return MethodologySkillRegistry(
-        skills=tuple(load_methodology_skill(name) for name in P1_METHODOLOGY_SKILL_NAMES)
-    )
+    return load_methodology_skills(P1_METHODOLOGY_SKILL_NAMES)
+
+
+def load_methodology_skills(names: tuple[str, ...]) -> MethodologySkillRegistry:
+    """按名称列表加载方法论技能。"""
+
+    return MethodologySkillRegistry(skills=tuple(load_methodology_skill(name) for name in names))
 
 
 @lru_cache(maxsize=None)
