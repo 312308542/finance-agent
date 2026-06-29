@@ -45,6 +45,8 @@ WorkflowGraphState = dict[str, Any]
 ROUNDTABLE_MODEL_ROLES = (
     "technical_analyst",
     "factor_analyst",
+    "event_analyst",
+    "flow_analyst",
     "risk_rebuttal",
     "portfolio_manager",
     "memory_manager",

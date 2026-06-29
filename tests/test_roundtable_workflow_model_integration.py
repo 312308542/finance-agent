@@ -104,6 +104,8 @@ def test_resolve_roundtable_model_roles_limits_daily_review_cost_by_default() ->
     ) == [
         "technical_analyst",
         "factor_analyst",
+        "event_analyst",
+        "flow_analyst",
         "risk_rebuttal",
         "portfolio_manager",
         "memory_manager",

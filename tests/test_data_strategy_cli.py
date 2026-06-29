@@ -98,7 +98,7 @@ def test_data_strategy_list_and_show_return_serializable_payloads() -> None:
         _args(subcommand="show", strategy_id="strategy:ashare:short_swing")
     )
 
-    assert listed["data"]["count"] == 3
+    assert listed["data"]["count"] == 4
     assert shown["data"]["strategy"]["strategy_id"] == "strategy:ashare:short_swing"
     assert shown["data"]["strategy"]["status"] == "active"
 
