@@ -69,6 +69,7 @@ def main() -> None:
     """执行基础数据层健康检查。"""
 
     args = parse_args()
+    checked_at = datetime.now(tz=UTC)
     session_factory = create_session_factory()
     cache, locks, cache_status = create_cache_client(backend=args.cache_backend)
     runtime = CollectionRuntime(cache=cache, locks=locks)
@@ -80,8 +81,22 @@ def main() -> None:
         universe_counts = load_universe_counts(session)
 
     provider_keys = sorted(set(DEFAULT_PROVIDER_KEYS) | {row["endpoint"] for row in provider_rows})
+    gaps = infer_gaps(table_counts, provider_rows, freshness_rows)
+    recommendation_readiness = build_recommendation_readiness(
+        checked_at=checked_at,
+        table_counts=table_counts,
+        freshness_rows=freshness_rows,
+        universe_counts=universe_counts,
+        gaps=gaps,
+    )
+    gaps = infer_gaps(
+        table_counts,
+        provider_rows,
+        freshness_rows,
+        recommendation_readiness=recommendation_readiness if args.readiness else None,
+    )
     summary = {
-        "checked_at": datetime.now(tz=UTC).isoformat(),
+        "checked_at": checked_at.isoformat(),
         "cache": cache_status.__dict__,
         "table_counts": table_counts,
         "freshness": freshness_rows,
@@ -89,14 +104,16 @@ def main() -> None:
         "provider_summary": summarize_providers(provider_rows),
         "providers": provider_rows,
         "provider_circuits": runtime.list_provider_states(provider_keys),
-        "gaps": infer_gaps(table_counts, provider_rows, freshness_rows),
+        "gaps": gaps,
         "refresh_hints": build_refresh_hints(table_counts, freshness_rows, provider_rows),
     }
+    if args.readiness:
+        summary["recommendation_readiness"] = recommendation_readiness
     summary["backfill_jobs"] = [
         job.to_scheduler_job()
         for job in DataBackfillPlanner().build_backfill_jobs(
             health_summary=summary,
-            now=datetime.now(tz=UTC),
+            now=checked_at,
         )
     ]
     print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
@@ -112,6 +129,11 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "redis", "null"],
         default="auto",
         help="缓存后端；auto 会在 Redis 不可用时降级为空缓存",
+    )
+    parser.add_argument(
+        "--readiness",
+        action="store_true",
+        help="输出推荐链路就绪度报告，用于判断是否允许真实推荐运行",
     )
     return parser.parse_args()
 
@@ -169,6 +191,11 @@ def load_table_counts(session: Any) -> JsonDict:
             union all select 'asset_universe_members', count(1) from asset_universe_members
             union all select 'market_calendars', count(1) from market_calendars
             union all select 'market_bars', count(1) from market_bars
+            union all select 'indicator_frames', count(1) from indicator_frames
+            union all select 'factor_frames', count(1) from factor_frames
+            union all select 'asset_scores', count(1) from asset_scores
+            union all select 'signal_snapshots', count(1) from signal_snapshots
+            union all select 'screening_results', count(1) from screening_results
             union all select 'capital_flow_snapshots', count(1) from capital_flow_snapshots
             union all select 'fundamental_snapshots', count(1) from fundamental_snapshots
             union all select 'event_records', count(1) from event_records
@@ -264,6 +291,7 @@ def infer_gaps(
     table_counts: JsonDict,
     provider_rows: list[JsonDict],
     freshness_rows: list[JsonDict] | None = None,
+    recommendation_readiness: JsonDict | None = None,
 ) -> list[str]:
     """根据表计数和最近 Provider 状态推断基础数据缺口。"""
 
@@ -301,7 +329,155 @@ def infer_gaps(
             and age_hours > threshold_hours
         ):
             gaps.append(f"{table_name} 最近数据已过期，建议补采")
+    if recommendation_readiness and recommendation_readiness.get("status") != "ready":
+        reasons = recommendation_readiness.get("reasons") or []
+        if reasons:
+            gaps.append(f"推荐就绪度未通过：{', '.join(str(reason) for reason in reasons)}")
     return gaps
+
+
+def build_recommendation_readiness(
+    *,
+    checked_at: datetime,
+    table_counts: JsonDict,
+    freshness_rows: list[JsonDict],
+    universe_counts: list[JsonDict],
+    gaps: list[str],
+) -> JsonDict:
+    """构建推荐运行前的数据就绪度报告。
+
+    该报告只基于已入库数据的计数和 freshness，不触发外部采集。它用于把
+    “数据是否足够新、足够完整”变成推荐链路可消费的结构化闸门。
+    """
+
+    freshness_by_table = {str(row.get("table_name")): row for row in freshness_rows}
+    mainboard_members = max(
+        (
+            int(row.get("member_count") or 0)
+            for row in universe_counts
+            if "mainboard" in str(row.get("universe_id") or "")
+            or "ashare" in str(row.get("universe_id") or "")
+        ),
+        default=0,
+    )
+    dimensions = {
+        "market_bars": readiness_dimension(
+            table_counts=table_counts,
+            freshness_by_table=freshness_by_table,
+            table_name="market_bars",
+            min_count=50,
+            required=True,
+        ),
+        "asset_scores": readiness_dimension(
+            table_counts=table_counts,
+            freshness_by_table=freshness_by_table,
+            table_name="asset_scores",
+            min_count=50,
+            required=True,
+        ),
+        "factor_frames": readiness_dimension(
+            table_counts=table_counts,
+            freshness_by_table=freshness_by_table,
+            table_name="factor_frames",
+            min_count=50,
+            required=True,
+        ),
+        "capital_flow_snapshots": readiness_dimension(
+            table_counts=table_counts,
+            freshness_by_table=freshness_by_table,
+            table_name="capital_flow_snapshots",
+            min_count=1,
+            required=False,
+        ),
+        "fundamental_snapshots": readiness_dimension(
+            table_counts=table_counts,
+            freshness_by_table=freshness_by_table,
+            table_name="fundamental_snapshots",
+            min_count=1,
+            required=False,
+        ),
+        "event_records": readiness_dimension(
+            table_counts=table_counts,
+            freshness_by_table=freshness_by_table,
+            table_name="event_records",
+            min_count=1,
+            required=False,
+        ),
+        "screening_results": readiness_dimension(
+            table_counts=table_counts,
+            freshness_by_table=freshness_by_table,
+            table_name="screening_results",
+            min_count=1,
+            required=False,
+        ),
+    }
+    reasons: list[str] = []
+    warnings: list[str] = []
+    for name, dimension in dimensions.items():
+        issue_key = dimension.get("issue_key")
+        if not issue_key:
+            continue
+        if dimension["required"]:
+            reasons.append(str(issue_key))
+        else:
+            warnings.append(str(issue_key))
+    if mainboard_members <= 0:
+        warnings.append("mainboard_universe_empty")
+    status = "ready" if not reasons else "blocked"
+    return {
+        "schema_version": "recommendation_readiness_v1",
+        "checked_at": checked_at.isoformat(),
+        "status": status,
+        "executable": status == "ready",
+        "reasons": reasons,
+        "warnings": warnings,
+        "dimensions": dimensions,
+        "coverage": {
+            "mainboard_universe_members": mainboard_members,
+            "known_gaps": list(gaps),
+        },
+    }
+
+
+def readiness_dimension(
+    *,
+    table_counts: JsonDict,
+    freshness_by_table: dict[str, JsonDict],
+    table_name: str,
+    min_count: int,
+    required: bool,
+) -> JsonDict:
+    """构建单个数据维度的就绪度。"""
+
+    count = int(table_counts.get(table_name) or 0)
+    freshness = freshness_by_table.get(table_name) or {}
+    age_hours = freshness.get("age_hours")
+    threshold_hours = freshness.get("threshold_hours")
+    issue_key = None
+    status = "ready"
+    if count < min_count:
+        status = "missing"
+        issue_key = f"{table_name}_empty"
+    elif required and not freshness:
+        status = "unknown"
+        issue_key = f"{table_name}_freshness_unknown"
+    elif (
+        isinstance(age_hours, (int, float))
+        and isinstance(threshold_hours, int)
+        and age_hours > threshold_hours
+    ):
+        status = "stale"
+        issue_key = f"{table_name}_stale"
+    return {
+        "status": status,
+        "required": required,
+        "count": count,
+        "min_count": min_count,
+        "latest_as_of": freshness.get("latest_as_of"),
+        "age_hours": age_hours,
+        "threshold_hours": threshold_hours,
+        "issue_key": issue_key,
+    }
 
 
 def build_refresh_hints(
