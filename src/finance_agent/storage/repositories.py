@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Select, String, delete, func, or_, select, text
+from sqlalchemy import Select, String, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -1522,6 +1522,37 @@ class UniverseRepository:
         )
         statement = select(AssetUniverseMemberORM).where(AssetUniverseMemberORM.id.in_(member_ids))
         return list(self.session.scalars(statement))
+
+    def prune_missing_members(
+        self,
+        *,
+        universe_id: str,
+        current_asset_ids: Sequence[str],
+        as_of: datetime,
+        removed_reason: str = "not_in_latest_rebuild",
+    ) -> int:
+        """显式剔除本轮重建缺席的候选池成员。
+
+        `replace_members` 保留 upsert 语义，调用方只有在“本轮结果代表完整快照”
+        时才应调用本方法，把旧的 included 成员标记为 excluded。
+        """
+
+        active_asset_ids = sorted({str(asset_id).strip() for asset_id in current_asset_ids if asset_id})
+        statement = (
+            update(AssetUniverseMemberORM)
+            .where(AssetUniverseMemberORM.universe_id == universe_id)
+            .where(AssetUniverseMemberORM.included.is_(True))
+            .values(
+                included=False,
+                removed_reason=removed_reason,
+                as_of=as_of,
+            )
+        )
+        if active_asset_ids:
+            statement = statement.where(AssetUniverseMemberORM.asset_id.not_in(active_asset_ids))
+        result = self.session.execute(statement)
+        self.session.flush()
+        return int(getattr(result, "rowcount", 0) or 0)
 
     def get_universe(self, universe_id: str) -> AssetUniverseORM:
         """根据候选池 ID 查询候选池。"""

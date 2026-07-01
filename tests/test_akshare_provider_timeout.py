@@ -427,10 +427,17 @@ def test_eastmoney_common_curl_get_json_uses_browser_cookie(monkeypatch) -> None
     assert captured["kwargs"]["headers"]["Cookie"] == "qgqp_b_id=test-cookie"
 
 
-def test_eastmoney_headers_generates_anonymous_cookie_when_env_missing(monkeypatch) -> None:
+def test_eastmoney_headers_generates_anonymous_cookie_when_env_missing(
+    monkeypatch,
+    tmp_path,
+) -> None:
     """未配置浏览器 cookie 时，应生成进程内匿名东方财富 cookie。"""
 
     monkeypatch.delenv("FINANCE_AGENT_EASTMONEY_COOKIE", raising=False)
+    monkeypatch.setenv(
+        "FINANCE_AGENT_EASTMONEY_COOKIE_FILE",
+        str(tmp_path / "missing_eastmoney_cookie.json"),
+    )
     if hasattr(eastmoney_curl, "_SYNTHETIC_EASTMONEY_COOKIE"):
         monkeypatch.setattr(eastmoney_curl, "_SYNTHETIC_EASTMONEY_COOKIE", None)
 

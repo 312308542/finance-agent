@@ -746,6 +746,12 @@ class ProductionUniverseService:
             universe_id=target_universe_id,
             members=[plan.to_repository_payload() for plan in plans],
         )
+        self.universes.prune_missing_members(
+            universe_id=target_universe_id,
+            current_asset_ids=[plan.asset_id for plan in plans],
+            as_of=as_of,
+            removed_reason="not_in_latest_merge",
+        )
         return plans
 
     def rebuild_avoid_pool(

@@ -211,6 +211,27 @@ def test_universe_and_calendar_batch_methods_write_in_chunks() -> None:
     assert session.flush_count == 1
 
 
+def test_universe_repository_prunes_missing_members() -> None:
+    """显式 prune 应只把本轮缺席的旧成员标记为 excluded，保留 upsert 默认语义。"""
+
+    session = _RowCountSession(rowcounts=[2])
+    result = UniverseRepository(session).prune_missing_members(
+        universe_id="universe:test:ashare",
+        current_asset_ids=["ashare:000001", "ashare:600519"],
+        as_of=datetime(2026, 6, 30, tzinfo=UTC),
+        removed_reason="not_in_latest_merge",
+    )
+
+    sql = _compiled(session.executed[0])
+
+    assert result == 2
+    assert "UPDATE asset_universe_members" in sql
+    assert "asset_universe_members.universe_id = " in sql
+    assert "asset_universe_members.included IS true" in sql
+    assert "asset_universe_members.asset_id NOT IN" in sql
+    assert session.flush_count == 1
+
+
 def test_fact_repository_batch_methods_write_in_chunks() -> None:
     as_of = datetime(2026, 6, 8, tzinfo=UTC)
 

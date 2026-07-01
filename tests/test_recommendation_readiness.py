@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 from scripts.data.check_base_data_health import (
     build_recommendation_readiness,
+    freshness_row_is_stale,
     infer_gaps,
     load_table_counts,
 )
@@ -39,6 +40,137 @@ def test_build_recommendation_readiness_marks_ready_when_core_dimensions_pass() 
     assert readiness["reasons"] == []
     assert readiness["dimensions"]["market_bars"]["status"] == "ready"
     assert readiness["dimensions"]["asset_scores"]["status"] == "ready"
+
+
+def test_build_recommendation_readiness_prefers_tradeable_included_universe_count() -> None:
+    """覆盖基数应优先取可交易主板池 included 数，避免历史残留成员抬高基数。"""
+
+    checked_at = datetime(2026, 6, 30, 10, tzinfo=UTC)
+    readiness = build_recommendation_readiness(
+        checked_at=checked_at,
+        table_counts={
+            "market_bars": 2_200_000,
+            "asset_scores": 4_000,
+            "factor_frames": 4_000,
+        },
+        freshness_rows=[
+            freshness("market_bars", checked_at - timedelta(hours=2), 12, checked_at),
+            freshness("asset_scores", checked_at - timedelta(hours=3), 24, checked_at),
+            freshness("factor_frames", checked_at - timedelta(hours=3), 24, checked_at),
+        ],
+        universe_counts=[
+            {
+                "universe_id": "universe:merged:ashare:recommendation",
+                "member_count": 5_855,
+                "included_member_count": 3_482,
+            },
+            {
+                "universe_id": "universe:tradeable:ashare:main_board",
+                "member_count": 3_482,
+                "included_member_count": 3_482,
+            },
+        ],
+        gaps=[],
+    )
+
+    assert readiness["coverage"]["mainboard_universe_members"] == 3_482
+
+
+def test_build_recommendation_readiness_keeps_daily_bars_ready_until_next_close() -> None:
+    """日 K 应按交易日收盘语义判断，不能在次日凌晨被 12 小时阈值误判过期。"""
+
+    checked_at = datetime(2026, 7, 1, 6, tzinfo=UTC)
+    latest_daily_bar = datetime(2026, 6, 30, 15, tzinfo=UTC)
+    readiness = build_recommendation_readiness(
+        checked_at=checked_at,
+        table_counts={
+            "market_bars": 2_200_000,
+            "asset_scores": 4_000,
+            "factor_frames": 4_000,
+        },
+        freshness_rows=[
+            freshness("market_bars", latest_daily_bar, 12, checked_at)
+            | {
+                "timeframe": "1d",
+                "market": "ashare",
+                "expected_latest_as_of": latest_daily_bar.isoformat(),
+                "expected_close_at": datetime(2026, 7, 1, 7, tzinfo=UTC).isoformat(),
+            },
+            freshness("asset_scores", checked_at - timedelta(hours=3), 24, checked_at),
+            freshness("factor_frames", checked_at - timedelta(hours=3), 24, checked_at),
+        ],
+        universe_counts=[{"universe_id": "ashare:mainboard:tradable", "member_count": 3200}],
+        gaps=[],
+    )
+
+    assert readiness["status"] == "ready"
+    assert "market_bars_stale" not in readiness["reasons"]
+    assert readiness["dimensions"]["market_bars"]["status"] == "ready"
+    assert readiness["dimensions"]["market_bars"]["freshness_policy"] == "trading_day_close"
+
+
+def test_build_recommendation_readiness_keeps_daily_factors_and_scores_ready_until_next_close() -> None:
+    """日级因子和评分继承日 K 交易日时间戳，下一次收盘前不应被固定小时阈值误判过期。"""
+
+    checked_at = datetime(2026, 7, 1, 6, tzinfo=UTC)
+    latest_daily_snapshot = datetime(2026, 6, 30, 0, tzinfo=UTC)
+    freshness_policy = {
+        "timeframe": "1d",
+        "market": "ashare",
+        "freshness_policy": "trading_day_close",
+        "expected_latest_as_of": latest_daily_snapshot.isoformat(),
+        "expected_close_at": datetime(2026, 7, 1, 7, tzinfo=UTC).isoformat(),
+    }
+    readiness = build_recommendation_readiness(
+        checked_at=checked_at,
+        table_counts={
+            "market_bars": 2_200_000,
+            "asset_scores": 4_000,
+            "factor_frames": 4_000,
+        },
+        freshness_rows=[
+            freshness("market_bars", latest_daily_snapshot, 12, checked_at)
+            | freshness_policy,
+            freshness("asset_scores", latest_daily_snapshot, 24, checked_at)
+            | freshness_policy,
+            freshness("factor_frames", latest_daily_snapshot, 24, checked_at)
+            | freshness_policy,
+        ],
+        universe_counts=[{"universe_id": "ashare:mainboard:tradable", "member_count": 3200}],
+        gaps=[],
+    )
+
+    assert readiness["status"] == "ready"
+    assert readiness["reasons"] == []
+    assert readiness["dimensions"]["asset_scores"]["status"] == "ready"
+    assert readiness["dimensions"]["factor_frames"]["status"] == "ready"
+
+
+def test_daily_derived_snapshot_freshness_detects_missing_expected_trade_date() -> None:
+    """日级衍生截面缺少最近应收盘交易日时，应按日期缺口判定 stale。"""
+
+    assert freshness_row_is_stale(
+        {
+            "table_name": "asset_scores",
+            "timeframe": "1d",
+            "freshness_policy": "trading_day_close",
+            "latest_as_of": "2026-06-29T00:00:00+00:00",
+            "expected_latest_as_of": "2026-06-30T00:00:00+00:00",
+        }
+    )
+
+
+def test_daily_market_bar_freshness_detects_missing_expected_trade_date() -> None:
+    """日 K 缺少最近应收盘交易日时，应按日期缺口判定 stale。"""
+
+    assert freshness_row_is_stale(
+        {
+            "table_name": "market_bars",
+            "timeframe": "1d",
+            "latest_as_of": "2026-06-29T00:00:00+00:00",
+            "expected_latest_as_of": "2026-06-30T00:00:00+00:00",
+        }
+    )
 
 
 def test_build_recommendation_readiness_blocks_when_scores_are_missing_or_stale() -> None:

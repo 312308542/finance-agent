@@ -64,6 +64,13 @@ FRESHNESS_THRESHOLDS_HOURS = {
     "screening_results": 24,
 }
 
+DAILY_MARKET_BAR_FRESHNESS_POLICY = "trading_day_close"
+DAILY_DERIVED_SNAPSHOT_TABLES = {
+    "factor_frames",
+    "asset_scores",
+    "signal_snapshots",
+}
+
 
 def main() -> None:
     """执行基础数据层健康检查。"""
@@ -238,8 +245,8 @@ def load_table_freshness(session: Any) -> list[JsonDict]:
             """
         )
     ).mappings()
-    freshness: list[JsonDict] = []
     now = datetime.now(tz=UTC)
+    freshness: list[JsonDict] = []
     for row in rows:
         latest_as_of = row["latest_as_of"]
         age_hours = None
@@ -253,7 +260,107 @@ def load_table_freshness(session: Any) -> list[JsonDict]:
                 "threshold_hours": FRESHNESS_THRESHOLDS_HOURS.get(row["table_name"]),
             }
         )
+    daily_market_bar = load_daily_market_bar_freshness(session, checked_at=now)
+    if daily_market_bar:
+        freshness = [
+            row for row in freshness if str(row.get("table_name") or "") != "market_bars"
+        ]
+        freshness.append(daily_market_bar)
+        freshness = apply_daily_derived_snapshot_freshness(
+            freshness,
+            daily_market_bar=daily_market_bar,
+        )
     return freshness
+
+
+def load_daily_market_bar_freshness(session: Any, *, checked_at: datetime) -> JsonDict | None:
+    """读取 A 股日 K 的交易日感知 freshness。
+
+    日 K 的时间戳通常是交易日期零点，不能用固定小时阈值判断是否过期。
+    这里按交易日历找出“当前检查时刻之前最后一个已收盘交易日”，只要日 K
+    覆盖到该交易日，就认为行情维度可用于推荐。
+    """
+
+    row = session.execute(
+        text(
+            """
+            select latest.latest_as_of,
+                   expected.expected_latest_as_of,
+                   expected.expected_close_at
+            from (
+                select max(timestamp) as latest_as_of
+                from market_bars
+                where market = 'ashare'
+                  and timeframe = '1d'
+                  and is_closed is true
+            ) as latest
+            cross join (
+                select (max(trade_date)::timestamp at time zone 'UTC') as expected_latest_as_of,
+                       max(close_at) as expected_close_at
+                from market_calendars
+                where market = 'ashare'
+                  and is_trading_day is true
+                  and close_at is not null
+                  and close_at <= :checked_at
+            ) as expected
+            """
+        ),
+        {"checked_at": checked_at},
+    ).mappings().one()
+    latest_as_of = normalize_datetime_value(row["latest_as_of"])
+    expected_latest_as_of = normalize_datetime_value(row["expected_latest_as_of"])
+    expected_close_at = normalize_datetime_value(row["expected_close_at"])
+    if latest_as_of is None and expected_latest_as_of is None:
+        return None
+    age_hours = None
+    if latest_as_of is not None:
+        age_hours = (checked_at.astimezone(UTC) - latest_as_of).total_seconds() / 3600
+    return {
+        "table_name": "market_bars",
+        "market": "ashare",
+        "timeframe": "1d",
+        "freshness_policy": DAILY_MARKET_BAR_FRESHNESS_POLICY,
+        "latest_as_of": latest_as_of.isoformat() if latest_as_of is not None else None,
+        "expected_latest_as_of": expected_latest_as_of.isoformat()
+        if expected_latest_as_of is not None
+        else None,
+        "expected_close_at": expected_close_at.isoformat()
+        if expected_close_at is not None
+        else None,
+        "age_hours": round(age_hours, 2) if age_hours is not None else None,
+        "threshold_hours": None,
+    }
+
+
+def apply_daily_derived_snapshot_freshness(
+    freshness_rows: list[JsonDict],
+    *,
+    daily_market_bar: JsonDict,
+) -> list[JsonDict]:
+    """让日级因子、评分和信号沿用日 K 的交易日收盘 freshness 语义。"""
+
+    expected_latest = daily_market_bar.get("expected_latest_as_of")
+    if expected_latest is None:
+        return freshness_rows
+    adjusted: list[JsonDict] = []
+    for row in freshness_rows:
+        table_name = str(row.get("table_name") or "")
+        if table_name not in DAILY_DERIVED_SNAPSHOT_TABLES:
+            adjusted.append(row)
+            continue
+        updated = dict(row)
+        updated.update(
+            {
+                "market": "ashare",
+                "timeframe": "1d",
+                "freshness_policy": DAILY_MARKET_BAR_FRESHNESS_POLICY,
+                "expected_latest_as_of": expected_latest,
+                "expected_close_at": daily_market_bar.get("expected_close_at"),
+                "threshold_hours": None,
+            }
+        )
+        adjusted.append(updated)
+    return adjusted
 
 
 def load_universe_counts(session: Any) -> list[JsonDict]:
@@ -262,7 +369,9 @@ def load_universe_counts(session: Any) -> list[JsonDict]:
     rows = session.execute(
         text(
             """
-            select universe_id, count(1) as member_count
+            select universe_id,
+                   count(1) as member_count,
+                   count(1) filter (where included is true) as included_member_count
             from asset_universe_members
             group by universe_id
             order by universe_id
@@ -270,7 +379,11 @@ def load_universe_counts(session: Any) -> list[JsonDict]:
         )
     ).mappings()
     return [
-        {"universe_id": row["universe_id"], "member_count": int(row["member_count"])}
+        {
+            "universe_id": row["universe_id"],
+            "member_count": int(row["member_count"]),
+            "included_member_count": int(row["included_member_count"]),
+        }
         for row in rows
     ]
 
@@ -323,11 +436,7 @@ def infer_gaps(
         table_name = str(row.get("table_name") or "")
         age_hours = row.get("age_hours")
         threshold_hours = row.get("threshold_hours")
-        if (
-            isinstance(age_hours, (int, float))
-            and isinstance(threshold_hours, int)
-            and age_hours > threshold_hours
-        ):
+        if freshness_row_is_stale(row):
             gaps.append(f"{table_name} 最近数据已过期，建议补采")
     if recommendation_readiness and recommendation_readiness.get("status") != "ready":
         reasons = recommendation_readiness.get("reasons") or []
@@ -351,15 +460,7 @@ def build_recommendation_readiness(
     """
 
     freshness_by_table = {str(row.get("table_name")): row for row in freshness_rows}
-    mainboard_members = max(
-        (
-            int(row.get("member_count") or 0)
-            for row in universe_counts
-            if "mainboard" in str(row.get("universe_id") or "")
-            or "ashare" in str(row.get("universe_id") or "")
-        ),
-        default=0,
-    )
+    mainboard_members = infer_mainboard_universe_member_count(universe_counts)
     dimensions = {
         "market_bars": readiness_dimension(
             table_counts=table_counts,
@@ -439,6 +540,54 @@ def build_recommendation_readiness(
     }
 
 
+def infer_mainboard_universe_member_count(universe_counts: list[JsonDict]) -> int:
+    """推断推荐 readiness 使用的主板覆盖基数。
+
+    优先使用可交易主板池的 included 成员数；不存在时再退回到包含 mainboard
+    标识的 A 股池，最后才用 A 股相关池的最大 included 数作为兼容兜底。
+    """
+
+    preferred = [
+        universe_member_count(row)
+        for row in universe_counts
+        if is_tradeable_mainboard_universe(str(row.get("universe_id") or ""))
+    ]
+    if preferred:
+        return max(preferred)
+    mainboard = [
+        universe_member_count(row)
+        for row in universe_counts
+        if "mainboard" in str(row.get("universe_id") or "").lower()
+        or "main_board" in str(row.get("universe_id") or "").lower()
+    ]
+    if mainboard:
+        return max(mainboard)
+    return max(
+        (
+            universe_member_count(row)
+            for row in universe_counts
+            if "ashare" in str(row.get("universe_id") or "").lower()
+        ),
+        default=0,
+    )
+
+
+def is_tradeable_mainboard_universe(universe_id: str) -> bool:
+    """识别可交易主板池的常见命名。"""
+
+    normalized = universe_id.lower()
+    return (
+        ("tradeable" in normalized or "tradable" in normalized)
+        and ("main_board" in normalized or "mainboard" in normalized)
+    )
+
+
+def universe_member_count(row: JsonDict) -> int:
+    """读取候选池 included 成员数，兼容旧测试输入。"""
+
+    return int(row.get("included_member_count") or row.get("member_count") or 0)
+
+
 def readiness_dimension(
     *,
     table_counts: JsonDict,
@@ -461,14 +610,10 @@ def readiness_dimension(
     elif required and not freshness:
         status = "unknown"
         issue_key = f"{table_name}_freshness_unknown"
-    elif (
-        isinstance(age_hours, (int, float))
-        and isinstance(threshold_hours, int)
-        and age_hours > threshold_hours
-    ):
+    elif freshness_row_is_stale(freshness):
         status = "stale"
         issue_key = f"{table_name}_stale"
-    return {
+    result = {
         "status": status,
         "required": required,
         "count": count,
@@ -478,6 +623,79 @@ def readiness_dimension(
         "threshold_hours": threshold_hours,
         "issue_key": issue_key,
     }
+    if is_daily_market_bar_freshness(freshness):
+        result["freshness_policy"] = DAILY_MARKET_BAR_FRESHNESS_POLICY
+    for key in ("freshness_policy", "expected_latest_as_of", "expected_close_at", "timeframe"):
+        if key in freshness:
+            result[key] = freshness[key]
+    return result
+
+
+def freshness_row_is_stale(row: JsonDict) -> bool:
+    """判断 freshness 行是否过期，日 K 走交易日收盘语义。"""
+
+    if is_trading_day_close_freshness(row):
+        expected_latest = parse_datetime(row.get("expected_latest_as_of"))
+        latest_as_of = parse_datetime(row.get("latest_as_of"))
+        if expected_latest is None:
+            return False
+        if latest_as_of is None:
+            return True
+        return latest_as_of.date() < expected_latest.date()
+    age_hours = row.get("age_hours")
+    threshold_hours = row.get("threshold_hours")
+    return (
+        isinstance(age_hours, (int, float))
+        and isinstance(threshold_hours, int)
+        and age_hours > threshold_hours
+    )
+
+
+def is_daily_market_bar_freshness(row: JsonDict) -> bool:
+    """识别交易日感知的日 K freshness 行。"""
+
+    return str(row.get("table_name") or "") == "market_bars" and is_trading_day_close_freshness(
+        row
+    )
+
+
+def is_trading_day_close_freshness(row: JsonDict) -> bool:
+    """识别按交易日收盘日期判断 freshness 的日级数据。"""
+
+    table_name = str(row.get("table_name") or "")
+    return (
+        table_name in {"market_bars", *DAILY_DERIVED_SNAPSHOT_TABLES}
+        and str(row.get("timeframe") or "") == "1d"
+        and (
+            str(row.get("freshness_policy") or "") == DAILY_MARKET_BAR_FRESHNESS_POLICY
+            or row.get("expected_latest_as_of") is not None
+        )
+    )
+
+
+def parse_datetime(value: Any) -> datetime | None:
+    """解析 ISO 时间字符串或 datetime，并统一到 UTC。"""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return normalize_datetime_value(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return normalize_datetime_value(datetime.fromisoformat(value.replace("Z", "+00:00")))
+        except ValueError:
+            return None
+    return None
+
+
+def normalize_datetime_value(value: Any) -> datetime | None:
+    """把数据库返回的时间值统一成 UTC aware datetime。"""
+
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def build_refresh_hints(
@@ -493,9 +711,7 @@ def build_refresh_hints(
         table_name = str(row.get("table_name") or "")
         age_hours = row.get("age_hours")
         threshold_hours = row.get("threshold_hours")
-        if not isinstance(age_hours, (int, float)) or not isinstance(threshold_hours, int):
-            continue
-        if age_hours <= threshold_hours:
+        if not freshness_row_is_stale(row):
             continue
         hints.append(
             {
