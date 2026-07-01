@@ -3,6 +3,7 @@
 from finance_agent.storage.db import (
     create_engine_from_settings,
     create_session_factory,
+    dispose_cached_engines,
     get_database_url,
 )
 from finance_agent.storage.orm import Base
@@ -55,5 +56,6 @@ __all__ = [
     "WorkflowAuditRepository",
     "create_engine_from_settings",
     "create_session_factory",
+    "dispose_cached_engines",
     "get_database_url",
 ]

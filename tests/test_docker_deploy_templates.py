@@ -64,3 +64,11 @@ def test_dockerignore_excludes_heavy_and_sensitive_paths() -> None:
         "__pycache__",
     ]:
         assert expected in content
+
+
+def test_root_postgres_compose_raises_local_connection_limit() -> None:
+    """本地 TimescaleDB 应提高连接数，以适配 API、调度器和 MCP 并发。"""
+
+    content = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+
+    assert "max_connections=300" in content

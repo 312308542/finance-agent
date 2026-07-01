@@ -9,6 +9,8 @@ services:
       FINANCE_AGENT_DATABASE_URL: ${FINANCE_AGENT_DATABASE_URL:-postgresql+psycopg://finance_agent:finance_agent@postgres:5432/finance_agent}
       FINANCE_AGENT_REDIS_URL: ${FINANCE_AGENT_REDIS_URL:-redis://redis:6379/0}
       FINANCE_AGENT_CACHE_BACKEND: ${FINANCE_AGENT_CACHE_BACKEND:-redis}
+      FINANCE_AGENT_DB_POOL_SIZE: ${FINANCE_AGENT_DB_POOL_SIZE:-10}
+      FINANCE_AGENT_DB_MAX_OVERFLOW: ${FINANCE_AGENT_DB_MAX_OVERFLOW:-20}
     volumes:
       - ../../runtime:/app/runtime
     command:
