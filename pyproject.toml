@@ -26,6 +26,7 @@ dependencies = [
   "redis>=5.2,<6.0",
   "requests>=2.32,<3.0",
   "sqlalchemy>=2.0,<3.0",
+  "statsmodels>=0.14.6,<0.15",
   "TA-Lib>=0.6.5,<1.0",
   "uvicorn>=0.32,<1.0",
 ]

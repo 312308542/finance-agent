@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -15,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 JsonDict = dict[str, Any]
+CointegrationTest = Callable[[np.ndarray, np.ndarray], tuple[float, float, Any]]
 
 
 @dataclass(frozen=True)
@@ -132,6 +134,10 @@ class PairTradingResult:
     intercept: float
     spread_latest: float
     spread_zscore: float
+    cointegration_statistic: float
+    cointegration_pvalue: float
+    cointegration_critical_values: JsonDict
+    cointegration_status: str
     signal: JsonDict
     evidence_id: str
 
@@ -151,11 +157,18 @@ class PairTradingResult:
             "intercept": self.intercept,
             "spread_latest": self.spread_latest,
             "spread_zscore": self.spread_zscore,
+            "cointegration": {
+                "method": "statsmodels.tsa.stattools.coint",
+                "statistic": self.cointegration_statistic,
+                "pvalue": self.cointegration_pvalue,
+                "critical_values": self.cointegration_critical_values,
+                "status": self.cointegration_status,
+            },
             "signal": self.signal,
             "evidence_id": self.evidence_id,
             "red_lines": [
-                "配对价差和 z-score 由确定性适配器计算，LLM 只能解读。",
-                "当前轻量版不替代 statsmodels 协整检验。",
+                "配对价差、z-score 和协整检验由确定性适配器计算，LLM 只能解读。",
+                "不得用模型自行判断协整关系或修改配对信号方向。",
             ],
         }
 
@@ -244,7 +257,9 @@ class CorrelationAdapter:
                     }
                 )
 
-        input_end_at = normalize_datetime(max(point.timestamp for item in series for point in item.prices))
+        input_end_at = normalize_datetime(
+            max(point.timestamp for item in series for point in item.prices)
+        )
         return CorrelationResult(
             status="available",
             market=market,
@@ -258,6 +273,9 @@ class CorrelationAdapter:
 
 class PairTradingAdapter:
     """配对交易轻量统计适配器。"""
+
+    def __init__(self, *, cointegration_test: CointegrationTest | None = None) -> None:
+        self.cointegration_test = cointegration_test or statsmodels_cointegration_test
 
     def compute(
         self,
@@ -283,7 +301,14 @@ class PairTradingAdapter:
             spread_zscore = 0.0
         else:
             spread_zscore = float((spread[-1] - float(np.mean(spread))) / spread_std)
-        input_end_at = normalize_datetime(max(point.timestamp for point in left.prices + right.prices))
+        coint_statistic, coint_pvalue, coint_critical_values = self.cointegration_test(
+            left_values,
+            right_values,
+        )
+        cointegration_status = build_cointegration_status(coint_pvalue)
+        input_end_at = normalize_datetime(
+            max(point.timestamp for point in left.prices + right.prices)
+        )
         return PairTradingResult(
             status="available",
             left_asset_id=left.asset_id,
@@ -296,6 +321,10 @@ class PairTradingAdapter:
             intercept=round(intercept, 6),
             spread_latest=round(float(spread[-1]), 6),
             spread_zscore=round(spread_zscore, 6),
+            cointegration_statistic=round(to_finite_float(coint_statistic), 6),
+            cointegration_pvalue=round(to_finite_float(coint_pvalue), 6),
+            cointegration_critical_values=normalize_critical_values(coint_critical_values),
+            cointegration_status=cointegration_status,
             signal=build_pair_signal(spread_zscore, entry_zscore=entry_zscore),
             evidence_id=build_evidence_id(
                 "pair_trading",
@@ -376,6 +405,43 @@ def ordinary_least_squares(*, x: np.ndarray, y: np.ndarray) -> tuple[float, floa
     return float(slope), float(intercept)
 
 
+def statsmodels_cointegration_test(
+    left_values: np.ndarray,
+    right_values: np.ndarray,
+) -> tuple[float, float, Any]:
+    """使用 statsmodels 执行 Engle-Granger 协整检验。"""
+
+    try:
+        from statsmodels.tsa.stattools import coint
+    except ImportError as exc:  # pragma: no cover - 依赖缺失时给出可操作错误
+        raise RuntimeError("配对交易协整检验需要安装 statsmodels。") from exc
+    statistic, pvalue, critical_values = coint(left_values, right_values)
+    return float(statistic), float(pvalue), critical_values
+
+
+def normalize_critical_values(values: Any) -> JsonDict:
+    """把 statsmodels 临界值统一为可 JSON 化结构。"""
+
+    if isinstance(values, dict):
+        return {str(key): round(to_finite_float(value), 6) for key, value in values.items()}
+    labels = ("1%", "5%", "10%")
+    try:
+        iterable = list(values)
+    except TypeError as exc:
+        raise ValueError("协整检验临界值不可解析。") from exc
+    return {
+        label: round(to_finite_float(value), 6)
+        for label, value in zip(labels, iterable, strict=False)
+    }
+
+
+def build_cointegration_status(pvalue: float, *, significance_level: float = 0.05) -> str:
+    """根据 p 值给出协整状态。"""
+
+    parsed = to_finite_float(pvalue)
+    return "cointegrated" if parsed <= significance_level else "not_cointegrated"
+
+
 def build_pair_signal(spread_zscore: float, *, entry_zscore: float) -> JsonDict:
     """根据价差 z-score 生成配对信号。"""
 
@@ -398,7 +464,12 @@ def build_pair_signal(spread_zscore: float, *, entry_zscore: float) -> JsonDict:
     }
 
 
-def build_evidence_id(prefix: str, asset_or_market: str, timeframe: str, input_end_at: datetime) -> str:
+def build_evidence_id(
+    prefix: str,
+    asset_or_market: str,
+    timeframe: str,
+    input_end_at: datetime,
+) -> str:
     """生成方法论适配器证据 ID。"""
 
     normalized = input_end_at.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")

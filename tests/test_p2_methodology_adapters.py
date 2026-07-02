@@ -93,6 +93,35 @@ def test_pair_trading_adapter_computes_hedge_ratio_and_zscore_signal() -> None:
     assert result.to_indicator_payload()["schema_version"] == "pair_trading_v1"
 
 
+def test_pair_trading_adapter_records_statsmodels_cointegration_result() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    base = [100 + index for index in range(80)]
+    paired = [4 + 1.2 * value for value in base]
+    left = make_close_series("ashare:PAIR_A", "PAIR_A", paired, start=start)
+    right = make_close_series("ashare:PAIR_B", "PAIR_B", base, start=start)
+
+    def fake_cointegration(left_values, right_values):
+        assert len(left_values) == len(right_values)
+        return -4.25, 0.018, {"1%": -3.9, "5%": -3.3, "10%": -3.0}
+
+    result = PairTradingAdapter(cointegration_test=fake_cointegration).compute(
+        left=left,
+        right=right,
+        timeframe="1d",
+        min_observations=60,
+    )
+
+    assert result.cointegration_pvalue == pytest.approx(0.018)
+    assert result.cointegration_statistic == pytest.approx(-4.25)
+    assert result.cointegration_status == "cointegrated"
+    payload = result.to_indicator_payload()
+    assert payload["cointegration"]["pvalue"] == pytest.approx(0.018)
+    assert payload["red_lines"] == [
+        "配对价差、z-score 和协整检验由确定性适配器计算，LLM 只能解读。",
+        "不得用模型自行判断协整关系或修改配对信号方向。",
+    ]
+
+
 def make_close_series(
     asset_id: str,
     symbol: str,
