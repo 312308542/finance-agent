@@ -2679,9 +2679,10 @@ def test_seconds_until_next_run_handles_empty_waiting_states() -> None:
 
 
 def test_collect_base_data_with_timeout_sets_spawn_executable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """采集 payload 子进程应显式继承当前解释器，避免 Windows spawn 跑到其他 Python。"""
+    """采集 payload 子进程应固定到项目 venv，避免 Windows spawn 跑到其他 Python。"""
 
     configured_executables: list[str] = []
+    project_python = Path.cwd() / ".venv" / "Scripts" / "python.exe"
 
     class FakeQueue:
         def __init__(self, maxsize: int) -> None:
@@ -2719,6 +2720,7 @@ def test_collect_base_data_with_timeout_sets_spawn_executable(monkeypatch: pytes
         "set_executable",
         lambda executable: configured_executables.append(str(executable)),
     )
+    monkeypatch.setattr(scheduler_module.sys, "executable", r"C:\ProgramData\anaconda3\python.exe")
 
     result = collect_base_data_with_timeout(
         Namespace(),
@@ -2727,6 +2729,25 @@ def test_collect_base_data_with_timeout_sets_spawn_executable(monkeypatch: pytes
     )
 
     assert result == {"status": "ok"}
+    assert configured_executables == [str(project_python)]
+
+
+def test_direct_collect_base_data_configures_spawn_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """直接运行采集脚本时也应固定 spawn 解释器到当前虚拟环境。"""
+
+    collect_base_data = import_collection_module()
+    configured_executables: list[str] = []
+
+    monkeypatch.setattr(
+        collect_base_data.multiprocessing,
+        "set_executable",
+        lambda executable: configured_executables.append(str(executable)),
+    )
+
+    collect_base_data.configure_multiprocessing_spawn_executable()
+
     assert configured_executables == [sys.executable]
 
 
@@ -4595,6 +4616,52 @@ def test_pledge_risk_watermark_timeframe_fits_schema_limit() -> None:
 
     assert timeframe == "pledge_ratio"
     assert len(timeframe) <= 16
+
+
+def test_risk_sentiment_window_watermark_timeframes_fit_schema_limit() -> None:
+    """风险情绪窗口型水位 timeframe 必须压缩到表结构长度内。"""
+
+    collect_base_data = import_collection_module()
+
+    cases = [
+        (
+            "ashare_risk_lhb_detail",
+            "stock_lhb_detail_em",
+            {"start_date": "20260501", "end_date": "20260514"},
+        ),
+        (
+            "ashare_risk_block_trades",
+            "stock_dzjy_mrmx",
+            {"symbol": "A股", "start_date": "20260501", "end_date": "20260514"},
+        ),
+        (
+            "ashare_risk_margin_sse",
+            "stock_margin_sse",
+            {"start_date": "20260501", "end_date": "20260514"},
+        ),
+        (
+            "ashare_risk_margin_szse",
+            "stock_margin_szse",
+            {"date": "20260514"},
+        ),
+    ]
+
+    timeframes = [
+        collect_base_data.ashare_risk_sentiment_watermark_timeframe(
+            task=task,
+            provider=provider,
+            parameters=parameters,
+        )
+        for task, provider, parameters in cases
+    ]
+
+    assert timeframes == [
+        "lhb:260501-0514",
+        "dzjy:260501-0514",
+        "msse:260501-0514",
+        "mszse:260514",
+    ]
+    assert all(len(timeframe) <= 16 for timeframe in timeframes)
 
 
 def test_ashare_risk_sentiment_skips_only_source_in_failure_cooldown(
@@ -6837,6 +6904,44 @@ def test_crypto_derivatives_records_symbol_watermarks_and_uses_source_gate(
     assert watermark_calls[0]["market"] == "crypto_future"
     assert watermark_calls[0]["data_domain"] == collect_base_data.CRYPTO_DERIVATIVE_DATA_DOMAIN
     assert watermark_calls[0]["provider"] == collect_base_data.CRYPTO_DERIVATIVE_PROVIDER
+
+
+def test_crypto_derivative_symbol_resolution_respects_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """衍生品快照按资产池展开时应遵守单次 limit，避免真实补采误跑全量。"""
+
+    collect_base_data = import_collection_module()
+    observed_limits: list[int | None] = []
+
+    def fake_batch_symbols(
+        session: Any,
+        *,
+        market: str,
+        limit: int | None,
+        fallback_symbol: str,
+    ) -> list[str]:
+        observed_limits.append(limit)
+        return ["BTCUSDT", "ETHUSDT"]
+
+    monkeypatch.setattr(collect_base_data, "batch_crypto_derivative_symbols", fake_batch_symbols)
+
+    args = collect_base_data.default_collection_args(
+        group=["crypto"],
+        sync_task_type="derivative_refresh",
+        symbol_source="market_assets",
+        crypto_market_type="future",
+        limit=2,
+    )
+
+    symbols = collect_base_data.resolve_crypto_derivative_collection_symbols(
+        object(),
+        args,
+        market="crypto_future",
+    )
+
+    assert observed_limits == [2]
+    assert symbols == ["BTCUSDT", "ETHUSDT"]
 
 
 def test_record_crypto_symbol_watermark_records_success_and_failure(

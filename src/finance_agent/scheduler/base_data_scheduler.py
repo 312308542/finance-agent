@@ -2406,6 +2406,27 @@ def parse_lookback_days(value: str | None, *, default_days: int) -> int:
         return default_days
 
 
+def scheduler_python_executable(root_dir: Path | None = None) -> str:
+    """返回调度器派生子进程时应使用的项目 Python。"""
+
+    project_root = root_dir or Path(__file__).resolve().parents[3]
+    candidates = (
+        [
+            project_root / ".venv" / "Scripts" / "python.exe",
+            project_root / ".venv" / "bin" / "python",
+        ]
+        if os.name == "nt"
+        else [
+            project_root / ".venv" / "bin" / "python",
+            project_root / ".venv" / "Scripts" / "python.exe",
+        ]
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
+
+
 class JobTimeoutError(TimeoutError):
     """单个采集任务超过调度器允许时间。"""
 
@@ -2420,8 +2441,8 @@ def collect_base_data_with_timeout(
 ) -> JsonDict:
     """在子进程中执行采集，超时后终止子进程。"""
 
-    # Windows spawn 有可能继承到系统 Python，这里显式固定为当前调度进程解释器。
-    multiprocessing.set_executable(sys.executable)
+    # Windows venv 启动器可能让 sys.executable 指到底层 Anaconda，这里显式固定到项目 venv。
+    multiprocessing.set_executable(scheduler_python_executable())
     context = multiprocessing.get_context("spawn")
     result_queue: multiprocessing.Queue[JsonDict] = context.Queue(maxsize=1)
     if collect_base_data_func is None:

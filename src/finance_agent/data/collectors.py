@@ -894,7 +894,7 @@ class AshareP0Collector:
             strategy_context=strategy_context,
             as_of=result.collected_at,
             total_before_filter=len(result.assets),
-            total_after_filter=len(result.assets),
+            total_after_filter=sum(1 for asset in result.assets if asset.tradable),
             status=result.status,
             payload={
                 "provider_payload": result.payload,
@@ -922,6 +922,8 @@ class AshareP0Collector:
                     "symbol": asset.symbol,
                     "market": asset.market,
                     "as_of": result.collected_at,
+                    "included": asset.tradable,
+                    "removed_reason": None if asset.tradable else "untradable_realtime_quote",
                     "rank_hint": index,
                     "payload": asset.payload | {"raw_record_id": raw_record_id},
                 }

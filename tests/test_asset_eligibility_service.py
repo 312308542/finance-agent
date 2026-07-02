@@ -103,6 +103,53 @@ def test_filter_tradeable_assets_treats_missing_tradable_as_candidate() -> None:
     assert [asset.asset_id for asset in selected] == ["ashare:600519"]
 
 
+def test_filter_tradeable_assets_excludes_obviously_unlisted_ashare_names() -> None:
+    """可交易主板池应排除 PT、退市、摘牌等明确不可交易名称。"""
+
+    assets = [
+        SimpleNamespace(
+            asset_id="ashare:000003",
+            market="ashare",
+            symbol="000003",
+            name="PT金田A",
+            asset_type="stock",
+            tradable=True,
+            status="available",
+        ),
+        SimpleNamespace(
+            asset_id="ashare:000005",
+            market="ashare",
+            symbol="000005",
+            name="退市星源",
+            asset_type="stock",
+            tradable=True,
+            status="available",
+        ),
+        SimpleNamespace(
+            asset_id="ashare:000024",
+            market="ashare",
+            symbol="000024",
+            name="招商地产摘牌",
+            asset_type="stock",
+            tradable=True,
+            status="available",
+        ),
+        SimpleNamespace(
+            asset_id="ashare:600519",
+            market="ashare",
+            symbol="600519",
+            name="贵州茅台",
+            asset_type="stock",
+            tradable=True,
+            status="available",
+        ),
+    ]
+
+    selected = TradeableAssetEligibilityService().filter_tradeable_assets(assets)
+
+    assert [asset.asset_id for asset in selected] == ["ashare:600519"]
+
+
 def test_filter_tradeable_ashare_symbols_normalizes_and_deduplicates() -> None:
     """标的列表过滤应归一化代码、去重并跳过非主板标的。"""
 

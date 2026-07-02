@@ -110,6 +110,108 @@ def test_ashare_full_asset_collection_repairs_asset_master(
     assert len(universe_calls["members"][0][1]) == 1
 
 
+def test_ashare_full_asset_collection_excludes_untradable_members(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """全 A 资产池应保留不可交易资产身份，但候选池成员必须标记为 excluded。"""
+
+    asset_calls: dict[str, list[dict[str, Any]]] = {"master": []}
+    universe_calls: dict[str, list[Any]] = {"universes": [], "members": []}
+
+    class FakeAssetRepository:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        def upsert_asset_masters(self, rows: list[dict[str, Any]]) -> None:
+            asset_calls["master"].extend(rows)
+
+        def upsert_asset_profiles(self, rows: list[dict[str, Any]]) -> None:
+            return None
+
+        def upsert_asset_provider_mappings(self, rows: list[dict[str, Any]]) -> None:
+            return None
+
+        def upsert_asset_status_snapshots(self, rows: list[dict[str, Any]]) -> None:
+            return None
+
+        def upsert_realtime_quote_snapshots(self, rows: list[dict[str, Any]]) -> None:
+            return None
+
+    class FakeUniverseRepository:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        def upsert_universe(self, **kwargs: Any) -> None:
+            universe_calls["universes"].append(kwargs)
+
+        def replace_members(self, *, universe_id: str, members: list[dict[str, Any]]) -> None:
+            universe_calls["members"].append((universe_id, members))
+
+    class FakeRawRecordRepository:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+    class FakeProvider:
+        def fetch_assets(self, *, limit: int | None = None) -> AssetListResult:
+            as_of = datetime(2026, 7, 2, 9, 30, tzinfo=UTC)
+            return AssetListResult(
+                provider_name="akshare",
+                status="available",
+                collected_at=as_of,
+                payload={"actual_source": "eastmoney:curl_cffi:stock_zh_a_spot_em"},
+                assets=[
+                    AssetData(
+                        asset_id="ashare:000024",
+                        symbol="000024",
+                        name="招商地产",
+                        market="ashare",
+                        asset_type="stock",
+                        exchange="SZSE",
+                        currency="CNY",
+                        tradable=False,
+                        status="unavailable",
+                    ),
+                    AssetData(
+                        asset_id="ashare:600519",
+                        symbol="600519",
+                        name="贵州茅台",
+                        market="ashare",
+                        asset_type="stock",
+                        exchange="SSE",
+                        currency="CNY",
+                    ),
+                ],
+            )
+
+    monkeypatch.setattr("finance_agent.data.collectors.AssetRepository", FakeAssetRepository)
+    monkeypatch.setattr("finance_agent.data.collectors.UniverseRepository", FakeUniverseRepository)
+    monkeypatch.setattr(
+        "finance_agent.data.collectors.RawRecordRepository", FakeRawRecordRepository
+    )
+    monkeypatch.setattr(
+        "finance_agent.data.collectors.archive_provider_result",
+        lambda *args, **kwargs: "raw:test",
+    )
+
+    collector = AshareP0Collector(object(), provider=FakeProvider())
+
+    collector.collect_assets(
+        universe_id="universe:base:ashare:p0:all_a",
+        universe_name="全 A",
+        strategy_context="base_data_collect",
+    )
+
+    assert [(row["asset_id"], row["tradable"], row["status"]) for row in asset_calls["master"]] == [
+        ("ashare:000024", False, "unavailable"),
+        ("ashare:600519", True, "available"),
+    ]
+    members = universe_calls["members"][0][1]
+    assert [(member["asset_id"], member.get("included"), member.get("removed_reason")) for member in members] == [
+        ("ashare:000024", False, "untradable_realtime_quote"),
+        ("ashare:600519", True, None),
+    ]
+
+
 def test_crypto_market_collection_writes_asset_master(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

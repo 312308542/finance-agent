@@ -4,6 +4,7 @@ import pandas as pd
 
 from finance_agent.data.normalizers import (
     is_main_board_ashare_stock_symbol,
+    normalize_ashare_spot,
     normalize_ashare_fund_flow_rank,
 )
 
@@ -32,6 +33,24 @@ def test_fund_flow_rank_normalizes_and_filters_invalid_ashare_symbols() -> None:
         "ashare:000001",
         "ashare:000002",
         "ashare:600519",
+    ]
+
+
+def test_ashare_spot_marks_dash_price_assets_untradable() -> None:
+    """A 股实时列表里最新价为 '-' 的历史标的应保留身份但标记不可交易。"""
+
+    assets = normalize_ashare_spot(
+        pd.DataFrame(
+            [
+                {"代码": "000024", "名称": "招商地产", "最新价": "-", "涨跌幅": "-"},
+                {"代码": "600519", "名称": "贵州茅台", "最新价": 1410.0, "涨跌幅": 0.12},
+            ]
+        )
+    )
+
+    assert [(asset.symbol, asset.tradable, asset.status) for asset in assets] == [
+        ("000024", False, "unavailable"),
+        ("600519", True, "available"),
     ]
 
 

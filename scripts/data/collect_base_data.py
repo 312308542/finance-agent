@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import multiprocessing
 import os
 import sys
 import threading
@@ -212,6 +213,12 @@ def configure_logging_from_environment() -> None:
         root_logger.addHandler(file_handler)
 
 
+def configure_multiprocessing_spawn_executable() -> None:
+    """固定 Windows spawn 子进程解释器，避免虚拟环境退回 base Python。"""
+
+    multiprocessing.set_executable(sys.executable)
+
+
 def default_collection_args(**overrides: Any) -> argparse.Namespace:
     """生成采集入口默认参数，供调度器和其他编排脚本复用。"""
 
@@ -239,6 +246,7 @@ def collect_base_data(args: argparse.Namespace) -> JsonDict:
     global COLLECTION_PROGRESS_RECORDER, COLLECTION_RUNTIME_ARGS, SOURCE_RATE_LIMITER
     global SOURCE_RATE_POLICY_FINGERPRINT
     configure_logging_from_environment()
+    configure_multiprocessing_spawn_executable()
     COLLECTION_RUNTIME_ARGS = args
     rate_policies = getattr(args, "rate_policies", None)
     if rate_policies:
@@ -5049,13 +5057,37 @@ def ashare_capital_flow_watermark_asset_id(indicator: str) -> str:
     return f"ashare:capital_flow:rank:{safe_indicator}"
 
 
+def _compact_risk_date(value: Any, *, month_day: bool = False) -> str:
+    """将 YYYYMMDD 日期压缩为水位短键片段。"""
+
+    text = str(value or "").strip()
+    if len(text) == 8 and text.isdigit():
+        return text[4:] if month_day else text[2:]
+    return ""
+
+
+def _compact_risk_date_window(parameters: Mapping[str, Any]) -> str:
+    """生成不超过 11 字符的风险窗口短键，例如 260501-0514。"""
+
+    start_token = _compact_risk_date(parameters.get("start_date"))
+    end_token = _compact_risk_date(parameters.get("end_date"), month_day=True)
+    if start_token and end_token:
+        return f"{start_token}-{end_token}"
+    end_full_token = _compact_risk_date(parameters.get("end_date") or parameters.get("date"))
+    if end_full_token:
+        return end_full_token
+    if start_token:
+        return start_token
+    return "latest"
+
+
 def ashare_risk_sentiment_watermark_timeframe(
     *,
     task: str,
     provider: str,
     parameters: Mapping[str, Any],
 ) -> str:
-    """生成风险情绪子源水位粒度，确保不同日期窗口互不误伤。"""
+    """生成风险情绪子源水位粒度，压缩到 data_sync_watermarks 字段限制内。"""
 
     if task == "ashare_risk_stop_list":
         return "stop_list"
@@ -5064,21 +5096,17 @@ def ashare_risk_sentiment_watermark_timeframe(
     if task == "ashare_sentiment_zt_pool":
         return f"zt_pool:{parameters.get('date') or 'latest'}"
     if task in {"ashare_risk_lhb_detail", "ashare_risk_margin_sse"}:
-        start_date = str(parameters.get("start_date") or "").strip() or "latest"
-        end_date = str(parameters.get("end_date") or "").strip() or "latest"
-        return f"{provider}:{start_date}:{end_date}"
+        prefix = "lhb" if task == "ashare_risk_lhb_detail" else "msse"
+        return f"{prefix}:{_compact_risk_date_window(parameters)}"
     if task == "ashare_risk_block_trades":
-        symbol = str(parameters.get("symbol") or "A股").strip() or "A股"
-        start_date = str(parameters.get("start_date") or "").strip() or "latest"
-        end_date = str(parameters.get("end_date") or "").strip() or "latest"
-        return f"{provider}:{symbol}:{start_date}:{end_date}"
+        return f"dzjy:{_compact_risk_date_window(parameters)}"
     if task == "ashare_risk_restricted_release":
         end_date = str(parameters.get("end_date") or "").strip() or "latest"
         return f"rr:{end_date}"
     if task == "ashare_risk_pledge_ratio":
         return "pledge_ratio"
     if task == "ashare_risk_margin_szse":
-        return f"margin_szse:{parameters.get('date') or 'latest'}"
+        return f"mszse:{_compact_risk_date_window(parameters)}"
     return task or provider
 
 
@@ -5997,7 +6025,7 @@ def resolve_crypto_derivative_collection_symbols(
         return batch_crypto_derivative_symbols(
             session,
             market=market,
-            limit=None,
+            limit=runtime_collection_limit(args),
             fallback_symbol=args.crypto_symbol,
         )
     return [args.crypto_symbol]

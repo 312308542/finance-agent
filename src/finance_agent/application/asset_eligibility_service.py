@@ -16,6 +16,7 @@ TRADEABLE_FUND_TYPES = {
     "lof",
     "open_fund",
 }
+UNLISTED_ASHARE_NAME_MARKERS = ("PT", "退市", "终止上市", "摘牌")
 
 
 def is_tradeable_ashare_symbol(symbol: Any) -> bool:
@@ -36,7 +37,12 @@ class TradeableAssetEligibilityService:
         asset_type = str(getattr(asset, "asset_type", "") or "").strip().lower()
         symbol = str(getattr(asset, "symbol", "") or "").strip()
         if market == "ashare":
-            return asset_type in {"", "stock"} and is_tradeable_ashare_symbol(symbol)
+            name = str(getattr(asset, "name", "") or "").strip()
+            return (
+                asset_type in {"", "stock"}
+                and is_tradeable_ashare_symbol(symbol)
+                and not is_obviously_unlisted_ashare_name(name)
+            )
         if market == "fund":
             return asset_type in TRADEABLE_FUND_TYPES
         return False
@@ -69,3 +75,12 @@ def asset_market(asset: Any) -> str:
     if ":" in asset_id:
         return asset_id.split(":", 1)[0]
     return ""
+
+
+def is_obviously_unlisted_ashare_name(name: str) -> bool:
+    """判断 A 股名称是否明确指向不可交易/退市状态。"""
+
+    normalized = name.strip().upper().replace(" ", "")
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in UNLISTED_ASHARE_NAME_MARKERS)

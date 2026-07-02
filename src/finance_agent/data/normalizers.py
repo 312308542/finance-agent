@@ -54,6 +54,7 @@ def normalize_ashare_spot(df: pd.DataFrame, *, limit: int | None = None) -> list
         symbol = str(row.get("代码", "")).strip()
         if not symbol:
             continue
+        tradable = _ashare_spot_row_is_tradable(row)
         assets.append(
             AssetData(
                 asset_id=f"ashare:{symbol}",
@@ -63,11 +64,20 @@ def normalize_ashare_spot(df: pd.DataFrame, *, limit: int | None = None) -> list
                 asset_type="stock",
                 exchange=infer_ashare_exchange(symbol),
                 currency="CNY",
-                tradable=True,
+                tradable=tradable,
+                status="available" if tradable else "unavailable",
                 payload={"raw": row},
             )
         )
     return assets
+
+
+def _ashare_spot_row_is_tradable(row: dict[str, Any]) -> bool:
+    """根据实时行情行判断是否仍有可交易报价。"""
+
+    if "最新价" not in row:
+        return True
+    return nullable_decimal(row.get("最新价")) is not None
 
 
 def normalize_ashare_spot_tx(df: pd.DataFrame, *, limit: int | None = None) -> list[AssetData]:
