@@ -15,6 +15,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from finance_agent.application.theme_context_service import ThemeContextService
 from finance_agent.factors import FactorComputationResult, FactorService
 from finance_agent.indicators import IndicatorComputationResult, IndicatorService
 from finance_agent.recommendations import RecommendationRunResult, RecommendationService
@@ -23,12 +24,12 @@ from finance_agent.screening import ScreeningRunResult, ScreeningService
 from finance_agent.screening.service import ensure_single_market_universe
 from finance_agent.signals import SignalComputationResult, SignalService
 from finance_agent.storage.orm import AssetUniverseMemberORM, AssetUniverseORM
-from finance_agent.storage.repositories import UniverseRepository
-from finance_agent.storage.repositories import ScreeningRepository
+from finance_agent.storage.repositories import ScreeningRepository, UniverseRepository
 
 JsonDict = dict[str, Any]
 TECHNICAL_SCREENING_POOL_SOURCE = "technical_screening_pool"
 TECHNICAL_SCREENING_STRATEGY = "technical_screening_v1"
+THEME_FACTOR_GROUP_NAMES = {"sector_strength", "leadership"}
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,7 @@ class UniverseRecommendationPipeline:
         self.scoring = ScoringService(session)
         self.signals = SignalService(session)
         self.recommendations = RecommendationService(session)
+        self.theme_contexts = ThemeContextService(session)
 
     def run_for_universe(
         self,
@@ -168,12 +170,18 @@ class UniverseRecommendationPipeline:
             members=members,
             indicator_results=indicator_results,
         )
+        generated_theme_contexts = build_theme_contexts_for_members(
+            theme_contexts=getattr(self, "theme_contexts", None),
+            members=indicator_backed_members,
+            errors=errors,
+        )
         for member in indicator_backed_members:
             factor = self._compute_factor(
                 member=member,
                 timeframe=effective_timeframe,
                 horizon=horizon,
                 errors=errors,
+                generated_theme_context=generated_theme_contexts.get(member.asset_id),
             )
             if factor is not None:
                 factor_results.append(factor)
@@ -315,6 +323,7 @@ class UniverseRecommendationPipeline:
         timeframe: str,
         horizon: str,
         errors: list[JsonDict],
+        generated_theme_context: Any | None = None,
     ) -> FactorComputationResult | None:
         """计算单个成员因子，并把异常收集到流水线摘要。"""
 
@@ -325,6 +334,10 @@ class UniverseRecommendationPipeline:
                 horizon=horizon,
                 fallback_symbol=member.symbol,
                 fallback_market=member.market,
+                supplemental_factor_groups=theme_factor_groups_from_member_payload(
+                    member.payload,
+                    generated_theme_context=generated_theme_context,
+                ),
             )
         except Exception as exc:
             errors.append(error_payload(member=member, stage="factor", error=exc))
@@ -436,6 +449,81 @@ def prefer_technical_screening_members(
         return members
     selected = [member for member in members if member.asset_id in passed_asset_ids]
     return selected or members
+
+
+def theme_factor_groups_from_member_payload(
+    payload: JsonDict | None,
+    *,
+    generated_theme_context: Any | None = None,
+) -> list[JsonDict]:
+    """从候选池成员 payload 中提取确定性题材因子组。"""
+
+    candidates: list[Any] = []
+    candidates.extend(theme_factor_groups_from_context(generated_theme_context))
+    if isinstance(payload, dict):
+        for key in ("supplemental_factor_groups", "theme_factor_groups", "factor_groups"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                candidates.extend(value)
+        theme_context = payload.get("theme_context")
+        candidates.extend(theme_factor_groups_from_context(theme_context))
+
+    result: list[JsonDict] = []
+    seen: set[str] = set()
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        group_name = str(item.get("group") or "").strip()
+        if group_name not in THEME_FACTOR_GROUP_NAMES or group_name in seen:
+            continue
+        seen.add(group_name)
+        result.append(dict(item))
+    return result
+
+
+def theme_factor_groups_from_context(context: Any | None) -> list[JsonDict]:
+    """从生产题材上下文对象或 dict 中提取 factor_groups。"""
+
+    if context is None:
+        return []
+    if hasattr(context, "to_member_payload"):
+        payload = context.to_member_payload()
+        if isinstance(payload, dict):
+            context = payload.get("theme_context")
+    if isinstance(context, dict) and "theme_context" in context:
+        nested = context.get("theme_context")
+        if isinstance(nested, dict):
+            context = nested
+    if isinstance(context, dict) and isinstance(context.get("factor_groups"), list):
+        return [dict(item) for item in context["factor_groups"] if isinstance(item, dict)]
+    return []
+
+
+def build_theme_contexts_for_members(
+    *,
+    theme_contexts: Any,
+    members: list[AssetUniverseMemberORM],
+    errors: list[JsonDict],
+) -> dict[str, Any]:
+    """调用生产题材上下文服务，失败时只记录错误，不阻塞推荐主链路。"""
+
+    if theme_contexts is None or not hasattr(theme_contexts, "build_for_members"):
+        return {}
+    try:
+        contexts = theme_contexts.build_for_members(members)
+    except Exception as exc:
+        errors.append(
+            {
+                "stage": "theme_context",
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "message": "题材上下文生成失败，本次推荐继续使用候选池原始 payload。",
+            }
+        )
+        return {}
+    if not isinstance(contexts, dict):
+        return {}
+    return contexts
 
 
 def exclude_avoid_pool_members(

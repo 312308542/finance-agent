@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,6 +19,7 @@ class _Member:
     asset_id: str
     symbol: str
     market: str = "ashare"
+    payload: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -60,10 +61,12 @@ class _Indicators:
 class _Factors:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.kwargs: list[dict[str, Any]] = []
 
     def compute_for_asset(self, **kwargs: Any) -> _FactorResult:
         asset_id = str(kwargs["asset_id"])
         self.calls.append(asset_id)
+        self.kwargs.append(kwargs)
         return _FactorResult(asset_id=asset_id)
 
 
@@ -114,6 +117,16 @@ class _Recommendations:
             run_id=None,
             top_recommendation_id=None,
         )
+
+
+class _ThemeContexts:
+    def __init__(self, context_by_asset_id: dict[str, dict[str, Any]]) -> None:
+        self.context_by_asset_id = context_by_asset_id
+        self.calls: list[list[str]] = []
+
+    def build_for_members(self, members: list[_Member]) -> dict[str, dict[str, Any]]:
+        self.calls.append([member.asset_id for member in members])
+        return self.context_by_asset_id
 
 
 class _ForbiddenStage:
@@ -295,3 +308,97 @@ def test_recommendation_pipeline_passes_market_regime_to_recommendation_service(
     )
 
     assert recommendations.calls[0]["market_regime"] == market_regime
+
+
+def test_recommendation_pipeline_passes_member_theme_groups_to_factor_service() -> None:
+    """候选池成员携带题材因子上下文时，流水线应透传给因子服务入帧。"""
+
+    pipeline = UniverseRecommendationPipeline.__new__(UniverseRecommendationPipeline)
+    factors = _Factors()
+    member = _Member(
+        asset_id="ashare:600519",
+        symbol="600519",
+        payload={
+            "theme_context": {
+                "factor_groups": [
+                    {"group": "sector_strength", "status": "available", "score": 92},
+                    {"group": "leadership", "status": "available", "score": 88},
+                    {"group": "technical", "status": "available", "score": 100},
+                ]
+            }
+        },
+    )
+    pipeline.factors = factors
+
+    result = pipeline._compute_factor(
+        member=member,
+        timeframe="1d",
+        horizon="swing",
+        errors=[],
+    )
+
+    assert result == _FactorResult(asset_id="ashare:600519")
+    assert factors.kwargs == [
+        {
+            "asset_id": "ashare:600519",
+            "timeframe": "1d",
+            "horizon": "swing",
+            "fallback_symbol": "600519",
+            "fallback_market": "ashare",
+            "supplemental_factor_groups": [
+                {"group": "sector_strength", "status": "available", "score": 92},
+                {"group": "leadership", "status": "available", "score": 88},
+            ],
+        }
+    ]
+
+
+def test_recommendation_pipeline_merges_generated_theme_context_before_factor_stage() -> None:
+    """生产侧题材上下文服务生成的因子组，应在因子计算前进入 supplemental groups。"""
+
+    pipeline = UniverseRecommendationPipeline.__new__(UniverseRecommendationPipeline)
+    member = _Member(
+        asset_id="ashare:600519",
+        symbol="600519",
+        payload={
+            "theme_context": {
+                "factor_groups": [
+                    {"group": "sector_strength", "status": "available", "score": 50}
+                ]
+            }
+        },
+    )
+    pipeline.universes = _Universes([member])
+    pipeline.indicators = _Indicators(available_asset_ids={"ashare:600519"})
+    factors = _Factors()
+    pipeline.factors = factors
+    pipeline.screening_repository = None
+    pipeline.screenings = _Screenings()
+    pipeline.scoring = _Scoring()
+    pipeline.signals = _Signals()
+    pipeline.recommendations = _Recommendations()
+    theme_contexts = _ThemeContexts(
+        {
+            "ashare:600519": {
+                "factor_groups": [
+                    {"group": "sector_strength", "status": "available", "score": 92},
+                    {"group": "leadership", "status": "available", "score": 88},
+                ]
+            }
+        }
+    )
+    pipeline.theme_contexts = theme_contexts
+
+    pipeline.run_for_universe(
+        universe_id="universe:test:ashare",
+        horizon="swing",
+        timeframe="1d",
+        min_indicator_coverage_ratio=0.5,
+        min_factor_coverage_ratio=0.0,
+    )
+
+    assert theme_contexts.calls == [["ashare:600519"]]
+    assert factors.kwargs[0]["supplemental_factor_groups"] == [
+        {"group": "sector_strength", "status": "available", "score": 92},
+        {"group": "leadership", "status": "available", "score": 88},
+    ]

@@ -8,7 +8,7 @@ LLM 参与打分。
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -43,6 +43,7 @@ from finance_agent.storage.repositories import (
 )
 
 JsonDict = dict[str, Any]
+SUPPLEMENTAL_FACTOR_GROUPS = {"sector_strength", "leadership"}
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,7 @@ class FactorService:
         indicator_library: str = "talib",
         fallback_symbol: str | None = None,
         fallback_market: str | None = None,
+        supplemental_factor_groups: Iterable[Mapping[str, Any]] | None = None,
     ) -> FactorComputationResult:
         """计算单标的第一版因子快照。"""
 
@@ -129,6 +131,9 @@ class FactorService:
             fallback_market=fallback_market,
         )
         as_of = indicator.input_end_at if indicator else datetime.now(tz=UTC)
+        supplemental_groups = normalize_supplemental_factor_groups(
+            supplemental_factor_groups or []
+        )
         groups = [
             build_technical_group(indicator),
             build_fundamental_group(fundamental),
@@ -164,6 +169,7 @@ class FactorService:
             ]
         elif market.startswith("ashare"):
             groups = [group for group in groups if group["group"] != "derivatives"]
+            groups = append_supplemental_factor_groups(groups, supplemental_groups)
         missing_groups = [item["group"] for item in groups if item["status"] == "unavailable"]
         partial_groups = [item["group"] for item in groups if item["status"] == "partial"]
         source_ids = collect_source_ids(
@@ -176,6 +182,7 @@ class FactorService:
             derivative_history=derivative_history,
             events=events,
             risks=risks,
+            supplemental_factor_groups=supplemental_groups,
         )
         available_count = len(groups) - len(missing_groups)
         status = "available" if not missing_groups and not partial_groups else "partial"
@@ -608,6 +615,57 @@ def build_risk_group(risks: list[RiskFindingORM]) -> JsonDict:
     }
 
 
+def normalize_supplemental_factor_groups(
+    groups: Iterable[Mapping[str, Any]],
+) -> list[JsonDict]:
+    """清洗外部注入的题材因子组，只允许确定性题材/龙头因子入帧。"""
+
+    normalized: list[JsonDict] = []
+    seen: set[str] = set()
+    for group in groups:
+        group_name = str(group.get("group") or "").strip()
+        if group_name not in SUPPLEMENTAL_FACTOR_GROUPS or group_name in seen:
+            continue
+        seen.add(group_name)
+        factors = group.get("factors")
+        missing_factors = group.get("missing_factors") or []
+        source_ids = supplemental_group_source_ids(group)
+        normalized.append(
+            {
+                "group": group_name,
+                "status": str(group.get("status") or "available"),
+                "score": coerce_float(group.get("score")),
+                "factors": dict(factors) if isinstance(factors, Mapping) else {},
+                "missing_factors": [str(item) for item in missing_factors if item],
+                "source_ids": source_ids,
+            }
+        )
+    return normalized
+
+
+def append_supplemental_factor_groups(
+    groups: list[JsonDict],
+    supplemental_groups: list[JsonDict],
+) -> list[JsonDict]:
+    """把题材因子组追加到基础因子组，已存在的组不重复写入。"""
+
+    existing = {str(group.get("group")) for group in groups}
+    return groups + [group for group in supplemental_groups if group["group"] not in existing]
+
+
+def supplemental_group_source_ids(group: Mapping[str, Any]) -> list[str]:
+    """从题材因子组中提取审计来源 ID。"""
+
+    values: list[str] = []
+    for key in ("source_ids", "evidence_ids"):
+        raw_values = group.get(key) or []
+        if isinstance(raw_values, str):
+            values.append(raw_values)
+        elif isinstance(raw_values, Iterable):
+            values.extend(str(value) for value in raw_values if value)
+    return unique_source_ids(values)
+
+
 def unavailable_group(group: str, missing: list[str]) -> JsonDict:
     """构建不可用因子组。"""
 
@@ -654,6 +712,7 @@ def collect_source_ids(
     fundamental_history: list[FundamentalSnapshotORM] | None = None,
     capital_flow_history: list[CapitalFlowSnapshotORM] | None = None,
     derivative_history: list[CryptoDerivativeSnapshotORM] | None = None,
+    supplemental_factor_groups: list[JsonDict] | None = None,
 ) -> list[str]:
     """收集因子来源 ID。"""
 
@@ -671,6 +730,8 @@ def collect_source_ids(
     source_ids.extend(item.snapshot_id for item in derivative_history or [])
     source_ids.extend(item.event_id for item in events)
     source_ids.extend(item.risk_id for item in risks)
+    for group in supplemental_factor_groups or []:
+        source_ids.extend(group.get("source_ids") or [])
     return unique_source_ids(source_ids)
 
 
