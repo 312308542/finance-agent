@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -82,6 +83,16 @@ def main() -> None:
         return
 
     config = load_scheduler_config(args.config)
+    if args.only:
+        selected_names = set(args.only)
+        available_names = {job.name for job in config.jobs}
+        missing_names = sorted(selected_names - available_names)
+        if missing_names:
+            raise SystemExit(f"--only 未匹配任何任务：{', '.join(missing_names)}")
+        config = replace(
+            config,
+            jobs=tuple(job for job in config.jobs if job.name in selected_names),
+        )
     scheduler = BaseDataScheduler(
         config,
         default_collection_args_func=default_collection_args,
@@ -122,6 +133,12 @@ def parse_args() -> argparse.Namespace:
         "--run-once",
         action="store_true",
         help="按配置执行所有启用任务后退出",
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        help="只运行指定任务名；可重复传入，适合单独验收某个调度链路",
     )
     parser.add_argument(
         "--loop",

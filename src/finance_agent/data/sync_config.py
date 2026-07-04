@@ -730,6 +730,7 @@ def export_scheduler_payload(config: DataSyncConfig) -> JsonDict:
         *[build_scheduler_job(task) for task in tasks],
         *build_data_quality_scheduler_jobs(config),
         *build_technical_screening_scheduler_jobs(config),
+        *build_structural_methodology_scheduler_jobs(config),
         *build_universe_preparation_scheduler_jobs(config),
         *build_recommendation_scheduler_jobs(config),
         *build_backtest_scheduler_jobs(config),
@@ -849,6 +850,7 @@ def scheduler_job_resource_pool(job: JsonDict) -> str:
         "recommendation_pipeline",
         "data_quality_refresh",
         "technical_screening_refresh",
+        "structural_methodology_refresh",
         "trigger_evaluation",
         "universe_merge",
         "universe_avoid_pool_rebuild",
@@ -877,10 +879,13 @@ def scheduler_job_priority(job: JsonDict) -> int:
         return 650
     if name in {"ashare.capital_flow", "ashare.events"}:
         return 600
+    if name == "analytics.structural.ashare.daily":
+        return 540
     if job_type in {
         "recommendation_pipeline",
         "data_quality_refresh",
         "technical_screening_refresh",
+        "structural_methodology_refresh",
         "trigger_evaluation",
         "universe_merge",
         "universe_avoid_pool_rebuild",
@@ -1040,11 +1045,11 @@ def build_universe_preparation_scheduler_jobs(config: DataSyncConfig) -> list[Js
                     "target_universe_id": "universe:merged:ashare:recommendation",
                     "name": "A 股推荐合并候选池",
                     "source_universe_ids": [
-                        "universe:base:ashare:p0:all_a",
+                        "universe:tradeable:ashare:main_board",
                         "universe:technical:ashare:main_board",
                     ],
                     "source_weights": {
-                        "universe:base:ashare:p0:all_a": 1.0,
+                        "universe:tradeable:ashare:main_board": 1.0,
                         "universe:technical:ashare:main_board": 2.0,
                     },
                     "strategy_context": "recommendation_universe_merge",
@@ -1131,6 +1136,49 @@ def build_technical_screening_scheduler_jobs(config: DataSyncConfig) -> list[Jso
                 }
             )
     return jobs
+
+
+def build_structural_methodology_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
+    """为收盘后 A 股日 K 生成结构方法论证据任务。"""
+
+    if not config.enabled:
+        return []
+    market_config = config.markets.get("ashare")
+    if (
+        market_config is None
+        or not market_config.enabled
+        or "market_bars" not in market_config.data_packages
+    ):
+        return []
+    timeframe = (market_config.timeframes or ["1d"])[0]
+    return [
+        {
+            "name": "analytics.structural.ashare.daily",
+            "job_type": "structural_methodology_refresh",
+            "group": "analytics",
+            "enabled": True,
+            "interval_seconds": 0,
+            "limit": min(market_config.batch_size, 200),
+            "market": "ashare",
+            "schedule_type": "after_success",
+            "depends_on": ["ashare.bars.1d.close_final"],
+            "params": {
+                "sync_task_type": "analytics.structural_methodology",
+                "market": "ashare",
+                "timeframe": timeframe,
+                "engines": ["swings", "smc", "harmonic", "elliott"],
+                "universe_ids": [
+                    "universe:technical:ashare:main_board",
+                    "universe:tradeable:ashare:main_board",
+                ],
+                "lookback_bars": 250,
+                "swing_window": 10,
+                "harmonic_max_bars_since_d": 10,
+                "fvg_min_atr_ratio": 0.3,
+                "elliott_confidence_threshold": 0.6,
+            },
+        }
+    ]
 
 
 def build_data_quality_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:

@@ -623,11 +623,11 @@ def test_scheduler_payload_registers_universe_merge_and_avoid_pool_jobs() -> Non
     assert merge_job["depends_on"] == ["analytics.technical_screening.ashare.main_board"]
     assert merge_job["params"]["target_universe_id"] == "universe:merged:ashare:recommendation"
     assert merge_job["params"]["source_universe_ids"] == [
-        "universe:base:ashare:p0:all_a",
+        "universe:tradeable:ashare:main_board",
         "universe:technical:ashare:main_board",
     ]
     assert merge_job["params"]["source_weights"] == {
-        "universe:base:ashare:p0:all_a": 1.0,
+        "universe:tradeable:ashare:main_board": 1.0,
         "universe:technical:ashare:main_board": 2.0,
     }
 

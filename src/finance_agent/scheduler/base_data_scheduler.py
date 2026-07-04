@@ -43,6 +43,7 @@ JOB_TYPES = {
     "recommendation_pipeline",
     "data_quality_refresh",
     "technical_screening_refresh",
+    "structural_methodology_refresh",
     "trigger_evaluation",
     "agent_loop_consume",
     "high_risk_reviews",
@@ -820,6 +821,7 @@ class BaseDataScheduler:
         run_recommendation_pipeline_func: Callable[..., JsonDict] | None = None,
         run_data_quality_refresh_func: Callable[..., JsonDict] | None = None,
         run_technical_screening_refresh_func: Callable[..., JsonDict] | None = None,
+        run_structural_methodology_refresh_func: Callable[..., JsonDict] | None = None,
         run_trigger_evaluation_func: Callable[..., JsonDict] | None = None,
         run_agent_loop_consume_func: Callable[..., JsonDict] | None = None,
         run_high_risk_reviews_func: Callable[..., JsonDict] | None = None,
@@ -839,6 +841,7 @@ class BaseDataScheduler:
         self._run_recommendation_pipeline = run_recommendation_pipeline_func
         self._run_data_quality_refresh = run_data_quality_refresh_func
         self._run_technical_screening_refresh = run_technical_screening_refresh_func
+        self._run_structural_methodology_refresh = run_structural_methodology_refresh_func
         self._run_trigger_evaluation = run_trigger_evaluation_func
         self._run_agent_loop_consume = run_agent_loop_consume_func
         self._run_high_risk_reviews = run_high_risk_reviews_func
@@ -1312,6 +1315,8 @@ class BaseDataScheduler:
             planned["data_quality_args"] = self.build_data_quality_refresh_kwargs(job)
         elif job.job_type == "technical_screening_refresh":
             planned["technical_screening_args"] = self.build_technical_screening_refresh_kwargs(job)
+        elif job.job_type == "structural_methodology_refresh":
+            planned["structural_methodology_args"] = self.build_structural_methodology_refresh_kwargs(job)
         elif job.job_type == "trigger_evaluation":
             planned["trigger_evaluation_args"] = self.build_trigger_evaluation_kwargs(job)
         elif job.job_type == "agent_loop_consume":
@@ -1512,6 +1517,9 @@ class BaseDataScheduler:
         if job.job_type == "technical_screening_refresh":
             kwargs = self.build_technical_screening_refresh_kwargs(job)
             return self.run_technical_screening_refresh(**kwargs)
+        if job.job_type == "structural_methodology_refresh":
+            kwargs = self.build_structural_methodology_refresh_kwargs(job)
+            return self.run_structural_methodology_refresh(**kwargs)
         if job.job_type == "trigger_evaluation":
             kwargs = self.build_trigger_evaluation_kwargs(job)
             return self.run_trigger_evaluation(**kwargs)
@@ -1691,6 +1699,64 @@ class BaseDataScheduler:
         value = job.params.get("source")
         if value is not None:
             params["source"] = str(value)
+        return params
+
+    def build_structural_methodology_refresh_kwargs(self, job: BaseDataSchedulerJob) -> JsonDict:
+        """把结构方法论任务配置转换为刷新服务参数。"""
+
+        if job.job_type != "structural_methodology_refresh":
+            raise ValueError(f"{job.name} 不是结构方法论刷新任务")
+        market = str(job.params.get("market") or job.market or "").strip()
+        if not market:
+            raise ValueError(f"{job.name}.params.market 不能为空")
+
+        def parse_string_list(value: Any) -> list[str]:
+            if isinstance(value, list | tuple):
+                return [str(item).strip() for item in value if str(item).strip()]
+            if value is None:
+                return []
+            return [str(value).strip()] if str(value).strip() else []
+
+        params: JsonDict = {
+            "market": market,
+            "timeframe": str(job.params.get("timeframe") or "1d"),
+            "engines": parse_string_list(
+                job.params.get("engines") or ["swings", "smc", "harmonic", "elliott"]
+            ),
+            "lookback_bars": int(job.params.get("lookback_bars") or 250),
+        }
+        if job.limit is not None:
+            params["limit"] = int(job.limit)
+        for key in (
+            "universe_ids",
+            "source",
+            "swing_window",
+            "harmonic_tolerance",
+            "harmonic_max_bars_since_d",
+            "fvg_min_atr_ratio",
+            "fvg_include_mitigated",
+            "elliott_confidence_threshold",
+            "min_bars_per_wave",
+        ):
+            value = job.params.get(key)
+            if value is None:
+                continue
+            if key == "universe_ids":
+                values = parse_string_list(value)
+                if values:
+                    params[key] = values
+            elif key in {"swing_window", "harmonic_max_bars_since_d", "min_bars_per_wave"}:
+                params[key] = int(value)
+            elif key == "fvg_include_mitigated":
+                params[key] = bool(value)
+            elif key in {
+                "harmonic_tolerance",
+                "fvg_min_atr_ratio",
+                "elliott_confidence_threshold",
+            }:
+                params[key] = float(value)
+            else:
+                params[key] = str(value)
         return params
 
     def build_trigger_evaluation_kwargs(self, job: BaseDataSchedulerJob) -> JsonDict:
@@ -2037,6 +2103,21 @@ class BaseDataScheduler:
             "rule_hits": result.rule_hits,
             "ttl_days": ttl_days,
         }
+
+    def run_structural_methodology_refresh(self, **kwargs: Any) -> JsonDict:
+        """刷新结构方法论证据快照。"""
+
+        if self._run_structural_methodology_refresh is not None:
+            return self._run_structural_methodology_refresh(**kwargs)
+
+        from finance_agent.application.structural_methodology_service import (
+            StructuralMethodologyRefreshService,
+        )
+        from finance_agent.storage.db import create_session_factory, session_scope
+
+        session_factory = create_session_factory()
+        with session_scope(session_factory) as session:
+            return StructuralMethodologyRefreshService(session).refresh(**kwargs)
 
     def run_trigger_evaluation(self, **kwargs: Any) -> JsonDict:
         """执行触发评估并按需派发到 Agent 唤醒队列。"""
@@ -2734,6 +2815,7 @@ def as_job_group_choice(
         "recommendation_pipeline",
         "data_quality_refresh",
         "technical_screening_refresh",
+        "structural_methodology_refresh",
         "trigger_evaluation",
         "high_risk_reviews",
         "reviews_due",
