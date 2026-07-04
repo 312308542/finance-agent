@@ -476,6 +476,28 @@ def fetch_concept_members(symbol: str) -> pd.DataFrame:
     return df
 
 
+def fetch_industry_names(*, limit: int | None = None) -> pd.DataFrame:
+    """获取东方财富行业板块目录。"""
+
+    df = _fetch_board_names("industry")
+    if limit is not None:
+        df = df.head(limit)
+    result = df.reset_index(drop=True)
+    result.attrs["actual_source"] = "eastmoney:curl_cffi:stock_board_industry_name_em"
+    return result
+
+
+def fetch_concept_names(*, limit: int | None = None) -> pd.DataFrame:
+    """获取东方财富概念板块目录。"""
+
+    df = _fetch_board_names("concept")
+    if limit is not None:
+        df = df.head(limit)
+    result = df.reset_index(drop=True)
+    result.attrs["actual_source"] = "eastmoney:curl_cffi:stock_board_concept_name_em"
+    return result
+
+
 def fetch_fund_flow_rank(indicator: str, *, limit: int | None = None) -> pd.DataFrame:
     """获取个股资金流排名。"""
 

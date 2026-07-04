@@ -63,17 +63,75 @@ class AshareSectorProvider:
         """获取东方财富行业板块目录。"""
 
         collected_at = datetime.now(tz=UTC)
+        fallback_trace: list[dict[str, str]] = []
+        actual_source = "akshare:stock_board_industry_name_em"
         try:
             df = ak.stock_board_industry_name_em()
-            names = _extract_name_catalog(df, ["板块名称", "名称", "行业名称"], limit=limit)
         except Exception as exc:
-            return ProviderResult(
-                provider_name=self.provider_name,
-                status="error",
-                collected_at=collected_at,
-                error_message=str(exc),
-                payload={"endpoint": "stock_board_industry_name_em"},
+            fallback_trace.append(
+                {
+                    "source": "akshare:stock_board_industry_name_em",
+                    "error_message": str(exc),
+                }
             )
+            try:
+                df = eastmoney_curl.fetch_industry_names(limit=limit)
+                actual_source = str(
+                    df.attrs.get(
+                        "actual_source",
+                        "eastmoney:curl_cffi:stock_board_industry_name_em",
+                    )
+                )
+            except Exception as fallback_exc:
+                fallback_trace.append(
+                    {
+                        "source": "eastmoney:curl_cffi:stock_board_industry_name_em",
+                        "error_message": str(fallback_exc),
+                    }
+                )
+                try:
+                    df = ak.stock_board_industry_name_ths()
+                    actual_source = "akshare:stock_board_industry_name_ths"
+                except Exception as ak_ths_exc:
+                    fallback_trace.append(
+                        {
+                            "source": "akshare:stock_board_industry_name_ths",
+                            "error_message": str(ak_ths_exc),
+                        }
+                    )
+                    try:
+                        df = ths_curl.fetch_industry_names(limit=limit)
+                        actual_source = str(
+                            df.attrs.get(
+                                "actual_source",
+                                "ths:curl_cffi:stock_board_industry_name",
+                            )
+                        )
+                    except Exception as ths_exc:
+                        fallback_trace.append(
+                            {
+                                "source": "ths:curl_cffi:stock_board_industry_name",
+                                "error_message": str(ths_exc),
+                            }
+                        )
+                        return ProviderResult(
+                            provider_name=self.provider_name,
+                            status="error",
+                            collected_at=collected_at,
+                            error_message=str(ths_exc),
+                            payload={
+                                "endpoint": "stock_board_industry_name_em",
+                                "fallback_trace": fallback_trace,
+                            },
+                        )
+                else:
+                    actual_source = str(
+                        df.attrs.get(
+                            "actual_source",
+                            actual_source,
+                        )
+                    )
+        names = _extract_name_catalog(df, ["板块名称", "名称", "行业名称", "name"], limit=limit)
         return ProviderResult(
             provider_name=self.provider_name,
             status="available" if names else "unavailable",
@@ -82,6 +140,9 @@ class AshareSectorProvider:
                 "endpoint": "stock_board_industry_name_em",
                 "row_count": len(names),
                 "names": names,
+                "actual_source": actual_source,
+                "fallback_used": bool(fallback_trace),
+                "fallback_trace": fallback_trace,
             },
         )
 
@@ -89,17 +150,75 @@ class AshareSectorProvider:
         """获取东方财富概念板块目录。"""
 
         collected_at = datetime.now(tz=UTC)
+        fallback_trace: list[dict[str, str]] = []
+        actual_source = "akshare:stock_board_concept_name_em"
         try:
             df = ak.stock_board_concept_name_em()
-            names = _extract_name_catalog(df, ["板块名称", "名称", "概念名称"], limit=limit)
         except Exception as exc:
-            return ProviderResult(
-                provider_name=self.provider_name,
-                status="error",
-                collected_at=collected_at,
-                error_message=str(exc),
-                payload={"endpoint": "stock_board_concept_name_em"},
+            fallback_trace.append(
+                {
+                    "source": "akshare:stock_board_concept_name_em",
+                    "error_message": str(exc),
+                }
             )
+            try:
+                df = eastmoney_curl.fetch_concept_names(limit=limit)
+                actual_source = str(
+                    df.attrs.get(
+                        "actual_source",
+                        "eastmoney:curl_cffi:stock_board_concept_name_em",
+                    )
+                )
+            except Exception as fallback_exc:
+                fallback_trace.append(
+                    {
+                        "source": "eastmoney:curl_cffi:stock_board_concept_name_em",
+                        "error_message": str(fallback_exc),
+                    }
+                )
+                try:
+                    df = ak.stock_board_concept_name_ths()
+                    actual_source = "akshare:stock_board_concept_name_ths"
+                except Exception as ak_ths_exc:
+                    fallback_trace.append(
+                        {
+                            "source": "akshare:stock_board_concept_name_ths",
+                            "error_message": str(ak_ths_exc),
+                        }
+                    )
+                    try:
+                        df = ths_curl.fetch_concept_names(limit=limit)
+                        actual_source = str(
+                            df.attrs.get(
+                                "actual_source",
+                                "ths:curl_cffi:stock_board_concept_name",
+                            )
+                        )
+                    except Exception as ths_exc:
+                        fallback_trace.append(
+                            {
+                                "source": "ths:curl_cffi:stock_board_concept_name",
+                                "error_message": str(ths_exc),
+                            }
+                        )
+                        return ProviderResult(
+                            provider_name=self.provider_name,
+                            status="error",
+                            collected_at=collected_at,
+                            error_message=str(ths_exc),
+                            payload={
+                                "endpoint": "stock_board_concept_name_em",
+                                "fallback_trace": fallback_trace,
+                            },
+                        )
+                else:
+                    actual_source = str(
+                        df.attrs.get(
+                            "actual_source",
+                            actual_source,
+                        )
+                    )
+        names = _extract_name_catalog(df, ["板块名称", "名称", "概念名称", "name"], limit=limit)
         return ProviderResult(
             provider_name=self.provider_name,
             status="available" if names else "unavailable",
@@ -108,6 +227,9 @@ class AshareSectorProvider:
                 "endpoint": "stock_board_concept_name_em",
                 "row_count": len(names),
                 "names": names,
+                "actual_source": actual_source,
+                "fallback_used": bool(fallback_trace),
+                "fallback_trace": fallback_trace,
             },
         )
 

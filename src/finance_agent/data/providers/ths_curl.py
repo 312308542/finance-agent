@@ -71,6 +71,30 @@ def fetch_concept_members(symbol: str, *, limit: int | None = None) -> pd.DataFr
     return df
 
 
+def fetch_industry_names(*, limit: int | None = None) -> pd.DataFrame:
+    """获取同花顺行业板块目录。"""
+
+    board_map = _fetch_board_name_map("industry")
+    df = _board_name_map_to_frame(board_map)
+    if limit is not None:
+        df = df.head(limit)
+    result = df.reset_index(drop=True)
+    result.attrs["actual_source"] = "ths:curl_cffi:stock_board_industry_name"
+    return result
+
+
+def fetch_concept_names(*, limit: int | None = None) -> pd.DataFrame:
+    """获取同花顺概念板块目录。"""
+
+    board_map = _fetch_concept_name_map_from_summary()
+    df = _board_name_map_to_frame(board_map)
+    if limit is not None:
+        df = df.head(limit)
+    result = df.reset_index(drop=True)
+    result.attrs["actual_source"] = "ths:curl_cffi:stock_board_concept_name"
+    return result
+
+
 def _fetch_detail_members(
     url: str,
     *,
@@ -145,6 +169,31 @@ def _find_concept_code_from_summary(symbol: str) -> str | None:
         if symbol in links:
             return links[symbol]
     return None
+
+
+def _fetch_concept_name_map_from_summary() -> dict[str, str]:
+    """从同花顺概念列表页全量展开概念名称到代码的映射。"""
+
+    first_url = "http://q.10jqka.com.cn/gn/index/field/addtime/order/desc/page/1/ajax/1/"
+    first_html = _q_ths_get_text(first_url, referer="http://q.10jqka.com.cn/gn/")
+    board_map = _extract_board_links(first_html)
+    page_count = _parse_page_count(first_html)
+    for page in range(2, page_count + 1):
+        url = f"http://q.10jqka.com.cn/gn/index/field/addtime/order/desc/page/{page}/ajax/1/"
+        html = _q_ths_get_text(url, referer="http://q.10jqka.com.cn/gn/")
+        board_map.update(_extract_board_links(html))
+    return board_map
+
+
+def _board_name_map_to_frame(board_map: dict[str, str]) -> pd.DataFrame:
+    """把名称到代码的映射转换为与 AKShare/东财一致的目录表结构。"""
+
+    rows = [
+        {"板块名称": name, "板块代码": code}
+        for name, code in board_map.items()
+        if str(name).strip()
+    ]
+    return pd.DataFrame(rows, columns=["板块名称", "板块代码"])
 
 
 def _extract_board_links(html: str) -> dict[str, str]:
