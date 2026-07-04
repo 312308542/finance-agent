@@ -1806,6 +1806,125 @@ tbody tr:last-child td {
   min-width: 150px;
 }
 
+.structure-evidence-card {
+  grid-column: 1 / -1;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid rgba(79, 140, 255, 0.22);
+  border-radius: 8px;
+  background: rgba(79, 140, 255, 0.06);
+}
+
+.structure-evidence-head {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-bottom: 10px;
+  color: var(--blue);
+}
+
+.structure-evidence-head > div {
+  min-width: 0;
+}
+
+.structure-evidence-head h3 {
+  margin: 0 0 3px;
+}
+
+.structure-evidence-head p {
+  margin: 0;
+}
+
+.structure-evidence-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+}
+
+.structure-evidence-grid article {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0b111b;
+}
+
+.structure-evidence-grid article > div:first-child {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.structure-evidence-grid strong,
+.structure-evidence-grid span,
+.structure-evidence-grid p,
+.structure-evidence-grid code,
+.structure-evidence-grid dd {
+  min-width: 0;
+}
+
+.structure-evidence-grid strong {
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.structure-evidence-grid span {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.structure-evidence-grid p {
+  margin: 8px 0;
+}
+
+.structure-evidence-grid dl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+}
+
+.structure-evidence-grid dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.structure-evidence-grid dd {
+  margin: 0;
+  color: var(--soft);
+  font-family:
+    "Fira Code",
+    Consolas,
+    monospace;
+  font-size: 12px;
+}
+
+.structure-evidence-grid code {
+  display: block;
+  overflow: hidden;
+  margin-top: 8px;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.structure-evidence-grid .tone-green {
+  border-color: rgba(35, 178, 109, 0.28);
+}
+
+.structure-evidence-grid .tone-amber {
+  border-color: rgba(216, 163, 51, 0.28);
+}
+
+.structure-evidence-grid .tone-red {
+  border-color: rgba(230, 92, 92, 0.28);
+}
+
 .order-draft-card {
   grid-column: 1 / -1;
   display: grid;

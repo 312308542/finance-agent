@@ -16,6 +16,20 @@ export type ScoreBreakdownItem = {
   tone: RecommendationTone;
 };
 
+export type StructureEvidenceItem = {
+  horizon: string;
+  title: string;
+  status: string;
+  statusLabel: string;
+  tone: RecommendationTone;
+  confidence: number;
+  confidenceDisplay: string;
+  summary: string;
+  evidenceId: string;
+  invalidationPrice: string;
+  confirmationPrice: string;
+};
+
 export type RecommendationItemModel = {
   recommendationId: string;
   runId: string;
@@ -37,6 +51,7 @@ export type RecommendationItemModel = {
   evidenceCount: number;
   summary: string;
   scoreBreakdown: ScoreBreakdownItem[];
+  structureEvidence: StructureEvidenceItem[];
   riskRebuttal: string;
   reportWorkflowRunId: string;
   pendingDecision: PendingDecisionModel | null;
@@ -199,6 +214,7 @@ export function normalizeRecommendationItem(
     evidenceCount: evidenceIds.length,
     summary: normalizeText(item.summary),
     scoreBreakdown: normalizeScoreBreakdown(payload.score_breakdown || payload.scoreBreakdown),
+    structureEvidence: normalizeStructureEvidence(payload),
     riskRebuttal: normalizeText(payload.risk_rebuttal || payload.riskRebuttal || payload.risk_summary),
     reportWorkflowRunId: normalizeText(payload.workflow_run_id || payload.report_workflow_run_id),
     pendingDecision,
@@ -341,6 +357,159 @@ function summarizeAvoidPool(payload: Record<string, any> | null | undefined) {
     description: count > 0 ? `本次运行剔除回避池 ${count} 项，已从候选建议中排除。` : "本次运行未发现回避池剔除项。",
     assets,
   };
+}
+
+export function normalizeStructureEvidence(value: unknown): StructureEvidenceItem[] {
+  const source = resolveStructureSource(value);
+  const frames = Array.isArray(source?.structure_frames)
+    ? source.structure_frames
+    : Array.isArray(source?.frames)
+      ? source.frames
+      : [];
+  return frames
+    .map((frame) => normalizeStructureFrame(frame))
+    .filter((item): item is StructureEvidenceItem => Boolean(item));
+}
+
+function resolveStructureSource(value: unknown): Record<string, any> | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  for (const key of ["structure", "structural_lite", "structuralLite", "structureEvidence"]) {
+    const candidate = value[key];
+    if (isRecord(candidate)) {
+      return candidate;
+    }
+  }
+  return value;
+}
+
+function normalizeStructureFrame(frame: unknown): StructureEvidenceItem | null {
+  if (!isRecord(frame)) {
+    return null;
+  }
+  const payload = isRecord(frame.payload) ? frame.payload : frame;
+  const horizon = normalizeText(frame.horizon || payload.schema_version || payload.horizon);
+  if (!horizon) {
+    return null;
+  }
+  const status = normalizeText(frame.status || payload.status) || "unknown";
+  const confidence = normalizeStructureConfidence(payload, frame);
+  return {
+    horizon,
+    title: structureTitle(horizon),
+    status,
+    statusLabel: structureStatusLabel(status),
+    tone: structureTone(status),
+    confidence,
+    confidenceDisplay: formatPercent(confidence),
+    summary: structureSummary(horizon, payload),
+    evidenceId: normalizeText(payload.evidence_id || frame.evidence_id),
+    invalidationPrice: normalizeStructurePrice(
+      firstRecord(payload.patterns)?.invalidation_price ??
+        firstRecord(payload.candidates)?.thesis_invalidation_price ??
+        firstRecord(payload.candidates)?.invalidation_price,
+    ),
+    confirmationPrice: normalizeStructurePrice(
+      firstRecord(payload.candidates)?.thesis_confirmation_price,
+    ),
+  };
+}
+
+function normalizeStructureConfidence(payload: Record<string, any>, frame: Record<string, any>): number {
+  const direct = normalizeNumber(payload.confidence ?? frame.confidence);
+  if (direct > 0) {
+    return direct;
+  }
+  const patternConfidence = normalizeNumber(firstRecord(payload.patterns)?.confidence);
+  if (patternConfidence > 0) {
+    return patternConfidence;
+  }
+  const candidateConfidence = normalizeNumber(firstRecord(payload.candidates)?.confidence);
+  return candidateConfidence;
+}
+
+function structureTitle(horizon: string): string {
+  if (horizon.includes("smc")) {
+    return "SMC 结构";
+  }
+  if (horizon.includes("harmonic")) {
+    return "谐波结构";
+  }
+  if (horizon.includes("elliott")) {
+    return "波浪结构";
+  }
+  if (horizon.includes("swing")) {
+    return "摆动结构";
+  }
+  return "结构证据";
+}
+
+function structureStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    available: "可用",
+    no_pattern: "无形态",
+    no_structure_event: "无结构事件",
+    insufficient_structure: "结构不足",
+    insufficient_data: "数据不足",
+    error: "异常",
+  };
+  return labels[status] ?? (status || "未知");
+}
+
+function structureTone(status: string): RecommendationTone {
+  if (status === "available") {
+    return "green";
+  }
+  if (status === "error") {
+    return "red";
+  }
+  if (status.startsWith("insufficient")) {
+    return "amber";
+  }
+  return "blue";
+}
+
+function structureSummary(horizon: string, payload: Record<string, any>): string {
+  if (horizon.includes("smc")) {
+    const eventCount = Array.isArray(payload.structure_events) ? payload.structure_events.length : 0;
+    const gapCount = Array.isArray(payload.fair_value_gaps) ? payload.fair_value_gaps.length : 0;
+    const firstEvent = firstRecord(payload.structure_events);
+    const eventName = normalizeText(firstEvent?.name).replace("bos", "BOS").replace("choch", "CHoCH");
+    return eventName
+      ? `${eventName}，结构事件 ${eventCount} 个，FVG ${gapCount} 个`
+      : `结构事件 ${eventCount} 个，FVG ${gapCount} 个`;
+  }
+  if (horizon.includes("harmonic")) {
+    const pattern = firstRecord(payload.patterns);
+    if (pattern) {
+      const direction = normalizeText(pattern.direction) === "bearish" ? "看空" : "看多";
+      return `${direction} ${normalizeText(pattern.pattern) || "形态"}，失效价 ${normalizeStructurePrice(pattern.invalidation_price) || "未给出"}`;
+    }
+  }
+  if (horizon.includes("elliott")) {
+    const candidate = firstRecord(payload.candidates);
+    if (candidate) {
+      return `${normalizeText(candidate.pattern) || "候选浪型"}，信号 ${normalizeText(candidate.signal_hint) || "待确认"}`;
+    }
+  }
+  if (horizon.includes("swing")) {
+    const count = Array.isArray(payload.swings) ? payload.swings.length : 0;
+    return `已确认摆动点 ${count} 个`;
+  }
+  return structureStatusLabel(normalizeText(payload.status));
+}
+
+function firstRecord(value: unknown): Record<string, any> | null {
+  return Array.isArray(value) && isRecord(value[0]) ? value[0] : null;
+}
+
+function normalizeStructurePrice(value: unknown): string {
+  if (value === null || value === undefined || value === "") {
+    return "";
+  }
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? String(numeric) : normalizeText(value);
 }
 
 function normalizeScoreBreakdown(value: unknown): ScoreBreakdownItem[] {

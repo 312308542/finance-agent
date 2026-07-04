@@ -4,6 +4,9 @@ import { Buffer } from "node:buffer";
 import ts from "typescript";
 
 const source = await readFile(new URL("../src/recommendationView.ts", import.meta.url), "utf8");
+const apiSource = await readFile(new URL("../src/api.ts", import.meta.url), "utf8");
+const pageSource = await readFile(new URL("../src/pages/RecommendationPage.tsx", import.meta.url), "utf8");
+const styleSource = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
 const { outputText } = ts.transpileModule(source, {
   compilerOptions: {
     module: ts.ModuleKind.ES2022,
@@ -19,6 +22,7 @@ const {
   formatMarketLabel,
   mergeRecommendationPayloads,
   normalizeRecommendationItem,
+  normalizeStructureEvidence,
 } = await import(moduleUrl);
 
 assert.equal(formatMarketLabel("ashare"), "A 股");
@@ -72,6 +76,39 @@ const payload = {
         },
         risk_rebuttal: "短期波动升高，仓位需要受限。",
         workflow_run_id: "workflow:report:1",
+        structure: {
+          library: "structural-lite",
+          structure_frames: [
+            {
+              horizon: "smc_lite_v2",
+              status: "available",
+              payload: {
+                schema_version: "smc_lite_v2",
+                status: "available",
+                confidence: 0.63,
+                structure_events: [{ name: "bos_bullish", direction: "bullish" }],
+                fair_value_gaps: [],
+                evidence_id: "smc_lite:ashare:000001:1d:20260704",
+              },
+            },
+            {
+              horizon: "harmonic_lite_v2",
+              payload: {
+                schema_version: "harmonic_lite_v2",
+                status: "available",
+                patterns: [
+                  {
+                    pattern: "Bat",
+                    direction: "bullish",
+                    confidence: 0.78,
+                    invalidation_price: 10.2,
+                  },
+                ],
+                evidence_id: "harmonic_lite:ashare:000001:1d:20260704",
+              },
+            },
+          ],
+        },
       },
     },
     {
@@ -152,6 +189,20 @@ assert.deepEqual(buildDecisionFeedbackPayload("modified", "改为观察", "watch
   modified_action: "watch_only",
 });
 
+assert.equal(model.items[0].structureEvidence.length, 2);
+assert.deepEqual(
+  model.items[0].structureEvidence.map((item) => [item.horizon, item.title, item.confidenceDisplay]),
+  [
+    ["smc_lite_v2", "SMC 结构", "63%"],
+    ["harmonic_lite_v2", "谐波结构", "78%"],
+  ],
+);
+assert.match(model.items[0].structureEvidence[0].summary, /BOS/);
+assert.match(model.items[0].structureEvidence[1].summary, /Bat/);
+assert.equal(model.items[0].structureEvidence[1].invalidationPrice, "10.2");
+assert.equal(normalized?.structureEvidence[0].evidenceId, "smc_lite:ashare:000001:1d:20260704");
+assert.equal(normalizeStructureEvidence({ structure_frames: [] }).length, 0);
+
 const merged = mergeRecommendationPayloads([
   {
     status: "ok",
@@ -174,3 +225,11 @@ assert.equal(cryptoModel.marketTabs.length, 2);
 assert.equal(cryptoModel.items.length, 1);
 assert.equal(cryptoModel.activeRun?.runId, "run:c");
 assert.equal(cryptoModel.avoidPoolSummary.count, 3);
+
+assert.match(pageSource, /function StructureEvidenceCard/);
+assert.match(pageSource, /item\.structureEvidence\.length/);
+assert.match(styleSource, /\.structure-evidence-grid\s*{[\s\S]*?grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(180px,\s*1fr\)\);/);
+assert.match(styleSource, /\.structure-evidence-card\s*{[\s\S]*?min-width:\s*0;/);
+assert.match(apiSource, /const fallbackRecommendations = fallbackSummary\.sections\.recommendations;/);
+assert.match(apiSource, /market === "ashare"[\s\S]*?fallbackRecommendations/);
+assert.match(apiSource, /status: "unavailable"[\s\S]*?\.\.\.fallbackData/);

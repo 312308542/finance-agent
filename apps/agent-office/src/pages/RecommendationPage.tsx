@@ -1,5 +1,5 @@
 import React from "react";
-import { BarChart3, ChevronRight, MessageSquareText, RefreshCcw, ShieldAlert } from "lucide-react";
+import { BarChart3, ChevronRight, GitBranch, MessageSquareText, RefreshCcw, ShieldAlert } from "lucide-react";
 import {
   confirmDecision,
   createOrderDraft,
@@ -15,6 +15,7 @@ import {
   type RecommendationItemModel,
   type RecommendationPageModel,
   type RecommendationTone,
+  type StructureEvidenceItem,
 } from "../recommendationView";
 
 type RecommendationPageProps = {
@@ -381,6 +382,7 @@ function RecommendationExpanded({
         <h3>风险反驳</h3>
         <p>{item.riskRebuttal || item.summary || "暂无风险反驳文本。"}</p>
       </div>
+      {item.structureEvidence.length ? <StructureEvidenceCard items={item.structureEvidence} /> : null}
       <div className="recommendation-expanded-actions">
         {item.reportWorkflowRunId ? (
           <a className="button button-ghost" href={`#report:${encodeURIComponent(item.reportWorkflowRunId)}`}>
@@ -408,6 +410,50 @@ function RecommendationExpanded({
         </button>
       </div>
       {draft ? <OrderDraftCard draft={draft} /> : null}
+    </section>
+  );
+}
+
+function StructureEvidenceCard({ items }: { items: StructureEvidenceItem[] }) {
+  return (
+    <section className="structure-evidence-card" aria-label="结构证据">
+      <div className="structure-evidence-head">
+        <GitBranch size={16} />
+        <div>
+          <h3>结构证据</h3>
+          <p>structural-lite 只提供技术结构补充，不参与确定性评分。</p>
+        </div>
+      </div>
+      <div className="structure-evidence-grid">
+        {items.map((item) => (
+          <article key={`${item.horizon}:${item.evidenceId || item.status}`} className={`tone-${item.tone}`}>
+            <div>
+              <strong>{item.title}</strong>
+              <span>{item.statusLabel}</span>
+            </div>
+            <p>{item.summary}</p>
+            <dl>
+              <div>
+                <dt>置信度</dt>
+                <dd>{item.confidenceDisplay}</dd>
+              </div>
+              {item.invalidationPrice ? (
+                <div>
+                  <dt>失效价</dt>
+                  <dd>{item.invalidationPrice}</dd>
+                </div>
+              ) : null}
+              {item.confirmationPrice ? (
+                <div>
+                  <dt>确认价</dt>
+                  <dd>{item.confirmationPrice}</dd>
+                </div>
+              ) : null}
+            </dl>
+            {item.evidenceId ? <code>{item.evidenceId}</code> : null}
+          </article>
+        ))}
+      </div>
     </section>
   );
 }

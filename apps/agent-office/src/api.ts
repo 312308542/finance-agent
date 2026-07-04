@@ -394,11 +394,31 @@ export async function loadLatestRecommendations(
   if (market) {
     params.set("market", market);
   }
-  return getJson(`/api/recommendations/latest?${params.toString()}`, {
-    runs: [],
-    recommendations: [],
-    metrics: {},
-  });
+  const fallbackRecommendations = fallbackSummary.sections.recommendations;
+  const fallbackData =
+    !market || market === "ashare"
+      ? fallbackRecommendations
+      : {
+          runs: [],
+          recommendations: [],
+          metrics: {},
+        };
+  try {
+    const response = await fetchWithTimeout(`${apiBase}/api/recommendations/latest?${params.toString()}`, {
+      timeoutMs: requestTimeoutMs,
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data?.message || `HTTP ${response.status}`);
+    }
+    return data;
+  } catch (error) {
+    return {
+      status: "unavailable",
+      message: error instanceof Error ? error.message : String(error),
+      ...fallbackData,
+    };
+  }
 }
 
 export async function loadPendingDecisions(ownerId: string, limit = 50): Promise<Record<string, any>> {
@@ -760,6 +780,41 @@ const fallbackSummary: DashboardSummary = {
           action: "watch",
           total_score: "86.4",
           confidence: "0.74",
+          payload: {
+            structure: {
+              library: "structural-lite",
+              structure_frames: [
+                {
+                  horizon: "smc_lite_v2",
+                  status: "available",
+                  payload: {
+                    schema_version: "smc_lite_v2",
+                    status: "available",
+                    confidence: 0.62,
+                    structure_events: [{ name: "bos_bullish", direction: "bullish" }],
+                    fair_value_gaps: [],
+                    evidence_id: "smc_lite:ashare:600519:1d:mock",
+                  },
+                },
+                {
+                  horizon: "harmonic_lite_v2",
+                  payload: {
+                    schema_version: "harmonic_lite_v2",
+                    status: "available",
+                    patterns: [
+                      {
+                        pattern: "Bat",
+                        direction: "bullish",
+                        confidence: 0.76,
+                        invalidation_price: 1480,
+                      },
+                    ],
+                    evidence_id: "harmonic_lite:ashare:600519:1d:mock",
+                  },
+                },
+              ],
+            },
+          },
         },
         {
           rank: 2,
