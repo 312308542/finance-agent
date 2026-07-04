@@ -149,6 +149,7 @@ const decisions = {
 };
 
 const model = buildRecommendationPageModel(payload, decisions, "ashare");
+assert.equal(model.isOfflineDemo, false);
 assert.equal(model.marketTabs.length, 2);
 assert.deepEqual(
   model.marketTabs.map((tab) => [tab.id, tab.label, tab.count]),
@@ -173,6 +174,7 @@ assert.deepEqual(model.items[0].scoreBreakdown.map((item) => item.group), [
   "risk",
 ]);
 assert.equal(model.items[0].riskRebuttal, "短期波动升高，仓位需要受限。");
+assert.equal(model.items[0].isDemo, false);
 
 const normalized = normalizeRecommendationItem(payload.recommendations[0], decisions.data.items);
 assert.equal(normalized?.assetLabel, "000001 平安银行");
@@ -190,6 +192,7 @@ assert.deepEqual(buildDecisionFeedbackPayload("modified", "改为观察", "watch
 });
 
 assert.equal(model.items[0].structureEvidence.length, 2);
+assert.equal(model.items[0].structureEvidence[0].isDemo, false);
 assert.deepEqual(
   model.items[0].structureEvidence.map((item) => [item.horizon, item.title, item.confidenceDisplay]),
   [
@@ -202,6 +205,38 @@ assert.match(model.items[0].structureEvidence[1].summary, /Bat/);
 assert.equal(model.items[0].structureEvidence[1].invalidationPrice, "10.2");
 assert.equal(normalized?.structureEvidence[0].evidenceId, "smc_lite:ashare:000001:1d:20260704");
 assert.equal(normalizeStructureEvidence({ structure_frames: [] }).length, 0);
+
+const offlineDemoModel = buildRecommendationPageModel(
+  {
+    ...payload,
+    data_source: "offline_demo",
+    recommendations: [
+      {
+        ...payload.recommendations[0],
+        recommendation_id: "rec:demo",
+        payload: {
+          ...payload.recommendations[0].payload,
+          structure: {
+            ...payload.recommendations[0].payload.structure,
+            structure_frames: payload.recommendations[0].payload.structure.structure_frames.map((frame) => ({
+              ...frame,
+              payload: {
+                ...frame.payload,
+                evidence_id: `${frame.payload.evidence_id}:mock`,
+              },
+            })),
+          },
+        },
+      },
+    ],
+  },
+  decisions,
+  "ashare",
+);
+assert.equal(offlineDemoModel.isOfflineDemo, true);
+assert.equal(offlineDemoModel.dataSource, "offline_demo");
+assert.equal(offlineDemoModel.items[0].isDemo, true);
+assert.equal(offlineDemoModel.items[0].structureEvidence[0].isDemo, true);
 
 const merged = mergeRecommendationPayloads([
   {
@@ -228,8 +263,16 @@ assert.equal(cryptoModel.avoidPoolSummary.count, 3);
 
 assert.match(pageSource, /function StructureEvidenceCard/);
 assert.match(pageSource, /item\.structureEvidence\.length/);
+assert.match(pageSource, /后端不可用，以下为离线演示数据，非真实推荐/);
+assert.match(pageSource, /offline-demo-banner/);
+assert.match(pageSource, /demo-badge/);
+assert.match(pageSource, /演示数据/);
+assert.match(pageSource, /model\.isOfflineDemo/);
 assert.match(styleSource, /\.structure-evidence-grid\s*{[\s\S]*?grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(180px,\s*1fr\)\);/);
 assert.match(styleSource, /\.structure-evidence-card\s*{[\s\S]*?min-width:\s*0;/);
+assert.match(styleSource, /\.offline-demo-banner\s*{/);
+assert.match(styleSource, /\.demo-badge\s*{/);
 assert.match(apiSource, /const fallbackRecommendations = fallbackSummary\.sections\.recommendations;/);
 assert.match(apiSource, /market === "ashare"[\s\S]*?fallbackRecommendations/);
 assert.match(apiSource, /status: "unavailable"[\s\S]*?\.\.\.fallbackData/);
+assert.match(apiSource, /data_source:\s*"offline_demo"/);

@@ -4,6 +4,7 @@ export type DashboardSummary = {
   owner_id: string;
   status: ApiStatus;
   source?: "api" | "fallback";
+  data_source?: "offline_demo" | string;
   generated_at?: string;
   message?: string;
   sections: {
@@ -153,6 +154,7 @@ export async function loadDashboardSummary(ownerId: string): Promise<DashboardSu
       ...fallbackSummary,
       owner_id: ownerId,
       source: "fallback",
+      data_source: "offline_demo",
       message: error instanceof Error ? error.message : String(error),
     };
   }
@@ -415,6 +417,7 @@ export async function loadLatestRecommendations(
   } catch (error) {
     return {
       status: "unavailable",
+      data_source: "offline_demo",
       message: error instanceof Error ? error.message : String(error),
       ...fallbackData,
     };
@@ -696,6 +699,7 @@ const fallbackSummary: DashboardSummary = {
   owner_id: "fallback",
   status: "partial",
   source: "fallback",
+  data_source: "offline_demo",
   generated_at: new Date().toISOString(),
   sections: {
     portfolio: {

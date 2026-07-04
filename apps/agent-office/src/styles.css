@@ -1543,6 +1543,20 @@ tbody tr:last-child td {
   color: var(--amber);
 }
 
+.offline-demo-banner {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid rgba(230, 92, 92, 0.42);
+  border-radius: 8px;
+  background: rgba(230, 92, 92, 0.14);
+  color: var(--red);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+
 .recommendation-tabs {
   display: flex;
   flex-wrap: wrap;
@@ -1677,8 +1691,7 @@ tbody tr:last-child td {
   gap: 3px;
 }
 
-.asset-cell strong,
-.asset-cell em {
+.asset-cell strong {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1689,9 +1702,30 @@ tbody tr:last-child td {
 }
 
 .asset-cell em {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
   color: var(--muted);
   font-style: normal;
   font-size: 12px;
+}
+
+.demo-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-height: 18px;
+  padding: 0 6px;
+  border: 1px solid rgba(216, 163, 51, 0.38);
+  border-radius: 999px;
+  background: rgba(216, 163, 51, 0.12);
+  color: var(--amber);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 700;
+  line-height: 1;
 }
 
 .risk-cell {
@@ -1873,9 +1907,18 @@ tbody tr:last-child td {
 }
 
 .structure-evidence-grid span {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
   color: var(--muted);
   font-size: 12px;
   white-space: nowrap;
+}
+
+.structure-demo-badge {
+  min-height: 17px;
+  padding-inline: 5px;
+  font-size: 10px;
 }
 
 .structure-evidence-grid p {

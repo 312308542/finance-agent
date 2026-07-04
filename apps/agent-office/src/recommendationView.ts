@@ -28,6 +28,7 @@ export type StructureEvidenceItem = {
   evidenceId: string;
   invalidationPrice: string;
   confirmationPrice: string;
+  isDemo: boolean;
 };
 
 export type RecommendationItemModel = {
@@ -52,6 +53,7 @@ export type RecommendationItemModel = {
   summary: string;
   scoreBreakdown: ScoreBreakdownItem[];
   structureEvidence: StructureEvidenceItem[];
+  isDemo: boolean;
   riskRebuttal: string;
   reportWorkflowRunId: string;
   pendingDecision: PendingDecisionModel | null;
@@ -70,6 +72,8 @@ export type RecommendationRunModel = {
 
 export type RecommendationPageModel = {
   status: string;
+  dataSource: string;
+  isOfflineDemo: boolean;
   selectedMarket: string;
   marketTabs: Array<{ id: string; label: string; count: number }>;
   runs: RecommendationRunModel[];
@@ -125,7 +129,9 @@ export function buildRecommendationPageModel(
   selectedMarket: string | null | undefined,
 ): RecommendationPageModel {
   const pendingDecisions = normalizePendingDecisions(decisionsPayload);
-  const allItems = normalizeRecommendationItems(recommendationPayload, pendingDecisions);
+  const dataSource = normalizeText(recommendationPayload?.data_source || recommendationPayload?.dataSource);
+  const isOfflineDemo = dataSource === "offline_demo";
+  const allItems = normalizeRecommendationItems(recommendationPayload, pendingDecisions, isOfflineDemo);
   const runs = normalizeRecommendationRuns(recommendationPayload);
   const marketTabs = buildMarketTabs(allItems, runs);
   const fallbackMarket = marketTabs[0]?.id ?? "ashare";
@@ -148,6 +154,8 @@ export function buildRecommendationPageModel(
   const metrics = isRecord(recommendationPayload?.metrics) ? recommendationPayload.metrics : {};
   return {
     status: normalizeText(recommendationPayload?.status) || "empty",
+    dataSource,
+    isOfflineDemo,
     selectedMarket: currentMarket,
     marketTabs,
     runs,
@@ -169,6 +177,7 @@ export function buildRecommendationPageModel(
 export function normalizeRecommendationItem(
   item: unknown,
   pendingDecisions: PendingDecisionModel[] = [],
+  isOfflineDemo = false,
 ): RecommendationItemModel | null {
   if (!isRecord(item)) {
     return null;
@@ -182,6 +191,10 @@ export function normalizeRecommendationItem(
   const action = normalizeText(item.action).toLowerCase();
   const meta = actionMeta[action] ?? { label: actionLabel(action), tone: "blue" as RecommendationTone };
   const payload = isRecord(item.payload) ? item.payload : {};
+  const isDemo =
+    isOfflineDemo ||
+    normalizeText(item.data_source || item.dataSource) === "offline_demo" ||
+    normalizeText(payload.data_source || payload.dataSource) === "offline_demo";
   const riskIds = Array.isArray(item.risk_ids) ? item.risk_ids : [];
   const evidenceIds = Array.isArray(item.evidence_ids) ? item.evidence_ids : [];
   const score = normalizeNumber(item.total_score);
@@ -214,7 +227,8 @@ export function normalizeRecommendationItem(
     evidenceCount: evidenceIds.length,
     summary: normalizeText(item.summary),
     scoreBreakdown: normalizeScoreBreakdown(payload.score_breakdown || payload.scoreBreakdown),
-    structureEvidence: normalizeStructureEvidence(payload),
+    structureEvidence: normalizeStructureEvidence(payload, { isOfflineDemo: isDemo }),
+    isDemo,
     riskRebuttal: normalizeText(payload.risk_rebuttal || payload.riskRebuttal || payload.risk_summary),
     reportWorkflowRunId: normalizeText(payload.workflow_run_id || payload.report_workflow_run_id),
     pendingDecision,
@@ -262,6 +276,7 @@ export function mergeRecommendationPayloads(payloads: Array<Record<string, any> 
   );
   return {
     status: recommendations.length ? "ok" : validPayloads.some((payload) => payload.status === "unavailable") ? "unavailable" : "empty",
+    data_source: validPayloads.some((payload) => payload.data_source === "offline_demo") ? "offline_demo" : undefined,
     runs,
     active_runs: activeRuns,
     active_run: activeRuns[0] ?? null,
@@ -273,10 +288,11 @@ export function mergeRecommendationPayloads(payloads: Array<Record<string, any> 
 function normalizeRecommendationItems(
   payload: Record<string, any> | null | undefined,
   pendingDecisions: PendingDecisionModel[],
+  isOfflineDemo: boolean,
 ): RecommendationItemModel[] {
   const rows = Array.isArray(payload?.recommendations) ? payload.recommendations : [];
   return rows
-    .map((item) => normalizeRecommendationItem(item, pendingDecisions))
+    .map((item) => normalizeRecommendationItem(item, pendingDecisions, isOfflineDemo))
     .filter((item): item is RecommendationItemModel => Boolean(item));
 }
 
@@ -359,7 +375,10 @@ function summarizeAvoidPool(payload: Record<string, any> | null | undefined) {
   };
 }
 
-export function normalizeStructureEvidence(value: unknown): StructureEvidenceItem[] {
+export function normalizeStructureEvidence(
+  value: unknown,
+  options: { isOfflineDemo?: boolean } = {},
+): StructureEvidenceItem[] {
   const source = resolveStructureSource(value);
   const frames = Array.isArray(source?.structure_frames)
     ? source.structure_frames
@@ -367,7 +386,7 @@ export function normalizeStructureEvidence(value: unknown): StructureEvidenceIte
       ? source.frames
       : [];
   return frames
-    .map((frame) => normalizeStructureFrame(frame))
+    .map((frame) => normalizeStructureFrame(frame, options))
     .filter((item): item is StructureEvidenceItem => Boolean(item));
 }
 
@@ -384,7 +403,10 @@ function resolveStructureSource(value: unknown): Record<string, any> | null {
   return value;
 }
 
-function normalizeStructureFrame(frame: unknown): StructureEvidenceItem | null {
+function normalizeStructureFrame(
+  frame: unknown,
+  options: { isOfflineDemo?: boolean },
+): StructureEvidenceItem | null {
   if (!isRecord(frame)) {
     return null;
   }
@@ -395,6 +417,7 @@ function normalizeStructureFrame(frame: unknown): StructureEvidenceItem | null {
   }
   const status = normalizeText(frame.status || payload.status) || "unknown";
   const confidence = normalizeStructureConfidence(payload, frame);
+  const evidenceId = normalizeText(payload.evidence_id || frame.evidence_id);
   return {
     horizon,
     title: structureTitle(horizon),
@@ -404,7 +427,7 @@ function normalizeStructureFrame(frame: unknown): StructureEvidenceItem | null {
     confidence,
     confidenceDisplay: formatPercent(confidence),
     summary: structureSummary(horizon, payload),
-    evidenceId: normalizeText(payload.evidence_id || frame.evidence_id),
+    evidenceId,
     invalidationPrice: normalizeStructurePrice(
       firstRecord(payload.patterns)?.invalidation_price ??
         firstRecord(payload.candidates)?.thesis_invalidation_price ??
@@ -413,6 +436,7 @@ function normalizeStructureFrame(frame: unknown): StructureEvidenceItem | null {
     confirmationPrice: normalizeStructurePrice(
       firstRecord(payload.candidates)?.thesis_confirmation_price,
     ),
+    isDemo: Boolean(options.isOfflineDemo) || evidenceId.includes(":mock"),
   };
 }
 

@@ -140,9 +140,9 @@ export function RecommendationPage({ ownerId }: RecommendationPageProps) {
   return (
     <section className="recommendation-workspace">
       <section className="recommendation-panel panel">
-        <RecommendationHeader
-          model={model}
-          loading={loading}
+      <RecommendationHeader
+        model={model}
+        loading={loading}
           notice={notice}
           onRefresh={() => void refresh()}
         />
@@ -210,6 +210,11 @@ function RecommendationHeader({
           {loading ? "刷新中" : "刷新"}
         </button>
       </div>
+      {model.isOfflineDemo ? (
+        <div className="offline-demo-banner" role="alert">
+          后端不可用，以下为离线演示数据，非真实推荐
+        </div>
+      ) : null}
       <div className="recommendation-metrics">
         <RecommendationMetric label="候选建议" value={model.metrics.recommendationCount} />
         <RecommendationMetric label="候选买入" value={model.metrics.buyCount} />
@@ -312,7 +317,10 @@ function RecommendationTable({
             <span className="rank-cell">{item.rank || "—"}</span>
             <span className="asset-cell">
               <strong>{item.assetLabel || item.assetId}</strong>
-              <em>{item.marketLabel}</em>
+              <em>
+                {item.marketLabel}
+                {item.isDemo ? <span className="demo-badge">演示</span> : null}
+              </em>
             </span>
             <RecommendationPill tone={item.actionTone}>{item.actionLabel}</RecommendationPill>
             <strong className="numeric-cell">{item.scoreDisplay}</strong>
@@ -429,7 +437,10 @@ function StructureEvidenceCard({ items }: { items: StructureEvidenceItem[] }) {
           <article key={`${item.horizon}:${item.evidenceId || item.status}`} className={`tone-${item.tone}`}>
             <div>
               <strong>{item.title}</strong>
-              <span>{item.statusLabel}</span>
+              <span>
+                {item.statusLabel}
+                {item.isDemo ? <em className="demo-badge structure-demo-badge">演示数据</em> : null}
+              </span>
             </div>
             <p>{item.summary}</p>
             <dl>
