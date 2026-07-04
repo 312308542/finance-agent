@@ -113,3 +113,70 @@ def test_profile_tool_calls_delegate_to_profile_services() -> None:
         "signal_snapshots.direction",
         "risk_findings.severity",
     ]
+
+
+class _FakeIndicators:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def get_latest_indicator_frame(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs["horizon"] == "smc_lite_v2":
+            return type(
+                "Frame",
+                (),
+                {
+                    "indicator_frame_id": "struct:smc:1",
+                    "asset_id": "ashare:600519",
+                    "symbol": "600519",
+                    "market": "ashare",
+                    "timeframe": "1d",
+                    "horizon": "smc_lite_v2",
+                    "library": "structural-lite",
+                    "library_version": "2026.07.04",
+                    "input_start_at": None,
+                    "input_end_at": None,
+                    "bar_count": 250,
+                    "rsi_14": None,
+                    "macd": None,
+                    "macd_signal": None,
+                    "macd_hist": None,
+                    "atr_14": None,
+                    "bb_percent_b": None,
+                    "ma_20": None,
+                    "ma_60": None,
+                    "status": "available",
+                    "as_of": None,
+                    "payload": {
+                        "schema_version": "smc_lite_v2",
+                        "status": "available",
+                        "evidence_id": "smc_lite:ashare:600519:1d:20260704T070000Z",
+                        "red_lines": ["LLM 只能解读结构引擎输出。"],
+                    },
+                },
+            )()
+        return None
+
+
+def test_structure_tool_is_registered_and_reads_structural_lite_frames() -> None:
+    """结构证据工具只读 `indicator_frames` 中的 structural-lite 输出。"""
+
+    runtime = FinanceToolRuntime.__new__(FinanceToolRuntime)
+    runtime._tools = {}
+    runtime.indicators = _FakeIndicators()
+    runtime.profile_service = _FakeProfileService()
+    runtime.profile_advice = _FakeAdviceService()
+
+    FinanceToolRuntime._register_builtin_tools(runtime)
+    result = runtime.call("structure.get_asset_context", asset_id="ashare:600519")
+
+    assert runtime.get_tool("structure.get_asset_context").read_only is True
+    assert result["library"] == "structural-lite"
+    assert result["structure_frames"][0]["horizon"] == "smc_lite_v2"
+    assert result["structure_frames"][0]["payload"]["evidence_id"].startswith("smc_lite:")
+    assert [call["horizon"] for call in runtime.indicators.calls] == [
+        "structural_swings_v2",
+        "smc_lite_v2",
+        "harmonic_lite_v2",
+        "elliott_lite_v2",
+    ]

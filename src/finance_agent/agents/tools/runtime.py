@@ -55,6 +55,13 @@ from finance_agent.storage.repositories import (
 
 JsonDict = dict[str, Any]
 ToolHandler = Callable[..., JsonDict]
+STRUCTURAL_LITE_LIBRARY = "structural-lite"
+STRUCTURAL_LITE_HORIZONS = (
+    "structural_swings_v2",
+    "smc_lite_v2",
+    "harmonic_lite_v2",
+    "elliott_lite_v2",
+)
 
 
 @dataclass(frozen=True)
@@ -159,6 +166,13 @@ class FinanceToolRuntime:
                 name="factor.get_asset_factor_context",
                 description="读取单标的 TA 指标、因子、评分和证据上下文。",
                 handler=self.get_asset_factor_context,
+            )
+        )
+        self.register(
+            FinanceTool(
+                name="structure.get_asset_context",
+                description="读取单标的 structural-lite 结构方法论证据，仅供技术分析师解读。",
+                handler=self.get_asset_structure_context,
             )
         )
         self.register(
@@ -415,6 +429,38 @@ class FinanceToolRuntime:
             "factor_frame": serialize_factor_frame(factor) if factor else None,
             "score": serialize_asset_score(score) if score else None,
             "evidence": [serialize_evidence(item) for item in evidence],
+        }
+
+    def get_asset_structure_context(
+        self,
+        *,
+        asset_id: str,
+        timeframe: str = "1d",
+        horizons: tuple[str, ...] = STRUCTURAL_LITE_HORIZONS,
+        library: str = STRUCTURAL_LITE_LIBRARY,
+    ) -> JsonDict:
+        """读取 structural-lite v2 结构证据；只读，不参与评分或交易动作。"""
+
+        frames = []
+        for horizon in horizons:
+            frame = self.indicators.get_latest_indicator_frame(
+                asset_id=asset_id,
+                timeframe=timeframe,
+                horizon=horizon,
+                library=library,
+            )
+            if frame is not None:
+                frames.append(serialize_indicator_frame(frame))
+        return {
+            "asset_id": asset_id,
+            "timeframe": timeframe,
+            "library": library,
+            "horizons": list(horizons),
+            "structure_frames": frames,
+            "usage_policy": {
+                "score_boundary": "excluded_from_asset_scores",
+                "llm_role": "interpret_engine_output_only",
+            },
         }
 
     def recall_asset_memories(

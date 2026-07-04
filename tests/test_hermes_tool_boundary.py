@@ -20,6 +20,7 @@ ALLOWED_TOOL_PREFIXES = (
     "portfolio.",
     "watchlist.",
     "factor.",
+    "structure.",
     "signal_risk.",
     "memory.",
     "profile.",

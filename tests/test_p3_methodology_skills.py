@@ -31,3 +31,22 @@ def test_p3_b_type_skills_declare_required_engines() -> None:
         "smc": "smc",
         "seasonal": "seasonal",
     }
+
+
+def test_structural_lite_skills_only_interpret_engine_outputs() -> None:
+    registry = load_methodology_skills(P3_METHODOLOGY_SKILL_NAMES)
+    skills = {
+        skill.name: skill.body
+        for skill in registry.skills
+        if skill.name in {"elliott-wave", "harmonic", "smc"}
+    }
+
+    for body in skills.values():
+        assert "structural-lite" in body
+        assert "只读取" in body
+        assert "不得自己" in body
+    assert "低置信度" in skills["elliott-wave"]
+    assert "thesis_confirmation_price" in skills["elliott-wave"]
+    assert "thesis_invalidation_price" in skills["elliott-wave"]
+    assert "XABCD" in skills["harmonic"]
+    assert "BOS" in skills["smc"]

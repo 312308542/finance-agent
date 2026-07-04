@@ -7,8 +7,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
+
+from sqlalchemy import inspect as sqlalchemy_inspect
 
 from finance_agent.agents.reports import build_chinese_decision_report
 from finance_agent.agents.runtime import (
@@ -17,9 +21,14 @@ from finance_agent.agents.runtime import (
     load_model_registry,
     ModelClient,
     ModelEndpointConfig,
+    ModelRegistry,
     ModelRoutingPolicy,
     OpenAICompatibleModelClient,
     ReviewDecisionContext,
+)
+from finance_agent.agents.runtime.model_config import (
+    build_model_configs_from_repository,
+    build_retrieval_profiles_from_repository,
 )
 from finance_agent.agents.tools import FinanceToolRuntime
 from finance_agent.graph.stores import DryRunGraphStore
@@ -146,6 +155,7 @@ def build_recommendation_asset_contexts(
 
     workflow_input: RecommendationDecisionInput = state["workflow_input"]
     factor_contexts = state.get("factor_contexts", {})
+    structure_contexts = state.get("structure_contexts", {})
     return {
         recommendation.asset_id: {
             "profile": {
@@ -154,6 +164,7 @@ def build_recommendation_asset_contexts(
                 "market": recommendation.market,
             },
             "factor": factor_contexts.get(recommendation.asset_id, {}),
+            "structure": structure_contexts.get(recommendation.asset_id, {}),
             "signal_risk": {
                 "signal": workflow_input.signals_by_asset.get(recommendation.asset_id),
                 "risks": workflow_input.risks_by_asset.get(recommendation.asset_id, ()),
@@ -631,10 +642,19 @@ def build_recommendation_decision_graph() -> Any:
             )
             for recommendation in workflow_input.recommendations
         }
+        structure_contexts = {
+            recommendation.asset_id: tool_runtime.call(
+                "structure.get_asset_context",
+                asset_id=recommendation.asset_id,
+                timeframe=state.get("timeframe", "1d"),
+            )
+            for recommendation in workflow_input.recommendations
+        }
         return {
             **state,
             "tool_runtime": tool_runtime,
             "factor_contexts": contexts,
+            "structure_contexts": structure_contexts,
             "node_trace": [*state.get("node_trace", []), "load_context"],
         }
 
@@ -945,7 +965,38 @@ def resolve_roundtable_model_registry(state: WorkflowGraphState) -> Any:
     registry = state.get("model_registry")
     if hasattr(registry, "get"):
         return registry
+    session_registry = build_roundtable_model_registry_from_state_repository(state)
+    if session_registry is not None:
+        return session_registry
     return load_model_registry()
+
+
+def build_roundtable_model_registry_from_state_repository(
+    state: WorkflowGraphState,
+) -> ModelRegistry | None:
+    """优先从当前 Workflow session 读取数据库模型配置。"""
+
+    repository = state.get("model_config_repository")
+    if repository is None:
+        session = state.get("session")
+        if session is None:
+            return None
+        repository = ModelRuntimeConfigRepository(session)
+    try:
+        models = build_model_configs_from_repository(repository)
+    except Exception:  # noqa: BLE001 - 模型配置读取失败时保留 fallback
+        return None
+    if not models:
+        return None
+    try:
+        retrieval_profiles = build_retrieval_profiles_from_repository(repository)
+    except Exception:  # noqa: BLE001 - 检索配置不应阻断模型调用
+        retrieval_profiles = {}
+    return ModelRegistry(
+        models=models,
+        source="database-session",
+        retrieval_profiles=retrieval_profiles,
+    )
 
 
 def resolve_roundtable_model_client(state: WorkflowGraphState) -> ModelClient:
@@ -998,13 +1049,129 @@ def build_roundtable_model_context(
     """为单条圆桌观点构造模型只读上下文。"""
 
     asset_id = str(opinion.get("asset_id") or "")
+    role = str(opinion.get("role") or "")
+    asset_context = asset_contexts.get(asset_id, {})
     return {
-        "asset_context": asset_contexts.get(asset_id, {}),
-        "portfolio_context": portfolio_context,
-        "watchlist_context": watchlist_context,
-        "recommendation_context": recommendation_context,
-        "fallback_opinion": opinion,
+        "asset_context": build_role_scoped_asset_context(
+            role=role,
+            asset_context=asset_context,
+        ),
+        "portfolio_context": compact_roundtable_model_value(portfolio_context),
+        "watchlist_context": compact_roundtable_model_value(watchlist_context),
+        "recommendation_context": compact_roundtable_model_value(recommendation_context),
+        "fallback_opinion": compact_roundtable_model_value(opinion),
     }
+
+
+def build_role_scoped_asset_context(
+    *,
+    role: str,
+    asset_context: dict[str, Any],
+) -> dict[str, Any]:
+    """按圆桌角色裁剪模型上下文，避免无关事实撑大 prompt。"""
+
+    profile = asset_context.get("profile", {})
+    if role == "risk_rebuttal":
+        return compact_roundtable_model_value(
+            {
+                "profile": profile,
+                "signal_risk": asset_context.get("signal_risk", {}),
+                "memory": asset_context.get("memory", {}),
+                "data_quality": asset_context.get("data_quality", {}),
+            }
+        )
+    if role == "technical_analyst":
+        factor = asset_context.get("factor", {})
+        return compact_roundtable_model_value(
+            {
+                "profile": profile,
+                "indicator_frame": factor.get("indicator_frame"),
+                "structure": asset_context.get("structure", {}),
+                "signal_risk": {
+                    "signal": (asset_context.get("signal_risk") or {}).get("signal"),
+                },
+            }
+        )
+    if role == "factor_analyst":
+        return compact_roundtable_model_value(
+            {
+                "profile": profile,
+                "factor": asset_context.get("factor", {}),
+            }
+        )
+    if role == "portfolio_manager":
+        return compact_roundtable_model_value({"profile": profile})
+    if role == "memory_manager":
+        return compact_roundtable_model_value(
+            {
+                "profile": profile,
+                "memory": asset_context.get("memory", {}),
+                "signal_risk": {
+                    "risks": (asset_context.get("signal_risk") or {}).get("risks", ()),
+                },
+            }
+        )
+    return compact_roundtable_model_value({"profile": profile})
+
+
+def compact_roundtable_model_value(value: Any, *, depth: int = 0) -> Any:
+    """把模型上下文压缩为 JSON 友好结构，并限制长列表和长文本。"""
+
+    if depth > 6:
+        return shorten_roundtable_text(str(value))
+    if value is None or isinstance(value, str | int | float | bool):
+        return shorten_roundtable_text(value) if isinstance(value, str) else value
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime | date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {
+            str(key): compact_roundtable_model_value(item, depth=depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, list | tuple | set):
+        items = list(value)
+        compacted = [
+            compact_roundtable_model_value(item, depth=depth + 1)
+            for item in items[:8]
+        ]
+        if len(items) > 8:
+            compacted.append({"omitted_count": len(items) - 8})
+        return compacted
+    if is_dataclass(value) and not isinstance(value, type):
+        return compact_roundtable_model_value(asdict(value), depth=depth + 1)
+    orm_payload = compact_roundtable_orm_columns(value, depth=depth)
+    if orm_payload is not None:
+        return orm_payload
+    return shorten_roundtable_text(str(value))
+
+
+def compact_roundtable_orm_columns(value: Any, *, depth: int) -> dict[str, Any] | None:
+    """把 SQLAlchemy ORM 实例转换为模型可读的轻量字典。"""
+
+    try:
+        inspected = sqlalchemy_inspect(value, raiseerr=False)
+    except Exception:  # noqa: BLE001 - 模型上下文压缩不能因未知对象中断
+        return None
+    mapper = getattr(inspected, "mapper", None)
+    if mapper is None:
+        return None
+    return {
+        column.key: compact_roundtable_model_value(
+            getattr(value, column.key),
+            depth=depth + 1,
+        )
+        for column in mapper.column_attrs
+    }
+
+
+def shorten_roundtable_text(value: str, *, limit: int = 1200) -> str:
+    """限制传给模型的单段文本长度。"""
+
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}...<truncated {len(value) - limit} chars>"
 
 
 def build_roundtable_allowed_evidence_ids(
@@ -1286,6 +1453,18 @@ def collect_asset_contexts(
                 "horizon": horizon,
             }
         )
+        structure_context = tool_runtime.call(
+            "structure.get_asset_context",
+            asset_id=asset_id,
+            timeframe=timeframe,
+        )
+        tool_calls.append(
+            {
+                "tool": "structure.get_asset_context",
+                "asset_id": asset_id,
+                "timeframe": timeframe,
+            }
+        )
         signal_risk_context = tool_runtime.call(
             "signal_risk.get_asset_context",
             asset_id=asset_id,
@@ -1316,6 +1495,7 @@ def collect_asset_contexts(
         asset_contexts[asset_id] = {
             "profile": build_asset_profile(asset_id=asset_id, factor_context=factor_context),
             "factor": factor_context,
+            "structure": structure_context,
             "signal_risk": signal_risk_context,
             "memory": memory_context,
         }
@@ -1385,6 +1565,18 @@ def collect_roundtable_report_context(state: WorkflowGraphState) -> dict[str, An
                 "horizon": state.get("horizon", "swing"),
             }
         )
+        structure_context = tool_runtime.call(
+            "structure.get_asset_context",
+            asset_id=asset_id,
+            timeframe=state.get("timeframe", "1d"),
+        )
+        tool_calls.append(
+            {
+                "tool": "structure.get_asset_context",
+                "asset_id": asset_id,
+                "timeframe": state.get("timeframe", "1d"),
+            }
+        )
         signal_risk_context = tool_runtime.call(
             "signal_risk.get_asset_context",
             asset_id=asset_id,
@@ -1415,6 +1607,7 @@ def collect_roundtable_report_context(state: WorkflowGraphState) -> dict[str, An
         asset_contexts[asset_id] = {
             "profile": build_asset_profile(asset_id=asset_id, factor_context=factor_context),
             "factor": factor_context,
+            "structure": structure_context,
             "signal_risk": signal_risk_context,
             "memory": memory_context,
         }
@@ -1520,6 +1713,10 @@ def build_report_roundtable_opinions(
             "tool": "factor.get_asset_factor_context",
             "asset_id": asset_id,
         }
+        structure_tool_call = {
+            "tool": "structure.get_asset_context",
+            "asset_id": asset_id,
+        }
         risk_tool_call = {
             "tool": "signal_risk.get_asset_context",
             "asset_id": asset_id,
@@ -1540,7 +1737,7 @@ def build_report_roundtable_opinions(
                         indicator=indicator,
                         signal=signal,
                     ),
-                    "tool_calls": [factor_tool_call, risk_tool_call],
+                    "tool_calls": [factor_tool_call, structure_tool_call, risk_tool_call],
                     "evidence_ids": [item["evidence_id"] for item in evidence],
                     "source_ids": compact_ids(indicator.get("indicator_frame_id")),
                 },
@@ -1935,6 +2132,10 @@ def build_roundtable_opinions(
         "asset_id": recommendation.asset_id,
         "horizon": recommendation.horizon,
     }
+    structure_tool_call = {
+        "tool": "structure.get_asset_context",
+        "asset_id": recommendation.asset_id,
+    }
 
     return [
         {
@@ -1942,7 +2143,7 @@ def build_roundtable_opinions(
             "asset_id": recommendation.asset_id,
             "stance": "support" if indicator else "insufficient",
             "summary": build_technical_summary(indicator=indicator, signal=signal),
-            "tool_calls": [tool_call],
+            "tool_calls": [tool_call, structure_tool_call],
             "evidence_ids": [item["evidence_id"] for item in evidence],
             "source_ids": [indicator.get("indicator_frame_id")] if indicator else [],
         },

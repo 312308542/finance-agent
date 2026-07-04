@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from finance_agent.agents.runtime.model_client import ModelClientResponse
 from finance_agent.agents.runtime.model_config import ModelEndpointConfig
 from finance_agent.agents.workflows.langgraph_graphs import (
+    build_roundtable_model_context,
     enrich_roundtable_opinions_with_model,
     resolve_roundtable_model_roles,
 )
+from finance_agent.storage.orm import RiskFindingORM
 
 
 class FakeModelRegistry:
@@ -130,6 +133,109 @@ def test_enrich_roundtable_opinions_keeps_fallback_when_model_config_missing() -
     assert {item["generated_by"] for item in opinions} == {"fallback"}
     assert client.calls == []
     assert any("圆桌模型配置不可用" in item for item in opinions[0]["data_gaps"])
+
+
+def test_build_roundtable_model_context_scopes_risk_role_and_serializes_orm() -> None:
+    risk = RiskFindingORM(
+        risk_id="risk:ashare:600519:demo",
+        asset_id="ashare:600519",
+        scope="asset",
+        risk_type="event",
+        severity="high",
+        score=None,
+        title="事件风险未解除",
+        description="等待公告落地。",
+        as_of=datetime(2026, 7, 3),
+        evidence_ids=["ev:risk"],
+        payload={},
+    )
+    context = build_roundtable_model_context(
+        opinion={
+            "role": "risk_rebuttal",
+            "asset_id": "ashare:600519",
+            "summary": "规则版风险观点。",
+        },
+        asset_contexts={
+            "ashare:600519": {
+                "profile": {"asset_id": "ashare:600519", "symbol": "600519"},
+                "factor": {
+                    "factor_frame": {
+                        "payload": {
+                            "factor_groups": [
+                                {
+                                    "group": "valuation",
+                                    "source_ids": [f"fundamental:{idx}" for idx in range(200)],
+                                }
+                            ]
+                        }
+                    }
+                },
+                "signal_risk": {"risks": (risk,)},
+                "memory": {"memories": []},
+            }
+        },
+        portfolio_context={"portfolio_id": "portfolio:test"},
+        watchlist_context={"watchlist_id": "watchlist:test"},
+        recommendation_context={"run_id": "run:test"},
+    )
+
+    assert "factor" not in context["asset_context"]
+    assert context["asset_context"]["signal_risk"]["risks"][0]["risk_id"] == (
+        "risk:ashare:600519:demo"
+    )
+    assert "source_ids" not in str(context)
+
+
+def test_build_roundtable_model_context_includes_structure_for_technical_role() -> None:
+    """技术分析师模型上下文应能读取结构证据，其他角色不应被该证据撑大。"""
+
+    asset_contexts = {
+        "ashare:600519": {
+            "profile": {"asset_id": "ashare:600519", "symbol": "600519"},
+            "factor": {"indicator_frame": {"indicator_frame_id": "indicator:1"}},
+            "structure": {
+                "structure_frames": [
+                    {
+                        "horizon": "smc_lite_v2",
+                        "status": "available",
+                        "payload": {
+                            "evidence_id": "smc_lite:ashare:600519:1d:20260704T070000Z",
+                            "red_lines": ["LLM 只能解读结构引擎输出。"],
+                        },
+                    }
+                ]
+            },
+            "signal_risk": {"signal": {"direction": "bullish"}},
+        }
+    }
+
+    technical = build_roundtable_model_context(
+        opinion={
+            "role": "technical_analyst",
+            "asset_id": "ashare:600519",
+            "summary": "规则版技术观点。",
+        },
+        asset_contexts=asset_contexts,
+        portfolio_context=None,
+        watchlist_context=None,
+        recommendation_context=None,
+    )
+    factor = build_roundtable_model_context(
+        opinion={
+            "role": "factor_analyst",
+            "asset_id": "ashare:600519",
+            "summary": "规则版因子观点。",
+        },
+        asset_contexts=asset_contexts,
+        portfolio_context=None,
+        watchlist_context=None,
+        recommendation_context=None,
+    )
+
+    assert technical["asset_context"]["structure"]["structure_frames"][0]["horizon"] == (
+        "smc_lite_v2"
+    )
+    assert "structure" not in factor["asset_context"]
 
 
 def build_fallback_opinions() -> list[dict[str, Any]]:

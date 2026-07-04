@@ -7,10 +7,12 @@ CLI、MCP、Scheduler 或后续 API 都应通过这里调用 `FinanceAssistantSe
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy.orm import Session
 
 from finance_agent.agents.personal_assistant import FinanceAssistantService
@@ -606,7 +608,7 @@ def serialize_workflow_summary(summary: Any) -> JsonDict:
         "workflow_run_id": summary.workflow_run_id,
         "workflow_type": summary.workflow_type,
         "final_state": sanitize_interface_state(summary.final_state),
-        "report": summary.report,
+        "report": interface_json_value(summary.report),
     }
 
 
@@ -614,9 +616,55 @@ def sanitize_interface_state(state: JsonDict) -> JsonDict:
     """清理不适合通过 CLI/MCP 返回的运行时对象。"""
 
     return {
-        key: value
+        key: interface_json_value(value)
         for key, value in state.items()
-        if key not in {"session", "tool_runtime", "workflow_input", "result"}
+        if key
+        not in {
+            "session",
+            "tool_runtime",
+            "workflow_input",
+            "result",
+            "model_registry",
+            "model_client",
+            "model_config_repository",
+        }
+    }
+
+
+def interface_json_value(value: Any) -> Any:
+    """把 Workflow 输出深度转换为 JSON 友好值。"""
+
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime | date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): interface_json_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [interface_json_value(item) for item in value]
+    if is_dataclass(value) and not isinstance(value, type):
+        return interface_json_value(asdict(value))
+    orm_payload = serialize_orm_columns(value)
+    if orm_payload is not None:
+        return orm_payload
+    return str(value)
+
+
+def serialize_orm_columns(value: Any) -> JsonDict | None:
+    """把 SQLAlchemy ORM 实例按列转为 JSON 友好字典。"""
+
+    try:
+        inspected = sqlalchemy_inspect(value, raiseerr=False)
+    except Exception:  # noqa: BLE001 - 接口输出清洗不能因未知对象中断
+        return None
+    mapper = getattr(inspected, "mapper", None)
+    if mapper is None:
+        return None
+    return {
+        column.key: interface_json_value(getattr(value, column.key))
+        for column in mapper.column_attrs
     }
 
 

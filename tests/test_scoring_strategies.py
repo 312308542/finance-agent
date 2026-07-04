@@ -158,6 +158,29 @@ def test_compute_asset_score_accepts_strategy_weights() -> None:
     }
 
 
+def test_compute_asset_score_ignores_structural_methodology_payload() -> None:
+    """结构方法论证据只供模型解读，不参与确定性评分。"""
+
+    baseline = compute_asset_score(_Factor())
+    payload_with_structure = dict(_Factor().payload or {})
+    payload_with_structure["structural"] = {
+        "library": "structural-lite",
+        "structure_frames": [
+            {
+                "horizon": "smc_lite_v2",
+                "status": "available",
+                "payload": {"confidence": 0.99, "direction": "bullish"},
+            }
+        ],
+    }
+
+    score = compute_asset_score(_Factor(payload=payload_with_structure))
+
+    assert score["total_score"] == baseline["total_score"]
+    assert score["group_scores"] == baseline["group_scores"]
+    assert all(group["group"] != "structural" for group in score["score_groups"])
+
+
 def test_scoring_service_records_strategy_snapshot_in_score_payload() -> None:
     """评分落库 payload 应保存 strategy_id 和权重快照，便于推荐结果复现。"""
 
