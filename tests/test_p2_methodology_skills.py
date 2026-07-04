@@ -34,3 +34,27 @@ def test_p2_skills_are_assigned_to_roundtable_roles() -> None:
         "regulatory-knowledge",
         "social-media-intelligence",
     }
+
+
+def test_ichimoku_skill_transfers_references_as_read_only_interpretation() -> None:
+    registry = load_methodology_skills(("ichimoku",))
+    skill = registry.skills[0]
+
+    assert "## 失效条件" in skill.body
+    assert "转换线" in skill.body
+    assert "基准线" in skill.body
+    assert "云带" in skill.body
+    assert "来源：Vibe-Trading references，MIT，已按只读解读视角改写。" in skill.body
+    assert section(skill.body, "## 禁令") == (
+        "不得自己计算一目均衡线、不得引用入库数据之外的事实、不得给目标价、"
+        "不得修改系统分数、信号方向、风险标记或动作枚举。"
+    )
+
+
+def section(body: str, title: str) -> str:
+    start = body.index(title) + len(title)
+    tail = body[start:]
+    next_title = tail.find("\n## ")
+    if next_title >= 0:
+        tail = tail[:next_title]
+    return tail.strip()
