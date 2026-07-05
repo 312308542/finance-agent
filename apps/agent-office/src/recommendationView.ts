@@ -53,6 +53,7 @@ export type RecommendationItemModel = {
   summary: string;
   scoreBreakdown: ScoreBreakdownItem[];
   structureEvidence: StructureEvidenceItem[];
+  structureStatus: string;
   isDemo: boolean;
   riskRebuttal: string;
   reportWorkflowRunId: string;
@@ -195,6 +196,7 @@ export function normalizeRecommendationItem(
     isOfflineDemo ||
     normalizeText(item.data_source || item.dataSource) === "offline_demo" ||
     normalizeText(payload.data_source || payload.dataSource) === "offline_demo";
+  const structureEvidence = normalizeStructureEvidence(payload, { isOfflineDemo: isDemo });
   const riskIds = Array.isArray(item.risk_ids) ? item.risk_ids : [];
   const evidenceIds = Array.isArray(item.evidence_ids) ? item.evidence_ids : [];
   const score = normalizeNumber(item.total_score);
@@ -227,7 +229,8 @@ export function normalizeRecommendationItem(
     evidenceCount: evidenceIds.length,
     summary: normalizeText(item.summary),
     scoreBreakdown: normalizeScoreBreakdown(payload.score_breakdown || payload.scoreBreakdown),
-    structureEvidence: normalizeStructureEvidence(payload, { isOfflineDemo: isDemo }),
+    structureEvidence,
+    structureStatus: normalizeStructureStatus(payload, structureEvidence),
     isDemo,
     riskRebuttal: normalizeText(payload.risk_rebuttal || payload.riskRebuttal || payload.risk_summary),
     reportWorkflowRunId: normalizeText(payload.workflow_run_id || payload.report_workflow_run_id),
@@ -388,6 +391,21 @@ export function normalizeStructureEvidence(
   return frames
     .map((frame) => normalizeStructureFrame(frame, options))
     .filter((item): item is StructureEvidenceItem => Boolean(item));
+}
+
+export function normalizeStructureStatus(
+  value: unknown,
+  evidence: StructureEvidenceItem[] = [],
+): string {
+  const source = resolveStructureSource(value);
+  const status = normalizeText(source?.status);
+  if (status) {
+    return status;
+  }
+  if (evidence.length) {
+    return "available";
+  }
+  return "";
 }
 
 function resolveStructureSource(value: unknown): Record<string, any> | null {

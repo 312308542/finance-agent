@@ -193,6 +193,7 @@ assert.deepEqual(buildDecisionFeedbackPayload("modified", "改为观察", "watch
 
 assert.equal(model.items[0].structureEvidence.length, 2);
 assert.equal(model.items[0].structureEvidence[0].isDemo, false);
+assert.equal(model.items[0].structureStatus, "available");
 assert.deepEqual(
   model.items[0].structureEvidence.map((item) => [item.horizon, item.title, item.confidenceDisplay]),
   [
@@ -205,6 +206,26 @@ assert.match(model.items[0].structureEvidence[1].summary, /Bat/);
 assert.equal(model.items[0].structureEvidence[1].invalidationPrice, "10.2");
 assert.equal(normalized?.structureEvidence[0].evidenceId, "smc_lite:ashare:000001:1d:20260704");
 assert.equal(normalizeStructureEvidence({ structure_frames: [] }).length, 0);
+
+const noStructureModel = buildRecommendationPageModel(
+  {
+    ...payload,
+    recommendations: [
+      {
+        ...payload.recommendations[0],
+        recommendation_id: "rec:no-structure",
+        payload: {
+          ...payload.recommendations[0].payload,
+          structure: { status: "no_structure_evidence" },
+        },
+      },
+    ],
+  },
+  decisions,
+  "ashare",
+);
+assert.equal(noStructureModel.items[0].structureEvidence.length, 0);
+assert.equal(noStructureModel.items[0].structureStatus, "no_structure_evidence");
 
 const offlineDemoModel = buildRecommendationPageModel(
   {
@@ -262,7 +283,10 @@ assert.equal(cryptoModel.activeRun?.runId, "run:c");
 assert.equal(cryptoModel.avoidPoolSummary.count, 3);
 
 assert.match(pageSource, /function StructureEvidenceCard/);
+assert.match(pageSource, /function StructureEvidenceEmptyState/);
 assert.match(pageSource, /item\.structureEvidence\.length/);
+assert.match(pageSource, /item\.structureStatus === "no_structure_evidence"/);
+assert.match(pageSource, /暂无结构证据/);
 assert.match(pageSource, /后端不可用，以下为离线演示数据，非真实推荐/);
 assert.match(pageSource, /offline-demo-banner/);
 assert.match(pageSource, /demo-badge/);

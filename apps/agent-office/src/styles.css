@@ -1849,6 +1849,11 @@ tbody tr:last-child td {
   background: rgba(79, 140, 255, 0.06);
 }
 
+.structure-evidence-empty {
+  border-style: dashed;
+  background: rgba(79, 140, 255, 0.035);
+}
+
 .structure-evidence-head {
   display: flex;
   gap: 8px;

@@ -391,6 +391,9 @@ function RecommendationExpanded({
         <p>{item.riskRebuttal || item.summary || "暂无风险反驳文本。"}</p>
       </div>
       {item.structureEvidence.length ? <StructureEvidenceCard items={item.structureEvidence} /> : null}
+      {!item.structureEvidence.length && item.structureStatus === "no_structure_evidence" ? (
+        <StructureEvidenceEmptyState />
+      ) : null}
       <div className="recommendation-expanded-actions">
         {item.reportWorkflowRunId ? (
           <a className="button button-ghost" href={`#report:${encodeURIComponent(item.reportWorkflowRunId)}`}>
@@ -464,6 +467,20 @@ function StructureEvidenceCard({ items }: { items: StructureEvidenceItem[] }) {
             {item.evidenceId ? <code>{item.evidenceId}</code> : null}
           </article>
         ))}
+      </div>
+    </section>
+  );
+}
+
+function StructureEvidenceEmptyState() {
+  return (
+    <section className="structure-evidence-card structure-evidence-empty" aria-label="结构证据">
+      <div className="structure-evidence-head">
+        <GitBranch size={16} />
+        <div>
+          <h3>结构证据</h3>
+          <p>暂无结构证据。structural-lite 未产出可展示的结构摘要。</p>
+        </div>
       </div>
     </section>
   );
