@@ -22,6 +22,7 @@ from finance_agent.storage.repositories import (
     AssetRepository,
     AssetScoreRepository,
     BacktestRepository,
+    IndicatorFrameRepository,
     RecommendationRepository,
     RiskRepository,
     ScreeningRepository,
@@ -31,6 +32,13 @@ from finance_agent.storage.repositories import (
 JsonDict = dict[str, Any]
 
 RULE_VERSION = "asset_recommendation_v1.0.0"
+STRUCTURAL_LITE_LIBRARY = "structural-lite"
+STRUCTURAL_LITE_HORIZONS: tuple[str, ...] = (
+    "structural_swings_v2",
+    "smc_lite_v2",
+    "harmonic_lite_v2",
+    "elliott_lite_v2",
+)
 
 
 @dataclass(frozen=True)
@@ -120,6 +128,7 @@ class RecommendationService:
         self.scores = AssetScoreRepository(session)
         self.signals = SignalSnapshotRepository(session)
         self.risks = RiskRepository(session)
+        self.indicators = IndicatorFrameRepository(session)
         self.recommendations = RecommendationRepository(session)
         self.backtests = BacktestRepository(session)
 
@@ -202,6 +211,11 @@ class RecommendationService:
                 rule_version=rule_version,
                 backtest_evidence=backtest_evidence,
                 decision_context=decision_context,
+                structure_evidence=build_asset_structure_payload(
+                    indicators=getattr(self, "indicators", None),
+                    asset_id=score.asset_id,
+                    timeframe=str(score.payload.get("timeframe") or "1d"),
+                ),
             )
             saved = self.recommendations.upsert_asset_recommendation(
                 recommendation_id=recommendation["recommendation_id"],
@@ -300,6 +314,7 @@ def build_recommendation_payload(
     rule_version: str,
     backtest_evidence: JsonDict | None = None,
     decision_context: RecommendationDecisionContext | None = None,
+    structure_evidence: JsonDict | None = None,
 ) -> JsonDict:
     """构建单标的推荐 payload。"""
 
@@ -338,7 +353,7 @@ def build_recommendation_payload(
         confidence=float(score.confidence),
     )
 
-    return {
+    payload = {
         "schema_version": "1.0",
         "rule_version": rule_version,
         "recommendation_id": build_recommendation_id(
@@ -374,6 +389,117 @@ def build_recommendation_payload(
         "memory_ranking_adjustment": score.payload.get("memory_ranking_adjustment"),
         "decision_context": decision_context_payload(decision_context),
     }
+    if structure_evidence is not None:
+        payload["structure"] = structure_evidence
+    return payload
+
+
+def build_asset_structure_payload(
+    *,
+    indicators: Any,
+    asset_id: str,
+    timeframe: str,
+) -> JsonDict:
+    """读取 structural-lite 最新帧并生成推荐 payload 的精简结构证据。"""
+
+    if indicators is None or not hasattr(indicators, "get_latest_indicator_frame"):
+        return {"status": "no_structure_evidence"}
+    frames: list[JsonDict] = []
+    for horizon in STRUCTURAL_LITE_HORIZONS:
+        frame = indicators.get_latest_indicator_frame(
+            asset_id=asset_id,
+            timeframe=timeframe,
+            horizon=horizon,
+            library=STRUCTURAL_LITE_LIBRARY,
+        )
+        if frame is None:
+            continue
+        compact = compact_structure_frame(frame)
+        if compact is not None:
+            frames.append(compact)
+    if not frames or all(is_insufficient_structure_status(frame["status"]) for frame in frames):
+        return {"status": "no_structure_evidence"}
+    return {
+        "library": STRUCTURAL_LITE_LIBRARY,
+        "structure_frames": frames,
+    }
+
+
+def compact_structure_frame(frame: Any) -> JsonDict | None:
+    """把完整 indicator_frame 压缩为前端展示和审计所需的摘要。"""
+
+    payload = frame.payload if isinstance(getattr(frame, "payload", None), dict) else {}
+    horizon = str(getattr(frame, "horizon", None) or payload.get("schema_version") or "")
+    if not horizon:
+        return None
+    status = str(payload.get("status") or getattr(frame, "status", None) or "unknown")
+    result: JsonDict = {
+        "horizon": horizon,
+        "status": status,
+        "confidence": normalize_structure_confidence(payload.get("confidence", getattr(frame, "confidence", 0))),
+        "evidence_id": str(payload.get("evidence_id") or getattr(frame, "evidence_id", "") or ""),
+        "as_of": _isoformat(getattr(frame, "as_of", None)) or _isoformat(payload.get("as_of")) or "",
+        "items": summarize_structure_items(horizon=horizon, payload=payload),
+    }
+    return result
+
+
+def summarize_structure_items(*, horizon: str, payload: JsonDict) -> list[JsonDict]:
+    """按引擎类型提取最多三条摘要，完整证据仍通过 evidence_id 回查。"""
+
+    if horizon == "smc_lite_v2":
+        return [
+            {
+                "name": str(item.get("name") or ""),
+                "direction": str(item.get("direction") or ""),
+                "break_level": _json_safe(item.get("break_level")),
+            }
+            for item in list_records(payload.get("structure_events"))[:3]
+        ]
+    if horizon == "harmonic_lite_v2":
+        return [
+            {
+                "pattern": str(item.get("pattern") or ""),
+                "direction": str(item.get("direction") or ""),
+                "bars_since_d": _json_safe(item.get("bars_since_d")),
+            }
+            for item in list_records(payload.get("patterns"))[:3]
+        ]
+    if horizon == "elliott_lite_v2":
+        return [
+            {
+                "pattern": str(item.get("pattern") or ""),
+                "signal_hint": str(item.get("signal_hint") or ""),
+            }
+            for item in list_records(payload.get("candidates"))[:3]
+        ]
+    if horizon == "structural_swings_v2":
+        segments = list_records(payload.get("segments"))
+        return [{"direction": str(item.get("direction") or "")} for item in segments[-3:]]
+    return []
+
+
+def list_records(value: Any) -> list[JsonDict]:
+    """只保留字典列表项，避免把完整复杂对象塞入推荐 payload。"""
+
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def is_insufficient_structure_status(status: str) -> bool:
+    """判断 structural-lite 状态是否不构成可展示结构证据。"""
+
+    return status.startswith("insufficient") or status in {"no_structure_evidence"}
+
+
+def normalize_structure_confidence(value: Any) -> float:
+    """把结构置信度转换成 JSON 友好的浮点数。"""
+
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def decision_context_payload(context: RecommendationDecisionContext | None) -> JsonDict | None:
@@ -538,10 +664,14 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _isoformat(value: datetime | None) -> str | None:
+def _isoformat(value: Any) -> str | None:
     """安全输出 ISO 时间字符串。"""
 
-    return value.isoformat() if value is not None else None
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
 
 
 def ensure_recommendation_market(market: str) -> None:
