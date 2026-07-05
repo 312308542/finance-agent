@@ -26,9 +26,9 @@ def test_p3_b_type_skills_declare_required_engines() -> None:
     }
 
     assert required_engines == {
-        "elliott-wave": "elliott_wave",
-        "harmonic": "harmonic",
-        "smc": "smc",
+        "elliott-wave": "structural_lite_elliott",
+        "harmonic": "structural_lite_harmonic",
+        "smc": "structural_lite_smc",
         "seasonal": "seasonal",
     }
 

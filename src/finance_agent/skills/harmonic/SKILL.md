@@ -2,7 +2,7 @@
 name: harmonic
 category: technical
 markets: [ashare, crypto]
-requires_engine: harmonic
+requires_engine: structural_lite_harmonic
 roundtable_role: technical_analyst
 ---
 ## 适用场景

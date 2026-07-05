@@ -2,7 +2,7 @@
 name: elliott-wave
 category: technical
 markets: [ashare, crypto]
-requires_engine: elliott_wave
+requires_engine: structural_lite_elliott
 roundtable_role: technical_analyst
 ---
 ## 适用场景

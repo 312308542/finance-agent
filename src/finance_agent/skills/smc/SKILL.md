@@ -2,7 +2,7 @@
 name: smc
 category: technical
 markets: [ashare, crypto]
-requires_engine: smc
+requires_engine: structural_lite_smc
 roundtable_role: technical_analyst
 ---
 ## 适用场景

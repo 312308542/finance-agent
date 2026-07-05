@@ -5,7 +5,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from finance_agent.skills.loader import MethodologySkillRegistry
+    from finance_agent.skills.loader import MethodologySkill, MethodologySkillRegistry
+
+ROLE_SKILL_BUDGET_CHARS = 6000
 
 ROLE_PROMPTS: dict[str, str] = {
     "technical_analyst": (
@@ -74,7 +76,7 @@ def role_prompt(role: str, *, skill_registry: "MethodologySkillRegistry | None" 
     skills = registry.for_role(role)
     if not skills:
         return prompt
-    skill_text = "\n\n".join(skill.prompt_excerpt() for skill in skills)
+    skill_text = build_role_skill_text(skills)
     return (
         f"{prompt}\n\n"
         "## 可加载方法论技能\n"
@@ -87,12 +89,53 @@ def role_prompt(role: str, *, skill_registry: "MethodologySkillRegistry | None" 
     )
 
 
+def build_role_skill_text(skills: list["MethodologySkill"]) -> str:
+    """按优先级和总预算拼接角色可用方法论技能。"""
+
+    ordered_skills = sorted(enumerate(skills), key=lambda item: (skill_priority(item[1].name), item[0]))
+    chunks: list[str] = []
+    omitted = 0
+    used = 0
+    separator = "\n\n"
+    for _, skill in ordered_skills:
+        excerpt = skill.prompt_excerpt()
+        extra = len(excerpt) + (len(separator) if chunks else 0)
+        if used + extra > ROLE_SKILL_BUDGET_CHARS:
+            omitted += 1
+            continue
+        chunks.append(excerpt)
+        used += extra
+    if omitted:
+        note = f"另有 {omitted} 个技能未注入，原因：超过角色方法论注入预算。"
+        extra = len(note) + (len(separator) if chunks else 0)
+        while chunks and used + extra > ROLE_SKILL_BUDGET_CHARS:
+            removed = chunks.pop()
+            used -= len(removed) + (len(separator) if chunks else 0)
+            omitted += 1
+            note = f"另有 {omitted} 个技能未注入，原因：超过角色方法论注入预算。"
+            extra = len(note) + (len(separator) if chunks else 0)
+        chunks.append(note)
+    return separator.join(chunks)
+
+
+def skill_priority(name: str) -> int:
+    """返回 prompt 注入优先级：P1 优先，其次 L1 结构技能。"""
+
+    from finance_agent.skills.loader import L1_METHODOLOGY_SKILL_NAMES, P1_METHODOLOGY_SKILL_NAMES
+
+    if name in P1_METHODOLOGY_SKILL_NAMES:
+        return 0
+    if name in L1_METHODOLOGY_SKILL_NAMES:
+        return 1
+    return 2
+
+
 def load_default_skill_registry() -> "MethodologySkillRegistry | None":
     """加载默认方法论技能；失败时保持旧 Prompt 可用。"""
 
     try:
-        from finance_agent.skills.loader import load_all_methodology_skills
+        from finance_agent.skills.loader import load_active_methodology_skills
 
-        return load_all_methodology_skills()
+        return load_active_methodology_skills()
     except Exception:  # noqa: BLE001 - Prompt 注入失败不能阻断圆桌 fallback
         return None
