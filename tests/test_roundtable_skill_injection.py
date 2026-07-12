@@ -41,6 +41,23 @@ def test_role_prompt_injects_active_structural_skills_with_budget() -> None:
         assert len(skill.prompt_excerpt()) <= 1200
 
 
+def test_role_prompt_injects_ichimoku_but_keeps_orphan_engines_blocked() -> None:
+    """Ichimoku 上线后应激活，其他孤儿引擎仍不能进入默认 Prompt。"""
+
+    prompt = role_prompt(
+        "technical_analyst",
+        skill_registry=load_all_methodology_skills(),
+    )
+    skill_block = prompt.split("## 可加载方法论技能", 1)[1].split(
+        "## 方法论红线", 1
+    )[0]
+
+    assert "ichimoku" in skill_block
+    assert "correlation-analysis" not in skill_block
+    assert "pair-trading" not in skill_block
+    assert "seasonal" not in skill_block
+
+
 def test_role_prompt_truncates_over_budget_skills_by_priority() -> None:
     registry = MethodologySkillRegistry(
         skills=(

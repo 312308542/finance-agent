@@ -74,6 +74,7 @@ L1_METHODOLOGY_SKILL_NAMES: tuple[str, ...] = (
     "smc",
     "harmonic",
     "elliott-wave",
+    "ichimoku",
     "chanlun-interpret",
 )
 
@@ -133,8 +134,8 @@ ENGINE_CAPABILITIES: dict[str, EngineCapability] = {
     ),
     "ichimoku": EngineCapability(
         key="ichimoku",
-        available=False,
-        description="IchimokuAdapter 已实现但暂无生产调度/入库消费",
+        available=True,
+        description="IchimokuAdapter 已接入 analytics.structural.ashare.daily 并产出 ichimoku_v1",
     ),
     "correlation": EngineCapability(
         key="correlation",

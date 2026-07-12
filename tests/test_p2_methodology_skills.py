@@ -51,6 +51,21 @@ def test_ichimoku_skill_transfers_references_as_read_only_interpretation() -> No
     )
 
 
+def test_orphan_engine_skills_are_explicitly_reserved() -> None:
+    """未建立生产消费方的引擎技能必须显式保持接口预留。"""
+
+    registry = load_methodology_skills(
+        ("correlation-analysis", "pair-trading", "seasonal")
+    )
+
+    for skill in registry.skills:
+        assert "## 接入状态" in skill.body
+        status = section(skill.body, "## 接入状态")
+        assert "接口预留" in status
+        assert "capability 保持 False" in status
+        assert "不得默认加载" in status
+
+
 def section(body: str, title: str) -> str:
     start = body.index(title) + len(title)
     tail = body[start:]

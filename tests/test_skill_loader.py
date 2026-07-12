@@ -28,10 +28,13 @@ def test_load_active_skills_enable_p1_and_available_l1_capabilities() -> None:
 
     names = set(registry.skill_names())
     assert set(P1_METHODOLOGY_SKILL_NAMES) <= names
-    assert {"smc", "harmonic", "elliott-wave"} <= names
+    assert {"smc", "harmonic", "elliott-wave", "ichimoku"} <= names
     assert "chanlun-interpret" not in names
-    assert "ichimoku" not in names
+    assert "correlation-analysis" not in names
+    assert "pair-trading" not in names
+    assert "seasonal" not in names
     assert ENGINE_CAPABILITIES["structural_lite_smc"].available is True
+    assert ENGINE_CAPABILITIES["ichimoku"].available is True
     assert ENGINE_CAPABILITIES["chanlun"].available is False
 
 

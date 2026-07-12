@@ -13,6 +13,7 @@ from typing import Any, Iterable, Sequence
 
 from sqlalchemy.orm import Session
 
+from finance_agent.indicators.methodology_adapters import IchimokuAdapter, PriceBar
 from finance_agent.indicators.structural_methodology_adapters import (
     ENGINE_VERSION,
     StructuralMethodologyAdapter,
@@ -27,13 +28,14 @@ from finance_agent.storage.repositories import (
 )
 
 JsonDict = dict[str, Any]
-DEFAULT_STRUCTURAL_ENGINES = ("swings", "smc", "harmonic", "elliott")
+DEFAULT_STRUCTURAL_ENGINES = ("swings", "smc", "harmonic", "elliott", "ichimoku")
 STRUCTURAL_LIBRARY = "structural-lite"
 ENGINE_SCHEMA_BY_NAME = {
     "swings": "structural_swings_v2",
     "smc": "smc_lite_v2",
     "harmonic": "harmonic_lite_v2",
     "elliott": "elliott_lite_v2",
+    "ichimoku": "ichimoku_v1",
 }
 
 
@@ -288,7 +290,7 @@ def compute_engine_payloads(
                 timeframe=timeframe,
                 bars=bars,
             )
-        else:
+        elif engine == "elliott":
             payload = adapter.compute_elliott(
                 asset_id=asset_id,
                 symbol=symbol,
@@ -296,8 +298,74 @@ def compute_engine_payloads(
                 timeframe=timeframe,
                 bars=bars,
             )
+        elif len(bars) < 52:
+            payload = build_ichimoku_insufficient_payload(
+                asset_id=asset_id,
+                symbol=symbol,
+                market=market,
+                timeframe=timeframe,
+                bars=bars,
+                as_of=as_of,
+            )
+        else:
+            payload = IchimokuAdapter().compute(
+                asset_id=asset_id,
+                symbol=symbol,
+                market=market,
+                timeframe=timeframe,
+                bars=[
+                    PriceBar(
+                        timestamp=bar.timestamp,
+                        open=bar.open,
+                        high=bar.high,
+                        low=bar.low,
+                        close=bar.close,
+                        volume=bar.volume,
+                    )
+                    for bar in bars
+                ],
+            ).to_indicator_payload()
         outputs.append((engine, payload))
     return outputs
+
+
+def build_ichimoku_insufficient_payload(
+    *,
+    asset_id: str,
+    symbol: str,
+    market: str,
+    timeframe: str,
+    bars: list[StructuralPriceBar],
+    as_of: datetime,
+) -> JsonDict:
+    """构造 Ichimoku 预热不足时的可审计指标帧。"""
+
+    input_start_at = bars[0].timestamp if bars else as_of
+    input_end_at = bars[-1].timestamp if bars else as_of
+    return {
+        "schema_version": "ichimoku_v1",
+        "status": "insufficient_data",
+        "asset_id": asset_id,
+        "symbol": symbol,
+        "market": market,
+        "timeframe": timeframe,
+        "input_start_at": input_start_at.isoformat(),
+        "input_end_at": input_end_at.isoformat(),
+        "bar_count": len(bars),
+        "lines": {},
+        "signals": [],
+        "evidence_id": build_structural_evidence_id(
+            schema_version="ichimoku_v1",
+            asset_id=asset_id,
+            timeframe=timeframe,
+            input_end_at=input_end_at,
+        ),
+        "caveats": [f"一目均衡计算至少需要 52 根 K 线，当前只有 {len(bars)} 根。"],
+        "red_lines": [
+            "一目均衡线必须由确定性适配器计算，LLM 只能解读。",
+            "不得用模型自行补算缺失线值或修改信号方向。",
+        ],
+    }
 
 
 def build_empty_payload(

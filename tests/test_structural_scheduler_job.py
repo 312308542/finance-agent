@@ -34,7 +34,7 @@ def test_scheduler_payload_registers_structural_methodology_job() -> None:
         "sync_task_type": "analytics.structural_methodology",
         "market": "ashare",
         "timeframe": "1d",
-        "engines": ["swings", "smc", "harmonic", "elliott"],
+        "engines": ["swings", "smc", "harmonic", "elliott", "ichimoku"],
         "universe_ids": [
             "universe:technical:ashare:main_board",
             "universe:tradeable:ashare:main_board",
@@ -148,6 +148,72 @@ def test_scheduler_runs_structural_methodology_without_collection() -> None:
     ]
 
 
+def test_scheduler_defaults_structural_methodology_to_ichimoku() -> None:
+    """未显式指定引擎时，调度器默认参数也应包含 Ichimoku。"""
+
+    config = parse_scheduler_config(
+        {
+            "enabled": True,
+            "jobs": [
+                {
+                    "name": "analytics.structural.ashare.daily",
+                    "job_type": "structural_methodology_refresh",
+                    "group": "analytics",
+                    "enabled": True,
+                    "interval_seconds": 60,
+                    "market": "ashare",
+                    "params": {"market": "ashare"},
+                }
+            ],
+        }
+    )
+
+    scheduler = BaseDataScheduler(config)
+
+    assert scheduler.build_structural_methodology_refresh_kwargs(config.jobs[0])["engines"] == [
+        "swings",
+        "smc",
+        "harmonic",
+        "elliott",
+        "ichimoku",
+    ]
+
+
+def test_structural_service_writes_ichimoku_v1_frame() -> None:
+    """K 线充足时应把确定性 Ichimoku 结果写成指标帧。"""
+
+    result, upsert_calls = _run_single_asset_ichimoku_refresh(bar_count=60)
+
+    assert result["status"] == "available"
+    assert result["written_count"] == 1
+    assert result["engine_counts"] == {"ichimoku": 1}
+    assert result["error_count"] == 0
+    assert len(upsert_calls) == 1
+    saved = upsert_calls[0]
+    assert saved["horizon"] == "ichimoku_v1"
+    assert saved["payload"]["status"] == "available"
+    assert saved["payload"]["lines"]
+    assert saved["payload"]["evidence_id"].startswith("ichimoku:")
+
+
+def test_structural_service_writes_insufficient_ichimoku_frame() -> None:
+    """预热不足时也应写可审计空帧，不能把资产计入错误。"""
+
+    result, upsert_calls = _run_single_asset_ichimoku_refresh(bar_count=3)
+
+    assert result["written_count"] == 1
+    assert result["engine_counts"] == {"ichimoku": 1}
+    assert result["status_counts"] == {"insufficient_data": 1}
+    assert result["error_count"] == 0
+    saved = upsert_calls[0]
+    assert saved["horizon"] == "ichimoku_v1"
+    assert saved["status"] == "insufficient_data"
+    assert saved["payload"]["status"] == "insufficient_data"
+    assert saved["payload"]["evidence_id"].startswith("ichimoku_v1:")
+    assert "至少需要 52 根" in saved["payload"]["caveats"][0]
+    assert "不得用模型自行补算" in saved["payload"]["red_lines"][1]
+
+
 def test_structural_service_writes_insufficient_outputs_with_stable_upsert_keys() -> None:
     """K 线不足也要写入结构证据快照，并保持同输入幂等键稳定。"""
 
@@ -240,6 +306,53 @@ def test_structural_service_writes_insufficient_outputs_with_stable_upsert_keys(
         assert call["payload"]["status"] == "insufficient_data"
         assert call["payload"]["schema_version"] == call["horizon"]
         assert call["payload"]["red_lines"]
+
+
+def _run_single_asset_ichimoku_refresh(
+    *, bar_count: int
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """用单资产测试替身运行 Ichimoku 刷新。"""
+
+    from finance_agent.application.structural_methodology_service import (
+        StructuralMethodologyRefreshService,
+    )
+
+    asset = SimpleNamespace(asset_id="ashare:600519", symbol="600519", market="ashare")
+    bars = [_market_bar(index, asset=asset) for index in range(bar_count)]
+    upsert_calls: list[dict[str, Any]] = []
+
+    class FakeUniverseRepository:
+        def list_members(self, universe_id: str, *, included_only: bool = True) -> list[Any]:
+            assert universe_id == "universe:technical:ashare:main_board"
+            assert included_only is True
+            return [asset]
+
+    class FakeMarketDataRepository:
+        def list_recent_bars(self, **kwargs: Any) -> list[Any]:
+            assert kwargs["asset_id"] == asset.asset_id
+            assert kwargs["timeframe"] == "1d"
+            assert kwargs["limit"] == 250
+            return bars
+
+    class FakeIndicatorFrameRepository:
+        def upsert_indicator_frame(self, **kwargs: Any) -> Any:
+            upsert_calls.append(kwargs)
+            return SimpleNamespace(**kwargs)
+
+    service = StructuralMethodologyRefreshService(
+        object(),
+        universe_repository=FakeUniverseRepository(),
+        market_data=FakeMarketDataRepository(),
+        indicators=FakeIndicatorFrameRepository(),
+    )
+    result = service.refresh(
+        market="ashare",
+        timeframe="1d",
+        engines=["ichimoku"],
+        universe_ids=["universe:technical:ashare:main_board"],
+        lookback_bars=250,
+    )
+    return result, upsert_calls
 
 
 def _market_bar(index: int, *, asset: Any) -> Any:

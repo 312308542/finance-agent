@@ -1166,7 +1166,7 @@ def build_structural_methodology_scheduler_jobs(config: DataSyncConfig) -> list[
                 "sync_task_type": "analytics.structural_methodology",
                 "market": "ashare",
                 "timeframe": timeframe,
-                "engines": ["swings", "smc", "harmonic", "elliott"],
+                "engines": ["swings", "smc", "harmonic", "elliott", "ichimoku"],
                 "universe_ids": [
                     "universe:technical:ashare:main_board",
                     "universe:tradeable:ashare:main_board",

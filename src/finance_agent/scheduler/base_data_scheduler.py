@@ -1721,7 +1721,8 @@ class BaseDataScheduler:
             "market": market,
             "timeframe": str(job.params.get("timeframe") or "1d"),
             "engines": parse_string_list(
-                job.params.get("engines") or ["swings", "smc", "harmonic", "elliott"]
+                job.params.get("engines")
+                or ["swings", "smc", "harmonic", "elliott", "ichimoku"]
             ),
             "lookback_bars": int(job.params.get("lookback_bars") or 250),
         }
