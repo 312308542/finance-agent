@@ -77,6 +77,17 @@ L1_METHODOLOGY_SKILL_NAMES: tuple[str, ...] = (
     "chanlun-interpret",
 )
 
+L2_PURE_KNOWLEDGE_SKILL_NAMES: tuple[str, ...] = (
+    "asset-allocation",
+    "hedging-strategy",
+    "etf-analysis",
+    "fund-analysis",
+    "convertible-bond",
+    "cross-market-strategy",
+    "credit-analysis",
+    "geopolitical-risk",
+)
+
 SKILL_EXCERPT_MAX_CHARS = 1200
 
 
@@ -214,10 +225,16 @@ def load_active_methodology_skills(
     *,
     capabilities: dict[str, EngineCapability] | None = None,
 ) -> MethodologySkillRegistry:
-    """加载默认活跃技能：P1 + capability 放行的 L1 扩展技能。"""
+    """加载默认活跃技能：P1、L2 纯知识和 capability 放行的扩展技能。"""
 
     capability_map = capabilities or ENGINE_CAPABILITIES
-    names = unique_skill_names((*P1_METHODOLOGY_SKILL_NAMES, *L1_METHODOLOGY_SKILL_NAMES))
+    names = unique_skill_names(
+        (
+            *P1_METHODOLOGY_SKILL_NAMES,
+            *L1_METHODOLOGY_SKILL_NAMES,
+            *L2_PURE_KNOWLEDGE_SKILL_NAMES,
+        )
+    )
     skills = tuple(
         skill
         for skill in (load_methodology_skill(name) for name in names)

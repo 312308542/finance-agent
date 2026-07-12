@@ -50,6 +50,25 @@ def test_load_active_skills_allows_fake_capability_to_unlock_chanlun() -> None:
     assert "chanlun-interpret" in registry.skill_names()
 
 
+def test_load_active_skills_enable_stage2_pure_knowledge_roles() -> None:
+    """阶段二应为组合经理和风险反驳员启用纯知识技能。"""
+
+    registry = load_active_methodology_skills()
+
+    assert {skill.name for skill in registry.for_role("portfolio_manager")} >= {
+        "asset-allocation",
+        "hedging-strategy",
+        "etf-analysis",
+        "fund-analysis",
+        "convertible-bond",
+        "cross-market-strategy",
+    }
+    assert {skill.name for skill in registry.for_role("risk_rebuttal")} >= {
+        "credit-analysis",
+        "geopolitical-risk",
+    }
+
+
 def test_load_all_skills_aliases_active_registry_and_filter_by_roundtable_role() -> None:
     registry = load_all_methodology_skills()
 

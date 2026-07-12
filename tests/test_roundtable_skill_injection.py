@@ -64,6 +64,36 @@ def test_role_prompt_truncates_over_budget_skills_by_priority() -> None:
     assert len(skill_block) <= 6000
 
 
+def test_role_prompt_injects_stage2_pure_knowledge_roles_with_budget() -> None:
+    """阶段二纯知识技能应按角色注入，并继续受总预算约束。"""
+
+    registry = load_all_methodology_skills()
+    expected_by_role = {
+        "portfolio_manager": {
+            "asset-allocation",
+            "hedging-strategy",
+            "etf-analysis",
+            "fund-analysis",
+            "convertible-bond",
+            "cross-market-strategy",
+        },
+        "risk_rebuttal": {"credit-analysis", "geopolitical-risk"},
+    }
+
+    for role, expected_names in expected_by_role.items():
+        prompt = role_prompt(role, skill_registry=registry)
+        skill_block = prompt.split("## 可加载方法论技能", 1)[1].split(
+            "## 方法论红线", 1
+        )[0]
+
+        assert expected_names <= {
+            skill.name for skill in registry.for_role(role)
+        }
+        assert all(name in skill_block for name in expected_names)
+        assert len(skill_block) <= 6000
+        assert "不得引用入库数据之外的事实" in prompt
+
+
 def test_role_prompt_keeps_red_lines_when_no_skill_matches() -> None:
     prompt = role_prompt(
         "unknown_role",
