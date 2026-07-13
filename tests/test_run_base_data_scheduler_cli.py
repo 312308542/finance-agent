@@ -12,7 +12,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
 def test_run_base_data_scheduler_only_runs_named_job(tmp_path: Path) -> None:
-    """`--only` 应只执行指定任务，便于单独验收某个调度链路。"""
+    """`--only` 应显式启用并只执行指定的手动任务。"""
 
     config_path = tmp_path / "scheduler.json"
     config_path.write_text(
@@ -32,10 +32,12 @@ def test_run_base_data_scheduler_only_runs_named_job(tmp_path: Path) -> None:
                     },
                     {
                         "name": "analytics.structural.ashare.daily",
+                        "enabled": False,
                         "job_type": "structural_methodology_refresh",
                         "group": "analytics",
                         "interval_seconds": 3600,
                         "market": "ashare",
+                        "schedule_type": "manual",
                         "params": {"scope": "technical_screening_pool"},
                     },
                 ],

@@ -89,9 +89,13 @@ def main() -> None:
         missing_names = sorted(selected_names - available_names)
         if missing_names:
             raise SystemExit(f"--only 未匹配任何任务：{', '.join(missing_names)}")
+        selected_jobs = tuple(job for job in config.jobs if job.name in selected_names)
+        if args.run_once:
+            # 手动任务在常驻计划中保持禁用；显式 run-once 选择时仅为本次进程临时启用。
+            selected_jobs = tuple(replace(job, enabled=True) for job in selected_jobs)
         config = replace(
             config,
-            jobs=tuple(job for job in config.jobs if job.name in selected_names),
+            jobs=selected_jobs,
         )
     scheduler = BaseDataScheduler(
         config,

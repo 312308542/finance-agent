@@ -238,12 +238,14 @@ Get-ScheduledTask -TaskName FinanceAgent-BaseDataScheduler,FinanceAgent-Api | Ge
 - 修改：`docs/开发方案/06-数据层收尾与部署模板.md`
 - 修改：`docs/开发方案/10-真实联调与验收.md`
 
-- [ ] **步骤 1：导出最新计划并确认三项手动任务**
+- [x] **步骤 1：导出最新计划并确认三项手动任务**
 
 ```powershell
 .\.venv\Scripts\python.exe -m finance_agent.cli data config export --output runtime\base_data_scheduler\scheme10-fund-bootstrap.json
 .\.venv\Scripts\python.exe scripts\data\run_base_data_scheduler.py --config runtime\base_data_scheduler\scheme10-fund-bootstrap.json --print-plan
 ```
+
+> 2026-07-13 执行记录：配置导出和 `--print-plan` 均退出 0，三项 bootstrap 都存在，参数为 `batch_size=50`、`max_workers=2`、`lookback=10y`、`source_limit=null`。首次对 ETF 运行同参数 `--dry-run` 得到 `enabled_jobs=0 / jobs=[]`，定位为 `--only` 仅筛选任务但没有临时启用配置中 `enabled=false` 的 manual job；若不修复，计划中的三条正式命令会假成功但不采集。GitNexus 对 CLI `main` 的 upstream impact 为 LOW，仅脚本文件入口 1 个直接上游、0 条流程；TDD 将现有 CLI 测试改为显式选择禁用 manual job，先得到 1 failed，再只在 `--run-once --only` 场景临时 `replace(job, enabled=True)`。测试转绿后真实 ETF dry-run 为 `enabled_jobs=1 / job_count=1 / status=planned`，常驻配置中的 manual job 仍保持禁用。
 
 - [ ] **步骤 2：按 ETF、LOF、开放式基金顺序分批执行**
 
