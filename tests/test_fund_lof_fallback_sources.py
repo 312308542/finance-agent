@@ -335,6 +335,122 @@ def test_fund_bar_collection_detects_middle_year_gap() -> None:
     assert requires_collection is True
 
 
+def test_fund_bar_collection_trusts_verified_trailing_gap() -> None:
+    """完整请求已成功时，应信任源端最新日之后的尾部空窗。"""
+
+    asset = SimpleNamespace(asset_id="fund:etf:510300")
+    watermark = SimpleNamespace(
+        status="available",
+        next_retry_at=None,
+        payload={"requested_start": "20160715", "requested_end": "20260713"},
+    )
+    year_coverage = {
+        year: (
+            1,
+            datetime(year, 1, 2, tzinfo=UTC),
+            datetime(year, 12, 30, tzinfo=UTC),
+        )
+        for year in range(2016, 2027)
+    }
+
+    requires_collection = collect_base_data._asset_requires_fund_bar_collection(
+        asset,
+        coverage={
+            asset.asset_id: (
+                2428,
+                datetime(2016, 7, 15, tzinfo=UTC),
+                datetime(2026, 7, 10, tzinfo=UTC),
+            )
+        },
+        watermark=watermark,
+        now=datetime(2026, 7, 13, 13, 0, tzinfo=UTC),
+        stale_before=None,
+        required_start_at=datetime(2016, 7, 15, tzinfo=UTC),
+        required_end_at=datetime(2026, 7, 13, tzinfo=UTC),
+        year_coverage=year_coverage,
+    )
+
+    assert requires_collection is False
+
+
+def test_fund_bar_collection_keeps_verified_middle_year_gap() -> None:
+    """完整请求水位只能信任边界空窗，中间整年缺口仍必须补采。"""
+
+    asset = SimpleNamespace(asset_id="fund:etf:510300")
+    watermark = SimpleNamespace(
+        status="available",
+        next_retry_at=None,
+        payload={"requested_start": "20160715", "requested_end": "20260713"},
+    )
+    year_coverage = {
+        year: (
+            1,
+            datetime(year, 1, 2, tzinfo=UTC),
+            datetime(year, 12, 30, tzinfo=UTC),
+        )
+        for year in range(2016, 2027)
+        if year != 2020
+    }
+
+    requires_collection = collect_base_data._asset_requires_fund_bar_collection(
+        asset,
+        coverage={
+            asset.asset_id: (
+                2200,
+                datetime(2016, 7, 15, tzinfo=UTC),
+                datetime(2026, 7, 10, tzinfo=UTC),
+            )
+        },
+        watermark=watermark,
+        now=datetime(2026, 7, 13, 13, 0, tzinfo=UTC),
+        stale_before=None,
+        required_start_at=datetime(2016, 7, 15, tzinfo=UTC),
+        required_end_at=datetime(2026, 7, 13, tzinfo=UTC),
+        year_coverage=year_coverage,
+    )
+
+    assert requires_collection is True
+
+
+def test_fund_coverage_queries_split_large_asset_sets() -> None:
+    """基金覆盖查询应分块，避免大候选池耗尽 PostgreSQL 动态共享内存。"""
+
+    executed_batch_sizes: list[int] = []
+
+    class RecordingSession:
+        def execute(self, statement):
+            list_params = [
+                value
+                for value in statement.compile().params.values()
+                if isinstance(value, (list, tuple))
+            ]
+            executed_batch_sizes.append(len(list_params[0]))
+            return []
+
+    session = RecordingSession()
+    asset_ids = [f"fund:etf:{index:06d}" for index in range(451)]
+    start_at = datetime(2016, 6, 12, tzinfo=UTC)
+    end_at = datetime(2026, 6, 12, tzinfo=UTC)
+
+    collect_base_data._fetch_fund_bar_coverage(session, asset_ids, timeframe="1d")
+    collect_base_data._fetch_fund_bar_year_coverage(
+        session,
+        asset_ids,
+        timeframe="1d",
+        start_at=start_at,
+        end_at=end_at,
+    )
+    collect_base_data._fetch_fund_nav_coverage(session, asset_ids)
+    collect_base_data._fetch_fund_nav_year_coverage(
+        session,
+        asset_ids,
+        start_at=start_at,
+        end_at=end_at,
+    )
+
+    assert executed_batch_sizes == [200, 200, 51] * 4
+
+
 def test_open_fund_nav_collection_trusts_verified_leading_gap() -> None:
     """已由全量请求验证过的开放式基金成立前空窗，不应继续触发净值补采。"""
 
@@ -362,6 +478,33 @@ def test_open_fund_nav_collection_trusts_verified_leading_gap() -> None:
         year_coverage={
             2026: (84, date(2026, 2, 3), date(2026, 6, 12)),
         },
+    )
+
+    assert requires_collection is False
+
+
+def test_open_fund_nav_collection_trusts_verified_trailing_gap() -> None:
+    """完整净值请求已成功时，应信任源端最新净值日之后的尾部空窗。"""
+
+    asset = SimpleNamespace(asset_id="fund:open:000001")
+    watermark = SimpleNamespace(
+        status="available",
+        next_retry_at=None,
+        payload={"requested_start": "20160715", "requested_end": "20260713"},
+    )
+    year_coverage = {
+        year: (1, date(year, 1, 2), date(year, 12, 30)) for year in range(2016, 2027)
+    }
+
+    requires_collection = collect_base_data._asset_requires_open_nav_collection(
+        asset,
+        coverage={asset.asset_id: (2400, date(2016, 7, 15), date(2026, 7, 10))},
+        watermark=watermark,
+        now=datetime(2026, 7, 13, 13, 0, tzinfo=UTC),
+        stale_before=None,
+        required_start_at=datetime(2016, 7, 15, tzinfo=UTC),
+        required_end_at=datetime(2026, 7, 13, tzinfo=UTC),
+        year_coverage=year_coverage,
     )
 
     assert requires_collection is False
@@ -552,3 +695,54 @@ def test_fund_success_watermark_uses_summary_latest_at_when_coverage_is_not_visi
     assert recorded["asset_id"] == "fund:lof:160716"
     assert recorded["watermark_at"] == datetime(2026, 6, 12, tzinfo=UTC)
     assert recorded["payload"]["item_count"] == 2428
+
+
+def test_fund_success_watermark_persists_full_history_request_range(monkeypatch) -> None:
+    """基金全历史成功水位应保存请求窗口，允许信任成立前空窗。"""
+
+    recorded: dict = {}
+
+    class FakeWatermarkRepository:
+        def __init__(self, session) -> None:
+            self.session = session
+
+        def record_success(self, **kwargs) -> None:
+            recorded.update(kwargs)
+
+        def record_failure(self, **kwargs) -> None:  # pragma: no cover - 本测试只覆盖成功路径
+            raise AssertionError("不应写失败水位")
+
+    monkeypatch.setattr(
+        collect_base_data,
+        collect_base_data.DataSyncWatermarkRepository.__name__,
+        FakeWatermarkRepository,
+    )
+    result = CollectionTaskResult(
+        task="fund_etf_ohlcv",
+        status="available",
+        raw_record_id="raw:etf",
+        item_count=2428,
+        error_message=None,
+        payload={"latest_at": "2026-06-12T00:00:00+00:00"},
+    )
+
+    collect_base_data._record_fund_symbol_watermark(
+        object(),
+        symbol="510300",
+        asset_type="etf",
+        data_domain=collect_base_data.FUND_MARKET_BAR_DATA_DOMAIN,
+        provider="akshare:fund_etf_hist_em",
+        timeframe="1d",
+        result=result,
+        requested_start="20160715",
+        requested_end="20260713",
+        sync_task_type="market_bars_full_history_backfill",
+    )
+
+    assert recorded["payload"] == {
+        "item_count": 2428,
+        "latest_count": 2428,
+        "requested_start": "20160715",
+        "requested_end": "20260713",
+        "sync_task_type": "market_bars_full_history_backfill",
+    }

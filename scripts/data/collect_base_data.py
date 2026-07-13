@@ -95,6 +95,7 @@ CRYPTO_MARKET_BAR_PROVIDER = "ccxt_binance_fetch_ohlcv"
 CRYPTO_DERIVATIVE_DATA_DOMAIN = "derivatives"
 CRYPTO_DERIVATIVE_PROVIDER = "binance_derivative_snapshot"
 ASHARE_BAR_COVERAGE_QUERY_CHUNK_SIZE = 500
+FUND_COVERAGE_QUERY_CHUNK_SIZE = 200
 EASTMONEY_KLINE_COOKIE_PROGRESS_SOURCE = "eastmoney_kline_cookie"
 FUND_MARKET_BAR_DATA_DOMAIN = "fund_market_bars"
 FUND_NAV_DATA_DOMAIN = "fund_nav"
@@ -2758,6 +2759,9 @@ def run_fund(
                         occurred_at=occurred_at,
                         session_factory=None if worker_session is not None else session_factory,
                         schedule_retry=schedule_retry,
+                        requested_start=getattr(args, "ashare_start", None),
+                        requested_end=getattr(args, "ashare_end", None),
+                        sync_task_type=task_type,
                     )
                     return attach_fund_retry_payload(
                         result,
@@ -2858,6 +2862,9 @@ def run_fund(
                         occurred_at=occurred_at,
                         session_factory=None if worker_session is not None else session_factory,
                         schedule_retry=schedule_retry,
+                        requested_start=getattr(args, "ashare_start", None),
+                        requested_end=getattr(args, "ashare_end", None),
+                        sync_task_type=task_type,
                     )
                     return attach_fund_retry_payload(
                         result,
@@ -3643,24 +3650,31 @@ def _fetch_fund_bar_coverage(
 
     if not asset_ids:
         return {}
-    statement = (
-        select(
-            MarketBarORM.asset_id,
-            func.count(MarketBarORM.timestamp),
-            func.min(MarketBarORM.timestamp),
-            func.max(MarketBarORM.timestamp),
+    coverage: dict[str, tuple[int, datetime | None, datetime | None]] = {}
+    unique_asset_ids = list(dict.fromkeys(asset_ids))
+    for offset in range(0, len(unique_asset_ids), FUND_COVERAGE_QUERY_CHUNK_SIZE):
+        chunk_asset_ids = unique_asset_ids[offset : offset + FUND_COVERAGE_QUERY_CHUNK_SIZE]
+        statement = (
+            select(
+                MarketBarORM.asset_id,
+                func.count(MarketBarORM.timestamp),
+                func.min(MarketBarORM.timestamp),
+                func.max(MarketBarORM.timestamp),
+            )
+            .where(
+                MarketBarORM.market == "fund",
+                MarketBarORM.timeframe == timeframe,
+                MarketBarORM.asset_id.in_(chunk_asset_ids),
+            )
+            .group_by(MarketBarORM.asset_id)
         )
-        .where(
-            MarketBarORM.market == "fund",
-            MarketBarORM.timeframe == timeframe,
-            MarketBarORM.asset_id.in_(asset_ids),
+        coverage.update(
+            {
+                str(asset_id): (int(count or 0), earliest, latest)
+                for asset_id, count, earliest, latest in session.execute(statement)
+            }
         )
-        .group_by(MarketBarORM.asset_id)
-    )
-    return {
-        str(asset_id): (int(count or 0), earliest, latest)
-        for asset_id, count, earliest, latest in session.execute(statement)
-    }
+    return coverage
 
 
 def _fetch_fund_bar_year_coverage(
@@ -3675,31 +3689,34 @@ def _fetch_fund_bar_year_coverage(
 
     if not asset_ids:
         return {}
-    year_expr = func.extract("year", MarketBarORM.timestamp).label("bar_year")
-    statement = (
-        select(
-            MarketBarORM.asset_id,
-            year_expr,
-            func.count(MarketBarORM.timestamp),
-            func.min(MarketBarORM.timestamp),
-            func.max(MarketBarORM.timestamp),
-        )
-        .where(
-            MarketBarORM.market == "fund",
-            MarketBarORM.timeframe == timeframe,
-            MarketBarORM.asset_id.in_(asset_ids),
-            MarketBarORM.timestamp >= start_at,
-            MarketBarORM.timestamp <= end_at,
-        )
-        .group_by(MarketBarORM.asset_id, year_expr)
-    )
     coverage: dict[str, dict[int, tuple[int, datetime | None, datetime | None]]] = {}
-    for asset_id, bar_year, count, earliest, latest in session.execute(statement):
-        coverage.setdefault(str(asset_id), {})[int(bar_year)] = (
-            int(count or 0),
-            earliest,
-            latest,
+    unique_asset_ids = list(dict.fromkeys(asset_ids))
+    year_expr = func.extract("year", MarketBarORM.timestamp).label("bar_year")
+    for offset in range(0, len(unique_asset_ids), FUND_COVERAGE_QUERY_CHUNK_SIZE):
+        chunk_asset_ids = unique_asset_ids[offset : offset + FUND_COVERAGE_QUERY_CHUNK_SIZE]
+        statement = (
+            select(
+                MarketBarORM.asset_id,
+                year_expr,
+                func.count(MarketBarORM.timestamp),
+                func.min(MarketBarORM.timestamp),
+                func.max(MarketBarORM.timestamp),
+            )
+            .where(
+                MarketBarORM.market == "fund",
+                MarketBarORM.timeframe == timeframe,
+                MarketBarORM.asset_id.in_(chunk_asset_ids),
+                MarketBarORM.timestamp >= start_at,
+                MarketBarORM.timestamp <= end_at,
+            )
+            .group_by(MarketBarORM.asset_id, year_expr)
         )
+        for asset_id, bar_year, count, earliest, latest in session.execute(statement):
+            coverage.setdefault(str(asset_id), {})[int(bar_year)] = (
+                int(count or 0),
+                earliest,
+                latest,
+            )
     return coverage
 
 
@@ -3766,20 +3783,27 @@ def _fetch_fund_nav_coverage(
 
     if not asset_ids:
         return {}
-    statement = (
-        select(
-            FundNavSnapshotORM.asset_id,
-            func.count(FundNavSnapshotORM.nav_date),
-            func.min(FundNavSnapshotORM.nav_date),
-            func.max(FundNavSnapshotORM.nav_date),
+    coverage: dict[str, tuple[int, date | None, date | None]] = {}
+    unique_asset_ids = list(dict.fromkeys(asset_ids))
+    for offset in range(0, len(unique_asset_ids), FUND_COVERAGE_QUERY_CHUNK_SIZE):
+        chunk_asset_ids = unique_asset_ids[offset : offset + FUND_COVERAGE_QUERY_CHUNK_SIZE]
+        statement = (
+            select(
+                FundNavSnapshotORM.asset_id,
+                func.count(FundNavSnapshotORM.nav_date),
+                func.min(FundNavSnapshotORM.nav_date),
+                func.max(FundNavSnapshotORM.nav_date),
+            )
+            .where(FundNavSnapshotORM.asset_id.in_(chunk_asset_ids))
+            .group_by(FundNavSnapshotORM.asset_id)
         )
-        .where(FundNavSnapshotORM.asset_id.in_(asset_ids))
-        .group_by(FundNavSnapshotORM.asset_id)
-    )
-    return {
-        str(asset_id): (int(count or 0), earliest, latest)
-        for asset_id, count, earliest, latest in session.execute(statement)
-    }
+        coverage.update(
+            {
+                str(asset_id): (int(count or 0), earliest, latest)
+                for asset_id, count, earliest, latest in session.execute(statement)
+            }
+        )
+    return coverage
 
 
 def _fetch_fund_nav_year_coverage(
@@ -3795,29 +3819,32 @@ def _fetch_fund_nav_year_coverage(
         return {}
     start_date = start_at.date()
     end_date = end_at.date()
-    year_expr = func.extract("year", FundNavSnapshotORM.nav_date).label("nav_year")
-    statement = (
-        select(
-            FundNavSnapshotORM.asset_id,
-            year_expr,
-            func.count(FundNavSnapshotORM.nav_date),
-            func.min(FundNavSnapshotORM.nav_date),
-            func.max(FundNavSnapshotORM.nav_date),
-        )
-        .where(
-            FundNavSnapshotORM.asset_id.in_(asset_ids),
-            FundNavSnapshotORM.nav_date >= start_date,
-            FundNavSnapshotORM.nav_date <= end_date,
-        )
-        .group_by(FundNavSnapshotORM.asset_id, year_expr)
-    )
     coverage: dict[str, dict[int, tuple[int, date | None, date | None]]] = {}
-    for asset_id, nav_year, count, earliest, latest in session.execute(statement):
-        coverage.setdefault(str(asset_id), {})[int(nav_year)] = (
-            int(count or 0),
-            earliest,
-            latest,
+    unique_asset_ids = list(dict.fromkeys(asset_ids))
+    year_expr = func.extract("year", FundNavSnapshotORM.nav_date).label("nav_year")
+    for offset in range(0, len(unique_asset_ids), FUND_COVERAGE_QUERY_CHUNK_SIZE):
+        chunk_asset_ids = unique_asset_ids[offset : offset + FUND_COVERAGE_QUERY_CHUNK_SIZE]
+        statement = (
+            select(
+                FundNavSnapshotORM.asset_id,
+                year_expr,
+                func.count(FundNavSnapshotORM.nav_date),
+                func.min(FundNavSnapshotORM.nav_date),
+                func.max(FundNavSnapshotORM.nav_date),
+            )
+            .where(
+                FundNavSnapshotORM.asset_id.in_(chunk_asset_ids),
+                FundNavSnapshotORM.nav_date >= start_date,
+                FundNavSnapshotORM.nav_date <= end_date,
+            )
+            .group_by(FundNavSnapshotORM.asset_id, year_expr)
         )
+        for asset_id, nav_year, count, earliest, latest in session.execute(statement):
+            coverage.setdefault(str(asset_id), {})[int(nav_year)] = (
+                int(count or 0),
+                earliest,
+                latest,
+            )
     return coverage
 
 
@@ -3863,6 +3890,7 @@ def _year_coverage_has_missing_year(
     required_start_at: datetime,
     required_end_at: datetime,
     trust_leading_gap: bool = False,
+    trust_trailing_gap: bool = False,
 ) -> bool:
     """判断起止年份之间是否存在整年覆盖缺口。"""
 
@@ -3873,9 +3901,12 @@ def _year_coverage_has_missing_year(
         year for year, value in coverage.items() if _coverage_bar_count(value) > 0
     )
     first_covered_year = covered_years[0] if covered_years else None
+    last_covered_year = covered_years[-1] if covered_years else None
     for year in range(required_start_at.year, required_end_at.year + 1):
         if _coverage_bar_count(coverage.get(year)) <= 0:
             if trust_leading_gap and first_covered_year is not None and year < first_covered_year:
+                continue
+            if trust_trailing_gap and last_covered_year is not None and year > last_covered_year:
                 continue
             return True
     return False
@@ -3913,7 +3944,7 @@ def _asset_requires_fund_bar_collection(
     latest_bar_at = _coverage_latest_bar_at(latest_coverage)
     if bar_count <= 0 or latest_bar_at is None:
         return True
-    if _datetime_before(latest_bar_at, required_end_at):
+    if _datetime_before(latest_bar_at, required_end_at) and not watermark_covers_request:
         return True
     if (
         required_start_at is not None
@@ -3923,6 +3954,7 @@ def _asset_requires_fund_bar_collection(
             required_start_at=required_start_at,
             required_end_at=required_end_at,
             trust_leading_gap=watermark_covers_request,
+            trust_trailing_gap=watermark_covers_request,
         )
     ):
         return True
@@ -3967,7 +3999,7 @@ def _asset_requires_open_nav_collection(
     latest_nav_date = _coverage_latest_nav_date(coverage_value)
     if nav_count <= 0 or latest_nav_date is None:
         return True
-    if _date_before(latest_nav_date, required_end_at):
+    if _date_before(latest_nav_date, required_end_at) and not watermark_covers_request:
         return True
     if (
         required_start_at is not None
@@ -3977,6 +4009,7 @@ def _asset_requires_open_nav_collection(
             required_start_at=required_start_at,
             required_end_at=required_end_at,
             trust_leading_gap=watermark_covers_request,
+            trust_trailing_gap=watermark_covers_request,
         )
     ):
         return True
@@ -5549,6 +5582,9 @@ def record_fund_symbol_watermark(
     occurred_at: datetime | None = None,
     session_factory: Any | None = None,
     schedule_retry: bool = True,
+    requested_start: str | None = None,
+    requested_end: str | None = None,
+    sync_task_type: str | None = None,
 ) -> None:
     """根据基金单标的采集结果更新成功水位或失败重试时间。"""
 
@@ -5565,6 +5601,9 @@ def record_fund_symbol_watermark(
                 result=result,
                 occurred_at=occurred_at,
                 schedule_retry=schedule_retry,
+                requested_start=requested_start,
+                requested_end=requested_end,
+                sync_task_type=sync_task_type,
             )
             watermark_session.commit()
         except SQLAlchemyError as exc:
@@ -5586,6 +5625,9 @@ def record_fund_symbol_watermark(
             result=result,
             occurred_at=occurred_at,
             schedule_retry=schedule_retry,
+            requested_start=requested_start,
+            requested_end=requested_end,
+            sync_task_type=sync_task_type,
         )
     except SQLAlchemyError as exc:
         rollback_session_if_possible(session)
@@ -5603,6 +5645,9 @@ def _record_fund_symbol_watermark(
     result: Any,
     occurred_at: datetime | None = None,
     schedule_retry: bool = True,
+    requested_start: str | None = None,
+    requested_end: str | None = None,
+    sync_task_type: str | None = None,
 ) -> None:
     """执行单个基金标的水位写入；事务边界由外层负责。"""
 
@@ -5631,6 +5676,17 @@ def _record_fund_symbol_watermark(
             latest_coverage = coverage.get(asset_id)
             latest_count = _coverage_bar_count(latest_coverage)
             latest_at = _coverage_latest_bar_at(latest_coverage)
+        success_payload: JsonDict = {
+            "item_count": result_item_count(result),
+            "latest_count": latest_count,
+        }
+        for key, value in (
+            ("requested_start", requested_start),
+            ("requested_end", requested_end),
+            ("sync_task_type", sync_task_type),
+        ):
+            if value not in (None, ""):
+                success_payload[key] = value
         repository.record_success(
             asset_id=asset_id,
             symbol=symbol,
@@ -5644,7 +5700,7 @@ def _record_fund_symbol_watermark(
                 else latest_at
             ),
             occurred_at=now,
-            payload={"item_count": result_item_count(result), "latest_count": latest_count},
+            payload=success_payload,
         )
         return
     repository.record_failure(
