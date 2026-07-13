@@ -16,8 +16,8 @@ def test_bt_backtest_adapter_returns_domain_result() -> None:
     dates = pd.date_range("2024-01-01", periods=6, freq="D")
     prices = pd.DataFrame(
         {
-            "AAA": [100, 102, 104, 106, 108, 110],
-            "BBB": [50, 50, 52, 52, 54, 54],
+            "AAA": [100, 102, 101, 106, 108, 110],
+            "BBB": [50, 50, 49, 52, 54, 54],
         },
         index=dates,
     )
@@ -38,6 +38,7 @@ def test_bt_backtest_adapter_returns_domain_result() -> None:
     assert payload["metrics"]["total_return"] > 0
     assert payload["metrics"]["max_drawdown"] <= 0
     assert payload["metrics"]["cagr"] > 0
+    assert math.isfinite(payload["metrics"]["sortino"])
     assert len(payload["equity_curve"]) >= len(prices)
     assert len(payload["drawdown_curve"]) == len(payload["equity_curve"])
     assert "bt" not in str(type(result)).lower()

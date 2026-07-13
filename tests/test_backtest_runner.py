@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from finance_agent.backtesting.models import BacktestResult
+from finance_agent.backtesting.runner import DatabaseBacktestScoreSource
 
 
 def test_run_factor_score_topn_backtest_persists_result(monkeypatch: Any) -> None:
@@ -108,3 +109,26 @@ def test_run_factor_score_topn_backtest_rejects_unknown_strategy() -> None:
         assert "factor_score_topn" in str(exc)
     else:
         raise AssertionError("未知回测策略应被拒绝")
+
+
+def test_database_score_source_accepts_partial_recommendation_scores() -> None:
+    """回测应复用真实推荐接受的 partial 评分，不能把生产截面全部过滤掉。"""
+
+    class CapturingSession:
+        def __init__(self) -> None:
+            self.statement: Any | None = None
+
+        def scalars(self, statement: Any) -> list[Any]:
+            self.statement = statement
+            return []
+
+    session = CapturingSession()
+    DatabaseBacktestScoreSource(session, market="ashare").list_replayed_scores(
+        universe_id="universe:merged:ashare:recommendation",
+        strategy_id="strategy:ashare:short_swing",
+        as_of=datetime(2026, 7, 13, tzinfo=UTC),
+    )
+
+    assert session.statement is not None
+    sql = str(session.statement.compile(compile_kwargs={"literal_binds": True}))
+    assert "asset_scores.status IN ('available', 'partial')" in sql

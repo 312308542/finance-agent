@@ -51,6 +51,7 @@ class BtBacktestAdapter:
             "cagr": _finite_float(stats.get("cagr")),
             "max_drawdown": _finite_float(stats.get("max_drawdown"), default=float(drawdown.min())),
             "sharpe": _finite_float(stats.get("daily_sharpe")),
+            "sortino": _finite_float(qs.stats.sortino(returns)),
             "volatility": _finite_float(stats.get("daily_vol")),
             "period_count": int(len(returns)),
         }

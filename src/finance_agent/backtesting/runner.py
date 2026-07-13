@@ -75,7 +75,7 @@ class DatabaseBacktestScoreSource:
             AssetScoreORM.market == self.market,
             AssetScoreORM.universe_id == universe_id,
             AssetScoreORM.horizon == self.horizon,
-            AssetScoreORM.status == "available",
+            AssetScoreORM.status.in_(("available", "partial")),
         )
         if not latest:
             statement = statement.where(AssetScoreORM.as_of <= as_of)
