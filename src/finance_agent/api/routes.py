@@ -244,7 +244,7 @@ def report(
     """读取 Workflow 中文报告。"""
 
     try:
-        return FinanceAgentInterface(session).get_report(workflow_run_id).to_dict()
+        return FinanceAgentInterface(session).get_report(workflow_run_id=workflow_run_id).to_dict()
     except Exception as exc:
         return {"status": "unavailable", "message": str(exc)[:240], "data": {}}
 

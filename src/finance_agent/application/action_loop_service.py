@@ -466,6 +466,9 @@ class ActionLoopService:
             timeframe=str(payload.get("timeframe") or "1d"),
             executed_at=record.executed_at,
         )
+        latest_at = latest.get("as_of") if isinstance(latest, dict) else None
+        if not isinstance(latest_at, datetime) or latest_at <= record.executed_at:
+            latest = None
         latest_price = extract_latest_price(latest)
         missing_fields = []
         if suggested_price is None:

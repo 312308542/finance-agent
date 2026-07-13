@@ -343,3 +343,26 @@ def test_console_read_routes_delegate_to_dashboard_service(monkeypatch: Any) -> 
         ]
         == "owner:demo"
     )
+
+
+def test_report_route_passes_workflow_run_id_as_keyword(monkeypatch: Any) -> None:
+    """报告详情路由必须遵守接口层的 keyword-only 调用契约。"""
+
+    class FakeFinanceAgentInterface:
+        def __init__(self, session: object) -> None:
+            self.session = session
+
+        def get_report(self, *, workflow_run_id: str) -> Any:
+            return SimpleNamespace(
+                to_dict=lambda: {
+                    "status": "ok",
+                    "data": {"workflow_run_id": workflow_run_id, "report": {"title": "验收报告"}},
+                }
+            )
+
+    monkeypatch.setattr(routes, "FinanceAgentInterface", FakeFinanceAgentInterface)
+
+    payload = routes.report(workflow_run_id="workflow:scheme10:t5", session=object())
+
+    assert payload["status"] == "ok"
+    assert payload["data"]["workflow_run_id"] == "workflow:scheme10:t5"

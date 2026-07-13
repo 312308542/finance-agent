@@ -472,6 +472,55 @@ def test_compare_execution_outcome_completes_review_with_structured_payload() ->
     assert "后续表现为正" in completed["result_summary"]
 
 
+def test_compare_execution_outcome_rejects_price_before_execution() -> None:
+    """执行前行情不能被当作执行后的持有表现。"""
+
+    record = SimpleNamespace(
+        execution_id="execution:600519:stale-price",
+        owner_id="owner:demo",
+        portfolio_id="portfolio:demo",
+        asset_id="ashare:600519",
+        market="ashare",
+        order_draft_id=None,
+        decision_log_id="decision:600519:stale-price",
+        action="buy",
+        executed_price=Decimal("10"),
+        executed_quantity=Decimal("100"),
+        executed_at=NOW,
+        fee=None,
+        note=None,
+        source="user_reported",
+    )
+    repository = FakeActionRepository()
+    repository.executions_by_id[record.execution_id] = record
+    memory = FakeExecutionMemoryService()
+
+    result = ActionLoopService(
+        session=FakeDecisionStore([]),
+        action_repository=repository,
+        memory_service=memory,
+        latest_price_loader=lambda **_: {
+            "price": Decimal("12.50"),
+            "as_of": datetime(2026, 6, 12, tzinfo=UTC),
+            "source": "market_bars",
+        },
+        now=lambda: datetime(2026, 7, 4, tzinfo=UTC),
+    ).compare_execution_outcome(
+        build_review_task(
+            payload={
+                "execution_id": record.execution_id,
+                "suggested_price": "9.80",
+            }
+        )
+    )
+
+    assert result.outcome == "partial"
+    completed = memory.completed_reviews[0]
+    assert completed["outcome"] == "partial"
+    assert "行情缺失" in completed["result_summary"]
+    assert completed["payload"]["execution_outcome"]["missing_fields"] == ["latest_price"]
+
+
 def test_compare_execution_outcome_marks_partial_when_latest_price_missing() -> None:
     """复盘缺少后续行情时必须标记 partial，不能编造收益结论。"""
 

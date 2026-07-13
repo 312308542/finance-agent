@@ -310,14 +310,19 @@ def build_memory_references(
     for asset_id, context in asset_contexts.items():
         profile = context.get("profile") or {}
         for memory in (context.get("memory") or {}).get("memories") or []:
+            memory_value = (
+                memory.get
+                if isinstance(memory, dict)
+                else lambda key: getattr(memory, key, None)
+            )
             memories.append(
                 {
                     "asset_id": asset_id,
                     "symbol": profile.get("symbol") or asset_id,
-                    "memory_id": memory.get("memory_id"),
-                    "memory_type": memory.get("memory_type"),
-                    "content": memory.get("content"),
-                    "confidence": memory.get("confidence"),
+                    "memory_id": memory_value("memory_id"),
+                    "memory_type": memory_value("memory_type"),
+                    "content": memory_value("content"),
+                    "confidence": memory_value("confidence"),
                 }
             )
     return memories

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from finance_agent.agents.reports.templates import build_chinese_decision_report
+from finance_agent.storage.orm import AssistantMemoryORM
 
 
 def test_report_roundtable_section_renders_model_key_points_and_rebuttals() -> None:
@@ -91,10 +93,43 @@ def test_report_key_evidence_marks_missing_backtest() -> None:
     assert "仅基于当前评分、信号和风险事实" in report["markdown"]
 
 
+def test_report_memory_references_accept_sqlalchemy_memory_rows() -> None:
+    """真实数据库返回 ORM 记忆时，报告模板也应生成可序列化引用。"""
+
+    memory = AssistantMemoryORM(
+        memory_id="memory:ashare:600519:review",
+        owner_id="owner:test",
+        memory_type="review_result",
+        scope="asset",
+        asset_id="ashare:600519",
+        source_decision_id="decision:test",
+        source_review_task_id="review:test",
+        content="复盘确认原建议风险偏高。",
+        embedding_ref=None,
+        confidence=Decimal("0.900000"),
+        status="active",
+        payload={},
+    )
+
+    report = build_report(roundtable_opinions=[], memory_items=[memory])
+
+    assert report["memory_references"] == [
+        {
+            "asset_id": "ashare:600519",
+            "symbol": "600519",
+            "memory_id": "memory:ashare:600519:review",
+            "memory_type": "review_result",
+            "content": "复盘确认原建议风险偏高。",
+            "confidence": Decimal("0.900000"),
+        }
+    ]
+
+
 def build_report(
     *,
     roundtable_opinions: list[dict[str, Any]],
     backtest: dict[str, Any] | None = None,
+    memory_items: list[Any] | None = None,
 ) -> dict[str, Any]:
     return build_chinese_decision_report(
         title="圆桌模型报告",
@@ -131,6 +166,7 @@ def build_report(
                 },
                 "signal_risk": {"data_quality": []},
                 "backtest": backtest,
+                "memory": {"memories": memory_items or []},
             }
         },
         model_routes=[],
