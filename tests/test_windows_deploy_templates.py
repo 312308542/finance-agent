@@ -43,6 +43,15 @@ def test_windows_api_task_template_binds_localhost_by_default() -> None:
     assert "SupportsShouldProcess" in content
 
 
+def test_windows_registration_errors_are_terminating() -> None:
+    """计划任务注册失败时必须终止脚本，不能继续输出成功提示。"""
+
+    for name in ("register_scheduler_task.ps1", "register_api_task.ps1"):
+        content = read_template(name)
+
+        assert "-Force -ErrorAction Stop | Out-Null" in content
+
+
 def test_windows_unregister_template_removes_both_tasks() -> None:
     """卸载模板应能移除调度器和 API 两个计划任务。"""
 

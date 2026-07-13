@@ -203,7 +203,7 @@ npm --prefix apps\agent-office run build
 - 修改：`docs/开发方案/06-数据层收尾与部署模板.md`
 - 修改：`docs/开发方案/10-真实联调与验收.md`
 
-- [ ] **步骤 1：导出可再生调度配置并预演**
+- [x] **步骤 1：导出可再生调度配置并预演**
 
 ```powershell
 .\.venv\Scripts\python.exe -m finance_agent.cli data config export --output runtime\base_data_scheduler\base_data_scheduler.json
@@ -225,9 +225,11 @@ Get-ScheduledTask -TaskName FinanceAgent-BaseDataScheduler,FinanceAgent-Api | Ge
 
 手动 `Start-ScheduledTask`，HTTP 检查 API，读取 scheduler status 心跳；停止任务进程后确认任务设置允许重启。不得为了通过验收修改系统安全策略。
 
-- [ ] **步骤 4：记录重启授权边界**
+- [x] **步骤 4：记录重启授权边界**
 
 整机重启会中断用户会话，只有获得明确授权后才执行。未授权时将“重启后自动恢复”保留为人工阻塞，文档不得标记全通过。
+
+> 2026-07-13 执行记录：调度配置已导出到 `runtime\base_data_scheduler\base_data_scheduler.json`（55,553 bytes），两个注册脚本的 `-WhatIf` 均退出 0。随后使用当前命令原文真实注册 `FinanceAgent-BaseDataScheduler` 和 `FinanceAgent-Api`，两次均返回 `HRESULT 0x80070005 / Access is denied`；当前用户为 `DESKTOP-ELT87C4\Administrator`，但令牌 `IsAdmin=False`、完整性级别为 Medium，查询确认两项任务均不存在。真实失败还暴露脚本会继续打印“Registered”并退出 0 的误导行为；GitNexus upstream impact 为 LOW、0 个直接调用者、0 条流程，按 TDD 增加失败终止测试后，为两个 `Register-ScheduledTask` 显式添加 `-ErrorAction Stop`。同一权限场景复跑时两个子进程均退出 1、包含 `Access is denied`、不再包含成功提示，任务数仍为 0。步骤 2 验收门槛未满足，步骤 3 无任务可启动，保持未勾选；当前手工启动的 `127.0.0.1:8000/api/health` 仍返回 `status=ok`，但不能替代计划任务验证。整机重启未经授权，未执行。
 
 ### 任务 6：T8 基金断点放量
 

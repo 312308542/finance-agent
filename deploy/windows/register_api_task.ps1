@@ -63,7 +63,7 @@ if ($PSCmdlet.ShouldProcess($TaskName, "Register finance-agent API task")) {
         -Settings $settings `
         -Principal $principal `
         -Description "finance-agent local API service" `
-        -Force | Out-Null
+        -Force -ErrorAction Stop | Out-Null
     Write-Host "Registered scheduled task: $TaskName"
     Write-Host "API URL: http://$BindHost`:$Port"
 }

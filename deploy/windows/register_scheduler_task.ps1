@@ -77,7 +77,7 @@ if ($PSCmdlet.ShouldProcess($TaskName, "Register finance-agent scheduler task"))
         -Settings $settings `
         -Principal $principal `
         -Description "finance-agent base data scheduler daemon" `
-        -Force | Out-Null
+        -Force -ErrorAction Stop | Out-Null
     Write-Host "Registered scheduled task: $TaskName"
     Write-Host "Status file: $StatusFile"
     Write-Host "Event log file: $EventLogFile"
