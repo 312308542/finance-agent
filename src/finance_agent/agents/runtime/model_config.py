@@ -299,6 +299,22 @@ def build_chat_completion_request(config: ModelEndpointConfig, prompt: str) -> J
     }
 
 
+def is_openai_compatible_chat_completion_response(response: requests.Response) -> bool:
+    """确认响应是最小可用的 OpenAI-compatible Chat Completions JSON。"""
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    first_choice = choices[0]
+    return isinstance(first_choice, dict) and isinstance(first_choice.get("message"), dict)
+
+
 def test_model_endpoint(
     *,
     registry: ModelRegistry,
@@ -338,8 +354,12 @@ def test_model_endpoint(
         timeout=timeout_seconds or config.timeout_seconds,
     )
     result["http_status"] = response.status_code
-    result["ok"] = response.ok
+    response_format_valid = is_openai_compatible_chat_completion_response(response)
+    result["response_format_valid"] = response_format_valid
+    result["ok"] = bool(response.ok and response_format_valid)
     result["response_preview"] = response.text[:500]
+    if response.ok and not response_format_valid:
+        result["error"] = "模型端点未返回 OpenAI-compatible JSON。"
     return result
 
 

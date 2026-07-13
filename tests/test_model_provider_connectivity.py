@@ -6,6 +6,18 @@ class _FakeResponse:
     ok = True
     text = '{"choices":[{"message":{"content":"pong"}}]}'
 
+    def json(self) -> dict[str, object]:
+        return {"choices": [{"message": {"content": "pong"}}]}
+
+
+class _HtmlResponse:
+    status_code = 200
+    ok = True
+    text = "<!doctype html><html><body>gateway console</body></html>"
+
+    def json(self) -> dict[str, object]:
+        raise ValueError("response is not json")
+
 
 def test_model_provider_connectivity_posts_minimal_chat_request(monkeypatch) -> None:
     """连通性测试只发送最小 Chat Completions 请求，并且不会把密钥写入返回值。"""
@@ -58,3 +70,26 @@ def test_model_provider_connectivity_requires_real_secret() -> None:
     assert result["status"] == "error"
     assert result["data"]["ready"] is False
     assert "API Key" in result["message"]
+
+
+def test_model_provider_connectivity_rejects_html_200_response(monkeypatch) -> None:
+    """HTTP 200 若返回网关 HTML，不能误报为模型连通。"""
+
+    monkeypatch.setattr(
+        "finance_agent.api.routes.requests.post",
+        lambda *_args, **_kwargs: _HtmlResponse(),
+    )
+
+    result = run_model_provider_connectivity_test(
+        provider_key="openai-compatible:gpt-5.5",
+        model_key="gpt-5.5",
+        model_name="gpt-5.5",
+        base_url="https://gateway.example.com",
+        api_key="test-api-key-live",
+        timeout_seconds=12,
+    )
+
+    assert result["status"] == "error"
+    assert result["data"]["ready"] is False
+    assert result["data"]["http_status"] == 200
+    assert "OpenAI-compatible JSON" in result["message"]

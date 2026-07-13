@@ -20,6 +20,9 @@ from sqlalchemy.orm import Session
 from finance_agent.agents.chat import FinanceAgentChatSession
 from finance_agent.agents.interfaces import FinanceAgentInterface
 from finance_agent.agents.runtime import load_model_registry, preview_model_routes
+from finance_agent.agents.runtime.model_config import (
+    is_openai_compatible_chat_completion_response,
+)
 from finance_agent.api.deps import get_session
 from finance_agent.api.schemas import (
     ChatRequest,
@@ -847,15 +850,24 @@ def run_model_provider_connectivity_test(
             timeout=timeout,
         )
         latency_ms = round((perf_counter() - started_at) * 1000)
+        response_format_valid = is_openai_compatible_chat_completion_response(response)
+        ready = bool(response.ok and response_format_valid)
         data = {
             **common_data,
-            "ready": response.ok,
+            "ready": ready,
             "http_status": response.status_code,
             "latency_ms": latency_ms,
+            "response_format_valid": response_format_valid,
             "response_preview": response.text[:240],
         }
-        if response.ok:
+        if ready:
             return {"status": "ok", "message": "模型接入连通性正常", "data": data}
+        if response.ok:
+            return {
+                "status": "error",
+                "message": "模型端点返回的不是 OpenAI-compatible JSON",
+                "data": data,
+            }
         return {
             "status": "error",
             "message": f"模型端点返回 HTTP {response.status_code}",
