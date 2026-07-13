@@ -177,7 +177,7 @@ npm --prefix apps\agent-office run build
 - 修改：`docs/开发方案/09-轻量回测与绩效验证.md`
 - 修改：`docs/开发方案/10-真实联调与验收.md`
 
-- [ ] **步骤 1：运行真实五年 TopN 回测**
+- [x] **步骤 1：运行真实五年 TopN 回测**
 
 ```powershell
 .\.venv\Scripts\python.exe -m finance_agent.cli backtest run --strategy factor_score_topn --universe universe:merged:ashare:recommendation --strategy-id strategy:ashare:short_swing --years 5 --score-mode replayed --topn 20 --rebalance monthly
@@ -185,15 +185,15 @@ npm --prefix apps\agent-office run build
 
 验收：状态不是因缺数据产生的 `partial`；CAGR、最大回撤、夏普、Sortino 均为有限数，`data_versions` 含 bars 水位、`score_mode=replayed`、策略/候选池/时间窗口。
 
-- [ ] **步骤 2：同参数重跑并比较**
+- [x] **步骤 2：同参数重跑并比较**
 
 再次运行同命令；比较核心指标、入选资产和数据版本。相同数据库水位下结果必须一致；水位变化则记录版本差异，不声称完全可复现。
 
-- [ ] **步骤 3：人工合理性审阅并记录**
+- [x] **步骤 3：人工合理性审阅并记录**
 
 检查年化、回撤、夏普和换手量级，确认没有 NaN、无穷大、单日未来数据或夸张收益；文档明确这是“历史模拟回放”，不是实盘收益。
 
-- [ ] **步骤 4：提交 T6 文档**
+- [x] **步骤 4：提交 T6 文档**
 
 方案 09/10 写入两个 backtest ID、参数、指标、数据版本和审阅结论。staged detect-changes 后提交：`docs(回测): 完成真实五年绩效验收`。
 
