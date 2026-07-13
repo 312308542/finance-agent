@@ -139,23 +139,23 @@ gitnexus detect-changes -r finance-agent --scope staged --max-files 50 --max-hun
 - 修改：`docs/开发方案/07-前端用户闭环页面.md`
 - 修改：`docs/开发方案/10-真实联调与验收.md`
 
-- [ ] **步骤 1：启动本地 API 与前端**
+- [x] **步骤 1：启动本地 API 与前端**
 
 API 只绑定 `127.0.0.1:8000`，前端使用项目现有 Vite 配置；先以 HTTP 健康检查证明服务可用，不修改 Windows 任务计划。
 
-- [ ] **步骤 2：创建真实 Workflow 报告**
+- [x] **步骤 2：创建真实 Workflow 报告**
 
 使用当前有效推荐 run 和 `owner:acceptance:scheme10` 运行 `recommendation_decision`，模型角色先限定为 `risk_rebuttal`，记录 workflow/report/decision ID；若数据闸门拒绝过期数据，先运行既有数据刷新任务，不绕过闸门。
 
-- [ ] **步骤 3：使用 in-app browser 完成用户动作**
+- [x] **步骤 3：使用 in-app browser 完成用户动作**
 
 调用 `browser:control-in-app-browser`，依次验证：报告页可见 → 推荐确认接受 → 生成订单草案 → 页面只有“去外部登记/执行登记”而无自动下单措辞 → 登记外部执行 → 持仓更新 → 复盘任务生成。
 
-- [ ] **步骤 4：数据库核验闭环**
+- [x] **步骤 4：数据库核验闭环**
 
 按上一步 ID 只读核验 `decision_logs.user_action`、`order_drafts`、`execution_records`、`positions`、复盘审计事件和 `assistant_memories`。每个下游记录必须引用前一节点 ID；不得用页面截图替代数据库引用证明。
 
-- [ ] **步骤 5：前端专项与生产构建**
+- [x] **步骤 5：前端专项与生产构建**
 
 ```powershell
 node apps\agent-office\scripts\test-action-loop-view.mjs
@@ -167,7 +167,7 @@ npm --prefix apps\agent-office run build
 
 如页面行为缺陷需要修复，先使用 `frontend-ui-verification`、GitNexus impact 和 TDD；修复后保留浏览器截图与 DOM/网络证据。
 
-- [ ] **步骤 6：记录证据并提交 T5 文档**
+- [x] **步骤 6：记录证据并提交 T5 文档**
 
 方案 07/10 记录脱敏 ID、数据库引用链、浏览器证据和红线检查。staged detect-changes 完整后提交：`docs(联调): 完成前端用户闭环真实验收`。
 
