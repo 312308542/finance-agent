@@ -1565,6 +1565,12 @@ class BaseDataScheduler:
             overrides["runtime_scheduler_config_file"] = str(self.scheduler_config_file)
         if job.limit is not None:
             overrides["limit"] = job.limit
+        elif (
+            job.market == "fund"
+            and str(job.params.get("sync_task_type") or "")
+            in {"market_bars_full_history_backfill", "fund_nav_full_history_backfill"}
+        ):
+            overrides["limit"] = None
         overrides.update(job.params)
         if (
             job.market == "ashare"

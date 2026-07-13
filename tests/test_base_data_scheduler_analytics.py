@@ -1761,6 +1761,45 @@ def test_scheduler_converts_fund_ten_year_bootstrap_lookback_to_collection_dates
     assert args.symbol_source == "market_assets"
 
 
+def test_scheduler_fund_full_history_jobs_clear_default_sample_limit() -> None:
+    """基金全历史初始化必须覆盖采集脚本的 5 条样例上限。"""
+
+    for name, sync_task_type in (
+        ("fund.etf.bars.1d.bootstrap", "market_bars_full_history_backfill"),
+        ("fund.open.nav.bootstrap", "fund_nav_full_history_backfill"),
+    ):
+        config = BaseDataSchedulerConfig(
+            job_timeout_seconds=0,
+            jobs=(
+                BaseDataSchedulerJob(
+                    name=name,
+                    job_type="collection",
+                    group="fund",
+                    interval_seconds=0,
+                    limit=None,
+                    market="fund",
+                    params={
+                        "sync_task_type": sync_task_type,
+                        "lookback": "10y",
+                        "symbol_source": "market_assets",
+                    },
+                ),
+            ),
+        )
+
+        def build_args(**kwargs: Any) -> Namespace:
+            values = {"limit": 5}
+            values.update(kwargs)
+            return Namespace(**values)
+
+        args = BaseDataScheduler(
+            config,
+            default_collection_args_func=build_args,
+        ).build_collection_args(config.jobs[0])
+
+        assert args.limit is None
+
+
 def test_scheduler_converts_fund_nav_lookback_to_collection_dates() -> None:
     """基金净值初始化和日常维护也应把 lookback 转成筛选窗口，供断点续跑使用。"""
 
