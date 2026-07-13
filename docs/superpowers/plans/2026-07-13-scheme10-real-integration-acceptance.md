@@ -63,7 +63,7 @@ npm --prefix apps\agent-office run build
 - 修改：`docs/开发方案/03-高风险复核回写.md`
 - 修改：`docs/开发方案/10-真实联调与验收.md`
 
-- [ ] **步骤 1：创建独立、可清理的真实复核样本**
+- [x] **步骤 1：创建独立、可清理的真实复核样本**
 
 在事务中使用 `AgentWorkflowRunORM`、`AgentWorkflowEventORM`、`DecisionLogORM` 创建：
 
@@ -115,13 +115,13 @@ decision_logs.user_action = rejected_by_review
 
 再创建同 owner 的第二条 `recommendation_sell` 事件，route 指向 `scheme10-invalid-review`，执行 `review-pending --limit 1`。验收：`unavailable_count=1`、源事件仍为 `review_unavailable` 可重试、`decision_logs.payload.review_confidence_multiplier=0.7`、没有订单草案。验证后删除临时 provider/model 与验收样本，真实 `gpt-5.5` 配置不得改动。
 
-- [ ] **步骤 5：若暴露缺陷则先图谱 impact，再 TDD 修复**
+- [x] **步骤 5：若暴露缺陷则先图谱 impact，再 TDD 修复**
 
 对实际待改函数/类执行 `gitnexus impact -r finance-agent --direction upstream`，目标参数必须是图谱返回的精确符号名或 UID，并把 direct callers、affected processes 和 risk level 记录到联调日志。
 
 HIGH/CRITICAL 先向用户告警。读取 `superpowers-zh:systematic-debugging` 与 `test-driven-development`，先补能复现真实失败的测试并确认红灯，再做最小实现；专项测试和全量测试都必须通过。
 
-- [ ] **步骤 6：记录脱敏样本并提交 T4 文档**
+- [x] **步骤 6：记录脱敏样本并提交 T4 文档**
 
 在方案 03/10 记录事件 ID、verdict、状态转换、错误 key 降级、无订单草案证明和命令输出摘要。暂存后运行：
 
@@ -129,7 +129,9 @@ HIGH/CRITICAL 先向用户告警。读取 `superpowers-zh:systematic-debugging` 
 gitnexus detect-changes -r finance-agent --scope staged --max-files 50 --max-hunks 300 --timeout-ms 25000
 ```
 
-提交：`docs(联调): 完成高风险复核真实回写验收`
+当前外部额度阻塞时提交：`docs(联调): 记录高风险复核额度阻塞`；只有 reject 门槛满足后才使用“完成高风险复核真实回写验收”。
+
+> 2026-07-13 执行记录：步骤 2 已真实执行，但供应商返回 HTTP 403 `insufficient_user_quota`，因此 reject 验收门槛未满足，步骤 2～4 保持未勾选。review_unavailable 审计链、0.7 置信度惩罚和零订单草案已真实通过；连接测试 HTML 200 假阳性已按 TDD 修复并提交 `72e1ac6`。补充额度后复用同一事件重跑。
 
 ### 任务 3：T5 端到端主链路与前端闭环
 
@@ -268,11 +270,12 @@ Get-ScheduledTask -TaskName FinanceAgent-BaseDataScheduler,FinanceAgent-Api | Ge
 - [ ] **步骤 3：运行文档、后端和前端总回归**
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_development_progress_docs.py -q
 .\.venv\Scripts\python.exe -m pytest -q
 npm --prefix apps\agent-office run build
 git diff --check
 ```
+
+当前仓库没有独立的进度文档 pytest；文档一致性通过逐项回读任务表、`git diff --check`、全量 pytest、前端构建和 staged GitNexus 共同验证，不引用已不存在的测试文件。
 
 - [ ] **步骤 4：staged GitNexus 检测并提交**
 
