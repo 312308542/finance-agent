@@ -263,6 +263,8 @@ Get-ScheduledTask -TaskName FinanceAgent-BaseDataScheduler,FinanceAgent-Api | Ge
 
 > 2026-07-15 批次续记：第十八批初次结果为 499 `available`、`012703` 瞬时超时，协调器按失败即停；随后逐标的真实重试成功并写入 1,076 条净值。累计前十八批 9,000 个任务最终 8,997 `available`、3 个结构性 `unavailable`；事实表覆盖 9,006 只、15,273,802 行，事实行非 available 数为 0，同窗口 resolver 剩余 11,629 个候选，第十九批已启动并正在运行。步骤 2/3 继续保持未勾选。
 
+> 2026-07-15 批次续记：第十九批 500/500 `available`、0 `error`、0 `unavailable`。累计前十九批 9,500 个任务最终 9,497 `available`、3 个结构性 `unavailable`；事实表覆盖 9,506 只、15,808,520 行，事实行非 available 数为 0，同窗口 resolver 剩余 11,129 个候选，第二十批已启动并正在运行。步骤 2/3 继续保持未勾选。
+
 - [ ] **步骤 2：按 ETF、LOF、开放式基金顺序分批执行**
 
 ```powershell
