@@ -486,6 +486,8 @@ def test_fund_market_preview_and_scheduler_jobs_are_exported() -> None:
     assert jobs["fund.lof.bars.1d.bootstrap"]["limit"] is None
     assert jobs["fund.open.nav.bootstrap"]["params"]["fund_asset_type"] == "open_fund"
     assert jobs["fund.open.nav.bootstrap"]["limit"] is None
+    assert jobs["fund.open.nav.bootstrap"]["params"]["max_workers"] == 1
+    assert jobs["fund.open.nav.bootstrap"]["params"]["source_limit"] == 500
     assert jobs["fund.bars.1d.close_final"]["params"]["only_failed_or_stale"] is True
     assert jobs["fund.open.nav.daily"]["params"]["sync_task_type"] == "fund_nav_daily"
     assert jobs["fund.open.nav.daily"]["params"]["only_failed_or_stale"] is True

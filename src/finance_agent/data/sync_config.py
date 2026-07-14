@@ -52,6 +52,7 @@ ASHARE_BOOTSTRAP_LOOKBACK = "10y"
 ASHARE_BOOTSTRAP_BATCH_SIZE = 50
 FUND_BOOTSTRAP_LOOKBACK = "10y"
 FUND_BOOTSTRAP_BATCH_SIZE = 50
+FUND_OPEN_NAV_BOOTSTRAP_SOURCE_LIMIT = 500
 
 DataSyncPreset = Literal[
     "personal-comprehensive",
@@ -2082,7 +2083,7 @@ def preview_fund_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                     enabled=False,
                     schedule_type="manual",
                     batch_size=min(config.batch_size, FUND_BOOTSTRAP_BATCH_SIZE),
-                    max_workers=min(config.max_workers, 2),
+                    max_workers=1,
                     max_retries=0,
                     lookback=FUND_BOOTSTRAP_LOOKBACK,
                     sources=["fund_open_fund_info_em"],
@@ -2090,6 +2091,7 @@ def preview_fund_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                     extra_params={
                         "fund_asset_type": "open_fund",
                         "schedule_failure_retry": False,
+                        "source_limit": FUND_OPEN_NAV_BOOTSTRAP_SOURCE_LIMIT,
                     },
                     notes=["手动触发，用于开放式基金 10 年净值初始化。"],
                 ),
