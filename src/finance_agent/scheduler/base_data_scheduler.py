@@ -1596,7 +1596,17 @@ class BaseDataScheduler:
             }
             and overrides.get("lookback")
         ):
-            overrides.update(build_fund_lookback_date_overrides(str(overrides["lookback"])))
+            fund_sync_task_type = str(overrides.get("sync_task_type") or "")
+            overrides.update(
+                build_fund_lookback_date_overrides(
+                    str(overrides["lookback"]),
+                    completed_only=fund_sync_task_type
+                    in {
+                        "market_bars_full_history_backfill",
+                        "fund_nav_full_history_backfill",
+                    },
+                )
+            )
         elif (
             job.market == "ashare"
             and str(overrides.get("sync_task_type") or "")
@@ -2464,11 +2474,18 @@ def build_ashare_lookback_date_overrides(lookback: str, *, now: datetime | None 
     }
 
 
-def build_fund_lookback_date_overrides(lookback: str, *, now: datetime | None = None) -> JsonDict:
+def build_fund_lookback_date_overrides(
+    lookback: str,
+    *,
+    now: datetime | None = None,
+    completed_only: bool = False,
+) -> JsonDict:
     """把基金 lookback 配置转换为采集脚本复用的 YYYYMMDD 起止日期。"""
 
     current = now or datetime.now(tz=UTC)
     end_date = current.date()
+    if completed_only:
+        end_date -= timedelta(days=1)
     start_date = end_date - timedelta(days=parse_lookback_days(lookback, default_days=30))
     return {
         "ashare_start": start_date.strftime("%Y%m%d"),

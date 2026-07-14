@@ -1725,25 +1725,36 @@ def test_scheduler_converts_ashare_ten_year_bootstrap_lookback_to_collection_dat
     assert args.symbol_source == "market_assets"
 
 
-def test_scheduler_converts_fund_ten_year_bootstrap_lookback_to_collection_dates() -> None:
+@pytest.mark.parametrize(
+    ("job_name", "sync_task_type", "fund_asset_type"),
+    (
+        ("fund.etf.bars.1d.bootstrap", "market_bars_full_history_backfill", "etf"),
+        ("fund.open.nav.bootstrap", "fund_nav_full_history_backfill", "open_fund"),
+    ),
+)
+def test_scheduler_converts_fund_ten_year_bootstrap_lookback_to_collection_dates(
+    job_name: str,
+    sync_task_type: str,
+    fund_asset_type: str,
+) -> None:
     """基金 10 年初始化任务也应动态换算采集日期，避免落回脚本默认样例日期。"""
 
     config = BaseDataSchedulerConfig(
         job_timeout_seconds=0,
         jobs=(
             BaseDataSchedulerJob(
-                name="fund.etf.bars.1d.bootstrap",
+                name=job_name,
                 job_type="collection",
                 group="fund",
                 interval_seconds=0,
                 limit=None,
                 market="fund",
                 params={
-                    "sync_task_type": "market_bars_full_history_backfill",
+                    "sync_task_type": sync_task_type,
                     "lookback": "10y",
                     "symbol_source": "market_assets",
                     "fund_timeframe": "1d",
-                    "fund_asset_type": "etf",
+                    "fund_asset_type": fund_asset_type,
                 },
             ),
         ),
@@ -1753,11 +1764,17 @@ def test_scheduler_converts_fund_ten_year_bootstrap_lookback_to_collection_dates
         default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
     )
 
+    today_before = datetime.now(tz=UTC).date()
     args = scheduler.build_collection_args(config.jobs[0])
+    today_after = datetime.now(tz=UTC).date()
 
     start_date = datetime.strptime(args.ashare_start, "%Y%m%d").replace(tzinfo=UTC)
     end_date = datetime.strptime(args.ashare_end, "%Y%m%d").replace(tzinfo=UTC)
     assert 3649 <= (end_date - start_date).days <= 3653
+    assert end_date.date() in {
+        today_before - timedelta(days=1),
+        today_after - timedelta(days=1),
+    }
     assert args.symbol_source == "market_assets"
 
 
