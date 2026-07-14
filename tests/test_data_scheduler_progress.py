@@ -796,6 +796,87 @@ def test_ashare_universe_p1_progress_extends_total_after_p0(monkeypatch) -> None
     assert snapshot["progress_ratio"] == 1.0
 
 
+def test_ashare_universe_p1_skips_index_catalog_entries_without_code() -> None:
+    """指数目录中的空代码条目应被过滤，不得进入错误的进度记录分支。"""
+
+    collect_base_data = import_collection_module()
+
+    class FakeSectorProvider:
+        def fetch_index_catalog(self, limit=None):
+            return CollectionTaskResult(
+                task="index_catalog",
+                status="available",
+                raw_record_id="raw-index-catalog",
+                item_count=2,
+                error_message=None,
+                payload={"indexes": [
+                    {"code": "", "name": "无效条目"},
+                    {"code": "000300", "name": "沪深300"},
+                ]},
+            )
+
+        def fetch_industry_names(self, limit=None):
+            return CollectionTaskResult(
+                task="industry_catalog",
+                status="available",
+                raw_record_id="raw-industry-catalog",
+                item_count=0,
+                error_message=None,
+                payload={"names": []},
+            )
+
+        def fetch_concept_names(self, limit=None):
+            return CollectionTaskResult(
+                task="concept_catalog",
+                status="available",
+                raw_record_id="raw-concept-catalog",
+                item_count=0,
+                error_message=None,
+                payload={"names": []},
+            )
+
+    class FakeP1Collector:
+        sector_provider = FakeSectorProvider()
+
+        def collect_index_members(self, **kwargs):
+            return None
+
+        def collect_flow_rank(self, **kwargs):
+            return None
+
+    class RecordingRuntime:
+        def __init__(self) -> None:
+            self.tasks: list[str] = []
+
+        def run_task(self, *, task, provider_key, parameters, collect, force=False):
+            self.tasks.append(task)
+            return CollectionTaskResult(
+                task=task,
+                status="available",
+                raw_record_id=f"raw-{task}",
+                item_count=1,
+                error_message=None,
+                payload={},
+            )
+
+    runtime = RecordingRuntime()
+    args = collect_base_data.default_collection_args(
+        index_catalog_limit=0,
+        industry_catalog_limit=0,
+        concept_catalog_limit=0,
+    )
+
+    collect_base_data.build_ashare_p1_universe_tasks(
+        collector=FakeP1Collector(),
+        args=args,
+        runtime=runtime,
+    )
+
+    assert [task for task in runtime.tasks if task.startswith("ashare_p1_index_members:")] == [
+        "ashare_p1_index_members:000300"
+    ]
+
+
 def test_ashare_universe_risk_progress_extends_total_after_p1(monkeypatch) -> None:
     """A 股 Universe 风险情绪采集应纳入同一任务总进度，避免 P1 后误报 100%。"""
 

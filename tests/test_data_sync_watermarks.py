@@ -111,6 +111,40 @@ def test_data_sync_watermark_failure_can_skip_retry_schedule() -> None:
     assert session.flushed is True
 
 
+def test_data_sync_watermark_unavailable_is_terminal_without_retry() -> None:
+    """源端确认无数据时应写终态 unavailable，且不得伪造成功或自动重试。"""
+
+    session = _FakeSession()
+    occurred_at = datetime(2026, 7, 15, 2, 35, tzinfo=UTC)
+    payload = {
+        "item_count": 0,
+        "requested_start": "20160715",
+        "requested_end": "20260714",
+        "sync_task_type": "fund_nav_full_history_backfill",
+    }
+
+    DataSyncWatermarkRepository(session).record_unavailable(
+        asset_id="fund:open:005471",
+        symbol="005471",
+        market="fund",
+        data_domain="fund_nav_snapshots",
+        provider="akshare:fund_open_fund_info_em",
+        timeframe="1d",
+        occurred_at=occurred_at,
+        error_message="源端未返回历史净值",
+        payload=payload,
+    )
+
+    params = session.executed[0].compile(dialect=postgresql.dialect()).params
+
+    assert params["status"] == "unavailable"
+    assert params["last_success_at"] is None
+    assert params["last_failed_at"] == occurred_at
+    assert params["next_retry_at"] is None
+    assert params["payload"] == payload
+    assert session.flushed is True
+
+
 def test_data_sync_watermark_reads_due_retry_time() -> None:
     """仓储层应能读取某个资产在某个数据域的下次重试时间。"""
 

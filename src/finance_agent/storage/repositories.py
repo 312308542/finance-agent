@@ -1210,6 +1210,58 @@ class DataSyncWatermarkRepository:
         )
         self.session.flush()
 
+    def record_unavailable(
+        self,
+        *,
+        asset_id: str,
+        symbol: str,
+        market: str,
+        data_domain: str,
+        provider: str,
+        timeframe: str | None = None,
+        occurred_at: datetime | None = None,
+        error_message: str | None = None,
+        payload: JsonDict | None = None,
+    ) -> None:
+        """记录源端确认无数据的终态水位，不安排自动重试。"""
+
+        now = occurred_at or datetime.now().astimezone()
+        values = {
+            "asset_id": asset_id,
+            "symbol": symbol,
+            "market": market,
+            "data_domain": data_domain,
+            "timeframe": timeframe or "",
+            "provider": provider,
+            "status": "unavailable",
+            "watermark_at": None,
+            "last_success_at": None,
+            "last_failed_at": now,
+            "next_retry_at": None,
+            "fail_count": 1,
+            "last_error_message": error_message,
+            "payload": _json_safe(payload or {}),
+            "updated_at": now,
+        }
+        statement = insert(DataSyncWatermarkORM).values(**values)
+        self.session.execute(
+            statement.on_conflict_do_update(
+                constraint="pk_data_sync_watermarks",
+                set_={
+                    "symbol": statement.excluded.symbol,
+                    "market": statement.excluded.market,
+                    "status": statement.excluded.status,
+                    "last_failed_at": statement.excluded.last_failed_at,
+                    "next_retry_at": None,
+                    "fail_count": DataSyncWatermarkORM.fail_count + 1,
+                    "last_error_message": statement.excluded.last_error_message,
+                    "payload": statement.excluded.payload,
+                    "updated_at": statement.excluded.updated_at,
+                },
+            )
+        )
+        self.session.flush()
+
     def get_next_retry_at(
         self,
         *,

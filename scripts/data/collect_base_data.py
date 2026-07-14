@@ -1355,12 +1355,9 @@ def build_ashare_p1_universe_tasks(
             batch_count=batch_count,
         )
 
-    for index, item in enumerate(index_sources, start=1):
+    for index, item in enumerate(index_progress_items, start=1):
         index_code = str(item.get("code") or "").strip()
         index_name = str(item.get("name") or index_code).strip()
-        if not index_code:
-            record_risk_stage_result(symbol=task, result=results[-1], batch_index=batch_index)
-            continue
         stage_key = "ashare_p1_index_members"
         batch_count = len(index_progress_items)
         record_p1_stage_started(
@@ -3987,6 +3984,8 @@ def _asset_requires_open_nav_collection(
         required_start_at=required_start_at,
         required_end_at=required_end_at,
     )
+    if status == "unavailable" and watermark_covers_request:
+        return False
     if (
         status == "error"
         and (next_retry_at is None or next_retry_at <= now)
@@ -5703,6 +5702,34 @@ def _record_fund_symbol_watermark(
             payload=success_payload,
         )
         return
+    failure_payload: JsonDict = {
+        "status": status,
+        "item_count": result_item_count(result),
+    }
+    for key, value in (
+        ("requested_start", requested_start),
+        ("requested_end", requested_end),
+        ("sync_task_type", sync_task_type),
+    ):
+        if value not in (None, ""):
+            failure_payload[key] = value
+    if status == "unavailable" and not schedule_retry:
+        if requested_start not in (None, ""):
+            failure_payload["verified_requested_start"] = requested_start
+        if requested_end not in (None, ""):
+            failure_payload["verified_requested_end"] = requested_end
+        repository.record_unavailable(
+            asset_id=asset_id,
+            symbol=symbol,
+            market="fund",
+            data_domain=data_domain,
+            provider=provider,
+            timeframe=timeframe,
+            occurred_at=now,
+            error_message=result_error_message(result),
+            payload=failure_payload,
+        )
+        return
     repository.record_failure(
         asset_id=asset_id,
         symbol=symbol,
@@ -5713,7 +5740,7 @@ def _record_fund_symbol_watermark(
         occurred_at=now,
         retry_after=timedelta(minutes=15) if schedule_retry else None,
         error_message=result_error_message(result),
-        payload={"status": status, "item_count": result_item_count(result)},
+        payload=failure_payload,
     )
 
 

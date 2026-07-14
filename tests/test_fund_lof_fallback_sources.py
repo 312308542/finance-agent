@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from argparse import Namespace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -746,3 +746,172 @@ def test_fund_success_watermark_persists_full_history_request_range(monkeypatch)
         "requested_end": "20260713",
         "sync_task_type": "market_bars_full_history_backfill",
     }
+
+
+def test_open_fund_unavailable_without_retry_records_terminal_watermark(monkeypatch) -> None:
+    """全历史初始化确认无净值时，应记录终态 unavailable 和完整请求窗口。"""
+
+    recorded: dict = {}
+
+    class FakeWatermarkRepository:
+        def __init__(self, session) -> None:
+            self.session = session
+
+        def record_unavailable(self, **kwargs) -> None:
+            recorded.update(kwargs)
+
+        def record_failure(self, **kwargs) -> None:  # pragma: no cover - 本测试只覆盖终态路径
+            raise AssertionError("不应写可重试失败水位")
+
+    monkeypatch.setattr(
+        collect_base_data,
+        collect_base_data.DataSyncWatermarkRepository.__name__,
+        FakeWatermarkRepository,
+    )
+    result = CollectionTaskResult(
+        task="fund_open_nav",
+        status="unavailable",
+        raw_record_id="raw:open:005471",
+        item_count=0,
+        error_message="源端未返回历史净值",
+        payload={},
+    )
+
+    collect_base_data._record_fund_symbol_watermark(
+        object(),
+        symbol="005471",
+        asset_type="open_fund",
+        data_domain=collect_base_data.FUND_NAV_DATA_DOMAIN,
+        provider="akshare:fund_open_fund_info_em",
+        timeframe="1d",
+        result=result,
+        schedule_retry=False,
+        requested_start="20160715",
+        requested_end="20260714",
+        sync_task_type="fund_nav_full_history_backfill",
+    )
+
+    assert recorded["asset_id"] == "fund:open:005471"
+    assert recorded["payload"] == {
+        "status": "unavailable",
+        "item_count": 0,
+        "requested_start": "20160715",
+        "requested_end": "20260714",
+        "verified_requested_start": "20160715",
+        "verified_requested_end": "20260714",
+        "sync_task_type": "fund_nav_full_history_backfill",
+    }
+
+
+def test_open_fund_unavailable_with_retry_keeps_failure_semantics(monkeypatch) -> None:
+    """日常任务允许自动重试时，unavailable 仍应沿用失败冷却语义。"""
+
+    recorded: dict = {}
+
+    class FakeWatermarkRepository:
+        def __init__(self, session) -> None:
+            self.session = session
+
+        def record_unavailable(self, **kwargs) -> None:  # pragma: no cover - 本测试只覆盖重试路径
+            raise AssertionError("不应写终态 unavailable 水位")
+
+        def record_failure(self, **kwargs) -> None:
+            recorded.update(kwargs)
+
+    monkeypatch.setattr(
+        collect_base_data,
+        collect_base_data.DataSyncWatermarkRepository.__name__,
+        FakeWatermarkRepository,
+    )
+    result = CollectionTaskResult(
+        task="fund_open_nav",
+        status="unavailable",
+        raw_record_id="raw:open:005471",
+        item_count=0,
+        error_message="源端暂未返回净值",
+        payload={},
+    )
+
+    collect_base_data._record_fund_symbol_watermark(
+        object(),
+        symbol="005471",
+        asset_type="open_fund",
+        data_domain=collect_base_data.FUND_NAV_DATA_DOMAIN,
+        provider="akshare:fund_open_fund_info_em",
+        timeframe="1d",
+        result=result,
+        schedule_retry=True,
+    )
+
+    assert recorded["retry_after"] == timedelta(minutes=15)
+
+
+def test_open_fund_terminal_unavailable_skips_same_verified_request() -> None:
+    """已确认无历史净值的同一窗口不应在后续批次重复入队。"""
+
+    asset = SimpleNamespace(asset_id="fund:open:005471")
+    watermark = SimpleNamespace(
+        status="unavailable",
+        next_retry_at=None,
+        payload={
+            "requested_start": "20160715",
+            "requested_end": "20260714",
+            "verified_requested_start": "20160715",
+            "verified_requested_end": "20260714",
+        },
+    )
+
+    requires_collection = collect_base_data._asset_requires_open_nav_collection(
+        asset,
+        coverage={},
+        watermark=watermark,
+        now=datetime(2026, 7, 15, 3, 0, tzinfo=UTC),
+        stale_before=None,
+        required_start_at=datetime(2016, 7, 15, tzinfo=UTC),
+        required_end_at=datetime(2026, 7, 14, tzinfo=UTC),
+        year_coverage={},
+    )
+
+    assert requires_collection is False
+
+
+def test_open_fund_terminal_unavailable_retries_expanded_request() -> None:
+    """请求窗口扩大后，既有 unavailable 水位不得阻止重新验证。"""
+
+    asset = SimpleNamespace(asset_id="fund:open:005471")
+    watermark = SimpleNamespace(
+        status="unavailable",
+        next_retry_at=None,
+        payload={
+            "verified_requested_start": "20160715",
+            "verified_requested_end": "20260714",
+        },
+    )
+
+    requires_collection = collect_base_data._asset_requires_open_nav_collection(
+        asset,
+        coverage={},
+        watermark=watermark,
+        now=datetime(2026, 7, 15, 3, 0, tzinfo=UTC),
+        stale_before=None,
+        required_start_at=datetime(2015, 7, 15, tzinfo=UTC),
+        required_end_at=datetime(2026, 7, 14, tzinfo=UTC),
+        year_coverage={},
+    )
+
+    assert requires_collection is True
+
+
+def test_open_fund_manual_symbol_resolution_allows_terminal_unavailable_retry() -> None:
+    """手工指定单标的时应绕过批次水位筛选，保留人工重跑能力。"""
+
+    symbols = collect_base_data.resolve_fund_nav_collection_symbols(
+        object(),
+        Namespace(
+            sync_task_type="fund_nav_full_history_backfill",
+            symbol_source="manual",
+            fund_symbol="005471",
+        ),
+    )
+
+    assert symbols == ["005471"]
