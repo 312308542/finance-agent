@@ -1748,25 +1748,6 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 data_packages=["capital_flow"],
             )
         )
-        tasks.append(
-            DataSyncTaskPreview(
-                task_key="ashare.northbound",
-                market="ashare",
-                task_type="northbound_flow_refresh",
-                title="刷新 A 股北向资金",
-                interval_seconds=config.interval_seconds.get("northbound_flow", 24 * 60 * 60),
-                mode="daily_market_flow_snapshot",
-                schedule_type="daily_time",
-                run_at=["18:10"],
-                timezone="Asia/Shanghai",
-                trading_day_policy="trading_day_only",
-                batch_size=config.batch_size,
-                lookback=f"{config.lookback_days}d",
-                sources=["stock_hsgt_hist_em", "stock_hsgt_individual_em"],
-                data_packages=["capital_flow"],
-                notes=["默认刷新市场级北向资金，并按水位小批轮转用户可交易主板标的。"],
-            )
-        )
     if "events" in config.data_packages:
         tasks.append(
             DataSyncTaskPreview(

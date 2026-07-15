@@ -338,21 +338,16 @@ def test_scheduler_payload_exports_low_symbol_fetch_concurrency() -> None:
     assert jobs["crypto_future.bars.1h"]["params"]["max_workers"] == 4
 
 
-def test_scheduler_payload_exports_ashare_northbound_flow_job() -> None:
-    """A 股资金流包应拆出北向资金任务，供因子侧消费外资偏好。"""
+def test_scheduler_payload_excludes_discontinued_daily_northbound_job() -> None:
+    """默认计划不应重复调度已停止披露的北向逐股日度数据。"""
 
     config = build_preset_config("personal-comprehensive")
 
     scheduler_payload = export_scheduler_payload(config)
     jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
 
-    assert jobs["ashare.northbound"]["job_type"] == "collection"
-    assert jobs["ashare.northbound"]["group"] == "ashare-p1"
-    assert jobs["ashare.northbound"]["params"]["sync_task_type"] == "northbound_flow_refresh"
-    assert jobs["ashare.northbound"]["params"]["group"] == ["ashare-p1"]
-    assert jobs["ashare.northbound"]["params"]["source_limit"] == jobs["ashare.northbound"]["limit"]
-    assert "stock_hsgt_hist_em" in jobs["ashare.northbound"]["params"]["sources"]
-    assert "stock_hsgt_individual_em" in jobs["ashare.northbound"]["params"]["sources"]
+    assert "ashare.capital_flow" in jobs
+    assert "ashare.northbound" not in jobs
 
 
 def test_scheduler_payload_exports_ashare_restricted_release_job() -> None:

@@ -862,23 +862,28 @@ def _fetch_ths_fund_flow_rank(indicator: str, *, limit: int | None = None) -> pd
     if indicator not in board_map:
         raise ValueError(f"同花顺资金流暂不支持周期: {indicator}")
 
-    first_url = "http://data.10jqka.com.cn/funds/ggzjl/field/code/order/desc/ajax/1/free/1/"
-    first_html = _ths_get_text(first_url, referer="http://data.10jqka.com.cn/funds/ggzjl/")
+    path = board_map[indicator]
+    url_template = (
+        f"http://data.10jqka.com.cn/funds/ggzjl/{path}"
+        "field/zdf/order/desc/page/{}/ajax/1/free/1/"
+    )
+    first_html = _ths_get_text(
+        url_template.format(1),
+        referer="http://data.10jqka.com.cn/funds/ggzjl/",
+    )
     page_count = _parse_ths_page_count(first_html)
     page_size = 60
     max_pages = page_count
     if limit is not None:
         max_pages = min(max_pages, max(math.ceil(limit / page_size), 1))
 
-    path = board_map[indicator]
-    url_template = (
-        f"http://data.10jqka.com.cn/funds/ggzjl/{path}"
-        "field/zdf/order/desc/page/{}/ajax/1/free/1/"
-    )
     frames: list[pd.DataFrame] = []
-    for page in range(1, max_pages + 1):
+    first_tables = _read_ths_html_tables(first_html)
+    if first_tables:
+        frames.append(first_tables[0])
+    for page in range(2, max_pages + 1):
         html = _ths_get_text(url_template.format(page), referer="http://data.10jqka.com.cn/funds/ggzjl/")
-        tables = pd.read_html(StringIO(html))
+        tables = _read_ths_html_tables(html)
         if not tables:
             continue
         frames.append(tables[0])
@@ -936,6 +941,7 @@ def _fetch_ths_fund_flow_rank(indicator: str, *, limit: int | None = None) -> pd
                 f"{indicator}主力净流入-净额",
             ]
         ]
+    big_df["代码"] = big_df["代码"].map(_normalize_ths_stock_code)
     if limit is not None:
         big_df = big_df.head(limit)
     big_df.attrs["actual_source"] = "ths:curl_cffi:stock_fund_flow_individual"
@@ -1613,3 +1619,18 @@ def _parse_ths_page_count(html: str) -> int:
     if not match:
         return 1
     return int(match.group(1))
+
+
+def _read_ths_html_tables(html: str) -> list[pd.DataFrame]:
+    """读取同花顺 HTML 表格，便于隔离测试替换网络报文解析。"""
+
+    return pd.read_html(StringIO(html))
+
+
+def _normalize_ths_stock_code(value: object) -> str:
+    """恢复同花顺 HTML 表格读取时丢失的 A 股代码前导零。"""
+
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    return text.zfill(6) if text.isdigit() else text
