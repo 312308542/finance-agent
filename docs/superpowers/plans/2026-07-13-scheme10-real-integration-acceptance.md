@@ -289,6 +289,8 @@ Get-ScheduledTask -TaskName FinanceAgent-BaseDataScheduler,FinanceAgent-Api | Ge
 
 > 2026-07-15 批次续记：第三十一批结果为 497 `available`、`021487/021743/021834` `unavailable`；三只均使用 `--no-schedule-failure-retry` 逐标的复验，仍为空历史并写终态水位。累计前三十一批 15,500 个任务最终 15,491 `available`、9 个结构性 `unavailable`；事实表覆盖 15,495 只、20,315,629 行，事实行非 available 数为 0，同窗口 resolver 剩余 5,101 个候选，第三十一批已收口。步骤 2/3 继续保持未勾选。
 
+> 2026-07-15 批次续记：第三十二批为 496 `available`、`022131` 瞬时超时、`021487/021743/021834` 三个既有结构性 `unavailable`；`022131` 单标的重试成功。第三十三批 500/500 `available`。当前事实表覆盖 16,492 只、20,671,966 行，唯一水位为 16,491 `available`、9 `unavailable`，从未尝试基金 4,103 只。动态窗口推进暴露成立前空窗信任丢失，导致 11,719 只已覆盖新结束日的基金误入队；TDD 修复后当前窗口 resolver 从 17,634 降至 6,393，首批仍为未初始化基金，9 个终态项全部排除。步骤 2/3 继续保持未勾选。
+
 - [ ] **步骤 2：按 ETF、LOF、开放式基金顺序分批执行**
 
 ```powershell

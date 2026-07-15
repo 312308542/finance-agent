@@ -3984,6 +3984,13 @@ def _asset_requires_open_nav_collection(
         required_start_at=required_start_at,
         required_end_at=required_end_at,
     )
+    watermark_trusts_leading_gap = status in {"available", "completed", "success"} and (
+        _watermark_covers_request(
+            watermark,
+            required_start_at=required_start_at,
+            required_end_at=None,
+        )
+    )
     if status == "unavailable" and watermark_covers_request:
         return False
     if (
@@ -4007,14 +4014,14 @@ def _asset_requires_open_nav_collection(
             year_coverage,
             required_start_at=required_start_at,
             required_end_at=required_end_at,
-            trust_leading_gap=watermark_covers_request,
+            trust_leading_gap=watermark_trusts_leading_gap,
             trust_trailing_gap=watermark_covers_request,
         )
     ):
         return True
     if watermark_covers_request:
         return False
-    if _date_after(earliest_nav_date, required_start_at):
+    if _date_after(earliest_nav_date, required_start_at) and not watermark_trusts_leading_gap:
         return True
     if stale_before is not None and latest_nav_date < stale_before.date():
         return True

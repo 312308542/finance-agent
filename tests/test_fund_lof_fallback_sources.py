@@ -510,6 +510,34 @@ def test_open_fund_nav_collection_trusts_verified_trailing_gap() -> None:
     assert requires_collection is False
 
 
+def test_open_fund_nav_collection_trusts_prior_leading_gap_when_latest_day_is_covered() -> None:
+    """请求结束日推进后，事实已覆盖新日期时仍应信任此前验证过的成立前空窗。"""
+
+    asset = SimpleNamespace(asset_id="fund:open:000001")
+    watermark = SimpleNamespace(
+        status="available",
+        next_retry_at=None,
+        payload={"requested_start": "20160715", "requested_end": "20260713"},
+    )
+
+    requires_collection = collect_base_data._asset_requires_open_nav_collection(
+        asset,
+        coverage={asset.asset_id: (600, date(2024, 1, 2), date(2026, 7, 14))},
+        watermark=watermark,
+        now=datetime(2026, 7, 15, 5, 0, tzinfo=UTC),
+        stale_before=None,
+        required_start_at=datetime(2016, 7, 16, tzinfo=UTC),
+        required_end_at=datetime(2026, 7, 14, tzinfo=UTC),
+        year_coverage={
+            2024: (240, date(2024, 1, 2), date(2024, 12, 31)),
+            2025: (240, date(2025, 1, 2), date(2025, 12, 31)),
+            2026: (120, date(2026, 1, 2), date(2026, 7, 14)),
+        },
+    )
+
+    assert requires_collection is False
+
+
 def test_open_fund_nav_symbol_resolution_uses_source_limit(monkeypatch) -> None:
     """开放式基金净值分批放量应使用 source_limit 限制本轮标的数量。"""
 
