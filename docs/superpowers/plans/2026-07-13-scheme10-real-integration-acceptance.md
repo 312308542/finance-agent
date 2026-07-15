@@ -283,6 +283,8 @@ Get-ScheduledTask -TaskName FinanceAgent-BaseDataScheduler,FinanceAgent-Api | Ge
 
 > 2026-07-15 批次续记：第二十八批初次结果为 496 `available`、`019221/019578` 瞬时超时、`019738/019739` `unavailable`；两个瞬时项重试成功并写入 526、670 条，两个无历史项复验仍为 `unavailable`，确认为结构性缺口。累计前二十八批 14,000 个任务最终 13,997 `available`、5 个结构性 `unavailable`；事实表覆盖 14,004 只、19,494,531 行，事实行非 available 数为 0，同窗口 resolver 剩余 6,629 个候选，第二十九批已启动并正在运行。步骤 2/3 继续保持未勾选。
 
+> 2026-07-15 批次续记：第二十九批结果为 497 `available`、`005792/006922/020490` `unavailable`；`020490` 以及此前状态漂移的 `019738/019739` 均使用 `--no-schedule-failure-retry` 逐标的复验，确认东财响应为空历史并将水位统一落为 `unavailable`。累计前二十九批 14,500 个任务最终 14,497 `available`、6 个结构性 `unavailable`；事实表覆盖 14,501 只、19,838,793 行，事实行非 available 数为 0，同窗口 resolver 剩余 6,098 个候选，第二十九批已收口。步骤 2/3 继续保持未勾选。
+
 - [ ] **步骤 2：按 ETF、LOF、开放式基金顺序分批执行**
 
 ```powershell
