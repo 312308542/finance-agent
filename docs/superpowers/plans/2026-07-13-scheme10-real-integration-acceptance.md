@@ -297,7 +297,9 @@ Get-ScheduledTask -TaskName FinanceAgent-BaseDataScheduler,FinanceAgent-Api | Ge
 
 > 2026-07-15 批次续记：第三十七批初次为 499 `available`、`025918` 瞬时连接超时，单标的重试成功并写入 114 条净值；第三十八批 500/500 `available`。当前事实表覆盖 18,992 只、21,120,001 行，唯一水位为 18,991 `available`、9 `unavailable`，从未尝试基金 1,603 只。步骤 2/3 继续保持未勾选。
 
-- [ ] **步骤 2：按 ETF、LOF、开放式基金顺序分批执行**
+> 2026-07-15 批次续记：第三十九批的 `027323`、第四十批的 `161913` 瞬时超时均已单标的重试成功；第四十一、四十二批均 500/500 `available`。20,604 只开放式基金首次扫描全部有归宿：事实覆盖 20,595 只、25,411,107 行，另有 9 只终态 `unavailable`，从未尝试数为 0。当前 resolver 仍有 1,909 只真实缺口，其中 1,887 只最新净值早于 `2026-07-14`，22 只缺中间年份。步骤 2 标记完成，步骤 3 继续保持未勾选。
+
+- [x] **步骤 2：按 ETF、LOF、开放式基金顺序分批执行**
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\data\run_base_data_scheduler.py --config runtime\base_data_scheduler\scheme10-fund-bootstrap.json --run-once --only fund.etf.bars.1d.bootstrap
