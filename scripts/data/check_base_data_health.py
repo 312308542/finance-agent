@@ -234,7 +234,9 @@ def load_table_freshness(session: Any) -> list[JsonDict]:
                 union all select 'capital_flow_snapshots', as_of from capital_flow_snapshots
                 union all select 'fundamental_snapshots', as_of from fundamental_snapshots
                 union all
-                select 'event_records', coalesce(published_at, collected_at) from event_records
+                select 'event_records',
+                       least(coalesce(published_at, collected_at), collected_at)
+                from event_records
                 union all select 'risk_findings', as_of from risk_findings
                 union all
                 select 'crypto_derivative_snapshots', as_of from crypto_derivative_snapshots

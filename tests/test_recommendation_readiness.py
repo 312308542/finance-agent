@@ -7,6 +7,7 @@ from scripts.data.check_base_data_health import (
     freshness_row_is_stale,
     infer_gaps,
     load_table_counts,
+    load_table_freshness,
 )
 
 
@@ -257,6 +258,17 @@ def test_load_table_counts_includes_recommendation_readiness_tables() -> None:
     assert "screening_results" in sql
 
 
+def test_load_table_freshness_caps_future_event_time_at_collection_time() -> None:
+    """事件 freshness 不应被晚于采集时刻的源发布时间推到未来。"""
+
+    session = FreshnessRecordingSession()
+
+    load_table_freshness(session)
+
+    sql = session.sql_statements[0].lower()
+    assert "least(coalesce(published_at, collected_at), collected_at)" in sql
+
+
 def freshness(
     table_name: str,
     latest_as_of: datetime,
@@ -275,7 +287,7 @@ class RecordingSession:
     def __init__(self) -> None:
         self.sql = ""
 
-    def execute(self, statement: object) -> "RecordingResult":
+    def execute(self, statement: object) -> RecordingResult:
         self.sql = str(statement)
         return RecordingResult()
 
@@ -283,3 +295,31 @@ class RecordingSession:
 class RecordingResult:
     def mappings(self) -> list[dict[str, object]]:
         return []
+
+
+class FreshnessRecordingSession:
+    def __init__(self) -> None:
+        self.sql_statements: list[str] = []
+
+    def execute(self, statement: object, *_args: object) -> FreshnessRecordingResult:
+        self.sql_statements.append(str(statement))
+        return FreshnessRecordingResult(is_daily_query=len(self.sql_statements) > 1)
+
+
+class FreshnessRecordingResult:
+    def __init__(self, *, is_daily_query: bool) -> None:
+        self.is_daily_query = is_daily_query
+
+    def mappings(self) -> FreshnessRecordingResult:
+        return self
+
+    def __iter__(self):
+        return iter(())
+
+    def one(self) -> dict[str, object | None]:
+        assert self.is_daily_query
+        return {
+            "latest_as_of": None,
+            "expected_latest_as_of": None,
+            "expected_close_at": None,
+        }

@@ -317,7 +317,7 @@ Get-ScheduledTask -TaskName FinanceAgent-BaseDataScheduler,FinanceAgent-Api | Ge
 
 ### 任务 7：T9 问题清单、T10 文档同步和方案 10 收尾
 
-- [ ] **步骤 1：登记真实问题清单**
+- [x] **步骤 1：登记真实问题清单**
 
 在方案 10 分成三类：确定性代码缺陷（已 TDD 修复并附提交）、模型质量问题（不改裁决规则）、外部权限/网络/重启阻塞（附复现命令和下一动作）。
 

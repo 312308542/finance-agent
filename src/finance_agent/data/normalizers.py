@@ -6,6 +6,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from hashlib import sha1
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -15,12 +16,14 @@ from finance_agent.data.models import (
     CryptoDerivativeSnapshotData,
     EventRecordData,
     EvidenceData,
-    FundNavSnapshotData,
     FundamentalSnapshotData,
+    FundNavSnapshotData,
     MarketBarData,
     RiskFindingData,
     UniverseSeedData,
 )
+
+ASHARE_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 def to_decimal(value: Any) -> Decimal:
@@ -629,8 +632,16 @@ def normalize_ashare_stock_news(
             continue
         summary = str(_first_present(row, ["新闻内容", "摘要", "内容"]) or "").strip() or None
         url = str(_first_present(row, ["新闻链接", "链接", "url"]) or "").strip() or None
-        published_at = parse_ashare_datetime(_first_present(row, ["发布时间", "时间", "日期"]))
-        event_id = stable_id("event", source, clean_symbol, title, published_at or collected_at)
+        raw_published_at = _first_present(row, ["发布时间", "时间", "日期"])
+        published_at = parse_ashare_published_datetime(raw_published_at)
+        legacy_identity_at = parse_ashare_datetime(raw_published_at)
+        event_id = stable_id(
+            "event",
+            source,
+            clean_symbol,
+            title,
+            legacy_identity_at or collected_at,
+        )
         evidence_id = stable_id("evidence", source, event_id)
         events.append(
             EventRecordData(
@@ -1909,6 +1920,20 @@ def parse_ashare_datetime(value: Any) -> datetime | None:
             return parsed.to_pydatetime().astimezone(UTC)
         return datetime.combine(parsed.date(), parsed.time() or time.min, tzinfo=UTC)
     return None
+
+
+def parse_ashare_published_datetime(value: Any) -> datetime | None:
+    """按北京时间解析 A 股新闻发布时间，并统一转换为 UTC。"""
+
+    if value is None or pd.isna(value):
+        return None
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed) or not isinstance(parsed, pd.Timestamp):
+        return None
+    published_at = parsed.to_pydatetime()
+    if published_at.tzinfo is None:
+        published_at = published_at.replace(tzinfo=ASHARE_TIMEZONE)
+    return published_at.astimezone(UTC)
 
 
 def infer_ashare_exchange_from_prefixed(symbol: str) -> str | None:
