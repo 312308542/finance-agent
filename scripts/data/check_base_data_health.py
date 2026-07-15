@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
 from typing import Any
 
 from sqlalchemy import text
@@ -21,6 +21,13 @@ from sqlalchemy import text
 from finance_agent.application.data_production_service import DataBackfillPlanner
 from finance_agent.cache import create_cache_client
 from finance_agent.data.collection_runtime import CollectionRuntime
+from finance_agent.data.freshness import (
+    ASHARE_FINANCIAL_INDICATOR_SOURCE,
+    ASHARE_HISTORICAL_VALUATION_SOURCE,
+    ASHARE_SPOT_VALUATION_SOURCE,
+    REPORTING_PERIOD_FRESHNESS_POLICY,
+    expected_ashare_report_period,
+)
 from finance_agent.storage.db import create_session_factory, session_scope
 
 JsonDict = dict[str, Any]
@@ -57,7 +64,6 @@ FRESHNESS_THRESHOLDS_HOURS = {
     "signal_snapshots": 24,
     "market_calendars": 24,
     "capital_flow_snapshots": 24,
-    "fundamental_snapshots": 72,
     "event_records": 48,
     "risk_findings": 48,
     "crypto_derivative_snapshots": 12,
@@ -205,6 +211,10 @@ def load_table_counts(session: Any) -> JsonDict:
             union all select 'screening_results', count(1) from screening_results
             union all select 'capital_flow_snapshots', count(1) from capital_flow_snapshots
             union all select 'fundamental_snapshots', count(1) from fundamental_snapshots
+            union all
+            select 'valuation_snapshots', count(1)
+            from fundamental_snapshots
+            where report_period is null
             union all select 'event_records', count(1) from event_records
             union all select 'evidence', count(1) from evidence
             union all select 'risk_findings', count(1) from risk_findings
@@ -232,7 +242,6 @@ def load_table_freshness(session: Any) -> list[JsonDict]:
                 union all
                 select 'market_calendars', trade_date::timestamptz from market_calendars
                 union all select 'capital_flow_snapshots', as_of from capital_flow_snapshots
-                union all select 'fundamental_snapshots', as_of from fundamental_snapshots
                 union all
                 select 'event_records',
                        least(coalesce(published_at, collected_at), collected_at)
@@ -272,7 +281,183 @@ def load_table_freshness(session: Any) -> list[JsonDict]:
             freshness,
             daily_market_bar=daily_market_bar,
         )
+    freshness.extend(
+        load_ashare_fundamental_freshness(
+            session,
+            checked_at=now,
+            daily_market_bar=daily_market_bar,
+        )
+    )
     return freshness
+
+
+def load_ashare_fundamental_freshness(
+    session: Any,
+    *,
+    checked_at: datetime,
+    daily_market_bar: JsonDict | None,
+) -> list[JsonDict]:
+    """按报告期和交易日分别读取 A 股财务、估值 freshness。"""
+
+    expected_report_period = expected_ashare_report_period(checked_at)
+    expected_valuation_at = parse_datetime(
+        (daily_market_bar or {}).get("expected_latest_as_of")
+    )
+    row = session.execute(
+        text(
+            """
+            with pool as (
+                select distinct asset_id
+                from asset_universe_members
+                where universe_id = 'universe:tradeable:ashare:main_board'
+                  and included is true
+            ),
+            latest_reports as (
+                select f.asset_id,
+                       max(to_date(f.report_period, 'YYYYMMDD')) as latest_report_period
+                from fundamental_snapshots f
+                join pool p on p.asset_id = f.asset_id
+                where f.source = :financial_source
+                  and f.report_period is not null
+                  and f.report_period ~ '^[0-9]{8}$'
+                group by f.asset_id
+            ),
+            latest_valuations as (
+                select f.asset_id, max(f.as_of) as latest_valuation_at
+                from fundamental_snapshots f
+                join pool p on p.asset_id = f.asset_id
+                where f.report_period is null
+                  and f.source in (:spot_valuation_source, :historical_valuation_source)
+                group by f.asset_id
+            )
+            select
+                (select count(1) from pool) as total_asset_count,
+                (select max(latest_report_period) from latest_reports) as latest_report_period,
+                (
+                    select count(1)
+                    from latest_reports
+                    where latest_report_period >= :expected_report_period
+                ) as report_covered_asset_count,
+                (
+                    select count(1)
+                    from latest_reports
+                    where latest_report_period < :expected_report_period
+                ) as report_stale_asset_count,
+                (
+                    select count(1)
+                    from pool p
+                    left join latest_reports r on r.asset_id = p.asset_id
+                    where r.asset_id is null
+                ) as report_missing_asset_count,
+                (select max(latest_valuation_at) from latest_valuations) as latest_valuation_at,
+                (
+                    select count(1)
+                    from latest_valuations
+                    where :expected_valuation_at is null
+                       or latest_valuation_at >= :expected_valuation_at
+                ) as valuation_covered_asset_count,
+                (
+                    select count(1)
+                    from latest_valuations
+                    where :expected_valuation_at is not null
+                      and latest_valuation_at < :expected_valuation_at
+                ) as valuation_stale_asset_count,
+                (
+                    select count(1)
+                    from pool p
+                    left join latest_valuations v on v.asset_id = p.asset_id
+                    where v.asset_id is null
+                ) as valuation_missing_asset_count
+            """
+        ),
+        {
+            "financial_source": ASHARE_FINANCIAL_INDICATOR_SOURCE,
+            "spot_valuation_source": ASHARE_SPOT_VALUATION_SOURCE,
+            "historical_valuation_source": ASHARE_HISTORICAL_VALUATION_SOURCE,
+            "expected_report_period": expected_report_period,
+            "expected_valuation_at": expected_valuation_at,
+        },
+    ).mappings().one()
+    total_asset_count = int(row["total_asset_count"] or 0)
+    latest_report_period = normalize_date_value(row["latest_report_period"])
+    latest_valuation_at = normalize_datetime_value(row["latest_valuation_at"])
+    expected_report_at = datetime.combine(expected_report_period, time.min, tzinfo=UTC)
+    return [
+        build_coverage_freshness_row(
+            table_name="fundamental_snapshots",
+            freshness_policy=REPORTING_PERIOD_FRESHNESS_POLICY,
+            latest_as_of=(
+                datetime.combine(latest_report_period, time.min, tzinfo=UTC)
+                if latest_report_period is not None
+                else None
+            ),
+            expected_latest_as_of=expected_report_at,
+            checked_at=checked_at,
+            total_asset_count=total_asset_count,
+            covered_asset_count=int(row["report_covered_asset_count"] or 0),
+            stale_asset_count=int(row["report_stale_asset_count"] or 0),
+            missing_asset_count=int(row["report_missing_asset_count"] or 0),
+            source=ASHARE_FINANCIAL_INDICATOR_SOURCE,
+        ),
+        build_coverage_freshness_row(
+            table_name="valuation_snapshots",
+            freshness_policy=DAILY_MARKET_BAR_FRESHNESS_POLICY,
+            latest_as_of=latest_valuation_at,
+            expected_latest_as_of=expected_valuation_at,
+            checked_at=checked_at,
+            total_asset_count=total_asset_count,
+            covered_asset_count=int(row["valuation_covered_asset_count"] or 0),
+            stale_asset_count=int(row["valuation_stale_asset_count"] or 0),
+            missing_asset_count=int(row["valuation_missing_asset_count"] or 0),
+            source=f"{ASHARE_SPOT_VALUATION_SOURCE},{ASHARE_HISTORICAL_VALUATION_SOURCE}",
+            market="ashare",
+            timeframe="1d",
+        ),
+    ]
+
+
+def build_coverage_freshness_row(
+    *,
+    table_name: str,
+    freshness_policy: str,
+    latest_as_of: datetime | None,
+    expected_latest_as_of: datetime | None,
+    checked_at: datetime,
+    total_asset_count: int,
+    covered_asset_count: int,
+    stale_asset_count: int,
+    missing_asset_count: int,
+    source: str,
+    market: str = "ashare",
+    timeframe: str | None = None,
+) -> JsonDict:
+    """构建带资产覆盖计数的 freshness 行。"""
+
+    age_hours = None
+    if latest_as_of is not None:
+        age_hours = (checked_at.astimezone(UTC) - latest_as_of).total_seconds() / 3600
+    row: JsonDict = {
+        "table_name": table_name,
+        "market": market,
+        "freshness_policy": freshness_policy,
+        "latest_as_of": latest_as_of.isoformat() if latest_as_of is not None else None,
+        "expected_latest_as_of": (
+            expected_latest_as_of.isoformat() if expected_latest_as_of is not None else None
+        ),
+        "age_hours": round(age_hours, 2) if age_hours is not None else None,
+        "threshold_hours": None,
+        "total_asset_count": total_asset_count,
+        "covered_asset_count": covered_asset_count,
+        "stale_asset_count": stale_asset_count,
+        "missing_asset_count": missing_asset_count,
+        "coverage_ratio": (
+            round(covered_asset_count / total_asset_count, 6) if total_asset_count > 0 else 0.0
+        ),
+        "source": source,
+    }
+    if timeframe is not None:
+        row["timeframe"] = timeframe
+    return row
 
 
 def load_daily_market_bar_freshness(session: Any, *, checked_at: datetime) -> JsonDict | None:
@@ -440,6 +625,17 @@ def infer_gaps(
         threshold_hours = row.get("threshold_hours")
         if freshness_row_is_stale(row):
             gaps.append(f"{table_name} 最近数据已过期，建议补采")
+        total_asset_count = int(row.get("total_asset_count") or 0)
+        stale_asset_count = int(row.get("stale_asset_count") or 0)
+        missing_asset_count = int(row.get("missing_asset_count") or 0)
+        coverage_gap = stale_asset_count + missing_asset_count
+        if total_asset_count > 0 and coverage_gap > 0:
+            coverage_name = (
+                "报告期" if row.get("freshness_policy") == REPORTING_PERIOD_FRESHNESS_POLICY else "当前截面"
+            )
+            gaps.append(
+                f"{table_name} {coverage_name}覆盖缺口 {coverage_gap}/{total_asset_count}"
+            )
     if recommendation_readiness and recommendation_readiness.get("status") != "ready":
         reasons = recommendation_readiness.get("reasons") or []
         if reasons:
@@ -496,6 +692,13 @@ def build_recommendation_readiness(
             table_counts=table_counts,
             freshness_by_table=freshness_by_table,
             table_name="fundamental_snapshots",
+            min_count=1,
+            required=False,
+        ),
+        "valuation_snapshots": readiness_dimension(
+            table_counts=table_counts,
+            freshness_by_table=freshness_by_table,
+            table_name="valuation_snapshots",
             min_count=1,
             required=False,
         ),
@@ -630,12 +833,30 @@ def readiness_dimension(
     for key in ("freshness_policy", "expected_latest_as_of", "expected_close_at", "timeframe"):
         if key in freshness:
             result[key] = freshness[key]
+    for key in (
+        "total_asset_count",
+        "covered_asset_count",
+        "stale_asset_count",
+        "missing_asset_count",
+        "coverage_ratio",
+        "source",
+    ):
+        if key in freshness:
+            result[key] = freshness[key]
     return result
 
 
 def freshness_row_is_stale(row: JsonDict) -> bool:
     """判断 freshness 行是否过期，日 K 走交易日收盘语义。"""
 
+    if str(row.get("freshness_policy") or "") == REPORTING_PERIOD_FRESHNESS_POLICY:
+        expected_latest = parse_datetime(row.get("expected_latest_as_of"))
+        latest_as_of = parse_datetime(row.get("latest_as_of"))
+        if expected_latest is None:
+            return False
+        if latest_as_of is None:
+            return True
+        return latest_as_of.date() < expected_latest.date()
     if is_trading_day_close_freshness(row):
         expected_latest = parse_datetime(row.get("expected_latest_as_of"))
         latest_as_of = parse_datetime(row.get("latest_as_of"))
@@ -666,7 +887,7 @@ def is_trading_day_close_freshness(row: JsonDict) -> bool:
 
     table_name = str(row.get("table_name") or "")
     return (
-        table_name in {"market_bars", *DAILY_DERIVED_SNAPSHOT_TABLES}
+        table_name in {"market_bars", "valuation_snapshots", *DAILY_DERIVED_SNAPSHOT_TABLES}
         and str(row.get("timeframe") or "") == "1d"
         and (
             str(row.get("freshness_policy") or "") == DAILY_MARKET_BAR_FRESHNESS_POLICY
@@ -700,6 +921,16 @@ def normalize_datetime_value(value: Any) -> datetime | None:
     return value.astimezone(UTC)
 
 
+def normalize_date_value(value: Any) -> date | None:
+    """把数据库日期值统一为 date。"""
+
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return None
+
+
 def build_refresh_hints(
     table_counts: JsonDict,
     freshness_rows: list[JsonDict],
@@ -709,6 +940,7 @@ def build_refresh_hints(
 
     latest_by_endpoint = {row["endpoint"]: row for row in provider_rows}
     hints: list[JsonDict] = []
+    hinted_tables: set[str] = set()
     for row in freshness_rows:
         table_name = str(row.get("table_name") or "")
         age_hours = row.get("age_hours")
@@ -722,6 +954,22 @@ def build_refresh_hints(
                 "threshold_hours": threshold_hours,
                 "action": "refresh",
                 "reason": f"{table_name} 超过 freshness 阈值，需要补采",
+            }
+        )
+        hinted_tables.add(table_name)
+    for row in freshness_rows:
+        table_name = str(row.get("table_name") or "")
+        total_asset_count = int(row.get("total_asset_count") or 0)
+        coverage_gap = int(row.get("stale_asset_count") or 0) + int(
+            row.get("missing_asset_count") or 0
+        )
+        if total_asset_count <= 0 or coverage_gap <= 0 or table_name in hinted_tables:
+            continue
+        hints.append(
+            {
+                "table_name": table_name,
+                "action": "refresh",
+                "reason": f"{table_name} 资产覆盖缺口 {coverage_gap}/{total_asset_count}，需要补采",
             }
         )
     if int(table_counts.get("capital_flow_snapshots") or 0) <= 0:

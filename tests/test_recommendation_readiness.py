@@ -9,6 +9,7 @@ from scripts.data.check_base_data_health import (
     load_table_counts,
     load_table_freshness,
 )
+from finance_agent.application.data_production_service import DataBackfillPlanner
 
 
 def test_build_recommendation_readiness_marks_ready_when_core_dimensions_pass() -> None:
@@ -174,6 +175,126 @@ def test_daily_market_bar_freshness_detects_missing_expected_trade_date() -> Non
     )
 
 
+def test_reporting_period_freshness_detects_missing_expected_report_period() -> None:
+    """财报最新报告期早于法定应有报告期时应判 stale。"""
+
+    assert freshness_row_is_stale(
+        {
+            "table_name": "fundamental_snapshots",
+            "freshness_policy": "reporting_period",
+            "latest_as_of": "2025-12-31T00:00:00+00:00",
+            "expected_latest_as_of": "2026-03-31T00:00:00+00:00",
+            "age_hours": 2400,
+            "threshold_hours": None,
+        }
+    )
+
+
+def test_reporting_period_freshness_ignores_fixed_hour_age_when_period_is_current() -> None:
+    """当前报告期已达标时，不能再按 72 小时阈值误判过期。"""
+
+    assert not freshness_row_is_stale(
+        {
+            "table_name": "fundamental_snapshots",
+            "freshness_policy": "reporting_period",
+            "latest_as_of": "2026-03-31T00:00:00+00:00",
+            "expected_latest_as_of": "2026-03-31T00:00:00+00:00",
+            "age_hours": 2400,
+            "threshold_hours": None,
+        }
+    )
+
+
+def test_infer_gaps_reports_fundamental_coverage_gap_separately() -> None:
+    """报告期覆盖缺口应按资产计数展示，不能被全表最新一条掩盖。"""
+
+    gaps = infer_gaps(
+        {
+            "assets": 10,
+            "asset_universe_members": 10,
+            "market_calendars": 1,
+            "market_bars": 10,
+            "capital_flow_snapshots": 10,
+            "fundamental_snapshots": 10,
+            "event_records": 10,
+            "evidence": 10,
+            "risk_findings": 10,
+            "crypto_derivative_snapshots": 10,
+        },
+        provider_rows=[],
+        freshness_rows=[
+            {
+                "table_name": "fundamental_snapshots",
+                "freshness_policy": "reporting_period",
+                "latest_as_of": "2026-03-31T00:00:00+00:00",
+                "expected_latest_as_of": "2026-03-31T00:00:00+00:00",
+                "total_asset_count": 3482,
+                "covered_asset_count": 3201,
+                "stale_asset_count": 281,
+                "missing_asset_count": 0,
+            }
+        ],
+    )
+
+    assert "fundamental_snapshots 报告期覆盖缺口 281/3482" in gaps
+
+
+def test_build_recommendation_readiness_includes_optional_valuation_dimension() -> None:
+    """估值 freshness 应作为独立可选维度进入推荐就绪度。"""
+
+    checked_at = datetime(2026, 7, 15, 10, tzinfo=UTC)
+    readiness = build_recommendation_readiness(
+        checked_at=checked_at,
+        table_counts={
+            "market_bars": 2_200_000,
+            "asset_scores": 4_000,
+            "factor_frames": 4_000,
+            "valuation_snapshots": 3_200,
+        },
+        freshness_rows=[
+            freshness("market_bars", checked_at - timedelta(hours=2), 12, checked_at),
+            freshness("asset_scores", checked_at - timedelta(hours=3), 24, checked_at),
+            freshness("factor_frames", checked_at - timedelta(hours=3), 24, checked_at),
+            {
+                "table_name": "valuation_snapshots",
+                "timeframe": "1d",
+                "market": "ashare",
+                "freshness_policy": "trading_day_close",
+                "latest_as_of": "2026-07-14T00:00:00+00:00",
+                "expected_latest_as_of": "2026-07-14T00:00:00+00:00",
+                "age_hours": 34,
+                "threshold_hours": None,
+            },
+        ],
+        universe_counts=[{"universe_id": "ashare:mainboard:tradable", "member_count": 3200}],
+        gaps=[],
+    )
+
+    assert readiness["dimensions"]["valuation_snapshots"]["status"] == "ready"
+    assert readiness["dimensions"]["valuation_snapshots"]["required"] is False
+
+
+def test_valuation_refresh_hint_builds_realtime_quote_backfill_job() -> None:
+    """估值 stale 应复用全市场实时行情任务，不能生成逐股全量估值任务。"""
+
+    jobs = DataBackfillPlanner().build_backfill_jobs(
+        health_summary={
+            "refresh_hints": [
+                {
+                    "table_name": "valuation_snapshots",
+                    "action": "refresh",
+                    "reason": "估值当前截面过期",
+                }
+            ],
+            "gaps": [],
+        }
+    )
+
+    assert len(jobs) == 1
+    assert jobs[0].task_type == "realtime_quote_refresh"
+    assert jobs[0].group == "ashare-p0"
+
+
 def test_build_recommendation_readiness_blocks_when_scores_are_missing_or_stale() -> None:
     checked_at = datetime(2026, 6, 30, 10, tzinfo=UTC)
     readiness = build_recommendation_readiness(
@@ -303,12 +424,12 @@ class FreshnessRecordingSession:
 
     def execute(self, statement: object, *_args: object) -> FreshnessRecordingResult:
         self.sql_statements.append(str(statement))
-        return FreshnessRecordingResult(is_daily_query=len(self.sql_statements) > 1)
+        return FreshnessRecordingResult(query_index=len(self.sql_statements))
 
 
 class FreshnessRecordingResult:
-    def __init__(self, *, is_daily_query: bool) -> None:
-        self.is_daily_query = is_daily_query
+    def __init__(self, *, query_index: int) -> None:
+        self.query_index = query_index
 
     def mappings(self) -> FreshnessRecordingResult:
         return self
@@ -317,9 +438,21 @@ class FreshnessRecordingResult:
         return iter(())
 
     def one(self) -> dict[str, object | None]:
-        assert self.is_daily_query
+        if self.query_index == 2:
+            return {
+                "latest_as_of": None,
+                "expected_latest_as_of": None,
+                "expected_close_at": None,
+            }
+        assert self.query_index == 3
         return {
-            "latest_as_of": None,
-            "expected_latest_as_of": None,
-            "expected_close_at": None,
+            "total_asset_count": 0,
+            "latest_report_period": None,
+            "report_covered_asset_count": 0,
+            "report_stale_asset_count": 0,
+            "report_missing_asset_count": 0,
+            "latest_valuation_at": None,
+            "valuation_covered_asset_count": 0,
+            "valuation_stale_asset_count": 0,
+            "valuation_missing_asset_count": 0,
         }

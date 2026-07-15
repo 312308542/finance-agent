@@ -335,6 +335,18 @@ class DataBackfillPlanner:
                 params={"group": ["ashare-p2"]},
             ),
         ),
+        "valuation_snapshots": (
+            BackfillJobPlan(
+                task_key="ashare_valuation_snapshot_refresh",
+                market="ashare",
+                task_type="realtime_quote_refresh",
+                group="ashare-p0",
+                reason="A 股当前估值截面缺口或过期",
+                priority=85,
+                data_packages=("realtime_quotes", "valuation"),
+                params={"group": ["ashare-p0"]},
+            ),
+        ),
         "event_records": (
             BackfillJobPlan(
                 task_key="ashare_event_refresh",
