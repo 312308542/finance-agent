@@ -106,6 +106,7 @@ def test_ashare_asset_collection_uses_asset_batch_methods(monkeypatch: pytest.Mo
                             "raw": {
                                 "市盈率-动态": "12.34",
                                 "市净率": "1.56",
+                                "更新时间戳": 1780819921,
                             }
                         },
                     ),
@@ -147,7 +148,7 @@ def test_ashare_asset_collection_uses_asset_batch_methods(monkeypatch: pytest.Mo
     assert valuation["source"] == "akshare:stock_zh_a_spot"
     assert valuation["pe_ttm"] == Decimal("12.34")
     assert valuation["pb"] == Decimal("1.56")
-    assert valuation["as_of"] == datetime(2026, 6, 8, tzinfo=UTC)
+    assert valuation["as_of"] == datetime(2026, 6, 7, tzinfo=UTC)
     assert valuation["payload"]["raw_record_id"] == "raw:test"
     assert valuation["payload"]["valuation_kind"] == "spot_snapshot"
 

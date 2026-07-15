@@ -742,6 +742,7 @@ def test_fetch_assets_eastmoney_uses_curl_cffi_when_akshare_disconnects(monkeypa
                             "f3": -0.93,
                             "f9": 5.32,
                             "f23": 0.58,
+                            "f124": 1780819921,
                         },
                         {
                             "f12": "600519",
@@ -750,6 +751,7 @@ def test_fetch_assets_eastmoney_uses_curl_cffi_when_akshare_disconnects(monkeypa
                             "f3": 0.12,
                             "f9": 20.11,
                             "f23": 7.21,
+                            "f124": 1780819922,
                         },
                     ],
                 }
@@ -782,8 +784,10 @@ def test_fetch_assets_eastmoney_uses_curl_cffi_when_akshare_disconnects(monkeypa
     assert captured["kwargs"]["headers"]["Cookie"] == "qgqp_b_id=test-cookie"
     assert "f9" in captured["kwargs"]["params"]["fields"]
     assert "f23" in captured["kwargs"]["params"]["fields"]
+    assert "f124" in captured["kwargs"]["params"]["fields"]
     assert result.assets[0].payload["raw"]["市盈率-动态"] == 5.32
     assert result.assets[0].payload["raw"]["市净率"] == 0.58
+    assert result.assets[0].payload["raw"]["更新时间戳"] == 1780819921
 
 
 def test_fetch_assets_eastmoney_curl_cffi_tries_next_host(monkeypatch) -> None:
@@ -807,6 +811,7 @@ def test_fetch_assets_eastmoney_curl_cffi_tries_next_host(monkeypatch) -> None:
                             "f3": -0.93,
                             "f9": 5.32,
                             "f23": 0.58,
+                            "f124": 1780819921,
                         }
                     ],
                 }
@@ -817,7 +822,7 @@ def test_fetch_assets_eastmoney_curl_cffi_tries_next_host(monkeypatch) -> None:
             return {
                 "data": {
                     "total": 1,
-                    "diff": [{"f12": "000001", "f14": "平安银行", "f2": 10.66}],
+                        "diff": [{"f12": "000001", "f14": "平安银行", "f2": 10.66}],
                 }
             }
 
@@ -868,6 +873,7 @@ def test_fetch_assets_eastmoney_curl_cffi_reuses_successful_host_for_next_page(
                         "f3": -0.93,
                         "f9": 5.32,
                         "f23": 0.58,
+                        "f124": 1780819921,
                     }
                 ]
                 if self.page == "1"
@@ -917,6 +923,7 @@ def test_fetch_assets_eastmoney_curl_cffi_retries_transient_page_disconnect(
                 "f3": 0.1,
                 "f9": 5.0,
                 "f23": 1.0,
+                "f124": 1780819921,
             }
             return {"data": {"total": 2, "diff": [row]}}
 

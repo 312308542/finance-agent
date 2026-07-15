@@ -324,7 +324,7 @@ class AkshareProvider:
             "invt": "2",
             "fid": "f3",
             "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-            "fields": "f12,f14,f2,f3,f9,f23",
+            "fields": "f12,f14,f2,f3,f9,f23,f124",
             "pz": str(page_size),
         }
         for page in range(1, max_pages + 1):
@@ -391,6 +391,7 @@ class AkshareProvider:
                 "f3": "涨跌幅",
                 "f9": "市盈率-动态",
                 "f23": "市净率",
+                "f124": "更新时间戳",
             },
             inplace=True,
         )

@@ -381,7 +381,6 @@ def build_ashare_spot_valuation_rows(
 ) -> list[JsonDict]:
     """从全市场实时行情原始行生成日级 PE/PB 估值快照。"""
 
-    snapshot_at = ashare_daily_snapshot_at(collected_at)
     rows: list[JsonDict] = []
     for asset in assets:
         pe_ttm = _first_decimal(
@@ -397,6 +396,15 @@ def build_ashare_spot_valuation_rows(
         if len(missing_fields) == 2:
             continue
         raw = asset.payload.get("raw")
+        source_observed_at = collected_at
+        if isinstance(raw, dict):
+            try:
+                source_timestamp = int(raw.get("更新时间戳") or 0)
+            except (TypeError, ValueError):
+                source_timestamp = 0
+            if source_timestamp > 0:
+                source_observed_at = datetime.fromtimestamp(source_timestamp, tz=UTC)
+        snapshot_at = ashare_daily_snapshot_at(source_observed_at)
         rows.append(
             {
                 "snapshot_id": stable_id(
