@@ -38,6 +38,7 @@ def test_ashare_asset_collection_uses_asset_batch_methods(monkeypatch: pytest.Mo
         "mappings": [],
         "statuses": [],
         "quotes": [],
+        "fundamentals": [],
     }
 
     class FakeAssetRepository:
@@ -77,6 +78,17 @@ def test_ashare_asset_collection_uses_asset_batch_methods(monkeypatch: pytest.Mo
         def replace_members(self, **_kwargs: Any) -> None:
             pass
 
+    class FakeFundamentalRepository:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        def upsert_fundamental_snapshots(self, rows: list[dict[str, Any]]) -> int:
+            calls["fundamentals"].append(rows)
+            return len(rows)
+
+        def upsert_fundamental_snapshot(self, **_kwargs: Any) -> None:
+            raise AssertionError("不应在全市场行情刷新中逐条写估值快照")
+
     class FakeProvider:
         def fetch_assets(self, *, limit: int | None = None) -> AssetListResult:
             return AssetListResult(
@@ -90,6 +102,12 @@ def test_ashare_asset_collection_uses_asset_batch_methods(monkeypatch: pytest.Mo
                         name="平安银行",
                         market="ashare",
                         asset_type="stock",
+                        payload={
+                            "raw": {
+                                "市盈率-动态": "12.34",
+                                "市净率": "1.56",
+                            }
+                        },
                     ),
                     AssetData(
                         asset_id="ashare:600519",
@@ -97,12 +115,17 @@ def test_ashare_asset_collection_uses_asset_batch_methods(monkeypatch: pytest.Mo
                         name="贵州茅台",
                         market="ashare",
                         asset_type="stock",
+                        payload={"raw": {"市盈率-动态": "-", "市净率": None}},
                     ),
                 ],
             )
 
     monkeypatch.setattr("finance_agent.data.collectors.AssetRepository", FakeAssetRepository)
     monkeypatch.setattr("finance_agent.data.collectors.UniverseRepository", FakeUniverseRepository)
+    monkeypatch.setattr(
+        "finance_agent.data.collectors.FundamentalDataRepository",
+        FakeFundamentalRepository,
+    )
     monkeypatch.setattr("finance_agent.data.collectors.RawRecordRepository", lambda _session: _FakeRawRecords())
 
     AshareP0Collector(object(), provider=FakeProvider()).collect_assets(
@@ -111,7 +134,22 @@ def test_ashare_asset_collection_uses_asset_batch_methods(monkeypatch: pytest.Mo
         strategy_context="test",
     )
 
-    assert [len(items[0]) for items in calls.values()] == [2, 2, 2, 2, 2]
+    assert [len(calls[key][0]) for key in ("masters", "profiles", "mappings", "statuses", "quotes")] == [
+        2,
+        2,
+        2,
+        2,
+        2,
+    ]
+    assert len(calls["fundamentals"][0]) == 1
+    valuation = calls["fundamentals"][0][0]
+    assert valuation["asset_id"] == "ashare:000001"
+    assert valuation["source"] == "akshare:stock_zh_a_spot"
+    assert valuation["pe_ttm"] == Decimal("12.34")
+    assert valuation["pb"] == Decimal("1.56")
+    assert valuation["as_of"] == datetime(2026, 6, 8, tzinfo=UTC)
+    assert valuation["payload"]["raw_record_id"] == "raw:test"
+    assert valuation["payload"]["valuation_kind"] == "spot_snapshot"
 
 
 def test_ashare_flow_rank_uses_batch_fact_persistence(monkeypatch: pytest.MonkeyPatch) -> None:

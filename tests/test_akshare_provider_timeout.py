@@ -735,8 +735,22 @@ def test_fetch_assets_eastmoney_uses_curl_cffi_when_akshare_disconnects(monkeypa
                 "data": {
                     "total": 2,
                     "diff": [
-                        {"f12": "000001", "f14": "平安银行", "f2": 10.66, "f3": -0.93},
-                        {"f12": "600519", "f14": "贵州茅台", "f2": 1410.0, "f3": 0.12},
+                        {
+                            "f12": "000001",
+                            "f14": "平安银行",
+                            "f2": 10.66,
+                            "f3": -0.93,
+                            "f9": 5.32,
+                            "f23": 0.58,
+                        },
+                        {
+                            "f12": "600519",
+                            "f14": "贵州茅台",
+                            "f2": 1410.0,
+                            "f3": 0.12,
+                            "f9": 20.11,
+                            "f23": 7.21,
+                        },
                     ],
                 }
             }
@@ -766,10 +780,14 @@ def test_fetch_assets_eastmoney_uses_curl_cffi_when_akshare_disconnects(monkeypa
     ]
     assert captured["kwargs"]["timeout"] == 7.0
     assert captured["kwargs"]["headers"]["Cookie"] == "qgqp_b_id=test-cookie"
+    assert "f9" in captured["kwargs"]["params"]["fields"]
+    assert "f23" in captured["kwargs"]["params"]["fields"]
+    assert result.assets[0].payload["raw"]["市盈率-动态"] == 5.32
+    assert result.assets[0].payload["raw"]["市净率"] == 0.58
 
 
 def test_fetch_assets_eastmoney_curl_cffi_tries_next_host(monkeypatch) -> None:
-    """东方财富列表子域名超时时，应尝试下一个 push2 子域名。"""
+    """东方财富列表子域名超时或缺估值字段时，应尝试下一个域名。"""
 
     called_urls: list[str] = []
 
@@ -781,15 +799,35 @@ def test_fetch_assets_eastmoney_curl_cffi_tries_next_host(monkeypatch) -> None:
             return {
                 "data": {
                     "total": 1,
-                    "diff": [{"f12": "000001", "f14": "平安银行", "f2": 10.66, "f3": -0.93}],
+                    "diff": [
+                        {
+                            "f12": "000001",
+                            "f14": "平安银行",
+                            "f2": 10.66,
+                            "f3": -0.93,
+                            "f9": 5.32,
+                            "f23": 0.58,
+                        }
+                    ],
+                }
+            }
+
+    class IncompleteResponse(FakeResponse):
+        def json(self) -> dict:
+            return {
+                "data": {
+                    "total": 1,
+                    "diff": [{"f12": "000001", "f14": "平安银行", "f2": 10.66}],
                 }
             }
 
     def fake_get(url, **kwargs):
         called_urls.append(url)
         if len(called_urls) == 1:
-            raise TimeoutError("first host timeout")
-        return FakeResponse()
+            return IncompleteResponse()
+        if url == "http://push2delay.eastmoney.com/api/qt/clist/get":
+            return FakeResponse()
+        raise TimeoutError("host timeout")
 
     monkeypatch.delenv("FINANCE_AGENT_EASTMONEY_COOKIE", raising=False)
     monkeypatch.setattr(
@@ -800,7 +838,106 @@ def test_fetch_assets_eastmoney_curl_cffi_tries_next_host(monkeypatch) -> None:
     df = AkshareProvider(request_timeout_seconds=7.0)._fetch_assets_eastmoney_curl_cffi()
 
     assert len(df.index) == 1
-    assert len(called_urls) == 2
+    assert called_urls[-1] == "http://push2delay.eastmoney.com/api/qt/clist/get"
+    assert df.iloc[0]["市盈率-动态"] == 5.32
+    assert df.iloc[0]["市净率"] == 0.58
+
+
+def test_fetch_assets_eastmoney_curl_cffi_reuses_successful_host_for_next_page(
+    monkeypatch,
+) -> None:
+    """找到完整备用域名后，后续分页应直接复用，避免重复探测失效主机。"""
+
+    delay_url = "http://push2delay.eastmoney.com/api/qt/clist/get"
+    calls: list[tuple[str, str]] = []
+
+    class FakeResponse:
+        def __init__(self, *, page: str) -> None:
+            self.page = page
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            rows = (
+                [
+                    {
+                        "f12": "000001",
+                        "f14": "平安银行",
+                        "f2": 10.66,
+                        "f3": -0.93,
+                        "f9": 5.32,
+                        "f23": 0.58,
+                    }
+                ]
+                if self.page == "1"
+                else []
+            )
+            return {"data": {"total": 201, "diff": rows}}
+
+    def fake_get(url, **kwargs):
+        page = kwargs["params"]["pn"]
+        calls.append((url, page))
+        if url == delay_url:
+            return FakeResponse(page=page)
+        raise TimeoutError("host timeout")
+
+    monkeypatch.setattr(
+        "finance_agent.data.providers.akshare_provider.curl_requests.get",
+        fake_get,
+    )
+
+    df = AkshareProvider(request_timeout_seconds=7.0)._fetch_assets_eastmoney_curl_cffi()
+
+    assert len(df.index) == 1
+    second_page_calls = [url for url, page in calls if page == "2"]
+    assert second_page_calls == [delay_url]
+
+
+def test_fetch_assets_eastmoney_curl_cffi_retries_transient_page_disconnect(
+    monkeypatch,
+) -> None:
+    """可用域名的单页瞬时断连应原地重试，不能放弃完整估值报文。"""
+
+    delay_url = "http://push2delay.eastmoney.com/api/qt/clist/get"
+    attempts: dict[str, int] = {}
+
+    class FakeResponse:
+        def __init__(self, *, page: str) -> None:
+            self.page = page
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            row = {
+                "f12": f"00000{self.page}",
+                "f14": f"测试{self.page}",
+                "f2": 10.0,
+                "f3": 0.1,
+                "f9": 5.0,
+                "f23": 1.0,
+            }
+            return {"data": {"total": 2, "diff": [row]}}
+
+    def fake_get(url, **kwargs):
+        page = kwargs["params"]["pn"]
+        if url != delay_url:
+            raise TimeoutError("host timeout")
+        attempts[page] = attempts.get(page, 0) + 1
+        if page == "2" and attempts[page] == 1:
+            raise ConnectionError("transient disconnect")
+        return FakeResponse(page=page)
+
+    monkeypatch.setattr(
+        "finance_agent.data.providers.akshare_provider.curl_requests.get",
+        fake_get,
+    )
+
+    df = AkshareProvider(request_timeout_seconds=7.0)._fetch_assets_eastmoney_curl_cffi()
+
+    assert len(df.index) == 2
+    assert attempts["2"] == 2
 
 
 def test_fetch_assets_falls_back_to_full_code_name_before_tencent(monkeypatch) -> None:

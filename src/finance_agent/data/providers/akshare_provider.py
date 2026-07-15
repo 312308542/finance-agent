@@ -310,11 +310,13 @@ class AkshareProvider:
             "https://20.push2.eastmoney.com/api/qt/clist/get",
             "https://29.push2.eastmoney.com/api/qt/clist/get",
             "https://push2his.eastmoney.com/api/qt/clist/get",
+            "http://push2delay.eastmoney.com/api/qt/clist/get",
         ]
         page_size = 200
         max_pages = 80
         rows: list[dict[str, Any]] = []
         total: int | None = None
+        preferred_url: str | None = None
         base_params = {
             "po": "1",
             "np": "1",
@@ -322,30 +324,54 @@ class AkshareProvider:
             "invt": "2",
             "fid": "f3",
             "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-            "fields": "f12,f14,f2,f3",
+            "fields": "f12,f14,f2,f3,f9,f23",
             "pz": str(page_size),
         }
         for page in range(1, max_pages + 1):
             last_error: Exception | None = None
-            for url in urls:
-                try:
-                    response = curl_requests.get(
-                        url,
-                        params=base_params | {"pn": str(page)},
-                        timeout=self.request_timeout_seconds,
-                        impersonate="chrome120",
-                        headers=eastmoney_headers(),
-                    )
+            data: dict[str, Any] = {}
+            page_rows: list[dict[str, Any]] = []
+            page_urls = (
+                [preferred_url, *(url for url in urls if url != preferred_url)]
+                if preferred_url is not None
+                else urls
+            )
+            host_succeeded = False
+            for url in page_urls:
+                max_attempts = 3 if url == preferred_url or "push2delay" in url else 1
+                for _attempt in range(max_attempts):
+                    try:
+                        response = curl_requests.get(
+                            url,
+                            params=base_params | {"pn": str(page)},
+                            timeout=self.request_timeout_seconds,
+                            impersonate="chrome120",
+                            headers=eastmoney_headers(),
+                        )
+                        response.raise_for_status()
+                        candidate_data = response.json().get("data") or {}
+                        candidate_rows = candidate_data.get("diff") or []
+                    except Exception as exc:
+                        last_error = exc
+                        continue
+                    if candidate_rows and not all(
+                        "f9" in row and "f23" in row for row in candidate_rows
+                    ):
+                        last_error = RuntimeError(
+                            f"东方财富 A 股列表响应缺少估值字段 url={url}"
+                        )
+                        break
+                    data = candidate_data
+                    page_rows = candidate_rows
+                    preferred_url = url
+                    host_succeeded = True
                     break
-                except Exception as exc:
-                    last_error = exc
-            else:
+                if host_succeeded:
+                    break
+            if not host_succeeded:
                 if last_error is not None:
                     raise last_error
                 raise RuntimeError("未配置可用的东方财富 A 股列表接口")
-            response.raise_for_status()
-            data = response.json().get("data") or {}
-            page_rows = data.get("diff") or []
             if total is None:
                 total_value = data.get("total")
                 total = int(total_value) if total_value is not None else None
@@ -363,6 +389,8 @@ class AkshareProvider:
                 "f14": "名称",
                 "f2": "最新价",
                 "f3": "涨跌幅",
+                "f9": "市盈率-动态",
+                "f23": "市净率",
             },
             inplace=True,
         )

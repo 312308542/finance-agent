@@ -33,6 +33,11 @@ from finance_agent.data.models import (
     UniverseSeedData,
     UniverseSeedsResult,
 )
+from finance_agent.data.freshness import (
+    ASHARE_SPOT_VALUATION_SOURCE,
+    ashare_daily_snapshot_at,
+)
+from finance_agent.data.normalizers import stable_id
 from finance_agent.data.providers import (
     AkshareFundProvider,
     AkshareProvider,
@@ -366,6 +371,57 @@ def _persist_asset_identity_rows(
         "upsert_realtime_quote_snapshot",
         quote_rows,
     )
+
+
+def build_ashare_spot_valuation_rows(
+    assets: Sequence[AssetData],
+    *,
+    collected_at: datetime,
+    raw_record_id: str,
+) -> list[JsonDict]:
+    """从全市场实时行情原始行生成日级 PE/PB 估值快照。"""
+
+    snapshot_at = ashare_daily_snapshot_at(collected_at)
+    rows: list[JsonDict] = []
+    for asset in assets:
+        pe_ttm = _first_decimal(
+            asset.payload,
+            ("市盈率-动态", "市盈率动态", "PE(TTM)", "滚动市盈率"),
+        )
+        pb = _first_decimal(asset.payload, ("市净率", "PB"))
+        missing_fields = [
+            field_name
+            for field_name, value in (("pe_ttm", pe_ttm), ("pb", pb))
+            if value is None
+        ]
+        if len(missing_fields) == 2:
+            continue
+        raw = asset.payload.get("raw")
+        rows.append(
+            {
+                "snapshot_id": stable_id(
+                    "fundamental",
+                    ASHARE_SPOT_VALUATION_SOURCE,
+                    asset.symbol,
+                    snapshot_at,
+                ),
+                "asset_id": asset.asset_id,
+                "symbol": asset.symbol,
+                "report_period": None,
+                "pe_ttm": pe_ttm,
+                "pb": pb,
+                "source": ASHARE_SPOT_VALUATION_SOURCE,
+                "status": "partial" if missing_fields else "available",
+                "missing_fields": missing_fields,
+                "as_of": snapshot_at,
+                "payload": {
+                    "raw": raw if isinstance(raw, dict) else {},
+                    "raw_record_id": raw_record_id,
+                    "valuation_kind": "spot_snapshot",
+                },
+            }
+        )
+    return rows
 
 
 def _persist_seed_identity_rows(
@@ -865,6 +921,7 @@ class AshareP0Collector:
         self.assets = AssetRepository(session)
         self.universes = UniverseRepository(session)
         self.market_data = MarketDataRepository(session)
+        self.fundamentals = FundamentalDataRepository(session)
         self.raw_records = RawRecordRepository(session)
         self.provider = provider or AkshareProvider()
 
@@ -912,6 +969,16 @@ class AshareP0Collector:
             raw_record_id=raw_record_id,
             source="akshare:stock_zh_a_spot",
             include_realtime_quote=True,
+        )
+        _persist_rows(
+            self.fundamentals,
+            "upsert_fundamental_snapshots",
+            "upsert_fundamental_snapshot",
+            build_ashare_spot_valuation_rows(
+                result.assets,
+                collected_at=result.collected_at,
+                raw_record_id=raw_record_id,
+            ),
         )
         self.universes.replace_members(
             universe_id=universe_id,
