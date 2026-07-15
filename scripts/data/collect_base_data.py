@@ -45,6 +45,10 @@ from finance_agent.data.collectors import (
     FundDataCollector,
 )
 from finance_agent.data.models import ProviderResult
+from finance_agent.data.freshness import (
+    ASHARE_FINANCIAL_INDICATOR_SOURCE,
+    expected_ashare_report_period,
+)
 from finance_agent.data.normalizers import (
     compact_crypto_symbol,
     normalize_ashare_symbol,
@@ -62,6 +66,7 @@ from finance_agent.storage.orm import (
     AssetRecommendationORM,
     DataSyncWatermarkORM,
     EventRecordORM,
+    FundamentalSnapshotORM,
     FundNavSnapshotORM,
     MarketCalendarORM,
     MarketBarORM,
@@ -95,6 +100,7 @@ CRYPTO_MARKET_BAR_PROVIDER = "ccxt_binance_fetch_ohlcv"
 CRYPTO_DERIVATIVE_DATA_DOMAIN = "derivatives"
 CRYPTO_DERIVATIVE_PROVIDER = "binance_derivative_snapshot"
 ASHARE_BAR_COVERAGE_QUERY_CHUNK_SIZE = 500
+ASHARE_FUNDAMENTAL_COVERAGE_QUERY_CHUNK_SIZE = 500
 FUND_COVERAGE_QUERY_CHUNK_SIZE = 200
 EASTMONEY_KLINE_COOKIE_PROGRESS_SOURCE = "eastmoney_kline_cookie"
 FUND_MARKET_BAR_DATA_DOMAIN = "fund_market_bars"
@@ -4148,7 +4154,7 @@ def batch_ashare_fundamental_symbols(
     only_failed_or_stale: bool = False,
     stale_before: datetime | None = None,
 ) -> list[str]:
-    """按财务/估值水位选择 A 股基本面刷新标的。"""
+    """按财报报告期和估值水位选择 A 股基本面刷新标的。"""
 
     selection_failed = False
     has_candidate_assets = False
@@ -4158,40 +4164,31 @@ def batch_ashare_fundamental_symbols(
         assets = eligibility.filter_tradeable_assets(repo.find_by_market("ashare"))
         has_candidate_assets = bool(assets)
         asset_ids = [asset.asset_id for asset in assets]
-        watermarks_by_domain: dict[str, dict[str, Any]] = {}
+        valuation_watermarks: dict[str, Any] = {}
+        financial_report_periods: dict[str, str] = {}
         if only_failed_or_stale:
-            watermarks_by_domain = {
-                ASHARE_FUNDAMENTAL_DATA_DOMAIN: _fetch_data_sync_watermarks(
-                    session,
-                    asset_ids,
-                    data_domain=ASHARE_FUNDAMENTAL_DATA_DOMAIN,
-                    provider=ASHARE_FINANCIAL_INDICATORS_PROVIDER,
-                    timeframe="",
-                ),
-                ASHARE_VALUATION_DATA_DOMAIN: _fetch_data_sync_watermarks(
-                    session,
-                    asset_ids,
-                    data_domain=ASHARE_VALUATION_DATA_DOMAIN,
-                    provider=ASHARE_VALUATION_PROVIDER,
-                    timeframe="",
-                ),
-            }
+            financial_report_periods = _fetch_ashare_financial_report_periods(
+                session,
+                asset_ids,
+            )
+            valuation_watermarks = _fetch_data_sync_watermarks(
+                session,
+                asset_ids,
+                data_domain=ASHARE_VALUATION_DATA_DOMAIN,
+                provider=ASHARE_VALUATION_PROVIDER,
+                timeframe="",
+            )
         current_time = now or datetime.now(tz=UTC)
+        expected_report_period = expected_ashare_report_period(current_time)
         selected_assets = [
             asset
             for asset in assets
             if (
                 not only_failed_or_stale
                 or _asset_requires_ashare_fundamental_collection(
-                    asset,
-                    fundamental_watermark=watermarks_by_domain.get(
-                        ASHARE_FUNDAMENTAL_DATA_DOMAIN,
-                        {},
-                    ).get(asset.asset_id),
-                    valuation_watermark=watermarks_by_domain.get(
-                        ASHARE_VALUATION_DATA_DOMAIN,
-                        {},
-                    ).get(asset.asset_id),
+                    latest_report_period=financial_report_periods.get(asset.asset_id),
+                    expected_report_period=expected_report_period,
+                    valuation_watermark=valuation_watermarks.get(asset.asset_id),
                     now=current_time,
                     stale_before=stale_before,
                 )
@@ -4298,19 +4295,88 @@ def _northbound_watermark_time(watermark: Any) -> datetime | None:
 
 
 def _asset_requires_ashare_fundamental_collection(
-    asset: Any,
     *,
-    fundamental_watermark: Any,
+    latest_report_period: str | date | datetime | None,
+    expected_report_period: date,
     valuation_watermark: Any,
     now: datetime,
     stale_before: datetime | None,
 ) -> bool:
     """判断单个 A 股标的是否需要重新同步基本面或估值。"""
 
-    return any(
-        _snapshot_watermark_requires_collection(watermark, now=now, stale_before=stale_before)
-        for watermark in (fundamental_watermark, valuation_watermark)
+    return _ashare_report_period_requires_collection(
+        latest_report_period,
+        expected_report_period=expected_report_period,
+    ) or _snapshot_watermark_requires_collection(
+        valuation_watermark,
+        now=now,
+        stale_before=stale_before,
     )
+
+
+def _ashare_report_period_requires_collection(
+    latest_report_period: str | date | datetime | None,
+    *,
+    expected_report_period: date,
+) -> bool:
+    """报告期缺失或早于当前最低应有报告期时触发财务补采。"""
+
+    normalized = _parse_ashare_report_period(latest_report_period)
+    return normalized is None or normalized < expected_report_period
+
+
+def _parse_ashare_report_period(value: str | date | datetime | None) -> date | None:
+    """解析财务快照中的 YYYYMMDD 或 ISO 报告期。"""
+
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    for date_format in ("%Y%m%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text_value, date_format).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _fetch_ashare_financial_report_periods(
+    session: Any,
+    asset_ids: list[str],
+) -> dict[str, str]:
+    """分块查询主要财务源每个标的的最新报告期。"""
+
+    if not asset_ids:
+        return {}
+    periods: dict[str, str] = {}
+    unique_asset_ids = list(dict.fromkeys(asset_ids))
+    for offset in range(
+        0,
+        len(unique_asset_ids),
+        ASHARE_FUNDAMENTAL_COVERAGE_QUERY_CHUNK_SIZE,
+    ):
+        chunk_asset_ids = unique_asset_ids[
+            offset : offset + ASHARE_FUNDAMENTAL_COVERAGE_QUERY_CHUNK_SIZE
+        ]
+        statement = (
+            select(
+                FundamentalSnapshotORM.asset_id,
+                func.max(FundamentalSnapshotORM.report_period),
+            )
+            .where(
+                FundamentalSnapshotORM.asset_id.in_(chunk_asset_ids),
+                FundamentalSnapshotORM.source == ASHARE_FINANCIAL_INDICATOR_SOURCE,
+                FundamentalSnapshotORM.report_period.is_not(None),
+            )
+            .group_by(FundamentalSnapshotORM.asset_id)
+        )
+        for asset_id, report_period in session.execute(statement):
+            if asset_id and report_period:
+                periods[str(asset_id)] = str(report_period)
+    return periods
 
 
 def _snapshot_watermark_requires_collection(

@@ -6389,6 +6389,15 @@ def test_batch_ashare_fundamental_symbols_uses_watermarks_for_resume(
 
     monkeypatch.setattr(collect_base_data, "AssetRepository", FakeAssetRepository)
     monkeypatch.setattr(collect_base_data, "_fetch_data_sync_watermarks", fake_watermarks)
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_ashare_financial_report_periods",
+        lambda session, asset_ids: {
+            "ashare:000001": "20260331",
+            "ashare:600519": "20260331",
+        },
+        raising=False,
+    )
 
     symbols = collect_base_data.batch_ashare_fundamental_symbols(
         object(),
@@ -6398,6 +6407,85 @@ def test_batch_ashare_fundamental_symbols_uses_watermarks_for_resume(
     )
 
     assert symbols == ["002594", "600519"]
+
+
+def test_batch_ashare_fundamental_symbols_uses_report_period_and_valuation_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """财报按报告期补缺，估值错误仍按水位进入重试。"""
+
+    collect_base_data = import_collection_module()
+    now = datetime(2026, 7, 15, tzinfo=UTC)
+    stale_before = now - timedelta(hours=72)
+
+    class FakeAssetRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def find_by_market(self, market: str, *, only_tradable: bool = True) -> list[Any]:
+            assert market == "ashare"
+            return [
+                Namespace(asset_id="ashare:000001", symbol="000001"),
+                Namespace(asset_id="ashare:000002", symbol="000002"),
+                Namespace(asset_id="ashare:000003", symbol="000003"),
+                Namespace(asset_id="ashare:000004", symbol="000004"),
+            ]
+
+    def fake_watermarks(
+        session: Any,
+        asset_ids: list[str],
+        data_domain: str,
+        provider: str,
+        timeframe: str,
+    ) -> dict[str, Any]:
+        assert asset_ids == [
+            "ashare:000001",
+            "ashare:000002",
+            "ashare:000003",
+            "ashare:000004",
+        ]
+        if data_domain == "fundamentals":
+            return {
+                asset_id: Namespace(
+                    status="available",
+                    watermark_at=now - timedelta(days=30),
+                )
+                for asset_id in asset_ids
+            }
+        if data_domain == "valuation":
+            return {
+                "ashare:000001": Namespace(status="available", watermark_at=now),
+                "ashare:000002": Namespace(status="available", watermark_at=now),
+                "ashare:000003": Namespace(status="available", watermark_at=now),
+                "ashare:000004": Namespace(
+                    status="error",
+                    next_retry_at=now - timedelta(minutes=1),
+                ),
+            }
+        return {}
+
+    monkeypatch.setattr(collect_base_data, "AssetRepository", FakeAssetRepository)
+    monkeypatch.setattr(collect_base_data, "_fetch_data_sync_watermarks", fake_watermarks)
+    monkeypatch.setattr(
+        collect_base_data,
+        "_fetch_ashare_financial_report_periods",
+        lambda session, asset_ids: {
+            "ashare:000001": "20260331",
+            "ashare:000002": "20251231",
+            "ashare:000004": "20260331",
+        },
+        raising=False,
+    )
+
+    symbols = collect_base_data.batch_ashare_fundamental_symbols(
+        object(),
+        fallback_symbol="000001",
+        now=now,
+        only_failed_or_stale=True,
+        stale_before=stale_before,
+    )
+
+    assert symbols == ["000002", "000003", "000004"]
 
 
 def test_record_ashare_fundamental_watermark_records_success_and_failure(
