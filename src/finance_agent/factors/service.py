@@ -16,6 +16,10 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from finance_agent.data.freshness import (
+    ASHARE_HISTORICAL_VALUATION_SOURCE,
+    ASHARE_SPOT_VALUATION_SOURCE,
+)
 from finance_agent.factors.specs import (
     DEFAULT_FACTOR_SPEC,
     AshareFactorSpec,
@@ -97,11 +101,20 @@ class FactorService:
             limit=self.spec.ashare.valuation_history_limit,
             source="akshare:stock_financial_analysis_indicator_em",
         )
-        valuation_history = self.fundamentals.list_recent_snapshots(
+        historical_valuation_history = self.fundamentals.list_recent_snapshots(
             asset_id=asset_id,
             limit=self.spec.ashare.valuation_history_limit,
-            source="akshare:stock_value_em",
+            source=ASHARE_HISTORICAL_VALUATION_SOURCE,
         )
+        spot_valuation_history = self.fundamentals.list_recent_snapshots(
+            asset_id=asset_id,
+            limit=self.spec.ashare.valuation_history_limit,
+            source=ASHARE_SPOT_VALUATION_SOURCE,
+        )
+        valuation_history = sorted(
+            historical_valuation_history + spot_valuation_history,
+            key=lambda snapshot: snapshot.as_of,
+        )[-self.spec.ashare.valuation_history_limit :]
         capital_flow_history = self.capital_flows.list_recent_snapshots(
             asset_id=asset_id,
             limit=self.spec.ashare.capital_flow_history_limit,

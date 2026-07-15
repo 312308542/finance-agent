@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -141,6 +142,120 @@ def test_factor_service_uses_default_event_signal_window(monkeypatch) -> None:
     assert captured["asset_id"] == "ashare:600519"
     assert captured["limit"] == 20
     assert captured["max_age_days"] == 90
+
+
+def test_factor_service_merges_historical_and_spot_valuation_snapshots(monkeypatch) -> None:
+    """估值因子应使用最新 spot 值，同时保留历史估值来源链。"""
+
+    requested_sources: list[str | None] = []
+    saved_payloads: list[dict[str, object]] = []
+    historical = SimpleNamespace(
+        snapshot_id="valuation:historical:600519:20260714",
+        asset_id="ashare:600519",
+        symbol="600519",
+        as_of=datetime(2026, 7, 14, tzinfo=UTC),
+        pe_ttm=Decimal("18.20"),
+        pb=Decimal("6.30"),
+        payload={},
+    )
+    spot = SimpleNamespace(
+        snapshot_id="valuation:spot:600519:20260715",
+        asset_id="ashare:600519",
+        symbol="600519",
+        as_of=datetime(2026, 7, 15, tzinfo=UTC),
+        pe_ttm=Decimal("16.80"),
+        pb=Decimal("5.90"),
+        payload={"valuation_kind": "spot_snapshot"},
+    )
+
+    class _Indicators:
+        def __init__(self, _session):
+            pass
+
+        def get_latest_indicator_frame(self, **_kwargs):
+            return None
+
+    class _Frames:
+        def __init__(self, _session):
+            pass
+
+        def upsert_factor_frame(self, **kwargs):
+            saved_payloads.append(kwargs)
+            return SimpleNamespace(
+                status=kwargs["status"],
+                factor_frame_id=kwargs["factor_frame_id"],
+                asset_id=kwargs["asset_id"],
+                symbol=kwargs["symbol"],
+                market=kwargs["market"],
+                horizon=kwargs["horizon"],
+                total_available_groups=kwargs["total_available_groups"],
+                missing_groups=kwargs["missing_groups"],
+            )
+
+    class _Fundamentals:
+        def __init__(self, _session):
+            pass
+
+        def list_recent_snapshots(self, **kwargs):
+            source = kwargs.get("source")
+            requested_sources.append(source)
+            if source == "akshare:stock_value_em":
+                return [historical]
+            if source == "akshare:stock_zh_a_spot":
+                return [spot]
+            return []
+
+    class _EmptySnapshots:
+        def __init__(self, _session):
+            pass
+
+        def list_recent_snapshots(self, **_kwargs):
+            return []
+
+    class _EmptyEvents:
+        def __init__(self, _session):
+            pass
+
+        def list_recent_events(self, **_kwargs):
+            return []
+
+    class _EmptyRisks:
+        def __init__(self, _session):
+            pass
+
+        def list_recent_risks(self, **_kwargs):
+            return []
+
+    monkeypatch.setattr(factor_service_module, "IndicatorFrameRepository", _Indicators)
+    monkeypatch.setattr(factor_service_module, "FactorFrameRepository", _Frames)
+    monkeypatch.setattr(factor_service_module, "FundamentalDataRepository", _Fundamentals)
+    monkeypatch.setattr(factor_service_module, "CapitalFlowRepository", _EmptySnapshots)
+    monkeypatch.setattr(factor_service_module, "DerivativeDataRepository", _EmptySnapshots)
+    monkeypatch.setattr(factor_service_module, "EventRepository", _EmptyEvents)
+    monkeypatch.setattr(factor_service_module, "RiskRepository", _EmptyRisks)
+
+    factor_service_module.FactorService(object()).compute_for_asset(
+        asset_id="ashare:600519",
+        fallback_symbol="600519",
+        fallback_market="ashare",
+    )
+
+    assert "akshare:stock_zh_a_spot" in requested_sources
+    valuation_group = next(
+        item
+        for item in saved_payloads[0]["payload"]["factor_groups"]
+        if item["group"] == "valuation"
+    )
+    assert valuation_group["factors"]["pe_ttm"] == 16.8
+    assert valuation_group["factors"]["pb"] == 5.9
+    assert valuation_group["source_ids"] == [
+        historical.snapshot_id,
+        spot.snapshot_id,
+    ]
+    assert saved_payloads[0]["source_ids"][-2:] == [
+        historical.snapshot_id,
+        spot.snapshot_id,
+    ]
 
 
 def test_factor_service_persists_supplemental_theme_factor_groups(monkeypatch) -> None:
