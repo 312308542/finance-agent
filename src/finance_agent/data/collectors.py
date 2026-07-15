@@ -100,6 +100,26 @@ def _deduplicate_fund_assets_by_symbol(assets: Sequence[AssetData]) -> list[Asse
     return [selected[symbol] for symbol in ordered_symbols if symbol in selected]
 
 
+def _existing_fund_asset_data(asset: Any) -> AssetData:
+    """把数据库已有基金身份转换为子源失败时可沿用的候选池成员。"""
+
+    return AssetData(
+        asset_id=str(asset.asset_id),
+        symbol=str(asset.symbol),
+        name=str(asset.name),
+        market=str(asset.market),
+        asset_type=str(asset.asset_type),
+        exchange=asset.exchange,
+        currency=asset.currency,
+        sector=asset.sector,
+        base_asset=asset.base_asset,
+        quote_asset=asset.quote_asset,
+        tradable=bool(asset.tradable),
+        status=str(asset.status),
+        payload=dict(asset.payload or {}),
+    )
+
+
 def archive_provider_result(
     raw_records: RawRecordRepository,
     result: ProviderResult,
@@ -1215,25 +1235,36 @@ class FundDataCollector:
     ) -> list[ArchivedProviderResult]:
         """顺序刷新 ETF、LOF、开放式基金资产池，并回写统一候选池。"""
 
+        existing_assets = self.assets.find_by_market("fund", only_tradable=False)
         results = [
             (
                 "akshare:fund_etf_spot_em",
+                "etf",
                 self.provider.fetch_etf_assets(),
             ),
             (
                 "akshare:fund_lof_spot_em",
+                "lof",
                 self.provider.fetch_lof_assets(),
             ),
             (
                 "akshare:fund_open_fund_daily_em",
+                "open_fund",
                 self.provider.fetch_open_fund_assets(),
             ),
         ]
         archived_results: list[ArchivedProviderResult] = []
         all_assets: list[AssetData] = []
-        exchange_traded_symbols: set[str] = set()
+        exchange_traded_symbols = {
+            str(asset.symbol or "").strip()
+            for asset in existing_assets
+            if (
+                asset.asset_type in EXCHANGE_TRADED_FUND_TYPES
+                and str(asset.symbol or "").strip()
+            )
+        }
         latest_as_of: datetime | None = None
-        for source, result in results:
+        for source, asset_type, result in results:
             raw_record_id = archive_provider_result(
                 self.raw_records,
                 result,
@@ -1246,6 +1277,11 @@ class FundDataCollector:
                 [value for value in [latest_as_of, result.collected_at] if value is not None]
             )
             if result.status != "available":
+                all_assets.extend(
+                    _existing_fund_asset_data(asset)
+                    for asset in existing_assets
+                    if asset.asset_type == asset_type
+                )
                 continue
             assets_to_persist = list(result.assets)
             result_asset_types = {asset.asset_type for asset in assets_to_persist}
@@ -1286,7 +1322,7 @@ class FundDataCollector:
             payload={
                 "asset_count": len(all_assets),
                 "source_count": len(results),
-                "sources": [source for source, _ in results],
+                "sources": [source for source, _, _ in results],
             },
         )
         if all_assets:
@@ -1304,6 +1340,12 @@ class FundDataCollector:
                     }
                     for index, asset in enumerate(all_assets, start=1)
                 ],
+            )
+            self.universes.prune_missing_members(
+                universe_id=universe_id,
+                current_asset_ids=[asset.asset_id for asset in all_assets],
+                as_of=latest_as_of,
+                removed_reason="not_in_latest_fund_universe",
             )
         return archived_results
 
