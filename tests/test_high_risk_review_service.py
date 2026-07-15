@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from finance_agent.cli import main as cli_main
-from finance_agent.agents.runtime.high_risk_review_service import HighRiskReviewService
+from finance_agent.agents.runtime.high_risk_review_service import (
+    HighRiskReviewService,
+    SqlAlchemyHighRiskReviewStore,
+)
 from finance_agent.agents.runtime.model_client import ModelClientResponse
 from finance_agent.agents.runtime.model_config import ModelEndpointConfig
 
@@ -255,6 +259,39 @@ def test_high_risk_review_service_keeps_retryable_when_model_unavailable() -> No
     assert store.decision_updates[0]["review_status"] == "review_unavailable"
     assert store.decision_updates[0]["confidence_multiplier"] == pytest.approx(0.7)
     assert store.decision_updates[0]["user_action"] is None
+
+
+def test_successful_review_clears_previous_unavailable_confidence_penalty() -> None:
+    """额度恢复后复核成功，不应保留上一轮 unavailable 的置信度惩罚。"""
+
+    decision = SimpleNamespace(
+        payload={
+            "review_status": "review_unavailable",
+            "review_confidence_multiplier": 0.7,
+        },
+        user_action="unknown",
+    )
+
+    class FakeSession:
+        def get(self, model: object, decision_id: str) -> object:
+            assert decision_id == "decision:retry-success"
+            return decision
+
+        def flush(self) -> None:
+            return None
+
+    store = SqlAlchemyHighRiskReviewStore(FakeSession())  # type: ignore[arg-type]
+
+    store.update_decision_review_status(
+        decision_id="decision:retry-success",
+        review_status="rejected_by_review",
+        review_result={"verdict": "reject"},
+        confidence_multiplier=None,
+        user_action="rejected_by_review",
+    )
+
+    assert "review_confidence_multiplier" not in decision.payload
+    assert decision.user_action == "rejected_by_review"
 
 
 def test_agent_review_pending_cli_dry_run_lists_queue(monkeypatch: pytest.MonkeyPatch) -> None:

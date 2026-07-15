@@ -442,6 +442,8 @@ class SqlAlchemyHighRiskReviewStore:
         payload["review_result"] = review_result
         if confidence_multiplier is not None:
             payload["review_confidence_multiplier"] = confidence_multiplier
+        else:
+            payload.pop("review_confidence_multiplier", None)
         decision.payload = payload
         if user_action:
             decision.user_action = user_action
