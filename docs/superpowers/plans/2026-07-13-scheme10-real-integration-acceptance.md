@@ -325,7 +325,7 @@ Get-ScheduledTask -TaskName FinanceAgent-BaseDataScheduler,FinanceAgent-Api | Ge
 
 同步方案 03/06/07/09/10、基金任务方案、优化进度表、项目进度表和 00 总览。未完成项保持未勾选；历史状态与当前证据矛盾时以本轮命令、数据库和页面证据为准。
 
-- [ ] **步骤 3：运行文档、后端和前端总回归**
+- [x] **步骤 3：运行文档、后端和前端总回归**
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
@@ -335,10 +335,10 @@ git diff --check
 
 当前仓库没有独立的进度文档 pytest；文档一致性通过逐项回读任务表、`git diff --check`、全量 pytest、前端构建和 staged GitNexus 共同验证，不引用已不存在的测试文件。
 
-- [ ] **步骤 4：staged GitNexus 检测并提交**
+- [x] **步骤 4：staged PyCharm/Git 审计并提交**
 
-确认 `.ai/`、`.codex/`、`artifacts/`、`runtime/`、密钥未暂存；运行完整 staged detect-changes，提交：`docs(方案): 完成统一真实联调阶段验收`。
+确认 `.ai/`、`.codex/`、`artifacts/`、`runtime/`、密钥未暂存；按用户授权使用 PyCharm Git 状态与 staged diff 替代本轮 WSL GitNexus，禁止目录暂存数为 0，提交 `0fedf72`。
 
-- [ ] **步骤 5：进入下一依赖项目**
+- [x] **步骤 5：进入下一依赖项目**
 
 重读方案 15、18、22 和待决策记录，按“方案 15 数据覆盖 → 方案 18 权重固化 → 方案 22 黄金样本/CHoCH → D-014 与文档卫生”继续目标，不因方案 10 的外部阻塞停止可独立推进的工作。

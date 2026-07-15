@@ -77,12 +77,12 @@ Hermes 侧的 skill 已经编写完成（`finance-agent-recommendation`），内
 
 ## 4. 任务拆解
 
-- [ ] T1 入库 skill 副本与可见性检查脚本（3.1）。
-- [ ] T2 编写 `tests/test_hermes_tool_boundary.py`（先盘点 `tools list` 实际输出，再写断言；TDD）。
-- [ ] T3 编写 `smoke_hermes_skill_commands.py` 的 `--mode direct`，在 Windows 直跑通过。
-- [ ] T4 补 `--mode wsl-bridge`；如遇编码问题按 3.2 修 CLI 入口（改 CLI 前先跑 gitnexus_impact）。
-- [ ] T5 编写 MCP 模板文档与 `smoke_mcp_handshake.py`。
-- [ ] T6 全量回归（pytest + 两个冒烟脚本），更新 `docs/优化版本进度跟踪表.md` O1 五个子任务状态和本文件进度表。
+- [x] T1 入库 skill 副本与可见性检查脚本（3.1）。
+- [x] T2 编写 `tests/test_hermes_tool_boundary.py`（先盘点 `tools list` 实际输出，再写断言；TDD）。
+- [x] T3 编写 `smoke_hermes_skill_commands.py` 的 `--mode direct`，在 Windows 直跑通过。
+- [x] T4 补 `--mode wsl-bridge`；如遇编码问题按 3.2 修 CLI 入口（改 CLI 前先跑 gitnexus_impact）。
+- [x] T5 编写 MCP 模板文档与 `smoke_mcp_handshake.py`。
+- [x] T6 全量回归（pytest + 两个冒烟脚本），更新 `docs/优化版本进度跟踪表.md` O1 五个子任务状态和本文件进度表。
 
 ## 5. 验收命令
 
