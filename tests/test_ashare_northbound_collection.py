@@ -9,6 +9,7 @@ import pandas as pd
 from finance_agent.data.collectors import AshareP1Collector
 from finance_agent.data.models import CapitalFlowSnapshotData, CapitalFlowSnapshotsResult
 from finance_agent.data import normalizers
+from finance_agent.data.providers.akshare_p1_provider import AshareCapitalFlowProvider
 
 
 class _FakeRawRecords:
@@ -79,6 +80,26 @@ def test_normalize_ashare_northbound_individual_flow_filters_non_main_board() ->
     assert snapshots[0].amount == Decimal("1000.50")
     assert snapshots[0].northbound_net_inflow == Decimal("12.30")
     assert snapshots[0].as_of == datetime(2026, 6, 11, tzinfo=UTC)
+
+
+def test_northbound_individual_none_payload_is_unavailable(monkeypatch) -> None:
+    """非互联互通标的返回空对象时应标记不可用，不能触发全局熔断。"""
+
+    def raise_no_data(*, symbol: str) -> None:
+        assert symbol == "000004"
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    monkeypatch.setattr(
+        "finance_agent.data.providers.akshare_p1_provider.ak.stock_hsgt_individual_em",
+        raise_no_data,
+    )
+
+    result = AshareCapitalFlowProvider().fetch_northbound_individual_flow(symbol="000004")
+
+    assert result.status == "unavailable"
+    assert result.error_message is None
+    assert result.snapshots == []
+    assert result.payload["unavailable_reason"] == "source_returned_no_data"
 
 
 def test_ashare_p1_collector_collects_northbound_flow_in_batch(

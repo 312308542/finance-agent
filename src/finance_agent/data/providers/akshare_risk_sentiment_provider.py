@@ -311,6 +311,25 @@ class AshareRiskProvider:
                 collected_at=collected_at,
                 limit=limit,
             )
+        except ValueError as exc:
+            if str(exc) != "Length mismatch: Expected axis has 0 elements, new values have 6 elements":
+                return RiskFindingsResult(
+                    provider_name=self.provider_name,
+                    status="error",
+                    collected_at=collected_at,
+                    error_message=str(exc),
+                    payload={"endpoint": endpoint, "date": date},
+                )
+            return RiskFindingsResult(
+                provider_name=self.provider_name,
+                status="unavailable",
+                collected_at=collected_at,
+                payload={
+                    "endpoint": endpoint,
+                    "date": date,
+                    "unavailable_reason": "source_returned_no_data",
+                },
+            )
         except Exception as exc:
             return RiskFindingsResult(
                 provider_name=self.provider_name,

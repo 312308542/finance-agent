@@ -186,6 +186,25 @@ class AshareValuationProvider:
                 as_of=collected_at,
                 limit=limit,
             )
+        except TypeError as exc:
+            if str(exc) != "'NoneType' object is not subscriptable":
+                return FundamentalSnapshotsResult(
+                    provider_name=self.provider_name,
+                    status="error",
+                    collected_at=collected_at,
+                    error_message=str(exc),
+                    payload={"endpoint": "stock_value_em", "symbol": symbol},
+                )
+            return FundamentalSnapshotsResult(
+                provider_name=self.provider_name,
+                status="unavailable",
+                collected_at=collected_at,
+                payload={
+                    "endpoint": "stock_value_em",
+                    "symbol": symbol,
+                    "unavailable_reason": "source_returned_no_data",
+                },
+            )
         except Exception as exc:
             return FundamentalSnapshotsResult(
                 provider_name=self.provider_name,

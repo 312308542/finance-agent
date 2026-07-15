@@ -1655,6 +1655,67 @@ def test_scheduler_converts_ashare_market_bars_lookback_to_collection_dates() ->
     assert args.symbol_source == "market_assets"
 
 
+def test_scheduler_sets_dynamic_dates_for_ashare_risk_sentiment() -> None:
+    """A 股风险情绪任务应使用当前日期窗口，不能沿用采集脚本样例日期。"""
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="ashare.risk_sentiment",
+                job_type="collection",
+                group="ashare-risk",
+                interval_seconds=300,
+                market="ashare",
+                params={"sync_task_type": "risk_sentiment_refresh"},
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+    )
+    today = datetime.now(tz=UTC).date()
+
+    args = scheduler.build_collection_args(config.jobs[0])
+
+    start_date = datetime.strptime(args.risk_start, "%Y%m%d").date()
+    end_date = datetime.strptime(args.risk_end, "%Y%m%d").date()
+    assert end_date == today
+    assert (end_date - start_date).days == 14
+
+
+def test_scheduler_preserves_explicit_ashare_risk_sentiment_dates() -> None:
+    """显式历史回补日期应覆盖风险情绪任务的动态默认窗口。"""
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="ashare.risk_sentiment.backfill",
+                job_type="collection",
+                group="ashare-risk",
+                interval_seconds=300,
+                market="ashare",
+                params={
+                    "sync_task_type": "risk_sentiment_refresh",
+                    "risk_start": "20260101",
+                    "risk_end": "20260131",
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+    )
+
+    args = scheduler.build_collection_args(config.jobs[0])
+
+    assert args.risk_start == "20260101"
+    assert args.risk_end == "20260131"
+
+
 def test_scheduler_sets_dynamic_end_for_ashare_full_history_without_lookback() -> None:
     """A 股全量历史 K 线不使用 lookback 时，结束日期应动态取当前日期。"""
 

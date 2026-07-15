@@ -1574,6 +1574,14 @@ class BaseDataScheduler:
         overrides.update(job.params)
         if (
             job.market == "ashare"
+            and str(overrides.get("sync_task_type") or "") == "risk_sentiment_refresh"
+            and (not overrides.get("risk_start") or not overrides.get("risk_end"))
+        ):
+            risk_dates = build_ashare_lookback_date_overrides("14d")
+            overrides.setdefault("risk_start", risk_dates["ashare_start"])
+            overrides.setdefault("risk_end", risk_dates["ashare_end"])
+        if (
+            job.market == "ashare"
             and str(overrides.get("sync_task_type") or "")
             in {
                 "market_bars_backfill",
