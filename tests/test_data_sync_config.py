@@ -2,8 +2,51 @@ from finance_agent.data.sync_config import (
     build_preset_config,
     export_scheduler_payload,
     parse_data_sync_config,
+    preset_label,
     preview_data_sync_config,
 )
+
+
+def test_personal_ashare_is_the_default_preset_without_crypto() -> None:
+    """无参数默认配置应只启用 A 股和基金。"""
+
+    config = build_preset_config()
+
+    assert config.preset == "personal-ashare"
+    assert list(config.markets) == ["ashare", "fund"]
+    assert preset_label(config.preset) == "私人助手 A 股与基金模式"
+
+
+def test_personal_comprehensive_remains_backward_compatible() -> None:
+    """旧全面预设仍应保留 A 股、基金和两类数字货币市场。"""
+
+    config = build_preset_config("personal-comprehensive")
+
+    assert list(config.markets) == [
+        "ashare",
+        "fund",
+        "crypto_spot",
+        "crypto_future",
+    ]
+
+
+def test_default_scheduler_plan_excludes_crypto_jobs() -> None:
+    """默认调度计划不得静默启用数字货币任务。"""
+
+    payload = export_scheduler_payload(build_preset_config())
+    job_names = [str(job["name"]) for job in payload["jobs"]]
+
+    assert any(name.startswith("ashare.") for name in job_names)
+    assert any(name.startswith("fund.") for name in job_names)
+    assert all("crypto" not in name for name in job_names)
+
+
+def test_crypto_comprehensive_remains_an_explicit_independent_preset() -> None:
+    """显式数字货币预设仍应独立导出 crypto 任务。"""
+
+    payload = export_scheduler_payload(build_preset_config("crypto-comprehensive"))
+
+    assert any("crypto" in str(job["name"]) for job in payload["jobs"])
 
 
 def test_timely_ashare_event_tasks_default_to_five_minutes() -> None:

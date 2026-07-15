@@ -51,8 +51,8 @@ def add_data_arguments(subparsers: argparse._SubParsersAction[argparse.ArgumentP
     init = config_commands.add_parser("init", help="生成数据同步配置模板。")
     init.add_argument(
         "--preset",
-        default="personal-comprehensive",
-        help="配置预设：personal-comprehensive、ashare-comprehensive、crypto-comprehensive、lightweight。",
+        default="personal-ashare",
+        help="配置预设：personal-ashare、personal-comprehensive、ashare-comprehensive、crypto-comprehensive、lightweight。",
     )
     init.add_argument(
         "--markets",

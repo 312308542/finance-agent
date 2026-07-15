@@ -110,7 +110,7 @@ export function DataSyncControlPanel({
     config.resource_pools ?? schedulerPayload.resource_pools,
     configuredMaxConcurrentJobs,
   );
-  const [preset, setPreset] = React.useState(config.preset ?? "personal-comprehensive");
+  const [preset, setPreset] = React.useState(config.preset ?? "personal-ashare");
   const [cacheBackend, setCacheBackend] = React.useState(config.cache_backend ?? "redis");
   const [enabled, setEnabled] = React.useState(config.enabled ?? true);
   const [markets, setMarkets] = React.useState<string[]>(enabledMarkets);
@@ -129,7 +129,7 @@ export function DataSyncControlPanel({
   const visibleTasks = filterPreviewTasksByMarkets(tasks, markets);
 
   React.useEffect(() => {
-    setPreset(config.preset ?? "personal-comprehensive");
+    setPreset(config.preset ?? "personal-ashare");
     setCacheBackend(config.cache_backend ?? "redis");
     setEnabled(config.enabled ?? true);
     setMarkets(pickEnabledMarkets(config));
@@ -257,7 +257,9 @@ export function DataSyncControlPanel({
           <label>
             <span>预设</span>
             <select value={preset} onChange={(event) => changePreset(event.target.value)}>
-              <option value="personal-comprehensive">personal-comprehensive</option>
+              <option value="personal-ashare">personal-ashare</option>
+
+              <option value="personal-comprehensive">personal-comprehensive</option>
               <option value="ashare-comprehensive">ashare-comprehensive</option>
               <option value="crypto-comprehensive">crypto-comprehensive</option>
               <option value="lightweight">lightweight</option>

@@ -72,3 +72,12 @@ def test_root_postgres_compose_raises_local_connection_limit() -> None:
     content = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 
     assert "max_connections=300" in content
+
+
+def test_root_compose_restarts_only_postgres_and_redis() -> None:
+    """根 Compose 只负责自动恢复 PostgreSQL 和 Redis，不默认启动调度器。"""
+
+    content = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+
+    assert content.count("restart: unless-stopped") == 2
+    assert "finance-agent-scheduler" not in content

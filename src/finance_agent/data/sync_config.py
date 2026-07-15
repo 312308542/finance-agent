@@ -55,6 +55,7 @@ FUND_BOOTSTRAP_BATCH_SIZE = 50
 FUND_OPEN_NAV_BOOTSTRAP_SOURCE_LIMIT = 500
 
 DataSyncPreset = Literal[
+    "personal-ashare",
     "personal-comprehensive",
     "ashare-comprehensive",
     "crypto-comprehensive",
@@ -63,6 +64,7 @@ DataSyncPreset = Literal[
 
 MARKETS = {"ashare", "fund", "crypto_spot", "crypto_future"}
 PRESETS = {
+    "personal-ashare",
     "personal-comprehensive",
     "ashare-comprehensive",
     "crypto-comprehensive",
@@ -203,7 +205,7 @@ class DataSyncValidationResult:
 
 
 def build_preset_config(
-    preset: str = "personal-comprehensive",
+    preset: str = "personal-ashare",
     *,
     markets: list[str] | None = None,
 ) -> DataSyncConfig:
@@ -236,7 +238,7 @@ def build_preset_config(
 
 
 def load_data_sync_config(config_file: str | Path | None = None) -> DataSyncConfig:
-    """从 JSON 文件读取数据同步配置；未传入时返回私人助手全面模式。"""
+    """从 JSON 文件读取数据同步配置；未传入时返回 A 股与基金模式。"""
 
     if config_file is None:
         return build_preset_config()
@@ -2327,6 +2329,8 @@ def normalize_markets(markets: list[str]) -> list[str]:
 def preset_markets(preset: str) -> list[str]:
     """返回预设默认市场。"""
 
+    if preset == "personal-ashare":
+        return ["ashare", "fund"]
     if preset == "ashare-comprehensive":
         return ["ashare"]
     if preset == "crypto-comprehensive":
@@ -2340,6 +2344,7 @@ def preset_label(preset: str) -> str:
     """返回预设中文名称。"""
 
     return {
+        "personal-ashare": "私人助手 A 股与基金模式",
         "personal-comprehensive": "私人助手全面模式",
         "ashare-comprehensive": "A 股全面模式",
         "crypto-comprehensive": "数字货币全面模式",

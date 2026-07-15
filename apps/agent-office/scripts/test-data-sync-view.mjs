@@ -4,6 +4,10 @@ import { Buffer } from "node:buffer";
 import ts from "typescript";
 
 const source = await readFile(new URL("../src/dataSyncView.ts", import.meta.url), "utf8");
+const panelSource = await readFile(
+  new URL("../src/pages/DataSyncControlPanel.tsx", import.meta.url),
+  "utf8",
+);
 const { outputText } = ts.transpileModule(source, {
   compilerOptions: {
     module: ts.ModuleKind.ES2022,
@@ -36,7 +40,9 @@ assert.deepEqual(
 
 assert.deepEqual(marketsForPreset("ashare-comprehensive"), ["ashare"]);
 assert.deepEqual(marketsForPreset("crypto-comprehensive"), ["crypto_spot", "crypto_future"]);
-assert.deepEqual(marketsForPreset("unknown-preset"), ["ashare", "fund", "crypto_spot", "crypto_future"]);
+assert.deepEqual(marketsForPreset("personal-ashare"), ["ashare", "fund"]);
+assert.deepEqual(marketsForPreset("unknown-preset"), ["ashare", "fund"]);
+assert.match(panelSource, /<option value="personal-ashare">personal-ashare<\/option>/);
 
 assert.deepEqual(
   filterPreviewTasksByMarkets(

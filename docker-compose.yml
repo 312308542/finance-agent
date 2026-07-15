@@ -2,6 +2,7 @@ services:
   postgres:
     image: timescale/timescaledb:latest-pg16
     container_name: finance-agent-timescaledb
+    restart: unless-stopped
     environment:
       POSTGRES_DB: finance_agent
       POSTGRES_USER: finance_agent
@@ -22,6 +23,7 @@ services:
   redis:
     image: redis:7.4-alpine
     container_name: finance-agent-redis
+    restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     environment:
       TZ: Asia/Shanghai

@@ -136,10 +136,8 @@ class ModelRouteUpdateRequest(BaseModel):
 class DataSyncConfigUpdateRequest(BaseModel):
     """数据同步配置保存请求。"""
 
-    preset: str = "personal-comprehensive"
-    markets: list[str] = Field(
-        default_factory=lambda: ["ashare", "fund", "crypto_spot", "crypto_future"]
-    )
+    preset: str = "personal-ashare"
+    markets: list[str] = Field(default_factory=lambda: ["ashare", "fund"])
     enabled: bool = True
     cache_backend: str = "redis"
     max_concurrent_jobs: int = Field(4, ge=1, le=16)

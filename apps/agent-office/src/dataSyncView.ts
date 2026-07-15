@@ -18,6 +18,7 @@ export type SchedulerQueueSummary = {
 
 const marketOrder = ["ashare", "fund", "crypto_spot", "crypto_future"];
 const presetMarketDefaults: Record<string, string[]> = {
+  "personal-ashare": ["ashare", "fund"],
   "personal-comprehensive": ["ashare", "fund", "crypto_spot", "crypto_future"],
   "ashare-comprehensive": ["ashare"],
   "crypto-comprehensive": ["crypto_spot", "crypto_future"],
@@ -56,7 +57,7 @@ export function pickEnabledMarkets(config: Record<string, any> | undefined): str
 
 export function marketsForPreset(preset: string | undefined): string[] {
   return [
-    ...(presetMarketDefaults[preset ?? ""] ?? presetMarketDefaults["personal-comprehensive"]),
+    ...(presetMarketDefaults[preset ?? ""] ?? presetMarketDefaults["personal-ashare"]),
   ];
 }
 
