@@ -55,7 +55,7 @@ npm --prefix apps\agent-office run build
 .\.venv\Scripts\python.exe -m finance_agent.cli agent review-pending --owner-id owner:demo --limit 20 --dry-run
 ```
 
-验收：主分析 `deepseek-v4-pro` 与复核 `gpt-5.5` 均 `ready=true`；dry-run 只读返回待复核事件。
+验收：主分析 `deepseek-v4-pro` 与复核 `gpt-5.6-sol` 均 `ready=true`；dry-run 只读返回待复核事件。
 
 ### 任务 2：T4 高风险复核真实回写
 
@@ -82,7 +82,7 @@ review_status = requires_model_review
 `review_input` 明确记录：没有对应持仓、行情和数据版本不可验证、仍要求卖出并生成订单草案。验收样本只使用命名空间 `owner:acceptance:scheme10`，不得覆盖现有 owner 数据。
 同一 run 先写一条 `event_type=model_route` 事件，payload 保存与 `model_review.output.route` 相同的脱敏路由，再写 `model_review`，确保验收的三段审计链是真实事件而不是只存在于嵌套 payload。
 
-- [ ] **步骤 2：运行真实复核模型**
+- [x] **步骤 2：运行真实复核模型**
 
 ```powershell
 .\.venv\Scripts\python.exe -m finance_agent.cli agent review-pending --owner-id owner:acceptance:scheme10 --limit 1
@@ -90,7 +90,7 @@ review_status = requires_model_review
 
 验收门槛：`processed_count=1`、`rejected_count=1`；若真实模型返回 `needs_human` 或 `approve`，保留原始事实并登记到 T9，不得把样本改写成 reject。
 
-- [ ] **步骤 3：只读验证完整审计链与 decision_logs**
+- [x] **步骤 3：只读验证完整审计链与 decision_logs**
 
 用 SQLAlchemy 只读查询上述 run，按 `created_at` 输出事件类型和 ID；断言：
 
@@ -104,7 +104,7 @@ decision_logs.user_action = rejected_by_review
 
 同时确认该 `decision_id` 没有 `order_drafts`；输出只保留模型名、verdict、reasons、token/延迟量级，不输出 key。
 
-- [ ] **步骤 4：用真实错误 key 验证 review_unavailable**
+- [x] **步骤 4：用真实错误 key 验证 review_unavailable**
 
 创建临时、独立模型配置：
 
@@ -132,6 +132,8 @@ gitnexus detect-changes -r finance-agent --scope staged --max-files 50 --max-hun
 当前外部额度阻塞时提交：`docs(联调): 记录高风险复核额度阻塞`；只有 reject 门槛满足后才使用“完成高风险复核真实回写验收”。
 
 > 2026-07-13 执行记录：步骤 2 已真实执行，但供应商返回 HTTP 403 `insufficient_user_quota`，因此 reject 验收门槛未满足，步骤 2～4 保持未勾选。review_unavailable 审计链、0.7 置信度惩罚和零订单草案已真实通过；连接测试 HTML 200 假阳性已按 TDD 修复并提交 `72e1ac6`。补充额度后复用同一事件重跑。
+
+> 2026-07-15 恢复记录：负责人补充额度并启用 `gpt-5.6-sol`；真实 endpoint test HTTP 200，未来高风险路由已切换且 `ready=true`。复用原事件并保持 `review_input` SHA256 不变后，真实复核返回 `processed_count=1/rejected_count=1`。数据库确认旧 unavailable 结果保留、新 reject 结果追加，decision 为 `rejected_by_review`、订单草案 0、待复核队列 0。步骤 4 使用 2026-07-13 的真实 HTTP 403 额度错误完成 unavailable 验收，没有再创建故意错误 key。复验发现并 TDD 修复临时 0.7 惩罚残留，相关回归 159 passed、全量 708 passed。
 
 ### 任务 3：T5 端到端主链路与前端闭环
 
