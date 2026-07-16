@@ -819,11 +819,24 @@ class AssetScoreORM(Base):
     __table_args__ = (
         Index("idx_asset_scores_universe_rank", "universe_id", "rank"),
         Index("idx_asset_scores_asset_horizon_asof", "asset_id", "horizon", "as_of"),
+        Index(
+            "idx_asset_scores_screening_strategy_rank",
+            "screening_id",
+            "strategy_id",
+            "rank",
+        ),
+        Index(
+            "idx_asset_scores_asset_strategy_horizon_asof",
+            "asset_id",
+            "strategy_id",
+            "horizon",
+            "as_of",
+        ),
         Index("idx_asset_scores_market_score", "market", "total_score"),
         Index("idx_asset_scores_status", "status"),
     )
 
-    score_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    score_id: Mapped[str] = mapped_column(String(255), primary_key=True)
     asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
     symbol: Mapped[str] = mapped_column(String(64), nullable=False)
     market: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -831,6 +844,7 @@ class AssetScoreORM(Base):
     screening_id: Mapped[str] = mapped_column(String(160), nullable=False)
     factor_frame_id: Mapped[str] = mapped_column(String(160), nullable=False)
     horizon: Mapped[str] = mapped_column(String(32), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128), nullable=False)
     total_score: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
     technical_score: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
     fundamental_score: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
@@ -1041,7 +1055,7 @@ class AssetRecommendationORM(Base):
     total_score: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
     confidence: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
     conviction: Mapped[str] = mapped_column(String(32), nullable=False)
-    score_id: Mapped[str | None] = mapped_column(String(160))
+    score_id: Mapped[str | None] = mapped_column(String(255))
     factor_frame_id: Mapped[str | None] = mapped_column(String(160))
     signal_ids: Mapped[list[str]] = mapped_column(
         JSONB, server_default=text("'[]'::jsonb"), nullable=False

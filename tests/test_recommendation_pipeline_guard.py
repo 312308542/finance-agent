@@ -282,6 +282,9 @@ def test_recommendation_pipeline_passes_strategy_id_to_scoring_service() -> None
             "strategy_id": "strategy:ashare:short_swing",
         }
     ]
+    assert pipeline.recommendations.calls[0]["score_strategy_id"] == (
+        "strategy:ashare:short_swing"
+    )
 
 
 def test_recommendation_pipeline_passes_market_regime_to_recommendation_service() -> None:

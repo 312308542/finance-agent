@@ -6,12 +6,12 @@ import hashlib
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from finance_agent.backtesting.models import BacktestResult, JsonDict
 from finance_agent.backtesting.service import BacktestService, BacktestServiceRequest, ScoreMode
-from finance_agent.storage.orm import AssetScoreORM
+from finance_agent.storage.orm import AssetScoreORM, ScreeningResultORM
 from finance_agent.storage.repositories import BacktestRepository, MarketDataRepository
 
 
@@ -71,23 +71,56 @@ class DatabaseBacktestScoreSource:
         as_of: datetime,
         latest: bool,
     ) -> list[AssetScoreORM]:
-        statement = select(AssetScoreORM).where(
-            AssetScoreORM.market == self.market,
-            AssetScoreORM.universe_id == universe_id,
-            AssetScoreORM.horizon == self.horizon,
-            AssetScoreORM.status.in_(("available", "partial")),
-        )
-        if not latest:
-            statement = statement.where(AssetScoreORM.as_of <= as_of)
-        rows = list(
-            self.session.scalars(
-                statement.order_by(AssetScoreORM.as_of.desc(), AssetScoreORM.rank).limit(
-                    self.max_rows
+        latest_statement = (
+            select(
+                AssetScoreORM.score_id.label("score_id"),
+                func.row_number()
+                .over(
+                    partition_by=AssetScoreORM.asset_id,
+                    order_by=(
+                        ScreeningResultORM.as_of.desc(),
+                        AssetScoreORM.as_of.desc(),
+                        AssetScoreORM.rank,
+                    ),
                 )
+                .label("latest_rank"),
+            )
+            .join(
+                ScreeningResultORM,
+                ScreeningResultORM.screening_id == AssetScoreORM.screening_id,
+            )
+            .where(
+                AssetScoreORM.market == self.market,
+                AssetScoreORM.universe_id == universe_id,
+                AssetScoreORM.horizon == self.horizon,
+                AssetScoreORM.strategy_id == strategy_id,
+                AssetScoreORM.status.in_(("available", "partial")),
             )
         )
-        matched = [row for row in rows if _row_strategy_id(row) == strategy_id]
-        return _dedupe_latest_scores(matched or rows)
+        if not latest:
+            latest_statement = latest_statement.where(
+                AssetScoreORM.as_of <= as_of,
+                ScreeningResultORM.as_of <= as_of,
+            )
+        latest_scores = latest_statement.subquery("asset_score_latest")
+        statement = (
+            select(AssetScoreORM)
+            .join(
+                latest_scores,
+                latest_scores.c.score_id == AssetScoreORM.score_id,
+            )
+            .where(latest_scores.c.latest_rank == 1)
+            .order_by(
+                AssetScoreORM.total_score.desc(),
+                AssetScoreORM.rank,
+                AssetScoreORM.asset_id,
+            )
+            .limit(self.max_rows)
+        )
+        rows = list(
+            self.session.scalars(statement)
+        )
+        return _dedupe_latest_scores(rows)
 
 
 class DatabaseBacktestPriceSource:
@@ -239,12 +272,6 @@ def _ensure_aware(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value
-
-
-def _row_strategy_id(row: AssetScoreORM) -> str | None:
-    payload = row.payload or {}
-    value = payload.get("strategy_id") or payload.get("score_strategy_id")
-    return str(value) if value else None
 
 
 def _dedupe_latest_scores(rows: list[AssetScoreORM]) -> list[AssetScoreORM]:

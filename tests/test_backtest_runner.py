@@ -132,3 +132,32 @@ def test_database_score_source_accepts_partial_recommendation_scores() -> None:
     assert session.statement is not None
     sql = str(session.statement.compile(compile_kwargs={"literal_binds": True}))
     assert "asset_scores.status IN ('available', 'partial')" in sql
+    assert (
+        "asset_scores.strategy_id = 'strategy:ashare:short_swing'"
+        in sql
+    )
+
+
+def test_database_score_source_limits_after_selecting_latest_score_per_asset() -> None:
+    """回测必须先取每个标的的最新评分，再按总分限流，避免高分标的被时间截断。"""
+
+    class CapturingSession:
+        def __init__(self) -> None:
+            self.statement: Any | None = None
+
+        def scalars(self, statement: Any) -> list[Any]:
+            self.statement = statement
+            return []
+
+    session = CapturingSession()
+    DatabaseBacktestScoreSource(session, market="ashare").list_replayed_scores(
+        universe_id="universe:merged:ashare:recommendation",
+        strategy_id="strategy:ashare:theme_momentum",
+        as_of=datetime(2026, 7, 15, tzinfo=UTC),
+    )
+
+    assert session.statement is not None
+    sql = str(session.statement.compile(compile_kwargs={"literal_binds": True}))
+    assert "row_number() OVER (PARTITION BY asset_scores.asset_id" in sql
+    assert "asset_score_latest.latest_rank = 1" in sql
+    assert "ORDER BY asset_scores.total_score DESC" in sql

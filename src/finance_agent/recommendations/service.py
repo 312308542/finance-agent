@@ -139,6 +139,7 @@ class RecommendationService:
         strategy: str = "balanced_swing_v1",
         horizon: str = "swing",
         limit: int = 20,
+        score_strategy_id: str | None = None,
         rule_version: str = RULE_VERSION,
         audit_payload: JsonDict | None = None,
         profile_style_tendency: JsonDict | None = None,
@@ -156,10 +157,20 @@ class RecommendationService:
             horizon=horizon,
             started_at=started_at,
         )
-        raw_scores = self.scores.list_scores_for_screening(screening_id)[:limit]
+        raw_scores = (
+            self.scores.list_scores_for_screening(
+                screening_id,
+                strategy_id=score_strategy_id,
+            )
+            if score_strategy_id is not None
+            else self.scores.list_scores_for_screening(screening_id)
+        )[:limit]
         scores = apply_memory_ranking_adjustments(raw_scores, memory_ranking_adjustments or {})
         ensure_scores_match_market(scores=scores, market=screening.market)
-        backtest_strategy_id = resolve_backtest_strategy_id(scores=scores, fallback=strategy)
+        backtest_strategy_id = resolve_backtest_strategy_id(
+            scores=scores,
+            fallback=score_strategy_id or strategy,
+        )
         backtests = getattr(self, "backtests", None)
         backtest_evidence = (
             build_backtest_evidence(
@@ -188,6 +199,7 @@ class RecommendationService:
             payload={
                 "screening_id": screening_id,
                 "strategy": strategy,
+                "score_strategy_id": score_strategy_id,
                 "horizon": horizon,
             },
         )
@@ -260,6 +272,7 @@ class RecommendationService:
                 "screening_id": screening_id,
                 "universe_id": screening.universe_id,
                 "score_count": len(scores),
+                "score_strategy_id": score_strategy_id,
             },
             "backtest_evidence": backtest_evidence,
         }
@@ -382,7 +395,8 @@ def build_recommendation_payload(
         "watch_conditions": watch_conditions,
         "invalid_if": invalid_if,
         "missing_data": missing_data,
-        "score_strategy_id": score.payload.get("strategy_id"),
+        "score_strategy_id": getattr(score, "strategy_id", None)
+        or score.payload.get("strategy_id"),
         "score_weight_snapshot": score.payload.get("weight_snapshot"),
         "backtest_evidence": backtest_evidence,
         "tradability": decision_context.tradability if decision_context else None,

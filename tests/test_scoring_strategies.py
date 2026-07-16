@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from finance_agent.scoring.service import ScoringService, compute_asset_score
+from finance_agent.scoring.service import ScoringService, build_score_id, compute_asset_score
 from finance_agent.scoring.strategies import (
     default_scoring_strategy_seeds,
     validate_scoring_strategy_payload,
@@ -201,9 +201,35 @@ def test_scoring_service_records_strategy_snapshot_in_score_payload() -> None:
     assert result.status == "available"
     assert strategies.calls == ["strategy:ashare:short_swing"]
     assert scores.records[0]["total_score"] == Decimal("82.0")
+    assert scores.records[0]["strategy_id"] == "strategy:ashare:short_swing"
+    assert scores.records[0]["score_id"] == build_score_id(
+        universe_id="universe:merged:ashare:recommendation",
+        asset_id="ashare:000001",
+        horizon="swing",
+        factor_frame_id="factor:ashare:000001:swing",
+        strategy_id="strategy:ashare:short_swing",
+    )
     assert scores.records[0]["payload"]["strategy_id"] == "strategy:ashare:short_swing"
     assert scores.records[0]["payload"]["weight_snapshot"] == {
         "strategy_id": "strategy:ashare:short_swing",
         "group_weights": {"technical": 0.8, "fundamental": 0.2},
         "missing_penalty": {"per_missing_group": 2.0, "per_partial_group": 1.0},
     }
+
+
+def test_scoring_service_records_market_legacy_strategy_when_unspecified() -> None:
+    """未显式选择策略时也必须写入稳定的市场级策略维度。"""
+
+    scores = _Scores()
+    service = ScoringService.__new__(ScoringService)
+    service.screenings = _Screenings()
+    service.factors = _Factors(_Factor())
+    service.scores = scores
+    service.strategies = _Strategies(None)
+
+    service.score_screening(screening_id="screen:ashare", horizon="swing")
+
+    record = scores.records[0]
+    assert record["strategy_id"] == "strategy:ashare:legacy_default"
+    assert record["payload"]["strategy_id"] == "strategy:ashare:legacy_default"
+    assert record["score_id"].endswith(":strategy:2293b5b68a56")

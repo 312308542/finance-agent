@@ -6,6 +6,7 @@ ScoringService 消费 `screening_result_items` 和 `factor_frames`，按固定�
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass
 from decimal import Decimal
@@ -69,14 +70,21 @@ class ScoringService:
         ranked_inputs.sort(key=lambda item: item[0]["total_score"], reverse=True)
         saved_ids: list[str] = []
         for rank, (score_payload, factor, item) in enumerate(ranked_inputs, start=1):
+            effective_strategy_id = (
+                str(score_payload["weight_snapshot"]["strategy_id"])
+                if strategy is not None
+                else f"strategy:{item.market}:legacy_default"
+            )
             score_id = build_score_id(
                 universe_id=item.universe_id,
                 asset_id=item.asset_id,
                 horizon=horizon,
                 factor_frame_id=factor.factor_frame_id,
+                strategy_id=effective_strategy_id,
             )
             payload = {
                 "schema_version": "1.0",
+                "strategy_id": effective_strategy_id,
                 "score_groups": score_payload["score_groups"],
                 "data_confidence": score_payload["data_confidence"],
                 "missing_groups": factor.missing_groups,
@@ -88,8 +96,7 @@ class ScoringService:
                     "llm_role": "explanation_only",
                 },
             }
-            if strategy_id:
-                payload["strategy_id"] = score_payload["weight_snapshot"]["strategy_id"]
+            if strategy is not None:
                 payload["weight_snapshot"] = score_payload["weight_snapshot"]
                 payload["policy"]["missing_penalty_per_group"] = score_payload[
                     "weight_snapshot"
@@ -107,6 +114,7 @@ class ScoringService:
                 screening_id=screening_id,
                 factor_frame_id=factor.factor_frame_id,
                 horizon=horizon,
+                strategy_id=effective_strategy_id,
                 total_score=to_decimal(score_payload["total_score"]),
                 technical_score=optional_decimal(score_payload["group_scores"].get("technical")),
                 fundamental_score=optional_decimal(
@@ -266,10 +274,18 @@ def build_score_id(
     asset_id: str,
     horizon: str,
     factor_frame_id: str,
+    strategy_id: str,
 ) -> str:
     """生成稳定评分 ID。"""
 
-    return f"score:{universe_id}:{asset_id}:{horizon}:{factor_frame_id}"
+    strategy_digest = hashlib.md5(
+        strategy_id.encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()[:12]
+    return (
+        f"score:{universe_id}:{asset_id}:{horizon}:{factor_frame_id}"
+        f":strategy:{strategy_digest}"
+    )
 
 
 def as_float(value: Any) -> float | None:

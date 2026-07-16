@@ -233,6 +233,7 @@ class UniverseRecommendationPipeline:
             horizon=horizon,
             strategy_id=strategy_id,
         )
+        score_strategy_id = strategy_id or f"strategy:{universe.market}:legacy_default"
 
         usable_factor_asset_ids = usable_factor_asset_ids_from_results(
             factor_results,
@@ -250,9 +251,10 @@ class UniverseRecommendationPipeline:
             strategy=strategy,
             horizon=horizon,
             limit=limit,
+            score_strategy_id=score_strategy_id,
             audit_payload=recommendation_audit_payload(
                 audit_payload=audit_payload,
-                strategy_id=strategy_id,
+                strategy_id=score_strategy_id,
             ),
             market_regime=market_regime,
         )

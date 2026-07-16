@@ -2305,6 +2305,7 @@ class AssetScoreRepository:
         screening_id: str,
         factor_frame_id: str,
         horizon: str,
+        strategy_id: str,
         total_score: Decimal,
         rank: int,
         confidence: Decimal,
@@ -2333,6 +2334,7 @@ class AssetScoreRepository:
             "screening_id": screening_id,
             "factor_frame_id": factor_frame_id,
             "horizon": horizon,
+            "strategy_id": strategy_id,
             "total_score": total_score,
             "technical_score": technical_score,
             "fundamental_score": fundamental_score,
@@ -2361,14 +2363,18 @@ class AssetScoreRepository:
         self.session.flush()
         return self.session.get_one(AssetScoreORM, score_id)
 
-    def list_scores_for_screening(self, screening_id: str) -> list[AssetScoreORM]:
+    def list_scores_for_screening(
+        self,
+        screening_id: str,
+        *,
+        strategy_id: str | None = None,
+    ) -> list[AssetScoreORM]:
         """查询一次初筛对应的评分结果。"""
 
-        statement = (
-            select(AssetScoreORM)
-            .where(AssetScoreORM.screening_id == screening_id)
-            .order_by(AssetScoreORM.rank)
-        )
+        statement = select(AssetScoreORM).where(AssetScoreORM.screening_id == screening_id)
+        if strategy_id is not None:
+            statement = statement.where(AssetScoreORM.strategy_id == strategy_id)
+        statement = statement.order_by(AssetScoreORM.rank)
         return list(self.session.scalars(statement))
 
     def get_latest_score(
@@ -2376,18 +2382,17 @@ class AssetScoreRepository:
         *,
         asset_id: str,
         horizon: str,
+        strategy_id: str | None = None,
     ) -> AssetScoreORM | None:
         """查询单标的最新多维评分。"""
 
-        statement = (
-            select(AssetScoreORM)
-            .where(
-                AssetScoreORM.asset_id == asset_id,
-                AssetScoreORM.horizon == horizon,
-            )
-            .order_by(AssetScoreORM.as_of.desc())
-            .limit(1)
+        statement = select(AssetScoreORM).where(
+            AssetScoreORM.asset_id == asset_id,
+            AssetScoreORM.horizon == horizon,
         )
+        if strategy_id is not None:
+            statement = statement.where(AssetScoreORM.strategy_id == strategy_id)
+        statement = statement.order_by(AssetScoreORM.as_of.desc()).limit(1)
         return self.session.scalars(statement).one_or_none()
 
 

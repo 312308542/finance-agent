@@ -145,8 +145,18 @@ class _Scores:
         self.records.append(record)
         return SimpleNamespace(score_id=kwargs["score_id"])
 
-    def list_scores_for_screening(self, screening_id: str) -> list[SimpleNamespace]:
-        return sorted(self.records, key=lambda item: item.rank)
+    def list_scores_for_screening(
+        self,
+        screening_id: str,
+        *,
+        strategy_id: str | None = None,
+    ) -> list[SimpleNamespace]:
+        records = [
+            item
+            for item in self.records
+            if strategy_id is None or item.strategy_id == strategy_id
+        ]
+        return sorted(records, key=lambda item: item.rank)
 
 
 class _Strategies:
