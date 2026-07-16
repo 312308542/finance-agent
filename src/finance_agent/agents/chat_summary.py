@@ -362,5 +362,5 @@ def normalize_string_list(value: Any) -> list[str]:
 def build_chat_summary_memory_id(*, owner_id: str, chat_session_id: str) -> str:
     """构造稳定的聊天摘要记忆 ID，避免长会话 ID 超过主键长度。"""
 
-    digest = sha1(f"{owner_id}:{chat_session_id}".encode("utf-8")).hexdigest()[:24]
+    digest = sha1(f"{owner_id}:{chat_session_id}".encode()).hexdigest()[:24]
     return f"memory:chat_summary:{digest}"

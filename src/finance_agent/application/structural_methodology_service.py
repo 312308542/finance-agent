@@ -463,7 +463,7 @@ def build_structural_indicator_frame_id(
     """生成稳定且长度可控的结构指标帧 ID。"""
 
     digest = hashlib.sha1(
-        f"{asset_id}|{timeframe}|{schema_version}|{input_end_at.isoformat()}".encode("utf-8")
+        f"{asset_id}|{timeframe}|{schema_version}|{input_end_at.isoformat()}".encode()
     ).hexdigest()[:16]
     return f"struct:{schema_version}:{digest}"
 

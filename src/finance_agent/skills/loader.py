@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -274,7 +274,7 @@ def load_methodology_skills(names: tuple[str, ...]) -> MethodologySkillRegistry:
     return MethodologySkillRegistry(skills=tuple(load_methodology_skill(name) for name in names))
 
 
-@lru_cache(maxsize=None)
+@cache
 def load_methodology_skill(name: str) -> MethodologySkill:
     """按目录名加载单个方法论技能。"""
 
