@@ -198,7 +198,7 @@ class TechnicalScreeningService:
             if not self.eligibility.is_tradeable_asset(asset):
                 skipped_count += 1
                 continue
-            asset_id = str(getattr(asset, "asset_id"))
+            asset_id = str(asset.asset_id)
             bars = list(bars_by_asset_id.get(asset_id, ()))
             candidates.append(
                 evaluate_technical_candidate(
@@ -397,8 +397,8 @@ def evaluate_technical_candidate(
 ) -> TechnicalScreeningCandidate:
     """对单个资产计算技术粗筛结果。"""
 
-    asset_id = str(getattr(asset, "asset_id"))
-    symbol = str(getattr(asset, "symbol"))
+    asset_id = str(asset.asset_id)
+    symbol = str(asset.symbol)
     market = str(getattr(asset, "market", "ashare") or "ashare")
     normalized_bars = sorted(bars, key=lambda item: getattr(item, "timestamp", as_of))
     if len(normalized_bars) < min_bars:
