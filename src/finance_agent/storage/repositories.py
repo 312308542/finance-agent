@@ -23,6 +23,7 @@ from finance_agent.storage.event_retention import (
     NEWS_ARTICLE_EVENT_TYPES,
     event_signal_cutoff,
 )
+from finance_agent.storage.event_validation import active_event_predicate
 from finance_agent.storage.orm import (
     AgentWorkflowEventORM,
     AgentWorkflowRunORM,
@@ -5705,7 +5706,10 @@ class EventRepository:
 
         statement = (
             select(EventRecordORM)
-            .where(EventRecordORM.asset_id == asset_id)
+            .where(
+                EventRecordORM.asset_id == asset_id,
+                active_event_predicate(EventRecordORM),
+            )
             .order_by(
                 EventRecordORM.published_at.desc().nullslast(),
                 EventRecordORM.collected_at.desc(),

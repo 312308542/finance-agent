@@ -24,6 +24,7 @@ from finance_agent.application import (
 )
 from finance_agent.graph import GraphSyncService, create_graph_store
 from finance_agent.graph.stores import MemoryGraphStore
+from finance_agent.storage.event_validation import active_evidence_predicate
 from finance_agent.storage.orm import (
     AssetScoreORM,
     AssistantMemoryORM,
@@ -1114,7 +1115,10 @@ def list_recent_evidence(
 
     statement = (
         select(EvidenceORM)
-        .where(EvidenceORM.asset_id == asset_id)
+        .where(
+            EvidenceORM.asset_id == asset_id,
+            active_evidence_predicate(EvidenceORM),
+        )
         .order_by(EvidenceORM.as_of.desc().nullslast(), EvidenceORM.collected_at.desc())
         .limit(limit)
     )

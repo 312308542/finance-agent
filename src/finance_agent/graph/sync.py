@@ -18,6 +18,7 @@ from finance_agent.graph.models import (
     json_safe,
 )
 from finance_agent.graph.stores import MemoryGraphStore, create_graph_store
+from finance_agent.storage.event_validation import active_evidence_predicate
 from finance_agent.storage.orm import (
     AssetORM,
     AssistantMemoryORM,
@@ -475,7 +476,10 @@ class GraphSyncService:
         evidence_ids.update(
             evidence_id for risk in risks for evidence_id in (risk.evidence_ids or [])
         )
-        statement = select(EvidenceORM).where(EvidenceORM.asset_id == asset_id)
+        statement = select(EvidenceORM).where(
+            EvidenceORM.asset_id == asset_id,
+            active_evidence_predicate(EvidenceORM),
+        )
         if evidence_ids:
             statement = statement.where(
                 (EvidenceORM.evidence_id.in_(evidence_ids)) | (EvidenceORM.asset_id == asset_id)

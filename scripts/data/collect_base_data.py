@@ -62,6 +62,7 @@ from finance_agent.data.source_rate_limiter import (
 from finance_agent.scheduler.base_data_progress import BaseDataTaskProgressRecorder
 from finance_agent.storage.db import create_session_factory, session_scope
 from finance_agent.storage.event_retention import DEFAULT_ARTICLE_FULL_TEXT_RETENTION_DAYS
+from finance_agent.storage.event_validation import active_event_predicate
 from finance_agent.storage.orm import (
     AssetRecommendationORM,
     DataSyncWatermarkORM,
@@ -1737,6 +1738,7 @@ def resolve_ashare_news_article_candidates(
                 EventRecordORM.market == "ashare",
                 EventRecordORM.event_type == "news",
                 EventRecordORM.url.is_not(None),
+                active_event_predicate(EventRecordORM),
             )
             .order_by(
                 EventRecordORM.published_at.desc().nullslast(),

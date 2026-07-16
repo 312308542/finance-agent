@@ -19,6 +19,10 @@ from finance_agent.storage.event_retention import (
     DEFAULT_EVENT_SIGNAL_LOOKBACK_DAYS,
     event_signal_cutoff,
 )
+from finance_agent.storage.event_validation import (
+    active_event_predicate,
+    active_evidence_predicate,
+)
 from finance_agent.storage.orm import (
     AssetORM,
     CapitalFlowSnapshotORM,
@@ -251,7 +255,10 @@ class AgentContextBuilder:
     def _load_recent_events(self, asset_id: str, *, limit: int) -> list[JsonDict]:
         statement = (
             select(EventRecordORM)
-            .where(EventRecordORM.asset_id == asset_id)
+            .where(
+                EventRecordORM.asset_id == asset_id,
+                active_event_predicate(EventRecordORM),
+            )
             .order_by(
                 EventRecordORM.published_at.desc().nullslast(),
                 EventRecordORM.collected_at.desc(),
@@ -286,7 +293,10 @@ class AgentContextBuilder:
     def _load_recent_evidence(self, asset_id: str, *, limit: int) -> list[JsonDict]:
         statement = (
             select(EvidenceORM)
-            .where(EvidenceORM.asset_id == asset_id)
+            .where(
+                EvidenceORM.asset_id == asset_id,
+                active_evidence_predicate(EvidenceORM),
+            )
             .order_by(EvidenceORM.as_of.desc().nullslast(), EvidenceORM.collected_at.desc())
             .limit(limit)
         )
