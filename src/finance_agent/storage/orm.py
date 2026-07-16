@@ -12,6 +12,7 @@ from typing import Any
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Index,
@@ -927,6 +928,154 @@ class BacktestResultORM(Base):
     )
     payload: Mapped[JsonDict] = mapped_column(
         JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class StrategyObservationRunORM(Base):
+    """每日多策略前向观察批次头。"""
+
+    __tablename__ = "strategy_observation_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "trade_date",
+            "universe_id",
+            name="uq_strategy_observation_run_day_universe",
+        ),
+        Index("idx_strategy_observation_runs_date", "trade_date"),
+        Index("idx_strategy_observation_runs_status", "status"),
+    )
+
+    observation_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    universe_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    screening_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    data_versions: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class StrategyObservationPositionORM(Base):
+    """单个观察批次中某策略的 Top N 仓位。"""
+
+    __tablename__ = "strategy_observation_positions"
+    __table_args__ = (
+        UniqueConstraint(
+            "observation_id",
+            "strategy_id",
+            "asset_id",
+            name="uq_strategy_position_asset",
+        ),
+        Index("idx_strategy_positions_observation", "observation_id"),
+        Index("idx_strategy_positions_strategy_signal", "strategy_id", "signal_date"),
+        Index("idx_strategy_positions_asset", "asset_id"),
+    )
+
+    position_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    observation_id: Mapped[str] = mapped_column(String(192), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    score_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    signal_date: Mapped[date] = mapped_column(Date, nullable=False)
+    entry_date: Mapped[date | None] = mapped_column(Date)
+    entry_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    benchmark_entry_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class StrategyObservationOutcomeORM(Base):
+    """观察仓位在 5/10/20 个交易日到期后的收益标签。"""
+
+    __tablename__ = "strategy_observation_outcomes"
+    __table_args__ = (
+        UniqueConstraint(
+            "position_id",
+            "horizon_days",
+            name="uq_strategy_outcome_horizon",
+        ),
+        CheckConstraint(
+            "horizon_days in (5, 10, 20)",
+            name="ck_strategy_outcome_horizon",
+        ),
+        Index("idx_strategy_outcomes_due_status", "due_trade_date", "status"),
+        Index("idx_strategy_outcomes_position", "position_id"),
+    )
+
+    outcome_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    position_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    horizon_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    due_trade_date: Mapped[date | None] = mapped_column(Date)
+    exit_date: Mapped[date | None] = mapped_column(Date)
+    exit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    gross_return: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    net_return: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    benchmark_return: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    excess_return: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class StrategyTrialStateORM(Base):
+    """策略历史验证、试运行、关闭和晋级状态。"""
+
+    __tablename__ = "strategy_trial_states"
+    __table_args__ = (
+        CheckConstraint(
+            "state in ('research','historical_passed','trial','validated','disabled')",
+            name="ck_strategy_trial_state",
+        ),
+        Index("idx_strategy_trial_states_state", "state"),
+    )
+
+    strategy_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    historical_evidence_id: Mapped[str | None] = mapped_column(String(192))
+    forward_metrics: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    consecutive_failure_count: Mapped[int] = mapped_column(
+        Integer, server_default=text("0"), nullable=False
+    )
+    disabled_reason: Mapped[str | None] = mapped_column(Text)
+    last_evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
 
 

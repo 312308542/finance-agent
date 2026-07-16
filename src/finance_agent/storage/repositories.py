@@ -77,6 +77,10 @@ from finance_agent.storage.orm import (
     ScreeningResultItemORM,
     ScreeningResultORM,
     SignalSnapshotORM,
+    StrategyObservationOutcomeORM,
+    StrategyObservationPositionORM,
+    StrategyObservationRunORM,
+    StrategyTrialStateORM,
     UserInvestmentProfileORM,
     WatchlistItemEventORM,
     WatchlistItemORM,
@@ -2662,6 +2666,276 @@ class BacktestRepository:
         return list(
             self.session.scalars(
                 statement.order_by(BacktestResultORM.created_at.desc()).limit(limit)
+            )
+        )
+
+
+class StrategyObservationRepository:
+    """多策略前向观察账本与试运行状态仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def upsert_run(
+        self,
+        *,
+        observation_id: str,
+        trade_date: date,
+        universe_id: str,
+        screening_id: str,
+        status: str,
+        data_versions: JsonDict,
+        payload: JsonDict | None = None,
+        created_at: datetime | None = None,
+        updated_at: datetime | None = None,
+    ) -> StrategyObservationRunORM:
+        """按交易日和候选池幂等写入观察批次头。"""
+
+        now = datetime.now().astimezone()
+        values = {
+            "observation_id": observation_id,
+            "trade_date": trade_date,
+            "universe_id": universe_id,
+            "screening_id": screening_id,
+            "status": status,
+            "data_versions": _json_safe(data_versions),
+            "payload": _json_safe(payload or {}),
+            "created_at": created_at or now,
+            "updated_at": updated_at or now,
+        }
+        statement = insert(StrategyObservationRunORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"observation_id", "trade_date", "universe_id", "created_at"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[
+                    StrategyObservationRunORM.trade_date,
+                    StrategyObservationRunORM.universe_id,
+                ],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(StrategyObservationRunORM, observation_id)
+
+    def upsert_positions(
+        self,
+        positions: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """幂等写入同一观察批次下各策略的 Top N 仓位。"""
+
+        now = datetime.now().astimezone()
+        rows = _dedupe_rows(
+            [
+                {
+                    **item,
+                    "payload": _json_safe(item.get("payload") or {}),
+                    "created_at": item.get("created_at") or now,
+                    "updated_at": item.get("updated_at") or now,
+                }
+                for item in positions
+            ],
+            ("observation_id", "strategy_id", "asset_id"),
+        )
+        if not rows:
+            return 0
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(StrategyObservationPositionORM).values(list(chunk))
+            update_values = {
+                key: statement.excluded[key]
+                for key in rows[0]
+                if key
+                not in {
+                    "position_id",
+                    "observation_id",
+                    "strategy_id",
+                    "asset_id",
+                    "created_at",
+                }
+            }
+            return statement.on_conflict_do_update(
+                index_elements=[
+                    StrategyObservationPositionORM.observation_id,
+                    StrategyObservationPositionORM.strategy_id,
+                    StrategyObservationPositionORM.asset_id,
+                ],
+                set_=update_values,
+            )
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
+
+    def ensure_outcomes(
+        self,
+        outcomes: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """只创建尚不存在的 5/10/20 日 pending 收益标签。"""
+
+        now = datetime.now().astimezone()
+        rows = _dedupe_rows(
+            [
+                {
+                    **item,
+                    "payload": _json_safe(item.get("payload") or {}),
+                    "created_at": item.get("created_at") or now,
+                    "updated_at": item.get("updated_at") or now,
+                }
+                for item in outcomes
+            ],
+            ("position_id", "horizon_days"),
+        )
+        if not rows:
+            return 0
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=lambda chunk: insert(StrategyObservationOutcomeORM)
+            .values(list(chunk))
+            .on_conflict_do_nothing(
+                index_elements=[
+                    StrategyObservationOutcomeORM.position_id,
+                    StrategyObservationOutcomeORM.horizon_days,
+                ]
+            ),
+        )
+
+    def list_due_outcomes(
+        self,
+        *,
+        as_of: date,
+        limit: int = 500,
+    ) -> list[StrategyObservationOutcomeORM]:
+        """查询已经到期但尚未结算的收益标签。"""
+
+        statement = (
+            select(StrategyObservationOutcomeORM)
+            .where(
+                StrategyObservationOutcomeORM.status == "pending",
+                StrategyObservationOutcomeORM.due_trade_date.is_not(None),
+                StrategyObservationOutcomeORM.due_trade_date <= as_of,
+            )
+            .order_by(
+                StrategyObservationOutcomeORM.due_trade_date,
+                StrategyObservationOutcomeORM.outcome_id,
+            )
+            .limit(limit)
+        )
+        return list(self.session.scalars(statement))
+
+    def mature_outcomes(self, outcomes: Sequence[JsonDict]) -> int:
+        """更新已存在的 pending 收益标签，不创建缺少仓位信息的新行。"""
+
+        updated = 0
+        for item in _dedupe_rows(list(outcomes), ("outcome_id",)):
+            values = {
+                key: _json_safe(value) if key == "payload" else value
+                for key, value in item.items()
+                if key != "outcome_id"
+            }
+            values["updated_at"] = item.get("updated_at") or datetime.now().astimezone()
+            result = self.session.execute(
+                update(StrategyObservationOutcomeORM)
+                .where(StrategyObservationOutcomeORM.outcome_id == item["outcome_id"])
+                .values(**values)
+            )
+            updated += int(result.rowcount or 0)
+        if outcomes:
+            self.session.flush()
+        return updated
+
+    def get_trial_state(self, strategy_id: str) -> StrategyTrialStateORM | None:
+        """读取单个策略的历史/前向验证状态。"""
+
+        return self.session.get(StrategyTrialStateORM, strategy_id)
+
+    def upsert_trial_state(
+        self,
+        *,
+        strategy_id: str,
+        strategy_version: str,
+        state: str,
+        historical_evidence_id: str | None,
+        forward_metrics: JsonDict,
+        consecutive_failure_count: int,
+        disabled_reason: str | None,
+        last_evaluated_at: datetime | None = None,
+        payload: JsonDict | None = None,
+        created_at: datetime | None = None,
+        updated_at: datetime | None = None,
+    ) -> StrategyTrialStateORM:
+        """幂等写入策略试运行状态，保留首次创建时间。"""
+
+        now = datetime.now().astimezone()
+        values = {
+            "strategy_id": strategy_id,
+            "strategy_version": strategy_version,
+            "state": state,
+            "historical_evidence_id": historical_evidence_id,
+            "forward_metrics": _json_safe(forward_metrics),
+            "consecutive_failure_count": consecutive_failure_count,
+            "disabled_reason": disabled_reason,
+            "last_evaluated_at": last_evaluated_at,
+            "payload": _json_safe(payload or {}),
+            "created_at": created_at or now,
+            "updated_at": updated_at or now,
+        }
+        statement = insert(StrategyTrialStateORM).values(**values)
+        update_values = {
+            key: statement.excluded[key]
+            for key in values
+            if key not in {"strategy_id", "created_at"}
+        }
+        self.session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[StrategyTrialStateORM.strategy_id],
+                set_=update_values,
+            )
+        )
+        self.session.flush()
+        return self.session.get_one(StrategyTrialStateORM, strategy_id)
+
+    def list_recent_matured_outcomes(
+        self,
+        *,
+        strategy_id: str,
+        horizon_days: int | None = None,
+        limit: int = 500,
+    ) -> list[StrategyObservationOutcomeORM]:
+        """按策略读取最近成熟的前向收益标签。"""
+
+        statement = (
+            select(StrategyObservationOutcomeORM)
+            .join(
+                StrategyObservationPositionORM,
+                StrategyObservationPositionORM.position_id
+                == StrategyObservationOutcomeORM.position_id,
+            )
+            .where(
+                StrategyObservationPositionORM.strategy_id == strategy_id,
+                StrategyObservationOutcomeORM.status == "matured",
+            )
+        )
+        if horizon_days is not None:
+            statement = statement.where(
+                StrategyObservationOutcomeORM.horizon_days == horizon_days
+            )
+        return list(
+            self.session.scalars(
+                statement.order_by(StrategyObservationOutcomeORM.exit_date.desc()).limit(limit)
             )
         )
 
