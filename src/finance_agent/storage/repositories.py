@@ -23,7 +23,7 @@ from finance_agent.storage.event_retention import (
     NEWS_ARTICLE_EVENT_TYPES,
     event_signal_cutoff,
 )
-from finance_agent.storage.event_validation import active_event_predicate
+from finance_agent.storage.event_validation import STOCK_NEWS_SOURCE, active_event_predicate
 from finance_agent.storage.orm import (
     AgentWorkflowEventORM,
     AgentWorkflowRunORM,
@@ -226,6 +226,86 @@ def _article_payload_update_statement(
         WHERE target.{match_column} = source.event_id
         """
     ).bindparams(**params)
+
+
+def _entity_validation_update_rows(updates: Sequence[JsonDict]) -> list[JsonDict]:
+    """标准化历史实体校验回填行，并按事件 ID 去重。"""
+
+    return _dedupe_rows(
+        [
+            {
+                "event_id": item["event_id"],
+                "entity_validation": _json_safe(item.get("entity_validation") or {}),
+            }
+            for item in updates
+        ],
+        ("event_id",),
+    )
+
+
+def _entity_validation_update_statement(
+    *,
+    table_name: str,
+    match_column: str,
+    rows: Sequence[JsonDict],
+) -> Any:
+    """构造实体校验 JSONB 子对象批量合并语句。"""
+
+    params: dict[str, Any] = {}
+    values_sql: list[str] = []
+    for index, row in enumerate(rows):
+        event_param = f"event_id_{index}"
+        validation_param = f"entity_validation_{index}"
+        params[event_param] = row["event_id"]
+        params[validation_param] = json.dumps(
+            row["entity_validation"],
+            ensure_ascii=False,
+        )
+        values_sql.append(f"(:{event_param}, CAST(:{validation_param} AS jsonb))")
+    values_clause = ", ".join(values_sql)
+    return text(
+        f"""
+        UPDATE {table_name} AS target
+        SET payload = jsonb_set(
+            COALESCE(target.payload, '{{}}'::jsonb),
+            '{{entity_validation}}',
+            source.entity_validation,
+            true
+        )
+        FROM (VALUES {values_clause}) AS source(event_id, entity_validation)
+        WHERE target.{match_column} = source.event_id
+        """
+    ).bindparams(**params)
+
+
+def _execute_entity_validation_updates(
+    session: Session,
+    *,
+    table_name: str,
+    match_column: str,
+    updates: Sequence[JsonDict],
+    chunk_size: int,
+) -> int:
+    """分块合并实体校验 payload，并返回真实受影响行数。"""
+
+    if chunk_size <= 0:
+        raise ValueError("chunk_size 必须大于 0")
+    rows = _entity_validation_update_rows(updates)
+    if not rows:
+        return 0
+    updated = 0
+    for index in range(0, len(rows), chunk_size):
+        chunk = rows[index : index + chunk_size]
+        result = session.execute(
+            _entity_validation_update_statement(
+                table_name=table_name,
+                match_column=match_column,
+                rows=chunk,
+            )
+        )
+        updated += int(result.rowcount or 0)
+    session.flush()
+    return updated
 
 
 def _expired_article_delete_statement(
@@ -5688,6 +5768,58 @@ class EventRepository:
                 match_column="data_ref",
                 rows=chunk,
             ),
+        )
+
+    def list_stock_news_for_entity_revalidation(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> list[tuple[EventRecordORM, str | None]]:
+        """读取全部关键词新闻审计行，并关联资产主表公司名。"""
+
+        statement = (
+            select(EventRecordORM, AssetORM.name)
+            .outerjoin(AssetORM, AssetORM.asset_id == EventRecordORM.asset_id)
+            .where(EventRecordORM.source == STOCK_NEWS_SOURCE)
+            .order_by(EventRecordORM.collected_at, EventRecordORM.event_id)
+        )
+        if limit is not None:
+            statement = statement.limit(max(limit, 1))
+        return [
+            (row[0], row[1])
+            for row in self.session.execute(statement).all()
+        ]
+
+    def update_news_entity_validations(
+        self,
+        updates: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """批量合并历史新闻事件的实体校验 payload。"""
+
+        return _execute_entity_validation_updates(
+            self.session,
+            table_name=EventRecordORM.__tablename__,
+            match_column="event_id",
+            updates=updates,
+            chunk_size=chunk_size,
+        )
+
+    def update_evidence_entity_validations(
+        self,
+        updates: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """按事件 ID 批量合并关联证据的实体校验 payload。"""
+
+        return _execute_entity_validation_updates(
+            self.session,
+            table_name=EvidenceORM.__tablename__,
+            match_column="data_ref",
+            updates=updates,
+            chunk_size=chunk_size,
         )
 
     def list_recent_events(
