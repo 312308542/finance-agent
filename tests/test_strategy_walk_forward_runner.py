@@ -15,12 +15,118 @@ from finance_agent.research.strategy_walk_forward import (
 from finance_agent.research.strategy_walk_forward_runner import (
     CandidateAsset,
     PointInTimeStrategyDataSource,
+    SqlPointInTimeReader,
     StrategyWalkForwardRequest,
     StrategyWalkForwardRunner,
 )
 from finance_agent.storage.event_validation import STOCK_NEWS_SOURCE
 
 SHORT = "strategy:ashare:short_swing"
+
+
+class _CountingSession:
+    """记录 SQL 读取次数，验证点时读取缓存不会改变结果。"""
+
+    def __init__(self, *, scalar_rows: list[Any] | None = None) -> None:
+        self.scalar_rows = scalar_rows or []
+        self.scalar_calls = 0
+        self.execute_rows: list[Any] = []
+        self.execute_calls = 0
+
+    def scalars(self, _statement: Any) -> list[Any]:
+        self.scalar_calls += 1
+        return list(self.scalar_rows)
+
+    def execute(self, _statement: Any) -> Any:
+        self.execute_calls += 1
+        rows = list(self.execute_rows)
+
+        class _Result:
+            def __init__(self, values: list[Any]) -> None:
+                self.values = values
+
+            def __iter__(self):
+                return iter(self.values)
+
+        return _Result(rows)
+
+
+def _bar_row(timestamp: datetime) -> SimpleNamespace:
+    return SimpleNamespace(
+        timestamp=timestamp,
+        open=10,
+        high=11,
+        low=9,
+        close=10.5,
+        volume=1000,
+        amount=10500,
+    )
+
+
+def test_sql_reader_reuses_asset_bars_for_feature_and_forward_reads() -> None:
+    """同一资产的特征和标签读取不得重复查询完整 K 线。"""
+
+    signal_at = datetime(2025, 1, 2, tzinfo=UTC)
+    session = _CountingSession(
+        scalar_rows=[
+            _bar_row(signal_at),
+            _bar_row(signal_at + timedelta(days=1)),
+            _bar_row(signal_at + timedelta(days=2)),
+        ]
+    )
+    reader = SqlPointInTimeReader(session)
+
+    bars = reader.list_bars(asset_id="ashare:000001", end_at=signal_at)
+    forward = reader.list_forward_bars(
+        asset_id="ashare:000001",
+        signal_date=signal_at.date(),
+        horizon_days=1,
+    )
+
+    assert len(bars) == 1
+    assert len(forward) == 2
+    assert session.scalar_calls == 1
+
+
+def test_sql_reader_caches_static_point_in_time_records_per_asset() -> None:
+    """基本面、资金流、事件、风险和题材记录应按资产复用。"""
+
+    session = _CountingSession(scalar_rows=[SimpleNamespace(record_id="record:1")])
+    reader = SqlPointInTimeReader(session)
+
+    for method_name in (
+        "list_fundamentals",
+        "list_capital_flows",
+        "list_events",
+        "list_risks",
+        "list_theme_memberships",
+    ):
+        method = getattr(reader, method_name)
+        method(asset_id="ashare:000001")
+        method(asset_id="ashare:000001")
+
+    assert session.scalar_calls == 5
+
+
+def test_sql_reader_caches_candidates_for_repeated_signal_date() -> None:
+    """同一交易日重复请求候选池只执行一次日截面查询。"""
+
+    session = _CountingSession()
+    session.execute_rows = [
+        ("ashare:000001", "000001"),
+        ("ashare:000002", "000002"),
+    ]
+    reader = SqlPointInTimeReader(session)
+    reader._warmup_timestamps = {
+        "ashare:000001": datetime(2024, 1, 1, tzinfo=UTC),
+    }
+
+    first = reader.list_candidates(signal_date=date(2025, 1, 2))
+    second = reader.list_candidates(signal_date=date(2025, 1, 2))
+
+    assert first == [CandidateAsset(asset_id="ashare:000001", symbol="000001")]
+    assert second == first
+    assert session.execute_calls == 1
 
 
 def _bars(*, end_at: datetime, count: int = 130) -> pd.DataFrame:
@@ -240,6 +346,27 @@ class _ResearchSource:
         return {"bars_max_at": "2026-07-16T00:00:00+00:00", "code_commit": "abc123"}
 
 
+class _CoverageShortCircuitSource(_ResearchSource):
+    """构造覆盖必然不足的截面，验证 runner 不做无意义的评分和标签。"""
+
+    def __init__(self) -> None:
+        super().__init__(available_weight=0.70)
+        self.assets = [
+            CandidateAsset(asset_id=f"ashare:{index:06d}", symbol=f"{index:06d}")
+            for index in range(20)
+        ]
+        self.snapshot_calls = 0
+        self.label_calls = 0
+
+    def build_factor_snapshot(self, **kwargs: Any) -> PointInTimeFactorSnapshot:
+        self.snapshot_calls += 1
+        return super().build_factor_snapshot(**kwargs)
+
+    def label_asset(self, **kwargs: Any) -> WalkForwardOutcome:
+        self.label_calls += 1
+        return super().label_asset(**kwargs)
+
+
 class _BacktestRepository:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -313,3 +440,19 @@ def test_runner_keeps_data_shortage_separate_from_strategy_failure() -> None:
 
     assert result["status"] == "insufficient_data"
     assert repository.calls[0]["status"] == "insufficient_data"
+
+
+def test_runner_short_circuits_when_cross_section_coverage_cannot_pass() -> None:
+    """覆盖失败数超过 10% 后，应停止该截面的评分和未来标签。"""
+
+    source = _CoverageShortCircuitSource()
+
+    result = StrategyWalkForwardRunner(
+        source=source,
+        repository=_BacktestRepository(),
+    ).run(_request(dry_run=True))
+
+    assert result["status"] == "insufficient_data"
+    assert result["metrics"]["total_cross_sections"] == len(source.days)
+    assert source.snapshot_calls == len(source.days) * 3
+    assert source.label_calls == 0

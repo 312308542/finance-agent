@@ -231,7 +231,7 @@ def evaluate_historical_gate(
     """按固定样本、收益、分阶段和回撤门槛评估历史结果。"""
 
     daily = _aggregate_daily_outcomes(outcomes)
-    all_dates = sorted({signal_date for signal_date, _horizon in daily})
+    all_dates = sorted(coverage_by_date)
     valid_coverage_dates = {
         signal_date
         for signal_date, weights in coverage_by_date.items()

@@ -27,6 +27,7 @@ from finance_agent.factors.service import (
 )
 from finance_agent.research.strategy_walk_forward import (
     MINIMUM_ASSET_AVAILABLE_WEIGHT,
+    MINIMUM_COVERED_ASSET_RATIO,
     SUPPORTED_HORIZONS,
     PointInTimeFactorSnapshot,
     WalkForwardOutcome,
@@ -189,16 +190,36 @@ class SqlPointInTimeReader:
         self.market_bar_source = market_bar_source
         self.asset_limit = max(int(asset_limit), 1) if asset_limit is not None else None
         self.code_commit = code_commit
+        self._research_start_at: datetime | None = None
+        self._research_end_at: datetime | None = None
+        self._warmup_timestamps: dict[str, datetime] | None = None
+        self._candidates_by_date: dict[date, list[CandidateAsset]] = {}
+        self._bars_by_asset: dict[str, pd.DataFrame] = {}
+        self._fundamentals_by_asset: dict[str, list[Any]] = {}
+        self._capital_flows_by_asset: dict[str, list[Any]] = {}
+        self._events_by_asset: dict[str, list[Any]] = {}
+        self._risks_by_asset: dict[str, list[Any]] = {}
+        self._theme_memberships_by_asset: dict[str, list[Any]] = {}
 
     def list_signal_dates(self, *, start_at: datetime, end_at: datetime) -> list[date]:
         """查询研究窗口内实际存在的 A 股交易日。"""
 
+        normalized_start = _ensure_aware(start_at)
+        normalized_end = _ensure_aware(end_at)
+        if (self._research_start_at, self._research_end_at) != (
+            normalized_start,
+            normalized_end,
+        ):
+            self._research_start_at = normalized_start
+            self._research_end_at = normalized_end
+            self._candidates_by_date.clear()
+            self._bars_by_asset.clear()
         statement = (
             select(func.date(MarketBarORM.timestamp))
             .where(
                 *self._bar_predicates(),
-                MarketBarORM.timestamp >= _ensure_aware(start_at),
-                MarketBarORM.timestamp <= _ensure_aware(end_at),
+                MarketBarORM.timestamp >= normalized_start,
+                MarketBarORM.timestamp <= normalized_end,
             )
             .distinct()
             .order_by(func.date(MarketBarORM.timestamp))
@@ -208,49 +229,46 @@ class SqlPointInTimeReader:
     def list_candidates(self, *, signal_date: date) -> list[CandidateAsset]:
         """按当日有收盘 K 线和至少 120 根预热记录重建候选池。"""
 
+        cached = self._candidates_by_date.get(signal_date)
+        if cached is not None:
+            return list(cached)
+        warmup_timestamps = self._load_warmup_timestamps()
+        day_start = datetime.combine(
+            signal_date,
+            time.min,
+            tzinfo=ASHARE_TIMEZONE,
+        ).astimezone(UTC)
         cutoff = _ashare_close_at(signal_date)
-        warmed_assets = (
-            select(MarketBarORM.asset_id.label("asset_id"))
-            .where(
-                *self._bar_predicates(),
-                MarketBarORM.timestamp <= cutoff,
-            )
-            .group_by(MarketBarORM.asset_id)
-            .having(func.count(MarketBarORM.timestamp.distinct()) >= 120)
-            .subquery("walk_forward_warmed_assets")
-        )
         statement = (
             select(MarketBarORM.asset_id, MarketBarORM.symbol)
             .where(
                 *self._bar_predicates(),
-                func.date(MarketBarORM.timestamp) == signal_date,
-                MarketBarORM.asset_id.in_(select(warmed_assets.c.asset_id)),
+                MarketBarORM.timestamp >= day_start,
+                MarketBarORM.timestamp <= cutoff,
             )
             .distinct()
             .order_by(MarketBarORM.asset_id)
         )
+        candidates: list[CandidateAsset] = []
+        for asset_id, symbol in self.session.execute(statement):
+            warmup_at = warmup_timestamps.get(asset_id)
+            if (
+                warmup_at is not None
+                and warmup_at <= cutoff
+                and is_main_board_ashare_stock_symbol(symbol)
+            ):
+                candidates.append(CandidateAsset(asset_id=asset_id, symbol=symbol))
         if self.asset_limit is not None:
-            statement = statement.limit(self.asset_limit)
-        return [
-            CandidateAsset(asset_id=asset_id, symbol=symbol)
-            for asset_id, symbol in self.session.execute(statement)
-            if is_main_board_ashare_stock_symbol(symbol)
-        ]
+            candidates = candidates[: self.asset_limit]
+        self._candidates_by_date[signal_date] = candidates
+        return list(candidates)
 
     def list_bars(self, *, asset_id: str, end_at: datetime) -> pd.DataFrame:
         """读取截面前最近一段 canonical 日 K，返回时间升序 DataFrame。"""
 
-        statement = (
-            select(MarketBarORM)
-            .where(
-                *self._bar_predicates(),
-                MarketBarORM.asset_id == asset_id,
-                MarketBarORM.timestamp <= _ensure_aware(end_at),
-            )
-            .order_by(MarketBarORM.timestamp.desc())
-            .limit(DEFAULT_FEATURE_BAR_LIMIT)
-        )
-        return _bars_to_frame(reversed(list(self.session.scalars(statement))))
+        bars = self._load_asset_bars(asset_id)
+        visible = bars.loc[bars["timestamp"] <= _ensure_aware(end_at)]
+        return visible.tail(DEFAULT_FEATURE_BAR_LIMIT).reset_index(drop=True)
 
     def list_forward_bars(
         self,
@@ -262,35 +280,41 @@ class SqlPointInTimeReader:
         """读取信号日及其后标签所需的交易日 K 线。"""
 
         start_at = datetime.combine(signal_date, time.min, tzinfo=UTC)
-        statement = (
-            select(MarketBarORM)
-            .where(
-                *self._bar_predicates(),
-                MarketBarORM.asset_id == asset_id,
-                MarketBarORM.timestamp >= start_at,
-            )
-            .order_by(MarketBarORM.timestamp)
-            .limit(horizon_days + 1)
+        bars = self._load_asset_bars(asset_id)
+        return bars.loc[bars["timestamp"] >= start_at].head(horizon_days + 1).reset_index(
+            drop=True
         )
-        return _bars_to_frame(self.session.scalars(statement))
 
     def list_fundamentals(self, *, asset_id: str) -> list[FundamentalSnapshotORM]:
+        cached = self._fundamentals_by_asset.get(asset_id)
+        if cached is not None:
+            return list(cached)
         statement = (
             select(FundamentalSnapshotORM)
             .where(FundamentalSnapshotORM.asset_id == asset_id)
             .order_by(FundamentalSnapshotORM.as_of)
         )
-        return list(self.session.scalars(statement))
+        rows = list(self.session.scalars(statement))
+        self._fundamentals_by_asset[asset_id] = rows
+        return list(rows)
 
     def list_capital_flows(self, *, asset_id: str) -> list[CapitalFlowSnapshotORM]:
+        cached = self._capital_flows_by_asset.get(asset_id)
+        if cached is not None:
+            return list(cached)
         statement = (
             select(CapitalFlowSnapshotORM)
             .where(CapitalFlowSnapshotORM.asset_id == asset_id)
             .order_by(CapitalFlowSnapshotORM.as_of)
         )
-        return list(self.session.scalars(statement))
+        rows = list(self.session.scalars(statement))
+        self._capital_flows_by_asset[asset_id] = rows
+        return list(rows)
 
     def list_events(self, *, asset_id: str) -> list[EventRecordORM]:
+        cached = self._events_by_asset.get(asset_id)
+        if cached is not None:
+            return list(cached)
         statement = (
             select(EventRecordORM)
             .where(
@@ -299,22 +323,96 @@ class SqlPointInTimeReader:
             )
             .order_by(EventRecordORM.published_at)
         )
-        return list(self.session.scalars(statement))
+        rows = list(self.session.scalars(statement))
+        self._events_by_asset[asset_id] = rows
+        return list(rows)
 
     def list_risks(self, *, asset_id: str) -> list[RiskFindingORM]:
+        cached = self._risks_by_asset.get(asset_id)
+        if cached is not None:
+            return list(cached)
         statement = (
             select(RiskFindingORM)
             .where(RiskFindingORM.asset_id == asset_id)
             .order_by(RiskFindingORM.as_of)
         )
-        return list(self.session.scalars(statement))
+        rows = list(self.session.scalars(statement))
+        self._risks_by_asset[asset_id] = rows
+        return list(rows)
 
     def list_theme_memberships(self, *, asset_id: str) -> list[AssetUniverseMemberORM]:
+        cached = self._theme_memberships_by_asset.get(asset_id)
+        if cached is not None:
+            return list(cached)
         statement = select(AssetUniverseMemberORM).where(
             AssetUniverseMemberORM.asset_id == asset_id,
             AssetUniverseMemberORM.included.is_(True),
         )
-        return list(self.session.scalars(statement))
+        rows = list(self.session.scalars(statement))
+        self._theme_memberships_by_asset[asset_id] = rows
+        return list(rows)
+
+    def _load_warmup_timestamps(self) -> dict[str, datetime]:
+        """一次计算每个资产第 120 根日 K，避免逐日重复全表聚合。"""
+
+        if self._warmup_timestamps is not None:
+            return self._warmup_timestamps
+        ranked = (
+            select(
+                MarketBarORM.asset_id.label("asset_id"),
+                MarketBarORM.timestamp.label("timestamp"),
+                func.row_number()
+                .over(
+                    partition_by=MarketBarORM.asset_id,
+                    order_by=MarketBarORM.timestamp,
+                )
+                .label("bar_number"),
+            )
+            .where(*self._bar_predicates())
+            .subquery("walk_forward_ranked_bars")
+        )
+        statement = select(ranked.c.asset_id, ranked.c.timestamp).where(
+            ranked.c.bar_number == 120
+        )
+        self._warmup_timestamps = {
+            asset_id: _ensure_aware(timestamp)
+            for asset_id, timestamp in self.session.execute(statement)
+        }
+        return self._warmup_timestamps
+
+    def _load_asset_bars(self, asset_id: str) -> pd.DataFrame:
+        """按资产缓存研究窗口所需历史 K 线，读取时仍按截面时间切片。"""
+
+        cached = self._bars_by_asset.get(asset_id)
+        if cached is not None:
+            return cached
+        predicates = (*self._bar_predicates(), MarketBarORM.asset_id == asset_id)
+        if self._research_start_at is None:
+            statement = (
+                select(MarketBarORM)
+                .where(*predicates)
+                .order_by(MarketBarORM.timestamp)
+            )
+            rows = list(self.session.scalars(statement))
+        else:
+            start_date = self._research_start_at.astimezone(ASHARE_TIMEZONE).date()
+            history_cutoff = _ashare_close_at(start_date)
+            history_statement = (
+                select(MarketBarORM)
+                .where(*predicates, MarketBarORM.timestamp <= history_cutoff)
+                .order_by(MarketBarORM.timestamp.desc())
+                .limit(DEFAULT_FEATURE_BAR_LIMIT)
+            )
+            forward_statement = (
+                select(MarketBarORM)
+                .where(*predicates, MarketBarORM.timestamp > history_cutoff)
+                .order_by(MarketBarORM.timestamp)
+            )
+            history = list(reversed(list(self.session.scalars(history_statement))))
+            rows = history + list(self.session.scalars(forward_statement))
+        cached = _bars_to_frame(rows)
+        self._bars_by_asset[asset_id] = cached
+        return cached
 
     def data_versions(self) -> JsonDict:
         """读取研究涉及表的最高数据水位。"""
@@ -570,7 +668,11 @@ class StrategyWalkForwardRunner:
 
             scored: list[tuple[float, CandidateAsset]] = []
             as_of = _ashare_close_at(signal_date)
-            for candidate in candidates:
+            minimum_covered = math.ceil(len(candidates) * MINIMUM_COVERED_ASSET_RATIO)
+            maximum_uncovered = len(candidates) - minimum_covered
+            uncovered_count = 0
+            coverage_cannot_pass = False
+            for index, candidate in enumerate(candidates):
                 snapshot = self.source.build_factor_snapshot(
                     asset_id=candidate.asset_id,
                     symbol=candidate.symbol,
@@ -578,6 +680,16 @@ class StrategyWalkForwardRunner:
                     strategy_id=request.strategy_id,
                 )
                 coverage_by_date[signal_date].append(snapshot.available_weight)
+                if (
+                    not math.isfinite(float(snapshot.available_weight))
+                    or snapshot.available_weight < MINIMUM_ASSET_AVAILABLE_WEIGHT
+                ):
+                    uncovered_count += 1
+                    if uncovered_count > maximum_uncovered:
+                        remaining = len(candidates) - index - 1
+                        coverage_by_date[signal_date].extend([0.0] * remaining)
+                        coverage_cannot_pass = True
+                        break
                 try:
                     score = self.source.score_snapshot(
                         snapshot,
@@ -590,6 +702,8 @@ class StrategyWalkForwardRunner:
                     scored.append((score, candidate))
                 else:
                     excluded_counts["unscored_candidates"] += 1
+            if coverage_cannot_pass:
+                continue
             scored.sort(key=lambda item: (-item[0], item[1].asset_id))
             selected = [candidate for _score, candidate in scored[: request.topn]]
             if not selected:
