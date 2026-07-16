@@ -778,7 +778,10 @@ def run_ashare_p0(
                 len(batch_symbols),
                 current_max_workers,
             )
-            def collect_symbol(symbol: str) -> CollectionTaskResult:
+            def collect_symbol(
+                symbol: str,
+                worker_count: int = current_max_workers,
+            ) -> CollectionTaskResult:
                 wait_for_runtime_scheduler_job_resume(args)
                 should_skip, skip_result = should_skip_ashare_market_bar_for_open_circuit(
                     runtime,
@@ -838,7 +841,7 @@ def run_ashare_p0(
                 window_results: list[CollectionTaskResult] = []
                 for window_start, window_end in request_windows:
                     wait_for_runtime_scheduler_job_resume(args)
-                    if session_factory is not None and current_max_workers > 1:
+                    if session_factory is not None and worker_count > 1:
                         with session_scope(session_factory) as worker_session:
                             worker_collector = AshareP0Collector(worker_session)
                             window_results.append(
@@ -870,19 +873,28 @@ def run_ashare_p0(
 
             batch_enriched_results: list[CollectionTaskResult | None] = [None] * len(batch_symbols)
 
-            def handle_symbol_result(symbol: str, result: CollectionTaskResult, index: int) -> None:
+            def handle_symbol_result(
+                symbol: str,
+                result: CollectionTaskResult,
+                index: int,
+                result_batch_index: int = batch_index,
+                result_batch_count: int = batch_count,
+                result_batch_size: int = current_batch_size,
+                result_slots: list[CollectionTaskResult | None] = batch_enriched_results,
+                worker_count: int = current_max_workers,
+            ) -> None:
                 enriched_result = attach_batch_payload(
                     result,
-                    batch_index=batch_index,
-                    batch_count=batch_count,
-                    batch_size=current_batch_size,
+                    batch_index=result_batch_index,
+                    batch_count=result_batch_count,
+                    batch_size=result_batch_size,
                     symbol_count=len(symbols),
                     sync_task_type=task_type,
                     requested_start=getattr(args, "ashare_start", None),
                     requested_end=getattr(args, "ashare_end", None),
                 )
-                batch_enriched_results[index] = enriched_result
-                watermark_session_factory = session_factory if current_max_workers > 1 else None
+                result_slots[index] = enriched_result
+                watermark_session_factory = session_factory if worker_count > 1 else None
                 record_ashare_market_bar_watermark(
                     session,
                     symbol=symbol,
@@ -2418,8 +2430,11 @@ def run_crypto(
                 )
             )
 
-            def collect_symbol(symbol: str) -> CollectionTaskResult:
-                if symbol in skip_symbols:
+            def collect_symbol(
+                symbol: str,
+                cooldown_symbols: set[str] = skip_symbols,
+            ) -> CollectionTaskResult:
+                if symbol in cooldown_symbols:
                     return crypto_watermark_skip_result(
                         task="crypto_ohlcv",
                         symbol=symbol,
@@ -2556,15 +2571,19 @@ def run_crypto(
                 )
             )
 
-            def collect_symbol(symbol: str) -> CollectionTaskResult:
-                if symbol in skip_symbols:
+            def collect_symbol(
+                symbol: str,
+                cooldown_symbols: set[str] = skip_symbols,
+                target_timeframe: str = derivative_timeframe,
+            ) -> CollectionTaskResult:
+                if symbol in cooldown_symbols:
                     return crypto_watermark_skip_result(
                         task="crypto_derivative_snapshot",
                         symbol=symbol,
                         market=crypto_market,
                         data_domain=CRYPTO_DERIVATIVE_DATA_DOMAIN,
                         provider=CRYPTO_DERIVATIVE_PROVIDER,
-                        timeframe=derivative_timeframe,
+                        timeframe=target_timeframe,
                     )
                 if session_factory is not None and max_workers > 1:
                     with session_scope(session_factory) as worker_session:

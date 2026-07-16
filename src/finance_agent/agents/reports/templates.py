@@ -313,7 +313,7 @@ def build_memory_references(
             memory_value = (
                 memory.get
                 if isinstance(memory, dict)
-                else lambda key: getattr(memory, key, None)
+                else lambda key, row=memory: getattr(row, key, None)
             )
             memories.append(
                 {
