@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,7 +15,7 @@ from finance_agent.agents.runtime.model_client import ModelClientResponse
 from finance_agent.agents.runtime.model_config import ModelEndpointConfig
 from finance_agent.cli import main as cli_main
 
-NOW = datetime(2026, 6, 12, 9, 30, tzinfo=timezone.utc)
+NOW = datetime(2026, 6, 12, 9, 30, tzinfo=UTC)
 
 
 @dataclass

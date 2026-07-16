@@ -7,9 +7,10 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from sqlalchemy.orm import Session
 

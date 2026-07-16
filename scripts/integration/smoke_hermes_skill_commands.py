@@ -13,9 +13,10 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any
 
 JsonDict = dict[str, Any]
 Validator = Callable[["CommandResult"], JsonDict | None]

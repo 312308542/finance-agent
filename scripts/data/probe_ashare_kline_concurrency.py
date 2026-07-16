@@ -10,10 +10,10 @@ import argparse
 import json
 import statistics
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import date, timedelta
-from typing import Callable
 
 import pandas as pd
 

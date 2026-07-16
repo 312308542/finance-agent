@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Iterable
+from typing import Any
 
 from sqlalchemy import select
 

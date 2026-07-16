@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from typing import Callable
+from collections.abc import Callable
 
 import akshare as ak
 import pandas as pd
