@@ -1651,6 +1651,7 @@ def build_ashare_news_article_enrichment_tasks(
     if session is None:
         return []
     candidates = resolve_ashare_news_article_candidates(session, args)
+    commit_session_if_possible(session)
     event_ids = [str(item["event_id"]) for item in candidates]
     candidate_by_id = {str(item["event_id"]): item for item in candidates}
     batches = split_symbol_batches(event_ids, batch_size=collection_batch_size(args))
@@ -1667,7 +1668,7 @@ def build_ashare_news_article_enrichment_tasks(
 
         def collect_event(event_id: str) -> CollectionTaskResult:
             candidate = candidate_by_id[event_id]
-            if session_factory is not None and max_workers > 1:
+            if session_factory is not None:
                 with session_scope(session_factory) as worker_session:
                     worker_collector = AshareP1Collector(worker_session)
                     return runtime.run_task(

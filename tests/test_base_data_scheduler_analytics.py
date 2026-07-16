@@ -4344,6 +4344,106 @@ def test_ashare_event_refresh_runs_stock_news_for_priority_assets_in_batches(
     assert notice_call["parameters"]["limit"] is None
 
 
+def test_news_article_enrichment_uses_short_transactions_with_one_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单 worker 正文补抓也应结束候选查询事务，并按事件使用独立短事务。"""
+
+    collect_base_data = import_collection_module()
+    trace: list[str] = []
+    worker_sessions: list[object] = []
+
+    class MainSession:
+        def commit(self) -> None:
+            trace.append("main_commit")
+
+    class OuterCollector:
+        def enrich_existing_stock_news_article(self, **_: Any) -> Any:
+            trace.append("outer_collect")
+            return Namespace(status="available")
+
+    class WorkerCollector:
+        def __init__(self, session: object) -> None:
+            self.session = session
+
+        def enrich_existing_stock_news_article(self, **_: Any) -> Any:
+            trace.append("worker_collect")
+            return Namespace(status="available")
+
+    class WorkerSessionScope:
+        def __init__(self, session_factory: Any) -> None:
+            self.session_factory = session_factory
+
+        def __enter__(self) -> object:
+            session = self.session_factory()
+            worker_sessions.append(session)
+            trace.append("worker_open")
+            return session
+
+        def __exit__(self, *_: Any) -> None:
+            trace.append("worker_commit")
+
+    class RecordingRuntime:
+        def run_task(self, *, task: str, collect: Any, **_: Any) -> Any:
+            collect()
+            return Namespace(
+                task=task,
+                status="available",
+                raw_record_id=None,
+                item_count=1,
+                error_message=None,
+                payload={},
+            )
+
+    candidates = [
+        {"event_id": "event:news:1", "url": "https://example.com/1"},
+        {"event_id": "event:news:2", "url": "https://example.com/2"},
+    ]
+    monkeypatch.setattr(
+        collect_base_data,
+        "resolve_ashare_news_article_candidates",
+        lambda session, args: candidates,
+    )
+    monkeypatch.setattr(collect_base_data, "AshareP1Collector", WorkerCollector)
+    monkeypatch.setattr(
+        collect_base_data,
+        "session_scope",
+        lambda session_factory: WorkerSessionScope(session_factory),
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "run_rate_limited_collection",
+        lambda _source, collect: collect(),
+    )
+    monkeypatch.setattr(
+        collect_base_data,
+        "attach_batch_payload",
+        lambda result, **_: result,
+    )
+
+    args = collect_base_data.default_collection_args(
+        group=["ashare-p1"],
+        sync_task_type="event_article_enrichment",
+        batch_size=2,
+        max_workers=1,
+    )
+
+    results = collect_base_data.build_ashare_news_article_enrichment_tasks(
+        MainSession(),
+        OuterCollector(),
+        args,
+        RecordingRuntime(),
+        session_factory=object,
+    )
+
+    assert len(results) == 2
+    assert trace[0] == "main_commit"
+    assert trace.count("outer_collect") == 0
+    assert trace.count("worker_collect") == 2
+    assert len(worker_sessions) == 2
+    assert trace.count("worker_commit") == 2
+
+
 def test_ashare_event_refresh_full_scope_uses_tradeable_market_assets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
