@@ -98,7 +98,10 @@ def test_data_strategy_list_and_show_return_serializable_payloads() -> None:
         _args(subcommand="show", strategy_id="strategy:ashare:short_swing")
     )
 
-    assert listed["data"]["count"] == 4
+    assert listed["data"]["count"] == 5
+    assert {
+        item["strategy_id"] for item in listed["data"]["strategies"]
+    } >= {"strategy:ashare:short_theme_mixed_v1"}
     assert shown["data"]["strategy"]["strategy_id"] == "strategy:ashare:short_swing"
     assert shown["data"]["strategy"]["status"] == "active"
 

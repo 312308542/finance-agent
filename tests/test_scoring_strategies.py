@@ -126,6 +126,34 @@ def test_default_scoring_strategy_seeds_are_valid() -> None:
         validate_scoring_strategy_payload(seed)
 
 
+def test_default_seeds_include_fixed_short_theme_mixed_strategy() -> None:
+    """混合策略必须使用已批准的固定权重，禁止按回测结果调参。"""
+
+    strategies = {
+        item["strategy_id"]: item for item in default_scoring_strategy_seeds()
+    }
+
+    mixed = strategies["strategy:ashare:short_theme_mixed_v1"]
+
+    assert sum(mixed["group_weights"].values()) == pytest.approx(1.0)
+    assert mixed["group_weights"] == {
+        "technical": 0.27,
+        "capital_flow": 0.20,
+        "sector_strength": 0.13,
+        "leadership": 0.12,
+        "event": 0.07,
+        "fundamental": 0.065,
+        "liquidity": 0.065,
+        "valuation": 0.05,
+        "risk": 0.02,
+        "event_decay": 0.01,
+    }
+    assert mixed["missing_penalty"] == {
+        "per_missing_group": 3.5,
+        "per_partial_group": 1.5,
+    }
+
+
 def test_validate_scoring_strategy_rejects_invalid_weight_sum() -> None:
     """策略权重和必须接近 1，避免评分不可解释。"""
 
