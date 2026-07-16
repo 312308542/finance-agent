@@ -41,6 +41,25 @@ def test_default_scheduler_plan_excludes_crypto_jobs() -> None:
     assert all("crypto" not in name for name in job_names)
 
 
+def test_personal_ashare_recommendation_job_exports_three_strategy_observation() -> None:
+    """默认 A 股推荐任务应复用原任务并启用三策略前向观察。"""
+
+    payload = export_scheduler_payload(build_preset_config())
+    jobs = {str(job["name"]): job for job in payload["jobs"]}
+    recommendation = jobs["analytics.recommendations.ashare.all_a"]
+
+    assert len(payload["jobs"]) == 36
+    assert all("crypto" not in name for name in jobs)
+    assert recommendation["job_type"] == "recommendation_pipeline"
+    assert recommendation["params"]["strategy_ids"] == [
+        "strategy:ashare:short_swing",
+        "strategy:ashare:theme_momentum",
+        "strategy:ashare:short_theme_mixed_v1",
+    ]
+    assert recommendation["params"]["observation_enabled"] is True
+    assert recommendation["params"]["round_trip_cost"] == 0.003
+
+
 def test_crypto_comprehensive_remains_an_explicit_independent_preset() -> None:
     """显式数字货币预设仍应独立导出 crypto 任务。"""
 

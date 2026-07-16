@@ -935,6 +935,13 @@ def build_recommendation_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict
                     min_factor_coverage_ratio=0.5,
                     min_available_factor_groups=3,
                     strategy_id="strategy:ashare:short_swing",
+                    strategy_ids=[
+                        "strategy:ashare:short_swing",
+                        "strategy:ashare:theme_momentum",
+                        "strategy:ashare:short_theme_mixed_v1",
+                    ],
+                    observation_enabled=True,
+                    round_trip_cost=0.003,
                     avoid_universe_id="universe:avoid:ashare:system",
                     auto_sync_watchlist=True,
                     owner_id="default-owner",
@@ -1394,6 +1401,9 @@ def build_recommendation_scheduler_job(
     min_available_factor_groups: int = 1,
     candidate_source: str | None = None,
     strategy_id: str | None = None,
+    strategy_ids: list[str] | None = None,
+    observation_enabled: bool | None = None,
+    round_trip_cost: float | None = None,
     avoid_universe_id: str | None = None,
     auto_sync_watchlist: bool = False,
     owner_id: str | None = None,
@@ -1431,6 +1441,12 @@ def build_recommendation_scheduler_job(
             "recommendation_intake_limit": recommendation_intake_limit or limit,
         },
     }
+    if strategy_ids is not None:
+        job["params"]["strategy_ids"] = list(strategy_ids)
+    if observation_enabled is not None:
+        job["params"]["observation_enabled"] = observation_enabled
+    if round_trip_cost is not None:
+        job["params"]["round_trip_cost"] = round_trip_cost
     if schedule_type != "interval":
         job["schedule_type"] = schedule_type
     if depends_on:

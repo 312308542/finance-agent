@@ -88,6 +88,47 @@ def test_recommendation_pipeline_job_kwargs_include_strategy_and_avoid_pool() ->
     assert kwargs["avoid_universe_id"] == "universe:avoid:ashare:system"
 
 
+def test_recommendation_pipeline_job_kwargs_include_multi_strategy_observation() -> None:
+    """推荐调度任务应透传三策略观察参数，并保持旧任务缺省行为。"""
+
+    job = BaseDataSchedulerJob(
+        name="analytics.recommendations.ashare.all_a",
+        job_type="recommendation_pipeline",
+        group="analytics",
+        enabled=True,
+        interval_seconds=3600,
+        limit=20,
+        market="ashare",
+        params={
+            "universe_id": "universe:merged:ashare:recommendation",
+            "strategy_ids": [
+                "strategy:ashare:short_swing",
+                "strategy:ashare:theme_momentum",
+                "strategy:ashare:short_theme_mixed_v1",
+            ],
+            "observation_enabled": True,
+            "round_trip_cost": 0.003,
+        },
+    )
+    scheduler = BaseDataScheduler(BaseDataSchedulerConfig(jobs=(job,)))
+
+    kwargs = scheduler.build_recommendation_pipeline_kwargs(job)
+
+    assert kwargs["strategy_ids"] == [
+        "strategy:ashare:short_swing",
+        "strategy:ashare:theme_momentum",
+        "strategy:ashare:short_theme_mixed_v1",
+    ]
+    assert kwargs["observation_enabled"] is True
+    assert kwargs["round_trip_cost"] == 0.003
+
+    legacy_job = replace(job, params={"universe_id": "universe:legacy"})
+    legacy_kwargs = scheduler.build_recommendation_pipeline_kwargs(legacy_job)
+    assert "strategy_ids" not in legacy_kwargs
+    assert "observation_enabled" not in legacy_kwargs
+    assert "round_trip_cost" not in legacy_kwargs
+
+
 def test_parse_scheduler_config_accepts_data_quality_refresh_job() -> None:
     """调度配置应能表达数据质量快照刷新任务。"""
 

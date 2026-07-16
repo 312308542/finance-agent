@@ -1653,6 +1653,11 @@ class BaseDataScheduler:
             value = job.params.get(key)
             if value is not None:
                 params[key] = value
+        strategy_ids = job.params.get("strategy_ids")
+        if strategy_ids is not None:
+            if not isinstance(strategy_ids, list | tuple):
+                raise ValueError(f"{job.name}.params.strategy_ids 必须是列表")
+            params["strategy_ids"] = [str(item) for item in strategy_ids]
         for key in ("window", "min_bars", "min_available_factor_groups"):
             value = job.params.get(key)
             if value is not None:
@@ -1664,6 +1669,12 @@ class BaseDataScheduler:
         value = job.params.get("auto_sync_watchlist")
         if value is not None:
             params["auto_sync_watchlist"] = bool(value)
+        value = job.params.get("observation_enabled")
+        if value is not None:
+            params["observation_enabled"] = bool(value)
+        value = job.params.get("round_trip_cost")
+        if value is not None:
+            params["round_trip_cost"] = float(value)
         for key in ("owner_id", "watchlist_id"):
             value = job.params.get(key)
             if value is not None:
