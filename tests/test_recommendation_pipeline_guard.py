@@ -4,7 +4,14 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
-from finance_agent.pipelines.recommendation import UniverseRecommendationPipeline
+from finance_agent.pipelines.recommendation import (
+    UniverseRecommendationPipeline,
+    recommendation_strategy_gate,
+)
+
+SHORT = "strategy:ashare:short_swing"
+THEME = "strategy:ashare:theme_momentum"
+MIXED = "strategy:ashare:short_theme_mixed_v1"
 
 
 @dataclass(frozen=True)
@@ -51,9 +58,11 @@ class _Universes:
 class _Indicators:
     def __init__(self, available_asset_ids: set[str] | None = None) -> None:
         self.available_asset_ids = available_asset_ids or set()
+        self.calls: list[str] = []
 
     def compute_for_asset(self, **kwargs: Any) -> _IndicatorResult:
         asset_id = str(kwargs["asset_id"])
+        self.calls.append(asset_id)
         frame_id = f"ind:{asset_id}:1d" if asset_id in self.available_asset_ids else None
         return _IndicatorResult(asset_id=asset_id, indicator_frame_id=frame_id)
 
@@ -107,16 +116,38 @@ class _Signals:
 
 
 class _Recommendations:
-    def __init__(self) -> None:
+    def __init__(self, *, recommendation_count: int = 0) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.recommendation_count = recommendation_count
 
     def rank_from_screening(self, **kwargs: Any) -> SimpleNamespace:
         self.calls.append(kwargs)
         return SimpleNamespace(
-            recommendation_count=0,
-            run_id=None,
-            top_recommendation_id=None,
+            recommendation_count=self.recommendation_count,
+            run_id=f"run:{kwargs.get('score_strategy_id')}",
+            top_recommendation_id=(
+                f"recommendation:{kwargs.get('score_strategy_id')}"
+                if self.recommendation_count
+                else None
+            ),
         )
+
+
+class _TrialStates:
+    def __init__(self, states: dict[str, Any]) -> None:
+        self.states = states
+
+    def get_trial_state(self, strategy_id: str) -> Any | None:
+        return self.states.get(strategy_id)
+
+
+class _Observations:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def capture(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        return {"status": "captured", "observation_id": "obs:test"}
 
 
 class _ThemeContexts:
@@ -285,6 +316,138 @@ def test_recommendation_pipeline_passes_strategy_id_to_scoring_service() -> None
     assert pipeline.recommendations.calls[0]["score_strategy_id"] == (
         "strategy:ashare:short_swing"
     )
+
+
+def test_pipeline_scores_three_strategies_from_one_screening() -> None:
+    """三策略必须复用一次指标、因子、初筛和信号计算。"""
+
+    members = [
+        _Member(asset_id="ashare:000001", symbol="000001"),
+        _Member(asset_id="ashare:600519", symbol="600519"),
+    ]
+    pipeline = UniverseRecommendationPipeline.__new__(UniverseRecommendationPipeline)
+    pipeline.universes = _Universes(members)
+    indicators = _Indicators(available_asset_ids={item.asset_id for item in members})
+    factors = _Factors()
+    scoring = _Scoring()
+    recommendations = _Recommendations(recommendation_count=1)
+    observations = _Observations()
+    pipeline.indicators = indicators
+    pipeline.factors = factors
+    pipeline.screening_repository = None
+    pipeline.screenings = _Screenings()
+    pipeline.scoring = scoring
+    pipeline.signals = _Signals()
+    pipeline.recommendations = recommendations
+    pipeline.observations = observations
+    pipeline.trial_states = _TrialStates(
+        {
+            THEME: SimpleNamespace(
+                state="research",
+                historical_evidence_id=None,
+            ),
+            MIXED: SimpleNamespace(
+                state="trial",
+                historical_evidence_id="bt:wf:mixed-passed",
+            ),
+        }
+    )
+
+    result = pipeline.run_for_universe(
+        universe_id="universe:test:ashare",
+        horizon="swing",
+        timeframe="1d",
+        strategy_ids=[SHORT, THEME, MIXED],
+        observation_enabled=True,
+        min_indicator_coverage_ratio=0.5,
+        min_factor_coverage_ratio=0.0,
+    )
+
+    assert indicators.calls == [item.asset_id for item in members]
+    assert factors.calls == [item.asset_id for item in members]
+    assert [call["strategy_id"] for call in scoring.calls] == [SHORT, THEME, MIXED]
+    assert observations.calls[0]["strategy_ids"] == (SHORT, THEME, MIXED)
+    assert [call["score_strategy_id"] for call in recommendations.calls] == [SHORT, MIXED]
+    assert recommendations.calls[1]["trial_state"] == "trial"
+    assert recommendations.calls[1]["validation_evidence_id"] == "bt:wf:mixed-passed"
+    strategy_results = {item["strategy_id"]: item for item in result.strategy_results}
+    assert strategy_results[THEME]["recommendation_status"] == "blocked"
+    assert strategy_results[THEME]["blocked_reason"] == "historical_gate_not_passed"
+    assert strategy_results[MIXED]["recommendation_status"] == "available"
+
+
+def test_pipeline_blocks_disabled_and_allows_validated_strategy() -> None:
+    """disabled 停止新推荐，validated 带验证证据生成独立推荐。"""
+
+    pipeline = UniverseRecommendationPipeline.__new__(UniverseRecommendationPipeline)
+    pipeline.universes = _Universes([_Member(asset_id="ashare:000001", symbol="000001")])
+    pipeline.indicators = _Indicators(available_asset_ids={"ashare:000001"})
+    pipeline.factors = _Factors()
+    pipeline.screening_repository = None
+    pipeline.screenings = _Screenings()
+    pipeline.scoring = _Scoring()
+    pipeline.signals = _Signals()
+    recommendations = _Recommendations(recommendation_count=1)
+    pipeline.recommendations = recommendations
+    pipeline.observations = _Observations()
+    pipeline.trial_states = _TrialStates(
+        {
+            THEME: SimpleNamespace(
+                state="disabled",
+                historical_evidence_id="bt:wf:theme-disabled",
+            ),
+            MIXED: SimpleNamespace(
+                state="validated",
+                historical_evidence_id="bt:wf:mixed-validated",
+            ),
+        }
+    )
+
+    result = pipeline.run_for_universe(
+        universe_id="universe:test:ashare",
+        horizon="swing",
+        timeframe="1d",
+        strategy_ids=[THEME, MIXED],
+        min_indicator_coverage_ratio=0.5,
+        min_factor_coverage_ratio=0.0,
+    )
+
+    assert len(recommendations.calls) == 1
+    assert recommendations.calls[0]["score_strategy_id"] == MIXED
+    assert recommendations.calls[0]["trial_state"] == "validated"
+    assert recommendations.calls[0]["validation_evidence_id"] == "bt:wf:mixed-validated"
+    statuses = {item["strategy_id"]: item for item in result.strategy_results}
+    assert statuses[THEME]["blocked_reason"] == "strategy_disabled"
+    assert statuses[MIXED]["recommendation_status"] == "available"
+
+
+def test_trial_gate_requires_validation_evidence_and_marks_validated_non_trial() -> None:
+    """状态本身不够，必须有历史证据；validated 不再标记为试运行。"""
+
+    missing_evidence = recommendation_strategy_gate(
+        market="ashare",
+        strategy_id=MIXED,
+        trial_states=_TrialStates(
+            {MIXED: SimpleNamespace(state="trial", historical_evidence_id=None)}
+        ),
+    )
+    validated = recommendation_strategy_gate(
+        market="ashare",
+        strategy_id=MIXED,
+        trial_states=_TrialStates(
+            {
+                MIXED: SimpleNamespace(
+                    state="validated",
+                    historical_evidence_id="bt:wf:validated",
+                )
+            }
+        ),
+    )
+
+    assert missing_evidence["allowed"] is False
+    assert missing_evidence["blocked_reason"] == "validation_evidence_missing"
+    assert validated["allowed"] is True
+    assert validated["trial"] is False
 
 
 def test_recommendation_pipeline_passes_market_regime_to_recommendation_service() -> None:

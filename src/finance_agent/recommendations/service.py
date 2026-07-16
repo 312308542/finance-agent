@@ -145,9 +145,16 @@ class RecommendationService:
         profile_style_tendency: JsonDict | None = None,
         market_regime: JsonDict | None = None,
         memory_ranking_adjustments: dict[str, MemoryRankingAdjustment] | None = None,
+        trial_state: str | None = None,
+        validation_evidence_id: str | None = None,
     ) -> RecommendationRunResult:
         """读取一次初筛的评分结果并生成推荐榜单。"""
 
+        validate_trial_audit(
+            trial_state=trial_state,
+            validation_evidence_id=validation_evidence_id,
+        )
+        is_trial = trial_state == "trial"
         screening = self.screenings.get_screening_result(screening_id)
         ensure_recommendation_market(screening.market)
         started_at = datetime.now(tz=UTC)
@@ -156,6 +163,9 @@ class RecommendationService:
             strategy=strategy,
             horizon=horizon,
             started_at=started_at,
+            score_strategy_id=score_strategy_id,
+            trial_state=trial_state,
+            validation_evidence_id=validation_evidence_id,
         )
         raw_scores = (
             self.scores.list_scores_for_screening(
@@ -201,6 +211,9 @@ class RecommendationService:
                 "strategy": strategy,
                 "score_strategy_id": score_strategy_id,
                 "horizon": horizon,
+                "trial": is_trial,
+                "validation_state": trial_state,
+                "validation_evidence_id": validation_evidence_id,
             },
         )
 
@@ -228,6 +241,8 @@ class RecommendationService:
                     asset_id=score.asset_id,
                     timeframe=str(score.payload.get("timeframe") or "1d"),
                 ),
+                trial_state=trial_state,
+                validation_evidence_id=validation_evidence_id,
             )
             saved = self.recommendations.upsert_asset_recommendation(
                 recommendation_id=recommendation["recommendation_id"],
@@ -273,8 +288,14 @@ class RecommendationService:
                 "universe_id": screening.universe_id,
                 "score_count": len(scores),
                 "score_strategy_id": score_strategy_id,
+                "trial": is_trial,
+                "validation_state": trial_state,
+                "validation_evidence_id": validation_evidence_id,
             },
             "backtest_evidence": backtest_evidence,
+            "trial": is_trial,
+            "validation_state": trial_state,
+            "validation_evidence_id": validation_evidence_id,
         }
         if profile_style_tendency:
             run_payload["profile_style_tendency"] = profile_style_tendency
@@ -328,6 +349,8 @@ def build_recommendation_payload(
     backtest_evidence: JsonDict | None = None,
     decision_context: RecommendationDecisionContext | None = None,
     structure_evidence: JsonDict | None = None,
+    trial_state: str | None = None,
+    validation_evidence_id: str | None = None,
 ) -> JsonDict:
     """构建单标的推荐 payload。"""
 
@@ -402,10 +425,28 @@ def build_recommendation_payload(
         "tradability": decision_context.tradability if decision_context else None,
         "memory_ranking_adjustment": score.payload.get("memory_ranking_adjustment"),
         "decision_context": decision_context_payload(decision_context),
+        "trial": trial_state == "trial",
+        "validation_state": trial_state,
+        "validation_evidence_id": validation_evidence_id,
     }
     if structure_evidence is not None:
         payload["structure"] = structure_evidence
     return payload
+
+
+def validate_trial_audit(
+    *,
+    trial_state: str | None,
+    validation_evidence_id: str | None,
+) -> None:
+    """试运行/已验证推荐必须携带对应历史验证证据。"""
+
+    if trial_state is None:
+        return
+    if trial_state not in {"trial", "validated"}:
+        raise ValueError(f"不允许为策略状态 {trial_state} 生成推荐")
+    if not validation_evidence_id:
+        raise ValueError("试运行或已验证推荐缺少 validation_evidence_id")
 
 
 def build_asset_structure_payload(
@@ -907,11 +948,25 @@ def build_run_id(
     strategy: str,
     horizon: str,
     started_at: datetime,
+    score_strategy_id: str | None = None,
+    trial_state: str | None = None,
+    validation_evidence_id: str | None = None,
 ) -> str:
     """生成稳定推荐运行 ID。"""
 
-    normalized_time = started_at.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
-    digest = hashlib.sha1(f"{screening_id}:{strategy}:{horizon}".encode()).hexdigest()[:12]
+    normalized_time = started_at.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    identity = "|".join(
+        (
+            screening_id,
+            strategy,
+            horizon,
+            score_strategy_id or "legacy_default",
+            trial_state or "production",
+            validation_evidence_id or "no_validation_evidence",
+            normalized_time,
+        )
+    )
+    digest = hashlib.sha1(identity.encode()).hexdigest()[:12]
     return f"run:{strategy}:{horizon}:{normalized_time}:{digest}"
 
 

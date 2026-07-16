@@ -6,6 +6,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from finance_agent.application.data_production_service import UniverseMergeService
 from finance_agent.pipelines.recommendation import UniverseRecommendationPipeline
 from finance_agent.recommendations.service import RecommendationService
@@ -324,3 +326,53 @@ def test_merged_avoid_strategy_recommendation_pipeline_smoke() -> None:
     assert recommendations.recommendation_payloads[0]["payload"]["score_weight_snapshot"][
         "group_weights"
     ] == {"technical": 0.8, "fundamental": 0.2}
+
+    trial_result = recommendation_service.rank_from_screening(
+        screening_id="screen:merged:ashare:short_swing",
+        strategy="balanced_swing_v1",
+        horizon="swing",
+        score_strategy_id="strategy:ashare:short_swing",
+        trial_state="trial",
+        validation_evidence_id="bt:wf:short-passed",
+        limit=5,
+    )
+
+    assert trial_result.status == "available"
+    assert recommendations.run_payload is not None
+    assert recommendations.run_payload["trial"] is True
+    assert recommendations.run_payload["validation_state"] == "trial"
+    assert recommendations.run_payload["validation_evidence_id"] == "bt:wf:short-passed"
+    assert recommendations.run_payload["source"]["trial"] is True
+    trial_payload = recommendations.recommendation_payloads[-1]["payload"]
+    assert trial_payload["trial"] is True
+    assert trial_payload["validation_state"] == "trial"
+    assert trial_payload["validation_evidence_id"] == "bt:wf:short-passed"
+
+    validated_result = recommendation_service.rank_from_screening(
+        screening_id="screen:merged:ashare:short_swing",
+        strategy="balanced_swing_v1",
+        horizon="swing",
+        score_strategy_id="strategy:ashare:short_swing",
+        trial_state="validated",
+        validation_evidence_id="bt:wf:short-validated",
+        limit=5,
+    )
+    assert validated_result.status == "available"
+    assert len(
+        {
+            result.recommendation_run_id,
+            trial_result.run_id,
+            validated_result.run_id,
+        }
+    ) == 3
+    assert recommendations.run_payload is not None
+    assert recommendations.run_payload["trial"] is False
+    assert recommendations.run_payload["validation_state"] == "validated"
+
+    with pytest.raises(ValueError, match="validation_evidence_id"):
+        recommendation_service.rank_from_screening(
+            screening_id="screen:merged:ashare:short_swing",
+            score_strategy_id="strategy:ashare:short_swing",
+            trial_state="trial",
+            validation_evidence_id=None,
+        )

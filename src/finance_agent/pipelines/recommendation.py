@@ -10,8 +10,12 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
@@ -19,17 +23,27 @@ from finance_agent.application.theme_context_service import ThemeContextService
 from finance_agent.factors import FactorComputationResult, FactorService
 from finance_agent.indicators import IndicatorComputationResult, IndicatorService
 from finance_agent.recommendations import RecommendationRunResult, RecommendationService
+from finance_agent.research.strategy_observation_service import (
+    BASELINE_STRATEGY_ID,
+    create_strategy_observation_service,
+)
 from finance_agent.scoring import ScoringRunResult, ScoringService
 from finance_agent.screening import ScreeningRunResult, ScreeningService
 from finance_agent.screening.service import ensure_single_market_universe
 from finance_agent.signals import SignalComputationResult, SignalService
 from finance_agent.storage.orm import AssetUniverseMemberORM, AssetUniverseORM
-from finance_agent.storage.repositories import ScreeningRepository, UniverseRepository
+from finance_agent.storage.repositories import (
+    ScreeningRepository,
+    StrategyObservationRepository,
+    UniverseRepository,
+)
 
 JsonDict = dict[str, Any]
 TECHNICAL_SCREENING_POOL_SOURCE = "technical_screening_pool"
 TECHNICAL_SCREENING_STRATEGY = "technical_screening_v1"
 THEME_FACTOR_GROUP_NAMES = {"sector_strength", "leadership"}
+DEFAULT_OBSERVATION_ROUND_TRIP_COST = 0.003
+ASHARE_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(frozen=True)
@@ -52,6 +66,7 @@ class UniverseRecommendationRunResult:
     recommendation_run_id: str | None
     top_recommendation_id: str | None
     errors: tuple[JsonDict, ...]
+    strategy_results: tuple[JsonDict, ...] = ()
 
 
 class UniverseRecommendationPipeline:
@@ -67,6 +82,8 @@ class UniverseRecommendationPipeline:
         self.signals = SignalService(session)
         self.recommendations = RecommendationService(session)
         self.theme_contexts = ThemeContextService(session)
+        self.observations = create_strategy_observation_service(session)
+        self.trial_states = StrategyObservationRepository(session)
 
     def run_for_universe(
         self,
@@ -86,11 +103,25 @@ class UniverseRecommendationPipeline:
         technical_screening_strategy: str = TECHNICAL_SCREENING_STRATEGY,
         avoid_universe_id: str | None = None,
         strategy_id: str | None = None,
+        strategy_ids: Sequence[str] | None = None,
+        observation_enabled: bool = False,
+        observation_trade_date: date | None = None,
+        round_trip_cost: float = DEFAULT_OBSERVATION_ROUND_TRIP_COST,
         market_regime: JsonDict | None = None,
     ) -> UniverseRecommendationRunResult:
         """执行一次候选池推荐流水线。"""
 
         universe = self.universes.get_universe(universe_id)
+        effective_strategy_ids = normalize_strategy_ids(
+            strategy_id=strategy_id,
+            strategy_ids=strategy_ids,
+        )
+        if observation_enabled and not math.isclose(
+            round_trip_cost,
+            DEFAULT_OBSERVATION_ROUND_TRIP_COST,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("前向观察交易成本固定为 0.003")
         members = self.universes.list_members(universe_id)
         ensure_single_market_universe(universe.market, members)
         members, audit_payload = exclude_avoid_pool_members(
@@ -228,12 +259,49 @@ class UniverseRecommendationPipeline:
             strategy=strategy,
             horizon=horizon,
         )
-        scoring = self.scoring.score_screening(
-            screening_id=screening.screening_id,
-            horizon=horizon,
-            strategy_id=strategy_id,
-        )
-        score_strategy_id = strategy_id or f"strategy:{universe.market}:legacy_default"
+        strategy_runs: list[JsonDict] = []
+        scoring_results: list[tuple[str | None, Any, JsonDict]] = []
+        for effective_strategy_id in effective_strategy_ids:
+            score_strategy_id = effective_strategy_id or (
+                f"strategy:{universe.market}:legacy_default"
+            )
+            strategy_result: JsonDict = {
+                "strategy_id": score_strategy_id,
+                "scoring_status": "pending",
+                "scored_count": 0,
+                "recommendation_status": "pending",
+                "recommendation_count": 0,
+                "recommendation_run_id": None,
+                "top_recommendation_id": None,
+                "trial_state": None,
+                "trial": False,
+                "validation_evidence_id": None,
+                "blocked_reason": None,
+                "observation_status": "disabled" if not observation_enabled else "pending",
+            }
+            try:
+                scoring = self.scoring.score_screening(
+                    screening_id=screening.screening_id,
+                    horizon=horizon,
+                    strategy_id=effective_strategy_id,
+                )
+            except Exception as exc:
+                strategy_result["scoring_status"] = "error"
+                strategy_result["recommendation_status"] = "blocked"
+                strategy_result["blocked_reason"] = "scoring_failed"
+                errors.append(
+                    strategy_stage_error(
+                        stage="scoring",
+                        strategy_id=score_strategy_id,
+                        error=exc,
+                    )
+                )
+                strategy_runs.append(strategy_result)
+                continue
+            strategy_result["scoring_status"] = "available"
+            strategy_result["scored_count"] = int(scoring.scored_count)
+            scoring_results.append((effective_strategy_id, scoring, strategy_result))
+            strategy_runs.append(strategy_result)
 
         usable_factor_asset_ids = usable_factor_asset_ids_from_results(
             factor_results,
@@ -246,26 +314,91 @@ class UniverseRecommendationPipeline:
             if signal is not None:
                 signal_results.append(signal)
 
-        recommendation = self.recommendations.rank_from_screening(
-            screening_id=screening.screening_id,
-            strategy=strategy,
-            horizon=horizon,
-            limit=limit,
-            score_strategy_id=score_strategy_id,
-            audit_payload=recommendation_audit_payload(
-                audit_payload=audit_payload,
-                strategy_id=score_strategy_id,
-            ),
-            market_regime=market_regime,
+        concrete_scored_strategy_ids = tuple(
+            effective_strategy_id
+            for effective_strategy_id, _scoring, _result in scoring_results
+            if effective_strategy_id is not None
         )
-        status = run_status(
+        if observation_enabled and universe.market == "ashare" and concrete_scored_strategy_ids:
+            try:
+                observation = self.observations.capture(
+                    screening_id=screening.screening_id,
+                    trade_date=observation_trade_date
+                    or datetime.now(tz=ASHARE_TIMEZONE).date(),
+                    strategy_ids=concrete_scored_strategy_ids,
+                )
+                for _strategy_id, _scoring, strategy_result in scoring_results:
+                    strategy_result["observation_status"] = observation["status"]
+                    strategy_result["observation_id"] = observation.get("observation_id")
+            except Exception as exc:
+                for _strategy_id, _scoring, strategy_result in scoring_results:
+                    strategy_result["observation_status"] = "error"
+                errors.append(
+                    strategy_stage_error(
+                        stage="observation",
+                        strategy_id=",".join(concrete_scored_strategy_ids),
+                        error=exc,
+                    )
+                )
+
+        recommendation_results: list[Any] = []
+        for _effective_strategy_id, _scoring, strategy_result in scoring_results:
+            score_strategy_id = str(strategy_result["strategy_id"])
+            gate = recommendation_strategy_gate(
+                market=universe.market,
+                strategy_id=score_strategy_id,
+                trial_states=getattr(self, "trial_states", None),
+            )
+            strategy_result.update(gate)
+            if not gate["allowed"]:
+                strategy_result["recommendation_status"] = "blocked"
+                continue
+            try:
+                recommendation = self.recommendations.rank_from_screening(
+                    screening_id=screening.screening_id,
+                    strategy=strategy,
+                    horizon=horizon,
+                    limit=limit,
+                    score_strategy_id=score_strategy_id,
+                    audit_payload=recommendation_audit_payload(
+                        audit_payload=audit_payload,
+                        strategy_id=score_strategy_id,
+                    ),
+                    market_regime=market_regime,
+                    trial_state=gate["trial_state"],
+                    validation_evidence_id=gate["validation_evidence_id"],
+                )
+            except Exception as exc:
+                strategy_result["recommendation_status"] = "error"
+                strategy_result["blocked_reason"] = "recommendation_failed"
+                errors.append(
+                    strategy_stage_error(
+                        stage="recommendation",
+                        strategy_id=score_strategy_id,
+                        error=exc,
+                    )
+                )
+                continue
+            recommendation_results.append(recommendation)
+            recommendation_count = int(recommendation.recommendation_count)
+            strategy_result["recommendation_status"] = (
+                "available" if recommendation_count > 0 else "unavailable"
+            )
+            strategy_result["recommendation_count"] = recommendation_count
+            strategy_result["recommendation_run_id"] = recommendation.run_id
+            strategy_result["top_recommendation_id"] = recommendation.top_recommendation_id
+
+        scored_count = sum(int(item["scored_count"]) for item in strategy_runs)
+        recommendation_count = sum(int(item["recommendation_count"]) for item in strategy_runs)
+        primary_recommendation = recommendation_results[0] if recommendation_results else None
+        status = multi_strategy_run_status(
             universe=universe,
             members=members,
             indicator_results=indicator_results,
             factor_results=factor_results,
             screening=screening,
-            scoring=scoring,
-            recommendation=recommendation,
+            scored_count=scored_count,
+            recommendation_count=recommendation_count,
             errors=errors,
         )
         return UniverseRecommendationRunResult(
@@ -283,11 +416,18 @@ class UniverseRecommendationPipeline:
             ),
             signal_count=count_successful_signals(signal_results),
             screening_id=screening.screening_id,
-            scored_count=scoring.scored_count,
-            recommendation_count=recommendation.recommendation_count,
-            recommendation_run_id=recommendation.run_id,
-            top_recommendation_id=recommendation.top_recommendation_id,
+            scored_count=scored_count,
+            recommendation_count=recommendation_count,
+            recommendation_run_id=(
+                primary_recommendation.run_id if primary_recommendation is not None else None
+            ),
+            top_recommendation_id=(
+                primary_recommendation.top_recommendation_id
+                if primary_recommendation is not None
+                else None
+            ),
             errors=tuple(errors),
+            strategy_results=tuple(strategy_runs),
         )
 
     def _compute_indicator(
@@ -359,6 +499,106 @@ class UniverseRecommendationPipeline:
         except Exception as exc:
             errors.append(error_payload(member=member, stage="signal", error=exc))
             return None
+
+
+def normalize_strategy_ids(
+    *,
+    strategy_id: str | None,
+    strategy_ids: Sequence[str] | None,
+) -> tuple[str | None, ...]:
+    """兼容单策略参数，并规范化显式多策略列表。"""
+
+    if strategy_ids is None:
+        return (strategy_id,)
+    normalized = tuple(
+        dict.fromkeys(str(item).strip() for item in strategy_ids if str(item).strip())
+    )
+    if not normalized:
+        raise ValueError("strategy_ids 不能为空")
+    if strategy_id is not None and strategy_id not in normalized:
+        raise ValueError("strategy_id 与 strategy_ids 不一致")
+    return normalized
+
+
+def recommendation_strategy_gate(
+    *,
+    market: str,
+    strategy_id: str,
+    trial_states: Any,
+) -> JsonDict:
+    """只让历史门槛通过的 A 股新增策略生成推荐。"""
+
+    if (
+        not market.startswith("ashare")
+        or strategy_id == BASELINE_STRATEGY_ID
+        or strategy_id.endswith(":legacy_default")
+    ):
+        return {
+            "allowed": True,
+            "trial_state": None,
+            "trial": False,
+            "validation_evidence_id": None,
+            "blocked_reason": None,
+        }
+    state = trial_states.get_trial_state(strategy_id) if trial_states is not None else None
+    state_name = str(getattr(state, "state", "research"))
+    evidence_id = getattr(state, "historical_evidence_id", None)
+    if state_name == "disabled":
+        blocked_reason = "strategy_disabled"
+    elif state_name not in {"trial", "validated"}:
+        blocked_reason = "historical_gate_not_passed"
+    elif not evidence_id:
+        blocked_reason = "validation_evidence_missing"
+    else:
+        return {
+            "allowed": True,
+            "trial_state": state_name,
+            "trial": state_name == "trial",
+            "validation_evidence_id": str(evidence_id),
+            "blocked_reason": None,
+        }
+    return {
+        "allowed": False,
+        "trial_state": state_name,
+        "trial": False,
+        "validation_evidence_id": str(evidence_id) if evidence_id else None,
+        "blocked_reason": blocked_reason,
+    }
+
+
+def multi_strategy_run_status(
+    *,
+    universe: AssetUniverseORM,
+    members: list[AssetUniverseMemberORM],
+    indicator_results: list[IndicatorComputationResult],
+    factor_results: list[FactorComputationResult],
+    screening: ScreeningRunResult,
+    scored_count: int,
+    recommendation_count: int,
+    errors: list[JsonDict],
+) -> str:
+    """汇总多策略运行，同时保持单策略原有状态语义。"""
+
+    if not members:
+        return "unavailable"
+    if recommendation_count > 0:
+        return "available" if not errors else "partial"
+    if scored_count > 0 or screening.passed_count > 0:
+        return "partial"
+    if factor_results or indicator_results:
+        return "partial"
+    return "unavailable" if universe.status == "unavailable" else "partial"
+
+
+def strategy_stage_error(*, stage: str, strategy_id: str, error: Exception) -> JsonDict:
+    """记录单策略失败，不阻断同批次其他策略。"""
+
+    return {
+        "stage": stage,
+        "strategy_id": strategy_id,
+        "error": str(error),
+        "error_type": type(error).__name__,
+    }
 
 
 def default_timeframe(market: str) -> str:
