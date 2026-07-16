@@ -156,8 +156,8 @@ class BacktestService:
             if len(bars) < 2:
                 continue
             series = pd.Series(
-                [_decimal_float(getattr(bar, "close")) for bar in bars],
-                index=pd.to_datetime([getattr(bar, "timestamp") for bar in bars]),
+                [_decimal_float(bar.close) for bar in bars],
+                index=pd.to_datetime([bar.timestamp for bar in bars]),
                 name=_symbol(score),
                 dtype="float64",
             )
@@ -196,7 +196,7 @@ class BacktestService:
 
 
 def _asset_id(score: Any) -> str:
-    return str(getattr(score, "asset_id"))
+    return str(score.asset_id)
 
 
 def _symbol(score: Any) -> str:
@@ -204,7 +204,7 @@ def _symbol(score: Any) -> str:
 
 
 def _score_value(score: Any) -> float:
-    return _decimal_float(getattr(score, "total_score"))
+    return _decimal_float(score.total_score)
 
 
 def _decimal_float(value: Decimal | int | float | str) -> float:

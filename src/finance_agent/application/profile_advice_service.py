@@ -172,18 +172,18 @@ def serialize_profile(profile: Any) -> JsonDict:
 
     updated_at = getattr(profile, "updated_at", None)
     return {
-        "profile_id": getattr(profile, "profile_id"),
-        "owner_id": getattr(profile, "owner_id"),
-        "risk_appetite": getattr(profile, "risk_appetite"),
-        "horizon": getattr(profile, "horizon"),
-        "capital_scale": getattr(profile, "capital_scale"),
-        "style_tendency": dict(getattr(profile, "style_tendency") or {}),
-        "timing_posture": getattr(profile, "timing_posture"),
-        "dimension_confidence": dict(getattr(profile, "dimension_confidence") or {}),
-        "source": dict(getattr(profile, "source") or {}),
-        "status": getattr(profile, "status"),
+        "profile_id": profile.profile_id,
+        "owner_id": profile.owner_id,
+        "risk_appetite": profile.risk_appetite,
+        "horizon": profile.horizon,
+        "capital_scale": profile.capital_scale,
+        "style_tendency": dict(profile.style_tendency or {}),
+        "timing_posture": profile.timing_posture,
+        "dimension_confidence": dict(profile.dimension_confidence or {}),
+        "source": dict(profile.source or {}),
+        "status": profile.status,
         "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else updated_at,
-        "payload": dict(getattr(profile, "payload") or {}),
+        "payload": dict(profile.payload or {}),
     }
 
 

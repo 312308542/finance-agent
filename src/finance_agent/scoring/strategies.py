@@ -177,12 +177,12 @@ def strategy_weight_snapshot(strategy: Any) -> JsonDict:
     """生成评分入库使用的策略权重快照。"""
 
     return {
-        "strategy_id": str(getattr(strategy, "strategy_id")),
+        "strategy_id": str(strategy.strategy_id),
         "group_weights": normalize_numeric_mapping(
-            getattr(strategy, "group_weights"),
+            strategy.group_weights,
             field_name="group_weights",
         ),
-        "missing_penalty": normalize_missing_penalty(getattr(strategy, "missing_penalty")),
+        "missing_penalty": normalize_missing_penalty(strategy.missing_penalty),
     }
 
 

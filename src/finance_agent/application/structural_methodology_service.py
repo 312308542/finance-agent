@@ -110,8 +110,8 @@ class StructuralMethodologyRefreshService:
         errors: list[JsonDict] = []
         as_of = datetime.now(tz=UTC)
         for asset in assets:
-            asset_id = str(getattr(asset, "asset_id"))
-            symbol = str(getattr(asset, "symbol"))
+            asset_id = str(asset.asset_id)
+            symbol = str(asset.symbol)
             asset_market = str(getattr(asset, "market", normalized_market) or normalized_market)
             try:
                 bars = self.market_data.list_recent_bars(
@@ -409,11 +409,11 @@ def to_structural_price_bar(bar: Any) -> StructuralPriceBar:
     """把标准 K 线 ORM 或测试替身转换为结构引擎输入。"""
 
     return StructuralPriceBar(
-        timestamp=parse_payload_datetime(getattr(bar, "timestamp"), fallback=datetime.now(tz=UTC)),
-        open=to_float(getattr(bar, "open")),
-        high=to_float(getattr(bar, "high")),
-        low=to_float(getattr(bar, "low")),
-        close=to_float(getattr(bar, "close")),
+        timestamp=parse_payload_datetime(bar.timestamp, fallback=datetime.now(tz=UTC)),
+        open=to_float(bar.open),
+        high=to_float(bar.high),
+        low=to_float(bar.low),
+        close=to_float(bar.close),
         volume=to_float(getattr(bar, "volume", 0)),
     )
 
