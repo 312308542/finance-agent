@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from finance_agent.pipelines.recommendation import UniverseRecommendationPipeline
+from finance_agent.pipelines.recommendation import (
+    UniverseRecommendationPipeline,
+    exclude_avoid_pool_members,
+)
 from finance_agent.recommendations.service import RecommendationService
 
 
@@ -199,6 +203,61 @@ def test_recommendation_pipeline_excludes_avoid_pool_before_recommendation() -> 
             }
         ],
     }
+
+
+def test_avoid_pool_only_excludes_members_from_latest_snapshot() -> None:
+    """旧回避快照不得继续污染当前推荐，当前风险成员仍必须剔除。"""
+
+    snapshot_at = datetime(2026, 7, 16, 13, 0, tzinfo=UTC)
+    current_risk = SimpleNamespace(
+        asset_id="ashare:600519",
+        symbol="600519",
+        market="ashare",
+        included=False,
+        removed_reason="当前风险",
+        payload={"avoid_reasons": ["当前风险"]},
+        as_of=snapshot_at,
+    )
+    stale_risk = SimpleNamespace(
+        asset_id="ashare:000001",
+        symbol="000001",
+        market="ashare",
+        included=False,
+        removed_reason="旧风险已解除",
+        payload={"avoid_reasons": ["旧风险已解除"]},
+        as_of=snapshot_at - timedelta(days=1),
+    )
+
+    class _SnapshotUniverses:
+        def get_universe(self, _universe_id: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                universe_id="universe:avoid",
+                market="ashare",
+                as_of=snapshot_at,
+            )
+
+        def list_members(self, _universe_id: str, *, included_only: bool) -> list[Any]:
+            assert included_only is False
+            return [current_risk, stale_risk]
+
+    candidate_members = [
+        SimpleNamespace(asset_id="ashare:000001", symbol="000001", market="ashare"),
+        SimpleNamespace(asset_id="ashare:600519", symbol="600519", market="ashare"),
+    ]
+
+    kept, audit = exclude_avoid_pool_members(
+        universes=_SnapshotUniverses(),
+        candidate_universe=SimpleNamespace(
+            universe_id="universe:candidate",
+            market="ashare",
+        ),
+        members=candidate_members,
+        avoid_universe_id="universe:avoid",
+    )
+
+    assert [member.asset_id for member in kept] == ["ashare:000001"]
+    assert audit["avoid_pool_excluded"]["count"] == 1
+    assert audit["avoid_pool_excluded"]["assets"][0]["asset_id"] == "ashare:600519"
 
 
 def test_recommendation_pipeline_keeps_auditable_removed_reason_when_payload_missing() -> None:

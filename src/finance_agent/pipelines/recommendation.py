@@ -787,7 +787,11 @@ def exclude_avoid_pool_members(
         )
     avoid_members = universes.list_members(avoid_universe_id, included_only=False)
     ensure_single_market_universe(avoid_universe.market, avoid_members)
-    avoid_by_asset_id = {member.asset_id: member for member in avoid_members if not member.included}
+    avoid_by_asset_id = {
+        member.asset_id: member
+        for member in avoid_members
+        if not member.included and avoid_member_matches_snapshot(member, avoid_universe)
+    }
     if not avoid_by_asset_id:
         return members, {
             "avoid_pool_excluded": {
@@ -817,6 +821,16 @@ def exclude_avoid_pool_members(
             "assets": excluded_assets,
         }
     }
+
+
+def avoid_member_matches_snapshot(member: Any, avoid_universe: AssetUniverseORM) -> bool:
+    """只使用最新回避池快照；缺少水位时维持风险侧 fail-closed。"""
+
+    snapshot_at = getattr(avoid_universe, "as_of", None)
+    member_at = getattr(member, "as_of", None)
+    if not isinstance(snapshot_at, datetime) or not isinstance(member_at, datetime):
+        return True
+    return member_at == snapshot_at
 
 
 def recommendation_audit_payload(*, audit_payload: JsonDict, strategy_id: str | None) -> JsonDict:
