@@ -1,5 +1,6 @@
 """第三方数据源 Provider。"""
 
+from finance_agent.data.providers.akshare_fund_provider import AkshareFundProvider
 from finance_agent.data.providers.akshare_p1_provider import (
     AshareCapitalFlowProvider,
     AshareEventProvider,
@@ -9,7 +10,6 @@ from finance_agent.data.providers.akshare_p2_provider import (
     AshareFundamentalProvider,
     AshareValuationProvider,
 )
-from finance_agent.data.providers.akshare_fund_provider import AkshareFundProvider
 from finance_agent.data.providers.akshare_provider import AkshareProvider
 from finance_agent.data.providers.akshare_risk_sentiment_provider import (
     AshareRiskProvider,

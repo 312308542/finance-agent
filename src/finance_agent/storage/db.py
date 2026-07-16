@@ -7,8 +7,7 @@ PostgreSQL + TimescaleDB，确保 hypertable、唯一约束和压缩策略行为
 from __future__ import annotations
 
 import os
-from collections.abc import Hashable
-from collections.abc import Iterator
+from collections.abc import Hashable, Iterator
 from contextlib import contextmanager
 from threading import RLock
 

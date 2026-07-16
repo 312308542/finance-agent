@@ -36,11 +36,11 @@ from finance_agent.scheduler import (
     read_scheduler_health,
     write_scheduler_status_file,
 )
-from finance_agent.scheduler.base_data_scheduler import parse_scheduler_resource_pools
 from finance_agent.scheduler.base_data_progress import (
     BaseDataTaskProgressRecorder,
     build_progress_snapshot_response,
 )
+from finance_agent.scheduler.base_data_scheduler import parse_scheduler_resource_pools
 
 JsonDict = dict[str, Any]
 logger = logging.getLogger(__name__)

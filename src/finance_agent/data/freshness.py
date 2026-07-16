@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, time
 from zoneinfo import ZoneInfo
 
-
 ASHARE_TIMEZONE = ZoneInfo("Asia/Shanghai")
 REPORTING_PERIOD_FRESHNESS_POLICY = "reporting_period"
 ASHARE_SPOT_VALUATION_SOURCE = "akshare:stock_zh_a_spot"

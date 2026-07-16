@@ -22,8 +22,8 @@ from finance_agent.storage.orm import (
     AssistantTriggerEventORM,
     DataQualitySnapshotORM,
     PositionORM,
-    RecommendationRunORM,
     RealtimeQuoteSnapshotORM,
+    RecommendationRunORM,
     SignalSnapshotORM,
     WatchlistItemORM,
 )

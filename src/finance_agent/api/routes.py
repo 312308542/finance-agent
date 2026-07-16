@@ -55,8 +55,7 @@ from finance_agent.storage.db import (
     create_session_factory,
     session_scope,
 )
-from finance_agent.storage.orm import DecisionLogORM
-from finance_agent.storage.orm import ReviewTaskORM
+from finance_agent.storage.orm import DecisionLogORM, ReviewTaskORM
 from finance_agent.storage.repositories import (
     ActionLoopRepository,
     ChatMemoryRepository,

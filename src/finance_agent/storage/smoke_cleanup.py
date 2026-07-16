@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import Engine, inspect, text
+
 JsonDict = dict[str, Any]
 
 

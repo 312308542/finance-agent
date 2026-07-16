@@ -26,6 +26,7 @@ from finance_agent.factors.specs import (
     CryptoFactorSpec,
     FactorSpec,
 )
+from finance_agent.storage.event_retention import DEFAULT_EVENT_SIGNAL_LOOKBACK_DAYS
 from finance_agent.storage.orm import (
     CapitalFlowSnapshotORM,
     CryptoDerivativeSnapshotORM,
@@ -35,7 +36,6 @@ from finance_agent.storage.orm import (
     IndicatorFrameORM,
     RiskFindingORM,
 )
-from finance_agent.storage.event_retention import DEFAULT_EVENT_SIGNAL_LOOKBACK_DAYS
 from finance_agent.storage.repositories import (
     CapitalFlowRepository,
     DerivativeDataRepository,

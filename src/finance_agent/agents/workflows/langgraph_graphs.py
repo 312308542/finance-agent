@@ -16,23 +16,21 @@ from sqlalchemy import inspect as sqlalchemy_inspect
 
 from finance_agent.agents.reports import build_chinese_decision_report
 from finance_agent.agents.runtime import (
-    build_workflow_context_envelope,
     HighRiskReviewPolicy,
-    load_model_registry,
     ModelClient,
     ModelEndpointConfig,
     ModelRegistry,
     ModelRoutingPolicy,
     OpenAICompatibleModelClient,
     ReviewDecisionContext,
+    build_workflow_context_envelope,
+    load_model_registry,
 )
 from finance_agent.agents.runtime.model_config import (
     build_model_configs_from_repository,
     build_retrieval_profiles_from_repository,
 )
 from finance_agent.agents.tools import FinanceToolRuntime
-from finance_agent.graph.stores import DryRunGraphStore
-from finance_agent.storage.repositories import ModelRuntimeConfigRepository
 from finance_agent.agents.workflows.portfolio_monitoring import (
     PortfolioMonitoringWorkflow,
 )
@@ -40,15 +38,17 @@ from finance_agent.agents.workflows.recommendation_decision import (
     RecommendationDecisionInput,
     RecommendationDecisionWorkflow,
 )
-from finance_agent.agents.workflows.watchlist_management import (
-    WatchlistManagementWorkflow,
-)
 from finance_agent.agents.workflows.roundtable_model_nodes import (
+    RoundtableOpinionRequest,
     build_fallback_opinion,
     collect_evidence_ids,
     generate_model_opinion,
-    RoundtableOpinionRequest,
 )
+from finance_agent.agents.workflows.watchlist_management import (
+    WatchlistManagementWorkflow,
+)
+from finance_agent.graph.stores import DryRunGraphStore
+from finance_agent.storage.repositories import ModelRuntimeConfigRepository
 
 WorkflowGraphState = dict[str, Any]
 ROUNDTABLE_MODEL_ROLES = (

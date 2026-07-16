@@ -17,7 +17,6 @@ from finance_agent.storage.orm import (
     WatchlistORM,
 )
 
-
 USER_WATCHLIST_PURPOSES = frozenset(
     {"manual_watchlist", "portfolio_watchlist", "fund_watchlist"}
 )

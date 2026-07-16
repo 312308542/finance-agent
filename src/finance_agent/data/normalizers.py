@@ -11,11 +11,6 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from finance_agent.data.news_entity_validation import (
-    NEWS_ENTITY_RULE_VERSION,
-    NewsEntityDecision,
-    validate_ashare_news_entity,
-)
 from finance_agent.data.models import (
     AssetData,
     CapitalFlowSnapshotData,
@@ -27,6 +22,11 @@ from finance_agent.data.models import (
     MarketBarData,
     RiskFindingData,
     UniverseSeedData,
+)
+from finance_agent.data.news_entity_validation import (
+    NEWS_ENTITY_RULE_VERSION,
+    NewsEntityDecision,
+    validate_ashare_news_entity,
 )
 
 ASHARE_TIMEZONE = ZoneInfo("Asia/Shanghai")
