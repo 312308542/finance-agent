@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from finance_agent.data.providers.akshare_fund_provider import AkshareFundProvider
 from finance_agent.data.providers import eastmoney_curl
+from finance_agent.data.providers.akshare_fund_provider import AkshareFundProvider
 from finance_agent.data.providers.akshare_provider import AkshareProvider
 from finance_agent.data.providers.ashare_kline_sources import (
     fetch_tencent_kline_direct,

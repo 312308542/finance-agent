@@ -1,6 +1,8 @@
 from finance_agent.agents.runtime.model_config import (
     ModelEndpointConfig,
     ModelRegistry,
+)
+from finance_agent.agents.runtime.model_config import (
     test_model_endpoint as run_model_endpoint_test,
 )
 

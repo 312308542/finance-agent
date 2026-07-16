@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from finance_agent.agents.chat import (
-    FinanceAgentChatSession,
     OPENAI_CHAT_TOOL_SCHEMAS,
+    FinanceAgentChatSession,
     to_openai_tool_name,
 )
 from finance_agent.agents.interfaces import AgentInterfaceResult

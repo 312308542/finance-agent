@@ -10,7 +10,6 @@ from finance_agent.data.freshness import (
     expected_ashare_report_period,
 )
 
-
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 

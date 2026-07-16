@@ -6,8 +6,8 @@ from typing import Any
 
 from finance_agent.application import data_sync_control_service as control_service
 from finance_agent.application.data_sync_control_service import (
-    DataSyncControlService,
     _ATTACHED_SCHEDULER_LOG_FILES,
+    DataSyncControlService,
     _SchedulerLogForwardDeduper,
     attach_running_manual_scheduler_log_forwarders,
     forward_scheduler_process_log_file,

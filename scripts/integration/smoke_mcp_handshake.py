@@ -10,7 +10,6 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
-
 JsonDict = dict[str, Any]
 
 REQUIRED_MCP_TOOLS = {

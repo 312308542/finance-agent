@@ -9,7 +9,6 @@ import pytest
 
 from finance_agent.application.action_loop_service import ActionLoopService, ExecutionRegistration
 
-
 NOW = datetime(2026, 6, 13, 10, 30, tzinfo=UTC)
 
 

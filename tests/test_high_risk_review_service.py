@@ -7,14 +7,13 @@ from typing import Any
 
 import pytest
 
-from finance_agent.cli import main as cli_main
 from finance_agent.agents.runtime.high_risk_review_service import (
     HighRiskReviewService,
     SqlAlchemyHighRiskReviewStore,
 )
 from finance_agent.agents.runtime.model_client import ModelClientResponse
 from finance_agent.agents.runtime.model_config import ModelEndpointConfig
-
+from finance_agent.cli import main as cli_main
 
 NOW = datetime(2026, 6, 12, 9, 30, tzinfo=timezone.utc)
 

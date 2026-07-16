@@ -20,6 +20,7 @@ for path in (SRC_DIR, DATA_SCRIPT_DIR):
         sys.path.insert(0, str(path))
 
 import collect_base_data as collector_module  # noqa: E402
+
 from finance_agent.data.models import ProviderResult  # noqa: E402
 
 

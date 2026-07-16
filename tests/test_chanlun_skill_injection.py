@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from finance_agent.agents.workflows.roundtable_prompts import role_prompt
-from finance_agent.skills.loader import load_methodology_skills, load_methodology_skill
+from finance_agent.skills.loader import load_methodology_skill, load_methodology_skills
 
 
 def test_chanlun_skill_declares_engine_and_red_lines() -> None:

@@ -6,7 +6,6 @@ import pytest
 
 from finance_agent.agents.interfaces import FinanceAgentInterface
 
-
 ALLOWED_WORKFLOWS = {
     "portfolio_monitoring",
     "watchlist_management",

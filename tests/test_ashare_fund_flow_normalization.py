@@ -4,8 +4,8 @@ import pandas as pd
 
 from finance_agent.data.normalizers import (
     is_main_board_ashare_stock_symbol,
-    normalize_ashare_spot,
     normalize_ashare_fund_flow_rank,
+    normalize_ashare_spot,
 )
 
 

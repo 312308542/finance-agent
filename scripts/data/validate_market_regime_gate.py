@@ -25,7 +25,12 @@ from finance_agent.recommendations.service import (
     decide_action,
 )
 from finance_agent.storage.db import create_session_factory, session_scope
-from finance_agent.storage.orm import AssetScoreORM, RiskFindingORM, ScreeningResultORM, SignalSnapshotORM
+from finance_agent.storage.orm import (
+    AssetScoreORM,
+    RiskFindingORM,
+    ScreeningResultORM,
+    SignalSnapshotORM,
+)
 from finance_agent.storage.repositories import (
     AssetScoreRepository,
     RiskRepository,

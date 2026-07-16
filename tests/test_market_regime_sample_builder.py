@@ -5,8 +5,8 @@ from decimal import Decimal
 
 from scripts.data.build_market_regime_samples import (
     DailyBarSample,
-    build_regime_samples,
     build_equal_weight_proxy_index_bars,
+    build_regime_samples,
     compute_breadth_metrics,
     compute_index_regime_input,
 )

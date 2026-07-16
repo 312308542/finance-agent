@@ -29,7 +29,6 @@ from curl_cffi import requests as curl_requests
 from finance_agent.data.normalizers import with_ashare_exchange_prefix
 from finance_agent.data.providers.akshare_provider import AkshareProvider
 
-
 JsonDict = dict[str, Any]
 
 

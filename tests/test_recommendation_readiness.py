@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from finance_agent.application.data_production_service import DataBackfillPlanner
 from scripts.data.check_base_data_health import (
     build_recommendation_readiness,
     freshness_row_is_stale,
@@ -9,7 +10,6 @@ from scripts.data.check_base_data_health import (
     load_table_counts,
     load_table_freshness,
 )
-from finance_agent.application.data_production_service import DataBackfillPlanner
 
 
 def test_build_recommendation_readiness_marks_ready_when_core_dimensions_pass() -> None:

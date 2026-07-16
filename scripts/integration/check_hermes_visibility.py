@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_PROJECT_ROOT = "/mnt/d/Code/aiAgents/finance-agent"
 
 

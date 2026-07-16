@@ -7,6 +7,7 @@ import json
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
+
 from sqlalchemy import select
 
 from finance_agent.indicators.structural_methodology_adapters import (

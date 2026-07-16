@@ -1,6 +1,7 @@
-import pytest
 import threading
 import time
+
+import pytest
 
 from finance_agent.data.source_rate_limiter import (
     AdaptiveSourceRateState,

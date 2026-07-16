@@ -1,5 +1,5 @@
-from datetime import UTC, datetime
 import logging
+from datetime import UTC, datetime
 
 from finance_agent.cache.null_cache import NullCacheClient
 from finance_agent.data.collection_runtime import (

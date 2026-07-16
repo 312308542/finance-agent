@@ -1,9 +1,9 @@
 import json
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from datetime import UTC, datetime, timedelta
 
 from finance_agent.application.data_sync_control_service import DataSyncControlService
 from finance_agent.cache.null_cache import NullCacheClient

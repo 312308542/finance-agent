@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-
 JsonDict = dict[str, Any]
 Validator = Callable[["CommandResult"], JsonDict | None]
 

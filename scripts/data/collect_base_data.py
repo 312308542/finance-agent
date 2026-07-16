@@ -44,11 +44,11 @@ from finance_agent.data.collectors import (
     CryptoDataCollector,
     FundDataCollector,
 )
-from finance_agent.data.models import ProviderResult
 from finance_agent.data.freshness import (
     ASHARE_FINANCIAL_INDICATOR_SOURCE,
     expected_ashare_report_period,
 )
+from finance_agent.data.models import ProviderResult
 from finance_agent.data.normalizers import (
     compact_crypto_symbol,
     normalize_ashare_symbol,
@@ -69,8 +69,8 @@ from finance_agent.storage.orm import (
     EventRecordORM,
     FundamentalSnapshotORM,
     FundNavSnapshotORM,
-    MarketCalendarORM,
     MarketBarORM,
+    MarketCalendarORM,
     WatchlistItemORM,
 )
 from finance_agent.storage.repositories import (

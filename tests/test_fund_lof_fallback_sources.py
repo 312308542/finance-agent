@@ -8,10 +8,10 @@ from types import SimpleNamespace
 import pandas as pd
 import requests
 
-from scripts.data import collect_base_data
 from finance_agent.data.collection_runtime import CollectionTaskResult
 from finance_agent.data.providers.akshare_fund_provider import AkshareFundProvider
 from finance_agent.data.providers.ashare_kline_sources import fetch_tencent_kline_direct
+from scripts.data import collect_base_data
 
 
 def test_tencent_direct_parses_lof_jsonp_sample(monkeypatch) -> None:

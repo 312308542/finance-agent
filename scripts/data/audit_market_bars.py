@@ -19,7 +19,6 @@ from sqlalchemy.orm import Session
 
 from finance_agent.storage.db import create_session_factory, session_scope
 
-
 JsonDict = dict[str, Any]
 
 

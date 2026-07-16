@@ -7,8 +7,8 @@ from typing import Any
 import pandas as pd
 
 from finance_agent.data import normalizers
-from finance_agent.data.models import RiskFindingsResult
 from finance_agent.data.collectors import AshareRiskSentimentCollector
+from finance_agent.data.models import RiskFindingsResult
 
 
 class _RawRecords:

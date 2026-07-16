@@ -6,9 +6,9 @@ from typing import Any
 
 import pandas as pd
 
+from finance_agent.data import normalizers
 from finance_agent.data.collectors import AshareP1Collector
 from finance_agent.data.models import CapitalFlowSnapshotData, CapitalFlowSnapshotsResult
-from finance_agent.data import normalizers
 from finance_agent.data.providers.akshare_p1_provider import AshareCapitalFlowProvider
 
 

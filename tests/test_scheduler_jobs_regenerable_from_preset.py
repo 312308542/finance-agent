@@ -7,7 +7,6 @@ from pathlib import Path
 from finance_agent.cli.data_sync import dispatch_data
 from finance_agent.data.sync_config import build_preset_config, export_scheduler_payload
 
-
 REQUIRED_BATCH5_PREREQUISITE_JOBS = {
     "analytics.triggers.evaluate.daily",
     "analytics.triggers.evaluate.intraday",
