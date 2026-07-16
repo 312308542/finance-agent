@@ -18,10 +18,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """解析参数；默认 dry-run，显式 ``--apply`` 才写库。"""
 
     parser = argparse.ArgumentParser(description="重验历史 A 股关键词新闻实体相关性")
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--apply",
         action="store_true",
         help="把重验结果合并到事件和关联证据 payload；默认仅输出 dry-run 摘要",
+    )
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="显式执行只读重验；不传模式参数时也默认为 dry-run",
     )
     parser.add_argument(
         "--limit",

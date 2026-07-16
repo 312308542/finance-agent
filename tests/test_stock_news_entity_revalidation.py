@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from sqlalchemy.dialects import postgresql
 
 from finance_agent.data.news_entity_revalidation import (
@@ -139,8 +140,8 @@ def test_revalidation_dry_run_reports_decisions_without_updates() -> None:
 
     assert result.scanned == 4
     assert result.passed == 1
-    assert result.failed == 2
-    assert result.ambiguous == 1
+    assert result.failed == 1
+    assert result.ambiguous == 2
     assert result.missing_asset == 1
     assert result.updated == 0
     assert result.reason_counts == {
@@ -157,7 +158,10 @@ def test_revalidation_cli_requires_explicit_apply_flag() -> None:
     script = _import_revalidation_script()
 
     assert script.parse_args([]).apply is False
+    assert script.parse_args(["--dry-run"]).apply is False
     assert script.parse_args(["--apply"]).apply is True
+    with pytest.raises(SystemExit):
+        script.parse_args(["--dry-run", "--apply"])
 
 
 def test_revalidation_apply_updates_event_and_evidence_idempotently() -> None:
@@ -166,6 +170,7 @@ def test_revalidation_apply_updates_event_and_evidence_idempotently() -> None:
     service = StockNewsEntityRevalidationService(repository)
 
     first = service.run(apply=True, chunk_size=2)
+    first_revalidated_at = rows[0][0].payload["entity_validation"].get("revalidated_at")
     second = service.run(apply=True, chunk_size=2)
 
     assert first.updated == second.updated == 4
@@ -173,6 +178,9 @@ def test_revalidation_apply_updates_event_and_evidence_idempotently() -> None:
     assert first.updated_evidence == second.updated_evidence == 4
     assert rows[1][0].payload["entity_validation"]["status"] == "failed"
     assert rows[2][0].payload["entity_validation"]["status"] == "ambiguous"
+    assert rows[3][0].payload["entity_validation"]["status"] == "ambiguous"
+    assert first_revalidated_at
+    assert rows[0][0].payload["entity_validation"]["revalidated_at"] == first_revalidated_at
     assert rows[0][0].payload["raw"] == {"新闻标题": "中山公用发布经营公告"}
     assert rows[0][0].payload["article"] == {"status": "available"}
 

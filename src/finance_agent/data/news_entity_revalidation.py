@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from finance_agent.data.news_entity_validation import (
@@ -81,6 +82,7 @@ class StockNewsEntityRevalidationService:
             raise ValueError("chunk_size 必须大于 0")
 
         rows = self.repository.list_stock_news_for_entity_revalidation(limit=limit)
+        revalidated_at = datetime.now(tz=UTC).isoformat()
         updates: list[JsonDict] = []
         status_counts = {"passed": 0, "failed": 0, "ambiguous": 0}
         reason_counts: dict[str, int] = {}
@@ -96,12 +98,18 @@ class StockNewsEntityRevalidationService:
                 title=getattr(event, "title", None),
                 summary=getattr(event, "summary", None),
             )
+            if decision.reason in {"missing_asset_name", "empty_text"}:
+                decision = replace(decision, status="ambiguous")
             status_counts[decision.status] += 1
             reason_counts[decision.reason] = reason_counts.get(decision.reason, 0) + 1
             updates.append(
                 {
                     "event_id": str(event.event_id),
-                    "entity_validation": _decision_payload(decision, asset_name=asset_name),
+                    "entity_validation": _decision_payload(
+                        decision,
+                        asset_name=asset_name,
+                        revalidated_at=_existing_revalidated_at(event) or revalidated_at,
+                    ),
                 }
             )
 
@@ -148,6 +156,7 @@ def _decision_payload(
     decision: NewsEntityDecision,
     *,
     asset_name: str,
+    revalidated_at: str,
 ) -> JsonDict:
     return {
         "status": decision.status,
@@ -156,4 +165,15 @@ def _decision_payload(
         "expected_exchange": decision.expected_exchange,
         "asset_name": asset_name,
         "rule_version": NEWS_ENTITY_RULE_VERSION,
+        "revalidated_at": revalidated_at,
     }
+
+
+def _existing_revalidated_at(event: Any) -> str:
+    payload = getattr(event, "payload", None)
+    if not isinstance(payload, dict):
+        return ""
+    validation = payload.get("entity_validation")
+    if not isinstance(validation, dict):
+        return ""
+    return str(validation.get("revalidated_at") or "").strip()
