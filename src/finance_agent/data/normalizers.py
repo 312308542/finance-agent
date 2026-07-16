@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from hashlib import sha1
@@ -10,6 +11,11 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from finance_agent.data.news_entity_validation import (
+    NEWS_ENTITY_RULE_VERSION,
+    NewsEntityDecision,
+    validate_ashare_news_entity,
+)
 from finance_agent.data.models import (
     AssetData,
     CapitalFlowSnapshotData,
@@ -24,6 +30,15 @@ from finance_agent.data.models import (
 )
 
 ASHARE_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+@dataclass(frozen=True)
+class StockNewsNormalizationResult:
+    """关键词新闻归一化结果及实体过滤审计。"""
+
+    events: list[EventRecordData]
+    evidence: list[EvidenceData]
+    entity_validation: dict[str, Any]
 
 
 def to_decimal(value: Any) -> Decimal:
@@ -616,21 +631,53 @@ def normalize_ashare_stock_news(
     df: pd.DataFrame,
     *,
     symbol: str,
+    asset_name: str,
     source: str,
     collected_at: datetime,
     limit: int | None = None,
-) -> tuple[list[EventRecordData], list[EvidenceData]]:
-    """归一化 AKShare 个股新闻。"""
+) -> StockNewsNormalizationResult:
+    """归一化关键词新闻，仅为实体相关性可证明的行生成事件。"""
 
     events: list[EventRecordData] = []
     evidence: list[EvidenceData] = []
+    filtered_rows: list[dict[str, Any]] = []
+    reason_counts: dict[str, int] = {}
+    passed_count = 0
+    failed_count = 0
+    ambiguous_count = 0
     clean_symbol = strip_ashare_exchange_prefix(symbol)
     rows = df.head(limit) if limit else df
-    for row in rows.to_dict("records"):
+    for row_index, row in enumerate(rows.to_dict("records")):
         title = str(_first_present(row, ["新闻标题", "标题", "title"]) or "").strip()
-        if not title:
-            continue
         summary = str(_first_present(row, ["新闻内容", "摘要", "内容"]) or "").strip() or None
+        decision = _stock_news_entity_decision(
+            symbol=clean_symbol,
+            asset_name=asset_name,
+            title=title,
+            summary=summary,
+        )
+        reason_counts[decision.reason] = reason_counts.get(decision.reason, 0) + 1
+        if decision.status != "passed" or not title:
+            status = decision.status if title else "failed"
+            reason = decision.reason if title else "missing_title"
+            if not title:
+                reason_counts[decision.reason] -= 1
+                if reason_counts[decision.reason] == 0:
+                    reason_counts.pop(decision.reason)
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            failed_count += int(status == "failed")
+            ambiguous_count += int(status == "ambiguous")
+            filtered_rows.append(
+                {
+                    "row_index": row_index,
+                    "status": status,
+                    "reason": reason,
+                    "raw": row,
+                }
+            )
+            continue
+
+        passed_count += 1
         url = str(_first_present(row, ["新闻链接", "链接", "url"]) or "").strip() or None
         raw_published_at = _first_present(row, ["发布时间", "时间", "日期"])
         published_at = parse_ashare_published_datetime(raw_published_at)
@@ -643,6 +690,10 @@ def normalize_ashare_stock_news(
             legacy_identity_at or collected_at,
         )
         evidence_id = stable_id("evidence", source, event_id)
+        validation_payload = _news_entity_validation_payload(
+            decision,
+            asset_name=asset_name,
+        )
         events.append(
             EventRecordData(
                 event_id=event_id,
@@ -658,7 +709,10 @@ def normalize_ashare_stock_news(
                 url=url,
                 published_at=published_at,
                 collected_at=collected_at,
-                payload={"raw": row},
+                payload={
+                    "raw": row,
+                    "entity_validation": validation_payload,
+                },
             )
         )
         evidence.append(
@@ -674,10 +728,56 @@ def normalize_ashare_stock_news(
                 reliability="medium",
                 as_of=published_at,
                 collected_at=collected_at,
-                payload={"event_id": event_id},
+                payload={
+                    "event_id": event_id,
+                    "entity_validation": validation_payload,
+                },
             )
         )
-    return events, evidence
+    return StockNewsNormalizationResult(
+        events=events,
+        evidence=evidence,
+        entity_validation={
+            "rule_version": NEWS_ENTITY_RULE_VERSION,
+            "asset_name": asset_name,
+            "source_row_count": len(rows),
+            "passed_count": passed_count,
+            "failed_count": failed_count,
+            "ambiguous_count": ambiguous_count,
+            "reason_counts": reason_counts,
+            "filtered_rows": filtered_rows,
+        },
+    )
+
+
+def _stock_news_entity_decision(
+    *,
+    symbol: str,
+    asset_name: str,
+    title: str,
+    summary: str | None,
+) -> NewsEntityDecision:
+    return validate_ashare_news_entity(
+        symbol=symbol,
+        asset_name=asset_name,
+        title=title,
+        summary=summary,
+    )
+
+
+def _news_entity_validation_payload(
+    decision: NewsEntityDecision,
+    *,
+    asset_name: str,
+) -> dict[str, Any]:
+    return {
+        "status": decision.status,
+        "reason": decision.reason,
+        "matched_by": decision.matched_by,
+        "expected_exchange": decision.expected_exchange,
+        "asset_name": asset_name,
+        "rule_version": NEWS_ENTITY_RULE_VERSION,
+    }
 
 
 def normalize_ashare_notice_reports(

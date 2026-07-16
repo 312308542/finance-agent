@@ -1894,7 +1894,11 @@ class AshareP1Collector:
     ) -> ArchivedProviderResult:
         """采集个股新闻，并写入事件和证据表。"""
 
-        result = self.event_provider.fetch_stock_news(symbol=symbol, limit=limit)
+        result = self.event_provider.fetch_stock_news(
+            symbol=symbol,
+            asset_name=str(asset_name or "").strip(),
+            limit=limit,
+        )
         if enrich_articles and result.status == "available":
             result = self._enrich_stock_news_articles(result)
         raw_record_id = archive_provider_result(

@@ -7,7 +7,17 @@ from finance_agent.data.providers.eastmoney_article_fetcher import ArticleFetchR
 
 
 class _FakeEventProvider:
-    def fetch_stock_news(self, *, symbol: str, limit: int | None = None) -> EventRecordsResult:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, int | None]] = []
+
+    def fetch_stock_news(
+        self,
+        *,
+        symbol: str,
+        asset_name: str,
+        limit: int | None = None,
+    ) -> EventRecordsResult:
+        self.calls.append((symbol, asset_name, limit))
         collected_at = datetime(2026, 6, 3, tzinfo=UTC)
         return EventRecordsResult(
             provider_name="akshare",
@@ -42,6 +52,44 @@ class _FakeEventProvider:
                 )
             ],
             payload={"endpoint": "stock_news_em", "symbol": symbol},
+        )
+
+
+class _FilteredEventProvider:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, int | None]] = []
+
+    def fetch_stock_news(
+        self,
+        *,
+        symbol: str,
+        asset_name: str,
+        limit: int | None = None,
+    ) -> EventRecordsResult:
+        self.calls.append((symbol, asset_name, limit))
+        return EventRecordsResult(
+            provider_name="akshare",
+            status="unavailable",
+            collected_at=datetime(2026, 7, 16, tzinfo=UTC),
+            payload={
+                "endpoint": "stock_news_em",
+                "symbol": symbol,
+                "asset_name": asset_name,
+                "entity_validation": {
+                    "source_row_count": 1,
+                    "passed_count": 0,
+                    "failed_count": 1,
+                    "ambiguous_count": 0,
+                    "filtered_rows": [
+                        {
+                            "row_index": 0,
+                            "status": "failed",
+                            "reason": "conflicting_exchange_suffix",
+                            "raw": {"新闻标题": "000685.SH 指数上涨"},
+                        }
+                    ],
+                },
+            },
         )
 
 
@@ -139,8 +187,33 @@ def test_collect_stock_news_does_not_write_asset_profile() -> None:
     )
 
     assert result.raw_record_id == "raw:stock_news:000001"
+    assert collector.event_provider.calls == [("000001", "平安银行", None)]
     assert collector.events.events[0]["asset_id"] == "ashare:000001"
     assert collector.events.evidence[0]["asset_id"] == "ashare:000001"
+
+
+def test_collect_stock_news_archives_filtered_rows_without_writing_events() -> None:
+    """全部过滤时保留原始审计，但不得写入资产、事件和证据。"""
+
+    collector = _build_collector(article_fetcher=None)
+    collector.event_provider = _FilteredEventProvider()
+
+    result = AshareP1Collector.collect_stock_news(
+        collector,
+        symbol="000685",
+        asset_name="中山公用",
+    )
+
+    assert collector.event_provider.calls == [("000685", "中山公用", None)]
+    assert result.result.status == "unavailable"
+    assert collector.assets.ensured == []
+    assert collector.events.events == []
+    assert collector.events.evidence == []
+    raw_payload = collector.raw_records.calls[0]["response_payload"]
+    assert raw_payload["entity_validation"]["failed_count"] == 1
+    assert raw_payload["entity_validation"]["filtered_rows"][0]["raw"] == {
+        "新闻标题": "000685.SH 指数上涨"
+    }
 
 
 def test_collect_stock_news_enriches_article_full_text() -> None:

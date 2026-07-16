@@ -25,6 +25,7 @@ from finance_agent.data.normalizers import (
     normalize_ashare_northbound_market_flow,
     normalize_ashare_notice_reports,
     normalize_ashare_stock_news,
+    strip_ashare_exchange_prefix,
 )
 from finance_agent.data.providers import eastmoney_curl, sina_curl, ths_curl
 
@@ -757,16 +758,33 @@ class AshareEventProvider:
         self,
         *,
         symbol: str,
+        asset_name: str,
         limit: int | None = None,
     ) -> EventRecordsResult:
         """获取个股新闻事件。"""
 
         collected_at = datetime.now(tz=UTC)
+        clean_symbol = strip_ashare_exchange_prefix(symbol)
+        clean_asset_name = str(asset_name or "").strip()
+        if not clean_asset_name or clean_asset_name == clean_symbol:
+            return EventRecordsResult(
+                provider_name=self.provider_name,
+                status="unavailable",
+                collected_at=collected_at,
+                payload={
+                    "endpoint": "stock_news_em",
+                    "symbol": clean_symbol,
+                    "asset_name": clean_asset_name,
+                    "reason": "missing_asset_name",
+                },
+            )
+        query = f"{clean_symbol} {clean_asset_name}"
         try:
-            df = ak.stock_news_em(symbol=symbol)
-            events, evidence = normalize_ashare_stock_news(
+            df = ak.stock_news_em(symbol=query)
+            normalized = normalize_ashare_stock_news(
                 df,
-                symbol=symbol,
+                symbol=clean_symbol,
+                asset_name=clean_asset_name,
                 source="akshare:stock_news_em",
                 collected_at=collected_at,
                 limit=limit,
@@ -777,15 +795,27 @@ class AshareEventProvider:
                 status="error",
                 collected_at=collected_at,
                 error_message=str(exc),
-                payload={"endpoint": "stock_news_em", "symbol": symbol},
+                payload={
+                    "endpoint": "stock_news_em",
+                    "symbol": clean_symbol,
+                    "asset_name": clean_asset_name,
+                    "query": query,
+                },
             )
         return EventRecordsResult(
             provider_name=self.provider_name,
-            status="available" if events else "unavailable",
+            status="available" if normalized.events else "unavailable",
             collected_at=collected_at,
-            events=events,
-            evidence=evidence,
-            payload={"endpoint": "stock_news_em", "symbol": symbol, "row_count": len(events)},
+            events=normalized.events,
+            evidence=normalized.evidence,
+            payload={
+                "endpoint": "stock_news_em",
+                "symbol": clean_symbol,
+                "asset_name": clean_asset_name,
+                "query": query,
+                "row_count": len(normalized.events),
+                "entity_validation": normalized.entity_validation,
+            },
         )
 
     def fetch_notice_reports(
