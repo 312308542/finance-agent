@@ -621,8 +621,6 @@ def infer_gaps(
     freshness_rows = freshness_rows or []
     for row in freshness_rows:
         table_name = str(row.get("table_name") or "")
-        age_hours = row.get("age_hours")
-        threshold_hours = row.get("threshold_hours")
         if freshness_row_is_stale(row):
             gaps.append(f"{table_name} 最近数据已过期，建议补采")
         total_asset_count = int(row.get("total_asset_count") or 0)
@@ -719,7 +717,7 @@ def build_recommendation_readiness(
     }
     reasons: list[str] = []
     warnings: list[str] = []
-    for name, dimension in dimensions.items():
+    for dimension in dimensions.values():
         issue_key = dimension.get("issue_key")
         if not issue_key:
             continue

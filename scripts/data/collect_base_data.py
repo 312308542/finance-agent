@@ -4284,7 +4284,6 @@ def batch_ashare_northbound_symbols(
             ),
         )
         for asset in ranked_assets:
-            asset_id = str(asset.asset_id)
             _append_unique_ashare_symbol(
                 symbols,
                 normalize_ashare_symbol(str(getattr(asset, "symbol", "") or "")),
