@@ -36,19 +36,19 @@ class ProviderFetchResult:
     error_message: str | None = None
 
     @classmethod
-    def ok(cls, *, payload: Any = None, row_count: int = 0) -> "ProviderFetchResult":
+    def ok(cls, *, payload: Any = None, row_count: int = 0) -> ProviderFetchResult:
         """创建成功结果。"""
 
         return cls(status="ok", payload=payload, row_count=max(0, int(row_count)))
 
     @classmethod
-    def error(cls, error_message: str, *, payload: Any = None) -> "ProviderFetchResult":
+    def error(cls, error_message: str, *, payload: Any = None) -> ProviderFetchResult:
         """创建失败结果。"""
 
         return cls(status="error", payload=payload, error_message=str(error_message))
 
     @classmethod
-    def skipped(cls, reason: str) -> "ProviderFetchResult":
+    def skipped(cls, reason: str) -> ProviderFetchResult:
         """创建跳过结果。"""
 
         return cls(status="skipped", error_message=str(reason))
@@ -178,7 +178,7 @@ class TaskItem:
     attempts: tuple[ProviderAttempt, ...] = ()
     updated_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
 
-    def mark_running(self) -> "TaskItem":
+    def mark_running(self) -> TaskItem:
         """标记 item 正在处理。"""
 
         return replace(self, status="running", updated_at=datetime.now(tz=UTC))
@@ -188,7 +188,7 @@ class TaskItem:
         *,
         item_count: int = 0,
         attempts: Sequence[ProviderAttempt] | None = None,
-    ) -> "TaskItem":
+    ) -> TaskItem:
         """标记 item 已完成。"""
 
         return replace(
@@ -205,7 +205,7 @@ class TaskItem:
         error_message: str,
         *,
         attempts: Sequence[ProviderAttempt] | None = None,
-    ) -> "TaskItem":
+    ) -> TaskItem:
         """标记 item 失败。"""
 
         return replace(
@@ -216,7 +216,7 @@ class TaskItem:
             updated_at=datetime.now(tz=UTC),
         )
 
-    def mark_skipped(self, reason: str) -> "TaskItem":
+    def mark_skipped(self, reason: str) -> TaskItem:
         """标记 item 被跳过。"""
 
         return replace(

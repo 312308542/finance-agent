@@ -329,7 +329,7 @@ class ActionLoopService:
         self,
         *,
         record: ExecutionRecordORM,
-        update: "PositionUpdate",
+        update: PositionUpdate,
     ) -> PositionORM:
         """写入已校验的持仓更新。"""
 

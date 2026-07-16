@@ -58,7 +58,7 @@ class UserInvestmentProfileService:
         self.repository = repository
 
     @classmethod
-    def from_session(cls, session: Any) -> "UserInvestmentProfileService":
+    def from_session(cls, session: Any) -> UserInvestmentProfileService:
         """从数据库 Session 构造画像服务。"""
 
         return cls(UserInvestmentProfileRepository(session))

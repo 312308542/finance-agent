@@ -288,11 +288,11 @@ class _IndicatorStore:
         self.frames = frames
 
     @classmethod
-    def empty(cls) -> "_IndicatorStore":
+    def empty(cls) -> _IndicatorStore:
         return cls({})
 
     @classmethod
-    def with_structure(cls) -> "_IndicatorStore":
+    def with_structure(cls) -> _IndicatorStore:
         as_of = datetime(2026, 7, 5, tzinfo=UTC)
         return cls(
             {

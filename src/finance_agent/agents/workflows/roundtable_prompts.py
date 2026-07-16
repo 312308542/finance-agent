@@ -66,7 +66,7 @@ OUTPUT_SCHEMA_PROMPT = """
 """.strip()
 
 
-def role_prompt(role: str, *, skill_registry: "MethodologySkillRegistry | None" = None) -> str:
+def role_prompt(role: str, *, skill_registry: MethodologySkillRegistry | None = None) -> str:
     """按角色返回圆桌模型提示词。"""
 
     prompt = ROLE_PROMPTS.get(role, DEFAULT_ROLE_PROMPT)
@@ -89,7 +89,7 @@ def role_prompt(role: str, *, skill_registry: "MethodologySkillRegistry | None" 
     )
 
 
-def build_role_skill_text(skills: list["MethodologySkill"]) -> str:
+def build_role_skill_text(skills: list[MethodologySkill]) -> str:
     """按优先级和总预算拼接角色可用方法论技能。"""
 
     ordered_skills = sorted(enumerate(skills), key=lambda item: (skill_priority(item[1].name), item[0]))
@@ -130,7 +130,7 @@ def skill_priority(name: str) -> int:
     return 2
 
 
-def load_default_skill_registry() -> "MethodologySkillRegistry | None":
+def load_default_skill_registry() -> MethodologySkillRegistry | None:
     """加载默认方法论技能；失败时保持旧 Prompt 可用。"""
 
     try:
