@@ -99,7 +99,15 @@ def test_attach_running_manual_scheduler_log_forwarders_adopts_existing_task(
     _ATTACHED_SCHEDULER_LOG_FILES.clear()
 
     class FakeThread:
-        def __init__(self, *, target: Any, args: tuple[Any, ...], kwargs: dict[str, Any], name: str, daemon: bool) -> None:
+        def __init__(
+            self,
+            *,
+            target: Any,
+            args: tuple[Any, ...],
+            kwargs: dict[str, Any],
+            name: str,
+            daemon: bool,
+        ) -> None:
             self.target = target
             self.args = args
             self.kwargs = kwargs

@@ -273,7 +273,11 @@ def test_factor_service_persists_supplemental_theme_factor_groups(monkeypatch) -
                 asset_id="ashare:600519",
                 symbol="600519",
                 market="ashare",
-                input_end_at=SimpleNamespace(astimezone=lambda _tz: SimpleNamespace(strftime=lambda _fmt: "20260630T070000Z")),
+                input_end_at=SimpleNamespace(
+                    astimezone=lambda _tz: SimpleNamespace(
+                        strftime=lambda _fmt: "20260630T070000Z"
+                    )
+                ),
                 ma_20=None,
                 ma_60=None,
                 rsi_14=None,

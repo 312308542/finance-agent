@@ -2769,7 +2769,11 @@ def run_fund(
                         ),
                     )
 
-                def wrap_result(result: CollectionTaskResult, *, worker_session: Any | None = None) -> CollectionTaskResult:
+                def wrap_result(
+                    result: CollectionTaskResult,
+                    *,
+                    worker_session: Any | None = None,
+                ) -> CollectionTaskResult:
                     occurred_at = datetime.now(tz=UTC)
                     target_session = worker_session if worker_session is not None else session
                     schedule_retry = bool(getattr(args, "schedule_failure_retry", True))
@@ -2872,7 +2876,11 @@ def run_fund(
                         ),
                     )
 
-                def wrap_result(result: CollectionTaskResult, *, worker_session: Any | None = None) -> CollectionTaskResult:
+                def wrap_result(
+                    result: CollectionTaskResult,
+                    *,
+                    worker_session: Any | None = None,
+                ) -> CollectionTaskResult:
                     occurred_at = datetime.now(tz=UTC)
                     target_session = worker_session if worker_session is not None else session
                     schedule_retry = bool(getattr(args, "schedule_failure_retry", True))

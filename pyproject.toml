@@ -44,8 +44,17 @@ dev = [
 where = ["src"]
 
 [tool.ruff]
-line-length = 100
+# 现有 SQL、DTO 与测试断言以 120 字符为主，统一限制并继续拦截真正过长的行。
+line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# 直接运行时需先注入项目根目录，项目模块导入必须位于路径初始化之后。
+"scripts/data/validate_market_regime_gate.py" = ["E402"]
+"scripts/storage/smoke_workflow_context_envelope.py" = ["E402"]
+# 已发布迁移中的数据库中文注释保持不可变，避免仅为换行改写历史 SQL。
+"src/finance_agent/storage/migrations/versions/20260614_0019_create_backtest_tables.py" = ["E501"]
+"src/finance_agent/storage/migrations/versions/20260630_0020_create_user_investment_profiles.py" = ["E501"]

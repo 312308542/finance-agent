@@ -1369,8 +1369,16 @@ def build_manual_run_task_view(
     title = manual_run_task_title(scheduler_job=scheduler_job, job_name=job_name)
     total_items, completed_items, running_items, failed_items = manual_run_summary_counts(status)
     duration_seconds = manual_run_duration_seconds(started_at=started_at, updated_at=updated_at)
-    process_log_file = Path(str(status_payload.get("process_log_file") or "")) if status_payload.get("process_log_file") else None
-    event_log_file = Path(str(status_payload.get("event_log_file") or "")) if status_payload.get("event_log_file") else None
+    process_log_file = (
+        Path(str(status_payload.get("process_log_file") or ""))
+        if status_payload.get("process_log_file")
+        else None
+    )
+    event_log_file = (
+        Path(str(status_payload.get("event_log_file") or ""))
+        if status_payload.get("event_log_file")
+        else None
+    )
     events = read_manual_run_events(
         event_log_file=event_log_file,
         process_log_file=process_log_file,

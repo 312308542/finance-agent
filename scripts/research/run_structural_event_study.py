@@ -190,9 +190,17 @@ def main() -> None:
             "mode": "historical_recompute" if args.historical else "stored_frames",
             "windows": [5, 10, 20],
             "split_date": split_date.isoformat() if split_date else None,
-            "lookahead_control": "历史重算只使用引擎输出的 confirmed_at；已入库帧模式只使用 confirmed_at 不晚于 frame.input_end_at；结果仅作研究，不改评分/动作。",
+            "lookahead_control": (
+                "历史重算只使用引擎输出的 confirmed_at；已入库帧模式只使用 confirmed_at "
+                "不晚于 frame.input_end_at；结果仅作研究，不改评分/动作。"
+            ),
         },
-        "input": {"frame_count": len(frames), "asset_count": len(price_rows), "event_count": len(events), "bar_count": len(bars)},
+        "input": {
+            "frame_count": len(frames),
+            "asset_count": len(price_rows),
+            "event_count": len(events),
+            "bar_count": len(bars),
+        },
         "summary": summarize_events(events, prices, benchmark_returns, split_date=split_date),
     }
     if period_splits:
@@ -206,18 +214,40 @@ def main() -> None:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    print(json.dumps(result["input"] | {"split_date": result["protocol"]["split_date"], "output": str(output)}, ensure_ascii=False))
+    print(
+        json.dumps(
+            result["input"]
+            | {"split_date": result["protocol"]["split_date"], "output": str(output)},
+            ensure_ascii=False,
+        )
+    )
 
 
 def _frame_signals(frame: IndicatorFrameORM):
     payload = frame.payload or {}
     if frame.horizon == "smc_lite_v2":
-        yield from ((str(item.get("name") or "smc_event"), [item], "direction") for item in payload.get("structure_events", []))
-        yield from ((str(item.get("name") or "fvg"), [item], "direction") for item in payload.get("fair_value_gaps", []))
+        yield from (
+            (str(item.get("name") or "smc_event"), [item], "direction")
+            for item in payload.get("structure_events", [])
+        )
+        yield from (
+            (str(item.get("name") or "fvg"), [item], "direction")
+            for item in payload.get("fair_value_gaps", [])
+        )
     elif frame.horizon == "harmonic_lite_v2":
-        yield from ((f"harmonic_{item.get('pattern', 'unknown')}", [item], "direction") for item in payload.get("patterns", []))
+        yield from (
+            (f"harmonic_{item.get('pattern', 'unknown')}", [item], "direction")
+            for item in payload.get("patterns", [])
+        )
     elif frame.horizon == "elliott_lite_v2":
-        yield from ((f"elliott_{item.get('pattern', item.get('signal_hint', 'unknown'))}", [item], "direction") for item in payload.get("candidates", []))
+        yield from (
+            (
+                f"elliott_{item.get('pattern', item.get('signal_hint', 'unknown'))}",
+                [item],
+                "direction",
+            )
+            for item in payload.get("candidates", [])
+        )
 
 
 if __name__ == "__main__":

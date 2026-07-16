@@ -468,7 +468,10 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
         lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
         for item in items:
             lines.append(
-                "| {as_of} | {regime} | {strength} | {t20:.2%} | {t60:.2%} | {vol:.2%} | {adr:.2f} | {lud:.2f} | {size} |".format(
+                (
+                    "| {as_of} | {regime} | {strength} | {t20:.2%} | {t60:.2%} | {vol:.2%} "
+                    "| {adr:.2f} | {lud:.2f} | {size} |"
+                ).format(
                     as_of=item["as_of"],
                     regime=item["regime"],
                     strength=item["strength"],

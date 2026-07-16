@@ -103,24 +103,67 @@ DEFAULT_CLEANUP_SPECS: tuple[CleanupSpec, ...] = (
             "source_decision_id",
         ),
     ),
-    CleanupSpec("position_snapshots", id_columns=("snapshot_id", "position_id", "portfolio_id", "asset_id"), source_columns=("source",)),
-    CleanupSpec("portfolio_snapshots", id_columns=("snapshot_id", "portfolio_id", "owner_id"), source_columns=("source",)),
+    CleanupSpec(
+        "position_snapshots",
+        id_columns=("snapshot_id", "position_id", "portfolio_id", "asset_id"),
+        source_columns=("source",),
+    ),
+    CleanupSpec(
+        "portfolio_snapshots", id_columns=("snapshot_id", "portfolio_id", "owner_id"), source_columns=("source",)
+    ),
     CleanupSpec("positions", id_columns=("position_id", "portfolio_id", "asset_id")),
     CleanupSpec("watchlist_items", id_columns=("watchlist_item_id", "watchlist_id", "asset_id", "source_id")),
     CleanupSpec("asset_theses", id_columns=("thesis_id", "asset_id", "owner_id", "source_id")),
     CleanupSpec("monitoring_alerts", id_columns=("alert_id", "owner_id", "portfolio_id", "asset_id")),
-    CleanupSpec("decision_logs", id_columns=("decision_id", "owner_id", "portfolio_id", "asset_id", "source_recommendation_id", "source_alert_id", "workflow_run_id"), source_columns=("decision_type",)),
-    CleanupSpec("assistant_memories", id_columns=("memory_id", "owner_id", "asset_id", "source_decision_id", "source_review_task_id")),
+    CleanupSpec(
+        "decision_logs",
+        id_columns=(
+            "decision_id",
+            "owner_id",
+            "portfolio_id",
+            "asset_id",
+            "source_recommendation_id",
+            "source_alert_id",
+            "workflow_run_id",
+        ),
+        source_columns=("decision_type",),
+    ),
+    CleanupSpec(
+        "assistant_memories",
+        id_columns=("memory_id", "owner_id", "asset_id", "source_decision_id", "source_review_task_id"),
+    ),
     CleanupSpec("review_tasks", id_columns=("review_task_id", "owner_id", "asset_id", "source_decision_id")),
-    CleanupSpec("assistant_trigger_events", id_columns=("trigger_event_id", "owner_id", "agent_task_id", "portfolio_id", "watchlist_id", "recommendation_run_id", "asset_id")),
+    CleanupSpec(
+        "assistant_trigger_events",
+        id_columns=(
+            "trigger_event_id",
+            "owner_id",
+            "agent_task_id",
+            "portfolio_id",
+            "watchlist_id",
+            "recommendation_run_id",
+            "asset_id",
+        ),
+    ),
     CleanupSpec("assistant_chat_sessions", id_columns=("chat_session_id", "owner_id"), payload_text=True),
     CleanupSpec("agent_workflow_runs", id_columns=("workflow_run_id", "owner_id"), source_columns=("workflow_type",)),
     CleanupSpec("agent_analysis_items", id_columns=("agent_analysis_item_id", "agent_run_id", "run_id", "asset_id")),
     CleanupSpec("agent_analysis_runs", id_columns=("agent_run_id", "run_id")),
-    CleanupSpec("asset_recommendations", id_columns=("recommendation_id", "run_id", "asset_id", "score_id", "factor_frame_id")),
+    CleanupSpec(
+        "asset_recommendations", id_columns=("recommendation_id", "run_id", "asset_id", "score_id", "factor_frame_id")
+    ),
     CleanupSpec("recommendation_run_universes", id_columns=("run_id", "universe_id")),
-    CleanupSpec("recommendation_runs", id_columns=("run_id", "universe_id", "screening_id"), source_columns=("strategy",), payload_text=True),
-    CleanupSpec("asset_scores", id_columns=("score_id", "asset_id", "universe_id", "screening_id", "factor_frame_id"), source_columns=("rule_version",)),
+    CleanupSpec(
+        "recommendation_runs",
+        id_columns=("run_id", "universe_id", "screening_id"),
+        source_columns=("strategy",),
+        payload_text=True,
+    ),
+    CleanupSpec(
+        "asset_scores",
+        id_columns=("score_id", "asset_id", "universe_id", "screening_id", "factor_frame_id"),
+        source_columns=("rule_version",),
+    ),
     CleanupSpec("screening_result_items", id_columns=("screening_item_id", "screening_id", "universe_id", "asset_id")),
     CleanupSpec("screening_results", id_columns=("screening_id", "universe_id"), source_columns=("strategy",)),
     CleanupSpec("signal_snapshots", id_columns=("signal_id", "asset_id"), source_columns=("rule_version",)),
@@ -132,13 +175,28 @@ DEFAULT_CLEANUP_SPECS: tuple[CleanupSpec, ...] = (
     CleanupSpec("capital_flow_snapshots", id_columns=("snapshot_id", "asset_id"), source_columns=("source",)),
     CleanupSpec("event_records", id_columns=("event_id", "asset_id"), source_columns=("source",)),
     CleanupSpec("crypto_derivative_snapshots", id_columns=("snapshot_id", "asset_id"), source_columns=("source",)),
-    CleanupSpec("market_bars", id_columns=("asset_id", "raw_record_id"), source_columns=("source",), payload_source=False),
-    CleanupSpec("raw_records", id_columns=("raw_record_id", "asset_id"), source_columns=("provider", "endpoint"), payload_source=False),
+    CleanupSpec(
+        "market_bars", id_columns=("asset_id", "raw_record_id"), source_columns=("source",), payload_source=False
+    ),
+    CleanupSpec(
+        "raw_records",
+        id_columns=("raw_record_id", "asset_id"),
+        source_columns=("provider", "endpoint"),
+        payload_source=False,
+    ),
     CleanupSpec("evidence", id_columns=("evidence_id", "asset_id"), source_columns=("source",)),
     CleanupSpec("asset_universe_members", id_columns=("universe_id", "asset_id")),
-    CleanupSpec("asset_universes", id_columns=("universe_id", "owner_id", "base_universe_id"), source_columns=("source", "strategy_context")),
-    CleanupSpec("model_routing_rules", id_columns=("rule_id", "model_key"), source_columns=("workflow_type", "decision_type")),
-    CleanupSpec("retrieval_profiles", id_columns=("profile_id", "profile_key", "embedding_model_key", "rerank_model_key")),
+    CleanupSpec(
+        "asset_universes",
+        id_columns=("universe_id", "owner_id", "base_universe_id"),
+        source_columns=("source", "strategy_context"),
+    ),
+    CleanupSpec(
+        "model_routing_rules", id_columns=("rule_id", "model_key"), source_columns=("workflow_type", "decision_type")
+    ),
+    CleanupSpec(
+        "retrieval_profiles", id_columns=("profile_id", "profile_key", "embedding_model_key", "rerank_model_key")
+    ),
     CleanupSpec("model_instances", id_columns=("model_instance_id", "provider_key", "model_key")),
     CleanupSpec("model_providers", id_columns=("provider_id", "provider_key")),
     CleanupSpec("portfolios", id_columns=("portfolio_id", "owner_id")),

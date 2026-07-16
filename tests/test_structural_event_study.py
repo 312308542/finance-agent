@@ -39,8 +39,20 @@ def test_forward_return_and_adverse_excursion_respect_direction() -> None:
 
 def test_summary_separates_out_of_sample_and_reports_excess() -> None:
     events = [
-        {"asset_id": "a", "signal": "bos_bullish", "direction": "bullish", "event_index": 0, "event_date": date(2026, 1, 1)},
-        {"asset_id": "a", "signal": "bos_bullish", "direction": "bullish", "event_index": 1, "event_date": date(2026, 2, 1)},
+        {
+            "asset_id": "a",
+            "signal": "bos_bullish",
+            "direction": "bullish",
+            "event_index": 0,
+            "event_date": date(2026, 1, 1),
+        },
+        {
+            "asset_id": "a",
+            "signal": "bos_bullish",
+            "direction": "bullish",
+            "event_index": 1,
+            "event_date": date(2026, 2, 1),
+        },
     ]
     result = summarize_events(
         events,
@@ -55,9 +67,27 @@ def test_summary_separates_out_of_sample_and_reports_excess() -> None:
 
 def test_summary_supports_two_ordered_out_of_sample_periods() -> None:
     events = [
-        {"asset_id": "a", "signal": "bos_bullish", "direction": "bullish", "event_index": 0, "event_date": date(2026, 1, 1)},
-        {"asset_id": "a", "signal": "bos_bullish", "direction": "bullish", "event_index": 1, "event_date": date(2026, 2, 1)},
-        {"asset_id": "a", "signal": "bos_bullish", "direction": "bullish", "event_index": 2, "event_date": date(2026, 3, 1)},
+        {
+            "asset_id": "a",
+            "signal": "bos_bullish",
+            "direction": "bullish",
+            "event_index": 0,
+            "event_date": date(2026, 1, 1),
+        },
+        {
+            "asset_id": "a",
+            "signal": "bos_bullish",
+            "direction": "bullish",
+            "event_index": 1,
+            "event_date": date(2026, 2, 1),
+        },
+        {
+            "asset_id": "a",
+            "signal": "bos_bullish",
+            "direction": "bullish",
+            "event_index": 2,
+            "event_date": date(2026, 3, 1),
+        },
     ]
     result = summarize_events(
         events,

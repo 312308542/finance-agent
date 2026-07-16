@@ -66,7 +66,20 @@ class FakeChanlunEngine:
         assert len(bars) == 5
         return {
             "fractals": [{"type": "top", "timestamp": bars[2].timestamp.isoformat()}],
-            "strokes": [{"direction": "up", "start": bars[0].timestamp.isoformat(), "end": bars[-1].timestamp.isoformat()}],
-            "centers": [{"price_low": 101, "price_high": 104, "start": bars[1].timestamp.isoformat(), "end": bars[3].timestamp.isoformat()}],
+            "strokes": [
+                {
+                    "direction": "up",
+                    "start": bars[0].timestamp.isoformat(),
+                    "end": bars[-1].timestamp.isoformat(),
+                }
+            ],
+            "centers": [
+                {
+                    "price_low": 101,
+                    "price_high": 104,
+                    "start": bars[1].timestamp.isoformat(),
+                    "end": bars[3].timestamp.isoformat(),
+                }
+            ],
             "signals": [{"name": "third_buy", "confidence": 0.72, "evidence": "中枢上沿回踩确认"}],
         }
