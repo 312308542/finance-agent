@@ -7,6 +7,7 @@ P1 侧重让选股推荐具备行业/主题、资金流和事件证据。
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 import akshare as ak
 
@@ -25,7 +26,7 @@ from finance_agent.data.normalizers import (
     normalize_ashare_notice_reports,
     normalize_ashare_stock_news,
 )
-from finance_agent.data.providers import eastmoney_curl, ths_curl
+from finance_agent.data.providers import eastmoney_curl, sina_curl, ths_curl
 
 
 class AshareSectorProvider:
@@ -132,6 +133,13 @@ class AshareSectorProvider:
                         )
                     )
         names = _extract_name_catalog(df, ["板块名称", "名称", "行业名称", "name"], limit=limit)
+        names, supplemental_sources, supplemental_trace = _supplement_name_catalog(
+            names,
+            fetch=sina_curl.fetch_industry_names,
+            candidates=["板块名称", "名称", "行业名称", "name"],
+            source="sina:curl_cffi:stock_sector_spot:industry",
+            enabled=limit is None,
+        )
         return ProviderResult(
             provider_name=self.provider_name,
             status="available" if names else "unavailable",
@@ -143,6 +151,8 @@ class AshareSectorProvider:
                 "actual_source": actual_source,
                 "fallback_used": bool(fallback_trace),
                 "fallback_trace": fallback_trace,
+                "supplemental_sources": supplemental_sources,
+                "supplemental_trace": supplemental_trace,
             },
         )
 
@@ -219,6 +229,13 @@ class AshareSectorProvider:
                         )
                     )
         names = _extract_name_catalog(df, ["板块名称", "名称", "概念名称", "name"], limit=limit)
+        names, supplemental_sources, supplemental_trace = _supplement_name_catalog(
+            names,
+            fetch=sina_curl.fetch_concept_names,
+            candidates=["板块名称", "名称", "概念名称", "name"],
+            source="sina:curl_cffi:stock_sector_spot:concept",
+            enabled=limit is None,
+        )
         return ProviderResult(
             provider_name=self.provider_name,
             status="available" if names else "unavailable",
@@ -230,6 +247,8 @@ class AshareSectorProvider:
                 "actual_source": actual_source,
                 "fallback_used": bool(fallback_trace),
                 "fallback_trace": fallback_trace,
+                "supplemental_sources": supplemental_sources,
+                "supplemental_trace": supplemental_trace,
             },
         )
 
@@ -318,53 +337,90 @@ class AshareSectorProvider:
         collected_at = datetime.now(tz=UTC)
         fallback_trace: list[dict[str, str]] = []
         primary_source = "akshare:stock_board_industry_cons_em"
+        source_routed = False
         try:
-            df = ak.stock_board_industry_cons_em(symbol=industry_name)
-            actual_source = primary_source
-        except Exception as exc:
-            fallback_trace.append({"source": primary_source, "error_message": str(exc)})
-            try:
-                df = eastmoney_curl.fetch_industry_members(industry_name)
+            if sina_curl.has_industry(industry_name):
+                df = sina_curl.fetch_industry_members(industry_name, limit=limit)
                 actual_source = str(
                     df.attrs.get(
                         "actual_source",
-                        "eastmoney:curl_cffi:stock_board_industry_cons_em",
+                        "sina:curl_cffi:stock_sector_detail:industry",
                     )
                 )
-            except Exception as fallback_exc:
-                fallback_trace.append(
-                    {
-                        "source": "eastmoney:curl_cffi:stock_board_industry_cons_em",
-                        "error_message": str(fallback_exc),
-                    }
-                )
+                source_routed = True
+        except Exception as exc:
+            fallback_trace.append(
+                {
+                    "source": "sina:curl_cffi:stock_sector_detail:industry",
+                    "error_message": str(exc),
+                }
+            )
+        if not source_routed:
+            try:
+                df = ak.stock_board_industry_cons_em(symbol=industry_name)
+                actual_source = primary_source
+            except Exception as exc:
+                fallback_trace.append({"source": primary_source, "error_message": str(exc)})
                 try:
-                    df = ths_curl.fetch_industry_members(industry_name, limit=limit)
+                    df = eastmoney_curl.fetch_industry_members(industry_name)
                     actual_source = str(
                         df.attrs.get(
                             "actual_source",
-                            "ths:curl_cffi:stock_board_industry_detail_first_page",
+                            "eastmoney:curl_cffi:stock_board_industry_cons_em",
                         )
                     )
-                except Exception as ths_exc:
+                except Exception as fallback_exc:
                     fallback_trace.append(
                         {
-                            "source": "ths:curl_cffi:stock_board_industry_detail_first_page",
-                            "error_message": str(ths_exc),
+                            "source": "eastmoney:curl_cffi:stock_board_industry_cons_em",
+                            "error_message": str(fallback_exc),
                         }
                     )
-                    return UniverseSeedsResult(
-                        provider_name=self.provider_name,
-                        status="error",
-                        collected_at=collected_at,
-                        error_message=str(ths_exc),
-                        payload={
-                            "endpoint": "stock_board_industry_cons_em",
-                            "symbol": industry_name,
-                            "primary_source": primary_source,
-                            "fallback_trace": fallback_trace,
-                        },
-                    )
+                    try:
+                        df = sina_curl.fetch_industry_members(industry_name, limit=limit)
+                        actual_source = str(
+                            df.attrs.get(
+                                "actual_source",
+                                "sina:curl_cffi:stock_sector_detail:industry",
+                            )
+                        )
+                    except Exception as sina_exc:
+                        fallback_trace.append(
+                            {
+                                "source": "sina:curl_cffi:stock_sector_detail:industry",
+                                "error_message": str(sina_exc),
+                            }
+                        )
+                        try:
+                            df = ths_curl.fetch_industry_members(industry_name, limit=limit)
+                            actual_source = str(
+                                df.attrs.get(
+                                    "actual_source",
+                                    "ths:curl_cffi:stock_board_industry_detail_first_page",
+                                )
+                            )
+                        except Exception as ths_exc:
+                            fallback_trace.append(
+                                {
+                                    "source": (
+                                        "ths:curl_cffi:"
+                                        "stock_board_industry_detail_first_page"
+                                    ),
+                                    "error_message": str(ths_exc),
+                                }
+                            )
+                            return UniverseSeedsResult(
+                                provider_name=self.provider_name,
+                                status="error",
+                                collected_at=collected_at,
+                                error_message=str(ths_exc),
+                                payload={
+                                    "endpoint": "stock_board_industry_cons_em",
+                                    "symbol": industry_name,
+                                    "primary_source": primary_source,
+                                    "fallback_trace": fallback_trace,
+                                },
+                            )
         seeds = normalize_ashare_board_members(
             df,
             source_name=industry_name,
@@ -385,6 +441,7 @@ class AshareSectorProvider:
                 "actual_source": actual_source,
                 "fallback_used": actual_source != primary_source,
                 "fallback_trace": fallback_trace,
+                "source_routed": source_routed,
                 "source_coverage": df.attrs.get("source_coverage"),
                 "source_board_code": df.attrs.get("board_code"),
             },
@@ -401,53 +458,87 @@ class AshareSectorProvider:
         collected_at = datetime.now(tz=UTC)
         fallback_trace: list[dict[str, str]] = []
         primary_source = "akshare:stock_board_concept_cons_em"
+        source_routed = False
         try:
-            df = ak.stock_board_concept_cons_em(symbol=concept_name)
-            actual_source = primary_source
-        except Exception as exc:
-            fallback_trace.append({"source": primary_source, "error_message": str(exc)})
-            try:
-                df = eastmoney_curl.fetch_concept_members(concept_name)
+            if sina_curl.has_concept(concept_name):
+                df = sina_curl.fetch_concept_members(concept_name, limit=limit)
                 actual_source = str(
                     df.attrs.get(
                         "actual_source",
-                        "eastmoney:curl_cffi:stock_board_concept_cons_em",
+                        "sina:curl_cffi:stock_sector_detail:concept",
                     )
                 )
-            except Exception as fallback_exc:
-                fallback_trace.append(
-                    {
-                        "source": "eastmoney:curl_cffi:stock_board_concept_cons_em",
-                        "error_message": str(fallback_exc),
-                    }
-                )
+                source_routed = True
+        except Exception as exc:
+            fallback_trace.append(
+                {
+                    "source": "sina:curl_cffi:stock_sector_detail:concept",
+                    "error_message": str(exc),
+                }
+            )
+        if not source_routed:
+            try:
+                df = ak.stock_board_concept_cons_em(symbol=concept_name)
+                actual_source = primary_source
+            except Exception as exc:
+                fallback_trace.append({"source": primary_source, "error_message": str(exc)})
                 try:
-                    df = ths_curl.fetch_concept_members(concept_name, limit=limit)
+                    df = eastmoney_curl.fetch_concept_members(concept_name)
                     actual_source = str(
                         df.attrs.get(
                             "actual_source",
-                            "ths:curl_cffi:stock_board_concept_detail_first_page",
+                            "eastmoney:curl_cffi:stock_board_concept_cons_em",
                         )
                     )
-                except Exception as ths_exc:
+                except Exception as fallback_exc:
                     fallback_trace.append(
                         {
-                            "source": "ths:curl_cffi:stock_board_concept_detail_first_page",
-                            "error_message": str(ths_exc),
+                            "source": "eastmoney:curl_cffi:stock_board_concept_cons_em",
+                            "error_message": str(fallback_exc),
                         }
                     )
-                    return UniverseSeedsResult(
-                        provider_name=self.provider_name,
-                        status="error",
-                        collected_at=collected_at,
-                        error_message=str(ths_exc),
-                        payload={
-                            "endpoint": "stock_board_concept_cons_em",
-                            "symbol": concept_name,
-                            "primary_source": primary_source,
-                            "fallback_trace": fallback_trace,
-                        },
-                    )
+                    try:
+                        df = sina_curl.fetch_concept_members(concept_name, limit=limit)
+                        actual_source = str(
+                            df.attrs.get(
+                                "actual_source",
+                                "sina:curl_cffi:stock_sector_detail:concept",
+                            )
+                        )
+                    except Exception as sina_exc:
+                        fallback_trace.append(
+                            {
+                                "source": "sina:curl_cffi:stock_sector_detail:concept",
+                                "error_message": str(sina_exc),
+                            }
+                        )
+                        try:
+                            df = ths_curl.fetch_concept_members(concept_name, limit=limit)
+                            actual_source = str(
+                                df.attrs.get(
+                                    "actual_source",
+                                    "ths:curl_cffi:stock_board_concept_detail_first_page",
+                                )
+                            )
+                        except Exception as ths_exc:
+                            fallback_trace.append(
+                                {
+                                    "source": "ths:curl_cffi:stock_board_concept_detail_first_page",
+                                    "error_message": str(ths_exc),
+                                }
+                            )
+                            return UniverseSeedsResult(
+                                provider_name=self.provider_name,
+                                status="error",
+                                collected_at=collected_at,
+                                error_message=str(ths_exc),
+                                payload={
+                                    "endpoint": "stock_board_concept_cons_em",
+                                    "symbol": concept_name,
+                                    "primary_source": primary_source,
+                                    "fallback_trace": fallback_trace,
+                                },
+                            )
         seeds = normalize_ashare_board_members(
             df,
             source_name=concept_name,
@@ -468,6 +559,7 @@ class AshareSectorProvider:
                 "actual_source": actual_source,
                 "fallback_used": actual_source != primary_source,
                 "fallback_trace": fallback_trace,
+                "source_routed": source_routed,
                 "source_coverage": df.attrs.get("source_coverage"),
                 "source_board_code": df.attrs.get("board_code"),
             },
@@ -753,6 +845,28 @@ def _extract_name_catalog(
         if name and name not in names:
             names.append(name)
     return names
+
+
+def _supplement_name_catalog(
+    names: list[str],
+    *,
+    fetch: Any,
+    candidates: list[str],
+    source: str,
+    enabled: bool,
+) -> tuple[list[str], list[str], list[dict[str, str]]]:
+    """在全量刷新时合并独立免费目录，失败不影响已有主目录。"""
+
+    if not enabled:
+        return names, [], []
+    try:
+        frame = fetch(limit=None)
+    except Exception as exc:
+        return names, [], [{"source": source, "error_message": str(exc)}]
+    supplemental = _extract_name_catalog(frame, candidates)
+    merged = list(dict.fromkeys([*names, *supplemental]))
+    actual_source = str(frame.attrs.get("actual_source", source))
+    return merged, [actual_source], []
 
 
 def _extract_index_catalog(df: object, *, limit: int | None = None) -> list[dict[str, str]]:

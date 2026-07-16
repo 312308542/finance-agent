@@ -1055,16 +1055,20 @@ class BaseDataScheduler:
                 running[executor.submit(self.run_job, state.job, dry_run=dry_run)] = state
 
         def write_loop_status() -> None:
-            self.write_status(
-                state="running",
-                mode="loop",
-                dry_run=dry_run,
-                started_at=started_at,
-                cycles=cycles,
-                running_jobs=running_job_names(),
-                queued_jobs=queued_job_names(),
-                max_concurrent_jobs=self.config.max_concurrent_jobs,
-            )
+            try:
+                self.write_status(
+                    state="running",
+                    mode="loop",
+                    dry_run=dry_run,
+                    started_at=started_at,
+                    cycles=cycles,
+                    running_jobs=running_job_names(),
+                    queued_jobs=queued_job_names(),
+                    max_concurrent_jobs=self.config.max_concurrent_jobs,
+                )
+            except OSError as exc:
+                # 状态文件被其他进程短暂占用时，不应终止调度主循环。
+                logger.warning("调度器心跳状态写入失败，将在下一轮重试：%s", exc)
         try:
             with ThreadPoolExecutor(
                 max_workers=max(DEFAULT_THREAD_POOL_MAX_WORKERS, self.config.max_concurrent_jobs),

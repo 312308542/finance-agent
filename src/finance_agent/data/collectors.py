@@ -177,6 +177,19 @@ def archive_provider_result(
     return record.raw_record_id
 
 
+def _is_complete_sector_member_snapshot(
+    result: UniverseSeedsResult,
+    *,
+    limit: int | None,
+) -> bool:
+    """只有未限量的完整板块快照才允许排除旧成员。"""
+
+    if result.status != "available" or limit is not None:
+        return False
+    coverage = str(result.payload.get("source_coverage") or "").strip().lower()
+    return coverage not in {"first_page", "limited", "partial"}
+
+
 def _nullable_decimal(value: Any) -> Decimal | None:
     """把 Provider payload 中的可选数值安全转成 Decimal。"""
 
@@ -1617,6 +1630,13 @@ class AshareP1Collector:
                 for seed in result.seeds
             ],
         )
+        if _is_complete_sector_member_snapshot(result, limit=limit):
+            self.universes.prune_missing_members(
+                universe_id=universe_id,
+                current_asset_ids=[seed.asset_id for seed in result.seeds],
+                as_of=result.collected_at,
+                removed_reason="not_in_latest_sector_snapshot",
+            )
         return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
     def collect_index_members(
@@ -1747,6 +1767,13 @@ class AshareP1Collector:
                 for seed in result.seeds
             ],
         )
+        if _is_complete_sector_member_snapshot(result, limit=limit):
+            self.universes.prune_missing_members(
+                universe_id=universe_id,
+                current_asset_ids=[seed.asset_id for seed in result.seeds],
+                as_of=result.collected_at,
+                removed_reason="not_in_latest_sector_snapshot",
+            )
         return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
 
     def collect_flow_rank(

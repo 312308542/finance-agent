@@ -247,6 +247,7 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 - `AshareP1Collector.collect_concept_members`
 - `AshareP2Collector`
 - `finance_agent/data/providers/ths_curl.py`
+- `finance_agent/data/providers/sina_curl.py`
 - `finance_agent/data/akshare_capabilities.py`
 - `scripts/data/check_akshare_capabilities.py`
 - `scripts/data/smoke_akshare_p1.py`
@@ -263,6 +264,10 @@ Agent 不重新抓 AKShare，不重新算分。Agent 只消费：
 - `market_bars` TimescaleDB 存储
 
 当前真实运行态：
+
+- 行业/概念成员链路为：新浪目录自有板块直接路由到新浪完整成员；其他名称按 AKShare 东财 -> 东财 curl -> 新浪同名板块 -> 同花顺首屏降级。
+- 新浪免费源包含 84 类官方行业、49 类新浪行业和 175 类概念。`new_` 行业会按页拉取到目录声明数量；源端目录与明细冲突时保留 `partial`，不伪装完整。
+- 只有未限量的完整成员快照会显式排除旧成员；同花顺首屏、人工限量和 `partial` 报文不会 prune。
 
 - `alembic current` 已到 `20260515_0003`。
 - `collect_base_data.py` 已支持按 `ashare-p0`、`ashare-p1`、`ashare-p2`、`ashare-risk`、`crypto` 和 `all` 分组采集基础数据，并输出每个任务的 `raw_record_id`。

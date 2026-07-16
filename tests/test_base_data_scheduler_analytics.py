@@ -2094,6 +2094,49 @@ def test_scheduler_loop_runs_due_jobs_concurrently() -> None:
     assert time.perf_counter() - started_at < 1.5
 
 
+def test_scheduler_loop_survives_transient_heartbeat_write_failure() -> None:
+    """心跳状态文件短暂被占用时，调度循环仍应完成当前任务。"""
+
+    def collect_base_data(args: Namespace) -> dict[str, Any]:
+        return {"status": "ok", "name": args.name}
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        loop_idle_seconds=0.01,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="heartbeat.probe",
+                group="ashare-p0",
+                interval_seconds=60,
+                params={"name": "heartbeat.probe"},
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=collect_base_data,
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        sleep_func=lambda _: None,
+    )
+    original_write_status = scheduler.write_status
+    raised = False
+
+    def flaky_write_status(**payload: Any) -> None:
+        nonlocal raised
+        if "cycles" in payload and not raised:
+            raised = True
+            raise PermissionError("状态文件暂时被占用")
+        original_write_status(**payload)
+
+    scheduler.write_status = flaky_write_status  # type: ignore[method-assign]
+
+    result = scheduler.run_loop(max_cycles=1)
+
+    assert raised
+    assert result["cycles"] == 1
+    assert result["jobs"][0]["status"] == "executed"
+
+
 def test_scheduler_respects_resource_pool_limit() -> None:
     """同一资源池达到上限时应跳过队首同池任务，先执行其它可用资源池任务。"""
 
