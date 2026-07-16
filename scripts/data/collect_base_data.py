@@ -1560,6 +1560,8 @@ def build_ashare_stock_news_tasks(
     source_limit = list_source_limit(args)
     tasks: list[CollectionTaskResult] = []
     symbols = resolve_ashare_stock_news_symbols(session, args)
+    if session is not None:
+        commit_session_if_possible(session)
 
     batches = split_symbol_batches(symbols, batch_size=collection_batch_size(args))
     max_workers = collection_max_workers(args) if session_factory is not None else 1
@@ -1577,9 +1579,11 @@ def build_ashare_stock_news_tasks(
             len(batch_symbols),
         )
         def collect_symbol(symbol: str) -> CollectionTaskResult:
-            if session_factory is not None and max_workers > 1:
+            if session_factory is not None:
                 with session_scope(session_factory) as worker_session:
                     worker_collector = AshareP1Collector(worker_session)
+                    asset_name = asset_name_for_symbol(worker_session, symbol)
+                    commit_session_if_possible(worker_session)
                     return runtime.run_task(
                         task="ashare_p1_stock_news",
                         provider_key=stock_news_provider_key(symbol),
@@ -1593,7 +1597,7 @@ def build_ashare_stock_news_tasks(
                             "stock_news_em",
                             lambda: worker_collector.collect_stock_news(
                                 symbol=symbol,
-                                asset_name=asset_name_for_symbol(worker_session, symbol),
+                                asset_name=asset_name,
                                 limit=source_limit,
                                 enrich_articles=False,
                             ),
