@@ -8,6 +8,9 @@ from typing import Any
 
 from sqlalchemy.dialects import postgresql
 
+from finance_agent.research.strategy_observation_service import (
+    SqlStrategyObservationStore,
+)
 from finance_agent.storage import StrategyObservationRepository
 from finance_agent.storage.orm import (
     StrategyObservationOutcomeORM,
@@ -220,3 +223,28 @@ def test_repository_due_and_matured_queries_preserve_pending_history() -> None:
     assert "strategy_observation_outcomes.due_trade_date" in due_sql
     assert matured == 1
     assert "UPDATE strategy_observation_outcomes" in mature_sql
+
+
+def test_sql_observation_store_only_updates_existing_position_entry() -> None:
+    """结算适配器只补写既有仓位入场事实，不插入或覆盖观察批次。"""
+
+    session = _FakeSession()
+    store = SqlStrategyObservationStore(session)
+
+    updated = store.update_position_entries(
+        [
+            {
+                "position_id": "position:1",
+                "entry_date": date(2026, 7, 17),
+                "entry_price": Decimal("10.00000000"),
+                "benchmark_entry_price": None,
+                "status": "entered",
+            }
+        ]
+    )
+
+    sql = _compiled(session.executed[0])
+    assert updated == 1
+    assert "UPDATE strategy_observation_positions" in sql
+    assert "entry_price" in sql
+    assert "WHERE strategy_observation_positions.position_id" in sql
