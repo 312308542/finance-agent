@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from finance_agent.backtesting.models import BacktestResult, JsonDict
+from finance_agent.backtesting.models import JsonDict
 from finance_agent.backtesting.service import BacktestService, BacktestServiceRequest, ScoreMode
 from finance_agent.storage.orm import AssetScoreORM, ScreeningResultORM
 from finance_agent.storage.repositories import BacktestRepository, MarketDataRepository

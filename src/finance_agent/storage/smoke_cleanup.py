@@ -7,15 +7,13 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import Engine, inspect, text
-from sqlalchemy.engine import RowMapping
-
 JsonDict = dict[str, Any]
 
 

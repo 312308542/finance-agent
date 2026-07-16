@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -141,4 +141,3 @@ def test_profile_repository_decay_marks_profile_stale_when_confidence_drops() ->
     assert decayed is not None
     assert decayed.status == "stale"
     assert decayed.dimension_confidence["risk_appetite"] < 0.05
-

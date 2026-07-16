@@ -10,7 +10,7 @@ from typing import Any, Literal, Protocol
 import pandas as pd
 
 from finance_agent.backtesting.adapters import BtBacktestAdapter
-from finance_agent.backtesting.models import BacktestResult, JsonDict
+from finance_agent.backtesting.models import BacktestResult
 
 ScoreMode = Literal["replayed", "historical"]
 
