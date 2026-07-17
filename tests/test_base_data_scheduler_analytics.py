@@ -26,6 +26,7 @@ from finance_agent.scheduler.base_data_scheduler import (
     collect_base_data_with_timeout,
     default_watchlist_name,
     import_collection_module,
+    next_run_after_completion,
     next_run_at_for_job,
     replace_file_with_retry,
     seconds_until_next_run,
@@ -585,6 +586,120 @@ def test_next_run_at_for_trading_day_only_skips_weekend() -> None:
     )
 
     assert next_run == datetime(2026, 6, 8, 7, 50, tzinfo=UTC)
+
+
+def _trading_session_job(
+    *,
+    run_at: tuple[str, ...] = ("15:10", "17:30"),
+) -> BaseDataSchedulerJob:
+    """构造用于时间计算测试的 A 股交易时段任务。"""
+
+    return BaseDataSchedulerJob(
+        name="ashare.realtime_quotes",
+        group="ashare-p0",
+        interval_seconds=300,
+        schedule_type="trading_session",
+        session_windows=("09:30-11:30", "13:00-15:00"),
+        run_at=run_at,
+        timezone="Asia/Shanghai",
+        trading_day_policy="trading_day_only",
+    )
+
+
+def test_parse_scheduler_config_accepts_trading_session_without_post_close_runs() -> None:
+    """盘中触发任务可以只配置交易窗口，不配置收盘补跑时间。"""
+
+    config = parse_scheduler_config(
+        {
+            "jobs": [
+                {
+                    "name": "analytics.triggers.evaluate.intraday",
+                    "job_type": "trigger_evaluation",
+                    "group": "analytics",
+                    "interval_seconds": 900,
+                    "schedule_type": "trading_session",
+                    "session_windows": ["09:30-11:30", "13:00-15:00"],
+                    "timezone": "Asia/Shanghai",
+                    "trading_day_policy": "trading_day_only",
+                }
+            ]
+        }
+    )
+
+    assert config.jobs[0].session_windows == ("09:30-11:30", "13:00-15:00")
+    assert config.jobs[0].run_at == ()
+
+
+@pytest.mark.parametrize(
+    ("session_windows", "message"),
+    [
+        ([], "session_windows 不能为空"),
+        (["15:00-09:30"], "开始时间必须早于结束时间"),
+        (["09:30-11:30", "11:00-13:00"], "交易时段窗口不能重叠"),
+    ],
+)
+def test_parse_scheduler_config_rejects_invalid_trading_session_windows(
+    session_windows: list[str],
+    message: str,
+) -> None:
+    """非法、倒置或重叠交易窗口应在加载配置时被拒绝。"""
+
+    with pytest.raises(ValueError, match=message):
+        parse_scheduler_config(
+            {
+                "jobs": [
+                    {
+                        "name": "ashare.realtime_quotes",
+                        "group": "ashare-p0",
+                        "interval_seconds": 300,
+                        "schedule_type": "trading_session",
+                        "session_windows": session_windows,
+                    }
+                ]
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("now", "expected"),
+    [
+        (datetime(2026, 6, 5, 1, 0, tzinfo=UTC), datetime(2026, 6, 5, 1, 30, tzinfo=UTC)),
+        (datetime(2026, 6, 5, 2, 0, tzinfo=UTC), datetime(2026, 6, 5, 2, 0, tzinfo=UTC)),
+        (datetime(2026, 6, 5, 4, 0, tzinfo=UTC), datetime(2026, 6, 5, 5, 0, tzinfo=UTC)),
+        (datetime(2026, 6, 5, 7, 5, tzinfo=UTC), datetime(2026, 6, 5, 7, 10, tzinfo=UTC)),
+        (datetime(2026, 6, 5, 7, 20, tzinfo=UTC), datetime(2026, 6, 5, 9, 30, tzinfo=UTC)),
+        (datetime(2026, 6, 5, 10, 0, tzinfo=UTC), datetime(2026, 6, 8, 1, 30, tzinfo=UTC)),
+    ],
+)
+def test_next_run_at_for_trading_session_respects_windows_and_post_close_times(
+    now: datetime,
+    expected: datetime,
+) -> None:
+    """初次调度应进入当前窗口、下一窗口、补跑时间或下一工作日。"""
+
+    assert next_run_at_for_job(_trading_session_job(), now=now) == expected
+
+
+@pytest.mark.parametrize(
+    ("completed_at", "expected"),
+    [
+        (datetime(2026, 6, 5, 2, 0, tzinfo=UTC), datetime(2026, 6, 5, 2, 5, tzinfo=UTC)),
+        (datetime(2026, 6, 5, 3, 29, tzinfo=UTC), datetime(2026, 6, 5, 5, 0, tzinfo=UTC)),
+        (datetime(2026, 6, 5, 6, 59, tzinfo=UTC), datetime(2026, 6, 5, 7, 10, tzinfo=UTC)),
+        (datetime(2026, 6, 5, 7, 11, tzinfo=UTC), datetime(2026, 6, 5, 9, 30, tzinfo=UTC)),
+        (datetime(2026, 6, 5, 9, 31, tzinfo=UTC), datetime(2026, 6, 8, 1, 30, tzinfo=UTC)),
+    ],
+)
+def test_next_run_after_completion_for_trading_session(
+    completed_at: datetime,
+    expected: datetime,
+) -> None:
+    """完成后的固定间隔不得穿过午休、收盘或周末继续轮询。"""
+
+    assert next_run_after_completion(
+        _trading_session_job(),
+        completed_at=completed_at,
+    ) == expected
 
 
 def test_next_run_at_for_manual_and_after_success_are_not_due_initially() -> None:

@@ -84,6 +84,7 @@ class BaseDataSchedulerJob:
     params: JsonDict = field(default_factory=dict)
     schedule_type: str = "interval"
     run_at: tuple[str, ...] = ()
+    session_windows: tuple[str, ...] = ()
     timezone: str = "UTC"
     trading_day_policy: str = "any_day"
     depends_on: tuple[str, ...] = ()
@@ -246,7 +247,9 @@ def next_run_at_for_job(job: BaseDataSchedulerJob, *, now: datetime) -> datetime
         return None
     if job.schedule_type == "interval":
         return normalized_now
-    if job.schedule_type in {"daily_time", "trading_session"}:
+    if job.schedule_type == "trading_session":
+        return next_trading_session_run_at(job, now=normalized_now)
+    if job.schedule_type == "daily_time":
         return next_calendar_run_at(
             job.run_at,
             now=normalized_now,
@@ -262,8 +265,58 @@ def next_run_after_completion(job: BaseDataSchedulerJob, *, completed_at: dateti
     normalized_completed_at = completed_at if completed_at.tzinfo else completed_at.replace(tzinfo=UTC)
     if job.schedule_type == "interval":
         return normalized_completed_at + timedelta(seconds=job.interval_seconds)
-    if job.schedule_type in {"daily_time", "trading_session"}:
+    if job.schedule_type == "trading_session":
+        return next_trading_session_run_at(
+            job,
+            now=normalized_completed_at + timedelta(seconds=job.interval_seconds),
+        )
+    if job.schedule_type == "daily_time":
         return next_run_at_for_job(job, now=normalized_completed_at)
+    return None
+
+
+def next_trading_session_run_at(
+    job: BaseDataSchedulerJob,
+    *,
+    now: datetime,
+) -> datetime | None:
+    """计算交易窗口或收盘补跑时间中的下一次执行时刻。"""
+
+    if not job.session_windows:
+        raise ValueError(f"{job.name}.session_windows 不能为空")
+    try:
+        zone = ZoneInfo(job.timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"未知时区：{job.timezone}") from exc
+
+    normalized_now = now if now.tzinfo else now.replace(tzinfo=UTC)
+    local_now = normalized_now.astimezone(zone)
+    windows = sorted(parse_session_window(value) for value in job.session_windows)
+    fixed_times = sorted(parse_local_time(value) for value in job.run_at)
+
+    for day_offset in range(0, 15):
+        local_date = local_now.date() + timedelta(days=day_offset)
+        if not schedule_date_allowed(local_date, job.trading_day_policy):
+            continue
+
+        if day_offset == 0:
+            for window_start, window_end in windows:
+                start_at = datetime.combine(local_date, window_start, tzinfo=zone)
+                end_at = datetime.combine(local_date, window_end, tzinfo=zone)
+                if start_at <= local_now <= end_at:
+                    return local_now.astimezone(UTC)
+
+        candidates: list[datetime] = []
+        for window_start, _ in windows:
+            candidate = datetime.combine(local_date, window_start, tzinfo=zone)
+            if day_offset > 0 or candidate > local_now:
+                candidates.append(candidate)
+        for fixed_time in fixed_times:
+            candidate = datetime.combine(local_date, fixed_time, tzinfo=zone)
+            if day_offset > 0 or candidate >= local_now:
+                candidates.append(candidate)
+        if candidates:
+            return min(candidates).astimezone(UTC)
     return None
 
 
@@ -304,6 +357,31 @@ def parse_local_time(value: str) -> Any:
     if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
         raise ValueError(f"run_at 时间超出范围：{value}")
     return datetime(2000, 1, 1, hour, minute, second).time()
+
+
+def parse_session_window(value: str) -> tuple[Any, Any]:
+    """解析并校验单个 HH:MM-HH:MM 交易时段窗口。"""
+
+    raw_value = str(value).strip()
+    start_value, separator, end_value = raw_value.partition("-")
+    if not separator or not start_value.strip() or not end_value.strip():
+        raise ValueError(f"交易时段窗口格式应为 HH:MM-HH:MM：{value}")
+    start_time = parse_local_time(start_value)
+    end_time = parse_local_time(end_value)
+    if start_time >= end_time:
+        raise ValueError(f"交易时段窗口开始时间必须早于结束时间：{value}")
+    return start_time, end_time
+
+
+def validate_session_windows(values: tuple[str, ...], *, field_name: str) -> None:
+    """校验交易时段窗口非空、顺序有效且互不重叠。"""
+
+    if not values:
+        raise ValueError(f"{field_name} 不能为空")
+    windows = sorted(parse_session_window(value) for value in values)
+    for (_, previous_end), (current_start, _) in zip(windows, windows[1:], strict=False):
+        if current_start < previous_end:
+            raise ValueError(f"{field_name} 交易时段窗口不能重叠")
 
 
 def schedule_date_allowed(local_date: Any, trading_day_policy: str) -> bool:
@@ -737,20 +815,29 @@ def parse_scheduler_job(payload: Any, *, index: int) -> BaseDataSchedulerJob:
         job_type=job_type,
         field_name=f"{name}.group",
     )
-    if schedule_type == "interval":
+    if schedule_type in {"interval", "trading_session"}:
         interval_seconds = as_positive_int(
             payload.get("interval_seconds"),
             field_name=f"{name}.interval_seconds",
         )
     else:
-        default_interval = 24 * 60 * 60 if schedule_type in {"daily_time", "trading_session"} else 0
+        default_interval = 24 * 60 * 60 if schedule_type == "daily_time" else 0
         interval_seconds = as_non_negative_int(
             payload.get("interval_seconds", default_interval),
             field_name=f"{name}.interval_seconds",
         )
     run_at = as_string_tuple(payload.get("run_at", ()), field_name=f"{name}.run_at")
-    if schedule_type in {"daily_time", "trading_session"} and not run_at:
+    if schedule_type == "daily_time" and not run_at:
         raise ValueError(f"{name}.run_at 不能为空")
+    session_windows = as_string_tuple(
+        payload.get("session_windows", ()),
+        field_name=f"{name}.session_windows",
+    )
+    if schedule_type == "trading_session":
+        validate_session_windows(
+            session_windows,
+            field_name=f"{name}.session_windows",
+        )
     timezone = str(payload.get("timezone") or "UTC").strip() or "UTC"
     trading_day_policy = as_choice(
         payload.get("trading_day_policy", "any_day"),
@@ -791,6 +878,7 @@ def parse_scheduler_job(payload: Any, *, index: int) -> BaseDataSchedulerJob:
         params=dict(params),
         schedule_type=schedule_type,
         run_at=run_at,
+        session_windows=session_windows,
         timezone=timezone,
         trading_day_policy=trading_day_policy,
         depends_on=depends_on,
