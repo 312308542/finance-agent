@@ -136,10 +136,10 @@ Web 页面中的连通性测试会通过后端发起一次 OpenAI-compatible 请
 - `runtime/data_sync_config.json`
 - `runtime/base_data_scheduler/base_data_scheduler.json`
 
-Web 页面可以通过 `/api/data/scheduler/start` 启动独立调度器进程。命令行入口是：
+基础数据调度器统一运行在 Docker Compose 的 `finance-agent-scheduler` 容器内。Web 页面中的 `/api/data/scheduler/start` 只返回容器健康状态，不会在 Windows 上启动 Python 进程。
 
 ```powershell
-.venv\Scripts\python.exe scripts\data\run_base_data_scheduler.py --config runtime\base_data_scheduler\base_data_scheduler.json --loop --status-file runtime\base_data_scheduler\status.json --event-log-file runtime\base_data_scheduler\events.jsonl
+docker compose up -d --build finance-agent-gotdx-gateway finance-agent-scheduler
 ```
 
 调度器运行链路：
@@ -163,7 +163,7 @@ BaseDataScheduler
 | `runtime/base_data_scheduler/base_data_scheduler.json` | 调度器可执行 jobs 配置。 |
 | `runtime/base_data_scheduler/status.json` | 调度器健康状态和最后任务状态。 |
 | `runtime/base_data_scheduler/events.jsonl` | 结构化任务事件日志。 |
-| `runtime/base_data_scheduler/process.log` | 子进程 stdout / stderr 日志。 |
+| `runtime/base_data_scheduler/process.log` | 容器内调度器 stdout / stderr 的兼容日志文件。 |
 
 `status=stale` 通常表示 `status.json` 超过阈值未刷新，不等同于没有写库。排查时应同时看 `process.log`、`events.jsonl`、数据库表行数和 Provider 熔断状态。
 
@@ -351,32 +351,16 @@ http://127.0.0.1:5177/
 
 如果 5173 被占用，Vite 自动换端口是正常现象。
 
-### 5.5 调度器 Run Configuration
+### 5.5 调度器 Docker 服务
 
-如果希望从 PyCharm 直接启动真实调度器，新建 `Python` 类型配置：
-
-| 配置项 | 值 |
-| --- | --- |
-| Name | `base-data-scheduler` |
-| Script path | `D:\Code\aiAgents\finance-agent\scripts\data\run_base_data_scheduler.py` |
-| Parameters | `--config runtime\base_data_scheduler\base_data_scheduler.json --loop --status-file runtime\base_data_scheduler\status.json --event-log-file runtime\base_data_scheduler\events.jsonl` |
-| Working directory | `D:\Code\aiAgents\finance-agent` |
-| Python interpreter | `D:\Code\aiAgents\finance-agent\.venv\Scripts\python.exe` |
-| Environment variables | 使用和后端相同的数据库、Redis、图谱配置 |
-
-验证计划但不写库：
+不要在 PyCharm 或 Windows 计划任务中创建 `run_base_data_scheduler.py --loop` 配置。统一使用根目录 Compose 服务：
 
 ```powershell
-.venv\Scripts\python.exe scripts\data\run_base_data_scheduler.py --config runtime\base_data_scheduler\base_data_scheduler.json --loop --dry-run --max-cycles 1
+docker compose up -d --build finance-agent-gotdx-gateway finance-agent-scheduler
+docker compose logs --since 10m finance-agent-scheduler
 ```
 
-真实执行一轮：
-
-```powershell
-.venv\Scripts\python.exe scripts\data\run_base_data_scheduler.py --config runtime\base_data_scheduler\base_data_scheduler.json --run-once
-```
-
-Web 控制台也可以通过 `/api/data/scheduler/start` 启动调度器。两种方式不要同时启动同一套配置，避免任务锁和日志判断混乱。
+调度器和 gotdx 网关共享 Compose 网络，gotdx 地址固定为 `http://finance-agent-gotdx-gateway:8790`。`127.0.0.1:8790` 仅表示容器自身，不可用于 scheduler 访问网关。
 
 ## 6. 常用验证命令
 
@@ -398,10 +382,10 @@ Web 控制台也可以通过 `/api/data/scheduler/start` 启动调度器。两�
 .venv\Scripts\python.exe scripts\data\check_base_data_health.py --cache-backend redis
 ```
 
-查看调度器健康：
+查看 Docker 调度器健康：
 
 ```powershell
-.venv\Scripts\python.exe scripts\data\run_base_data_scheduler.py --health-check --status-file runtime\base_data_scheduler\status.json
+Invoke-RestMethod http://127.0.0.1:8000/api/data/scheduler/status
 ```
 
 前端构建：

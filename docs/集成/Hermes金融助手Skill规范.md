@@ -1,6 +1,6 @@
 # Hermes 金融助手 Skill 规范
 
-> 版本：2026-06-12  
+> 版本：2026-07-22（对应 Hermes Skill 2.0.0）
 > 准源：本仓库版本为准源；Hermes 侧 `finance-agent-recommendation` skill 如有调整，必须同步回本文档。
 
 ## 1. 定位
@@ -14,6 +14,7 @@ Hermes 调用本项目时必须遵守以下原则：
 - 所有金融事实必须来自 `finance-agent` 已入库数据，优先通过 CLI 或 MCP 工具读取。
 - 所有建议必须引用 Workflow 报告、因子/风险/信号证据、Finance Memory 或审计事件。
 - 模型只能给出解释、比较、反驳和建议文本，不能修改确定性评分和风控标记。
+- Hermes 可以联网核对公告、新闻、政策和公司事件，也可以使用 Python 对 MCP 返回数据做统计、回测和质量检查；外部结果必须带来源和时间，只能作为交叉验证证据，不能覆盖已入库事实或绕过决策闸门。
 
 ## 2. 项目入口
 
@@ -184,7 +185,34 @@ Hermes 或其他 MCP 客户端应注册为：
 }
 ```
 
-## 8. 交付前检查清单
+## 8. MCP 2.0 编排与交付检查
+
+### 8.1 MCP 2.0 编排顺序
+
+Hermes 不应把 20 个 MCP 工具当作互不相关的查询接口，必须按任务链路编排：
+
+1. 新会话先调用 `list_workflows`、`list_tools` 和 `graph_health`，确认 6 个 Workflow、事实工具权限以及图谱状态。
+2. 推荐请求先读取 `recommendation.get_latest`，再读取候选标的的因子/TA、结构、信号/风险和数据质量；只有取得有效 `recommendation_run_id`、`portfolio_id` 和 `watchlist_id` 后才运行 `recommendation_decision`。
+3. 持仓请求先读取 `portfolio.get_snapshot`，再运行 `portfolio_monitoring`；出现弱持仓和强候选时，补齐源标的与候选标的后再运行 `swap_decision`。
+4. Workflow 运行后必须保存 `workflow_run_id`，继续调用 `get_workflow_run` 检查节点、模型路由、高风险复核和错误，再调用 `get_report(markdown=true)` 读取中文报告。
+5. 使用 `graph_explain_candidate_reason_chain`、`graph_find_similar_decision_paths`、`graph_find_memory_conflicts` 和 `graph_detect_risk_contagion` 复核入池理由、历史相似路径、记忆冲突和风险传导。
+6. 常规轮询分开使用 `evaluate_triggers` 和 `dispatch_triggers`；用户明确要求立即检查时才使用 `run_triggers_once`。触发器只负责生成事件并唤醒 Agent，不是交易指令。
+7. 数据过期、缺失、冲突、`critical` 风险、Workflow 失败或高风险复核未完成时，只能输出观察、补数或等待确认，不得给强买卖结论。
+
+Workflow 参数约束：
+
+| Workflow | 必要上下文 |
+| --- | --- |
+| `portfolio_monitoring` | `owner_id`、`portfolio_id` |
+| `watchlist_management` | `owner_id`、`watchlist_id` |
+| `recommendation_decision` | `owner_id`、`portfolio_id`、`watchlist_id`、`recommendation_run_id` |
+| `asset_deep_analysis` | `owner_id`、`asset_id`（或明确的 `asset_ids`） |
+| `swap_decision` | `owner_id`、`source_asset_id`、`candidate_asset_id` |
+| `daily_review` | `owner_id`，并尽量提供组合、观察池和推荐运行上下文 |
+
+面向用户的固定输出顺序为：结论、置信边界、证据与时间戳、风险反驳、失效条件、下一步、需要用户确认的动作。A 股结论还必须检查 T+1、涨跌停、停牌/退市、流动性、交易时段和行情新鲜度。实时快照不得描述为交易所级零延迟行情，也不得承诺瞬时成交或保证盈利。
+
+### 8.2 交付前检查清单
 
 - 已确认项目路径和 venv Python 存在。
 - `workflows list` 能返回 6 个金融团队 Workflow。
@@ -192,7 +220,7 @@ Hermes 或其他 MCP 客户端应注册为：
 - 中文报告输出不是乱码。
 - MCP 能 initialize 并 list tools。
 - 模型不可用时仍有确定性 fallback。
-- 回答没有基于外部网页或模型臆测行情。
+- 外部网页证据只用于公告、新闻、政策和事件交叉验证，带 URL、发布时间和检索时间；没有用模型臆测行情，也没有覆盖 MCP 事实。
 
 ## 9. 版本同步说明
 
@@ -201,3 +229,5 @@ Hermes 或其他 MCP 客户端应注册为：
 - Hermes 侧 skill 修改后，必须同步本文档并记录变更原因。
 - 本文档修改后，必须同步 Hermes 侧 `finance-agent-recommendation`。
 - 若两边内容冲突，以本文档为准，再由总负责人确认是否更新 Hermes 侧。
+
+2026-07-22 同步原因：MCP 已具备 20 个工具，新增 Workflow 收口、触发器、图谱/Finance Memory、数据新鲜度闸门、Hermes 联网/Python 复核和 A 股交易约束，删除“WSL 尚不可用”等过期描述。
