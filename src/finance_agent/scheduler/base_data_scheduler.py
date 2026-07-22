@@ -20,6 +20,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -33,6 +34,7 @@ from finance_agent.data.sync_config import (
     load_data_sync_config,
 )
 from finance_agent.scheduler.base_data_progress import BaseDataTaskProgressRecorder
+from finance_agent.scheduler.persistent_task_queue import PersistentTaskQueue, TaskClaim
 
 JsonDict = dict[str, Any]
 logger = logging.getLogger(__name__)
@@ -53,6 +55,7 @@ JOB_TYPES = {
     "backtest_run",
 }
 SCHEDULE_TYPES = {"interval", "daily_time", "trading_session", "manual", "after_success"}
+DEPENDENCY_MODES = {"all_of", "any_of", "barrier"}
 TRADING_DAY_POLICIES = {
     "any_day",
     "ashare",
@@ -88,6 +91,7 @@ class BaseDataSchedulerJob:
     timezone: str = "UTC"
     trading_day_policy: str = "any_day"
     depends_on: tuple[str, ...] = ()
+    dependency_mode: str = "all_of"
     max_retries: int | None = None
     mutex_key: str | None = None
     priority: int = DEFAULT_JOB_PRIORITY
@@ -125,6 +129,8 @@ class ScheduledJobState:
     last_summary: JsonDict | None = None
     running: bool = False
     queued: bool = False
+    last_success_generation: int | None = None
+    last_triggered_dependency_generation: int | None = None
 
 
 def is_market_universe_job(job: BaseDataSchedulerJob) -> bool:
@@ -402,8 +408,9 @@ def trigger_after_success_dependents(
     *,
     completed_job_name: str,
     triggered_at: datetime,
+    completion_generation: int | None = None,
 ) -> None:
-    """上游任务成功后唤醒声明 after_success 的依赖任务。"""
+    """上游成功后按依赖模式唤醒 after_success 任务。"""
 
     for state in states:
         if state.job.schedule_type != "after_success":
@@ -412,7 +419,65 @@ def trigger_after_success_dependents(
             continue
         if state.running or state.queued:
             continue
+        if (
+            completion_generation is not None
+            and state.last_triggered_dependency_generation == completion_generation
+        ):
+            continue
+        if not dependency_is_satisfied(
+            state.job,
+            states,
+            generation=completion_generation,
+        ):
+            continue
         state.next_run_at = triggered_at
+        state.last_triggered_dependency_generation = completion_generation
+
+
+def dependency_is_satisfied(
+    job: BaseDataSchedulerJob,
+    states: Sequence[ScheduledJobState],
+    *,
+    generation: int | None = None,
+) -> bool:
+    """判断任务依赖是否满足。
+
+    `all_of` 允许依赖分别在不同轮次成功；`any_of` 任一成功即可；`barrier`
+    要求所有依赖在同一调度轮次成功，适合需要同一时间截面的并行任务。
+    """
+
+    if not job.depends_on:
+        return True
+    by_name = {state.job.name: state for state in states}
+    dependency_states = [by_name.get(name) for name in job.depends_on]
+    if any(state is None for state in dependency_states):
+        return False
+    resolved = [state for state in dependency_states if state is not None]
+    generations = [state.last_success_generation for state in resolved]
+    if job.dependency_mode == "any_of":
+        return any(item is not None for item in generations)
+    if job.dependency_mode == "barrier":
+        if generation is None:
+            return False
+        return all(item == generation for item in generations)
+    return all(item is not None for item in generations)
+
+
+def filter_due_states_by_dependencies(
+    due_states: list[ScheduledJobState],
+    *,
+    all_states: Sequence[ScheduledJobState],
+) -> tuple[list[ScheduledJobState], list[ScheduledJobState]]:
+    """将依赖未满足的到期任务暂缓到下一轮。"""
+
+    runnable: list[ScheduledJobState] = []
+    blocked: list[ScheduledJobState] = []
+    for state in due_states:
+        if dependency_is_satisfied(state.job, all_states):
+            runnable.append(state)
+        else:
+            blocked.append(state)
+    return runnable, blocked
 
 
 def merge_scheduler_runtime_states(
@@ -847,6 +912,11 @@ def parse_scheduler_job(payload: Any, *, index: int) -> BaseDataSchedulerJob:
     depends_on = as_string_tuple(payload.get("depends_on", ()), field_name=f"{name}.depends_on")
     if schedule_type == "after_success" and not depends_on:
         raise ValueError(f"{name}.depends_on 不能为空")
+    dependency_mode = as_choice(
+        payload.get("dependency_mode", "all_of"),
+        choices=DEPENDENCY_MODES,
+        field_name=f"{name}.dependency_mode",
+    )
     mutex_key = str(payload.get("mutex_key") or "").strip() or None
     limit = payload.get("limit")
     if limit is not None:
@@ -882,6 +952,7 @@ def parse_scheduler_job(payload: Any, *, index: int) -> BaseDataSchedulerJob:
         timezone=timezone,
         trading_day_policy=trading_day_policy,
         depends_on=depends_on,
+        dependency_mode=dependency_mode,
         max_retries=(
             as_non_negative_int(payload.get("max_retries"), field_name=f"{name}.max_retries")
             if payload.get("max_retries") is not None
@@ -922,6 +993,9 @@ class BaseDataScheduler:
         event_log_file: str | Path | None = None,
         scheduler_config_file: str | Path | None = None,
         service_name: str = "base_data_scheduler",
+        persistent_task_queue_scope: Callable[
+            [], AbstractContextManager[PersistentTaskQueue]
+        ] | None = None,
     ) -> None:
         self.config = config
         self._collect_base_data = collect_base_data_func
@@ -943,6 +1017,8 @@ class BaseDataScheduler:
         self.event_log_file = Path(event_log_file) if event_log_file else None
         self.scheduler_config_file = Path(scheduler_config_file) if scheduler_config_file else None
         self.service_name = service_name
+        self._persistent_task_queue_scope = persistent_task_queue_scope
+        self._worker_id = f"{service_name}:{os.getpid()}:{uuid.uuid4().hex[:12]}"
         self.started_at: datetime | None = None
         self._status_lock = threading.Lock()
         self._event_lock = threading.Lock()
@@ -964,6 +1040,142 @@ class BaseDataScheduler:
         except Exception:
             cache, _, _ = create_cache_client(backend="null")
             return BaseDataTaskProgressRecorder.from_cache_client(cache, cache_backend="null")
+
+    def _persistent_task_idempotency_key(
+        self,
+        job: BaseDataSchedulerJob,
+        *,
+        scheduled_at: datetime,
+    ) -> str:
+        """构造单次调度运行的稳定幂等键。"""
+
+        normalized_at = scheduled_at.astimezone(UTC)
+        return f"scheduler:{job.name}:{normalized_at.isoformat()}"
+
+    def _claim_persistent_task(
+        self,
+        job: BaseDataSchedulerJob,
+        *,
+        scheduled_at: datetime,
+        dry_run: bool,
+    ) -> TaskClaim | None:
+        """将到期任务写入 PostgreSQL 并精确领取自己的租约。"""
+
+        if self._persistent_task_queue_scope is None or dry_run:
+            return None
+        occurred_at = datetime.now(tz=UTC)
+        idempotency_key = self._persistent_task_idempotency_key(
+            job,
+            scheduled_at=scheduled_at,
+        )
+        payload = {
+            "job_name": job.name,
+            "job_type": job.job_type,
+            "market": job.market,
+            "scheduled_at": scheduled_at.astimezone(UTC).isoformat(),
+            "params": serialize_scheduler_value(job.params),
+        }
+        lease_seconds = max(60, int(self.config.job_timeout_seconds or 0) + 60)
+        with self._persistent_task_queue_scope() as task_queue:
+            recovered = task_queue.claim(
+                worker_id=self._worker_id,
+                lease_seconds=lease_seconds,
+                job_name=job.name,
+                now=occurred_at,
+            )
+            if recovered is not None:
+                logger.info(
+                    "接管恢复任务 job=%s task_id=%s attempts=%s",
+                    job.name,
+                    recovered.task_id,
+                    recovered.attempts,
+                )
+                return recovered
+            task_queue.enqueue(
+                job_name=job.name,
+                idempotency_key=idempotency_key,
+                payload=payload,
+                max_attempts=1,
+                now=occurred_at,
+            )
+            return task_queue.claim(
+                worker_id=self._worker_id,
+                lease_seconds=lease_seconds,
+                job_name=job.name,
+                idempotency_key=idempotency_key,
+                now=occurred_at,
+            )
+
+    def _recover_expired_persistent_tasks(self) -> int:
+        """启动常驻循环前释放上次进程留下的过期租约。"""
+
+        if self._persistent_task_queue_scope is None:
+            return 0
+        with self._persistent_task_queue_scope() as task_queue:
+            recovered_count = task_queue.recover_expired()
+        if recovered_count:
+            logger.warning("已恢复过期持久化任务 count=%s", recovered_count)
+        return recovered_count
+
+    def _finish_persistent_task(
+        self,
+        claim: TaskClaim,
+        *,
+        succeeded: bool,
+        error_message: str | None = None,
+    ) -> None:
+        """在独立事务中完成或失败回写持久化任务。"""
+
+        if self._persistent_task_queue_scope is None:
+            return
+        with self._persistent_task_queue_scope() as task_queue:
+            if succeeded:
+                completed = task_queue.complete(
+                    task_id=claim.task_id,
+                    lease_token=claim.lease_token,
+                )
+                if not completed:
+                    logger.warning(
+                        "持久化任务完成回写未命中租约 task_id=%s worker_id=%s",
+                        claim.task_id,
+                        self._worker_id,
+                    )
+                return
+            task_queue.fail(
+                task_id=claim.task_id,
+                lease_token=claim.lease_token,
+                error_message=error_message or "scheduler_job_failed",
+                retry_after=timedelta(seconds=max(0, self.config.retry_backoff_seconds)),
+            )
+
+    def _run_persistent_job(
+        self,
+        job: BaseDataSchedulerJob,
+        *,
+        claim: TaskClaim,
+        dry_run: bool,
+    ) -> JsonDict:
+        """执行已领取任务，并将结果绑定到持久化租约。"""
+
+        try:
+            summary = self.run_job(job, dry_run=dry_run)
+        except Exception as exc:
+            self._finish_persistent_task(
+                claim,
+                succeeded=False,
+                error_message=str(exc),
+            )
+            raise
+        succeeded = summary.get("status") == "executed"
+        self._finish_persistent_task(
+            claim,
+            succeeded=succeeded,
+            error_message=str(summary.get("error_message") or "scheduler_job_failed"),
+        )
+        return summary | {
+            "persistent_task_id": claim.task_id,
+            "persistent_task_attempt": claim.attempts,
+        }
 
     def plan(self) -> JsonDict:
         """生成当前调度计划，不触发采集。"""
@@ -1074,6 +1286,7 @@ class BaseDataScheduler:
             logger.info("基础数据调度器已禁用 mode=loop")
             return result
 
+        self._recover_expired_persistent_tasks()
         states = [
             ScheduledJobState(job=job, next_run_at=next_run_at_for_job(job, now=started_at))
             for job in self.enabled_jobs()
@@ -1139,8 +1352,38 @@ class BaseDataScheduler:
                     break
                 state = queued.pop(selected_index)
                 state.queued = False
+                persistent_claim: TaskClaim | None = None
+                if self._persistent_task_queue_scope is not None and not dry_run:
+                    scheduled_at = state.next_run_at or datetime.now(tz=UTC)
+                    persistent_claim = self._claim_persistent_task(
+                        state.job,
+                        scheduled_at=scheduled_at,
+                        dry_run=dry_run,
+                    )
+                    if persistent_claim is None:
+                        # 任务可能已经由另一个进程领取或完成；推进本地水位，避免
+                        # 当前进程在同一个幂等键上忙等。
+                        state.next_run_at = next_run_after_completion(
+                            state.job,
+                            completed_at=datetime.now(tz=UTC),
+                        )
+                        logger.info(
+                            "持久化任务未领取，跳过本轮 job=%s scheduled_at=%s",
+                            state.job.name,
+                            scheduled_at.isoformat(),
+                        )
+                        continue
                 state.running = True
-                running[executor.submit(self.run_job, state.job, dry_run=dry_run)] = state
+                if persistent_claim is None:
+                    future = executor.submit(self.run_job, state.job, dry_run=dry_run)
+                else:
+                    future = executor.submit(
+                        self._run_persistent_job,
+                        state.job,
+                        claim=persistent_claim,
+                        dry_run=dry_run,
+                    )
+                running[future] = state
 
         def write_loop_status() -> None:
             try:
@@ -1190,10 +1433,12 @@ class BaseDataScheduler:
                             completed_at=state.last_run_at,
                         )
                         if summary.get("status") == "executed":
+                            state.last_success_generation = cycles
                             trigger_after_success_dependents(
                                 states,
                                 completed_job_name=state.job.name,
                                 triggered_at=state.last_run_at,
+                                completion_generation=cycles,
                             )
                         executed.append(
                             summary
@@ -1238,10 +1483,20 @@ class BaseDataScheduler:
                             and state.next_run_at <= now
                         )
                     ]
+                    due_states, dependency_blocked_states = filter_due_states_by_dependencies(
+                        due_states,
+                        all_states=states,
+                    )
+                    if dependency_blocked_states:
+                        logger.info(
+                            "任务依赖未满足，暂缓本轮调度 blocked_jobs=%s",
+                            [state.job.name for state in dependency_blocked_states],
+                        )
                     due_states, blocked_due_states = filter_due_states_by_market_universe(
                         due_states,
                         active_states=[*running.values(), *queued],
                     )
+                    blocked_due_states.extend(dependency_blocked_states)
                     if blocked_due_states:
                         logger.info(
                             "同市场资产池刷新优先执行，暂缓依赖任务 blocked_jobs=%s active_jobs=%s",

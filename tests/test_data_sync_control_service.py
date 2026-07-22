@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -347,111 +348,94 @@ def test_read_scheduler_progress_includes_manual_job_when_redis_degraded(
     assert job_name not in waiting_names
 
 
-def test_start_scheduler_refreshes_existing_scheduler_config(
+def test_start_scheduler_reports_docker_manager_without_spawning_local_process(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    """启动调度器前应刷新已存在的旧 scheduler JSON，确保新增 analytics job 生效。"""
+    """Web 启动接口只能报告 Docker 调度器，不能再次拉起 Windows Python 进程。"""
 
-    data_sync_config_file = tmp_path / "data_sync_config.json"
-    scheduler_config_file = tmp_path / "base_data_scheduler.json"
     status_file = tmp_path / "status.json"
-    event_log_file = tmp_path / "events.jsonl"
-    process_file = tmp_path / "process.json"
-    process_log_file = tmp_path / "process.log"
-    save_data_sync_config(build_preset_config("personal-comprehensive"), data_sync_config_file)
-    scheduler_config_file.write_text(
+    updated_at = datetime.now(tz=timezone.utc).isoformat()
+    status_file.write_text(
         json.dumps(
             {
-                "schema_version": "data-sync-scheduler-v1",
-                "enabled": True,
-                "jobs": [],
+                "state": "running",
+                "updated_at": updated_at,
+                "last_job_status": "executed",
             },
             ensure_ascii=False,
         ),
         encoding="utf-8",
     )
 
-    popen_call: dict[str, Any] = {}
+    def fail_popen(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("Docker 模式不应调用本机 subprocess.Popen")
 
-    def fake_popen(command: list[str], **kwargs: Any) -> _FakeProcess:
-        popen_call["command"] = command
-        popen_call["kwargs"] = kwargs
-        return _FakeProcess()
+    monkeypatch.setattr(control_service.subprocess, "Popen", fail_popen)
 
-    monkeypatch.setattr(
-        "finance_agent.application.data_sync_control_service.subprocess.Popen",
-        fake_popen,
-    )
+    result = DataSyncControlService().start_scheduler(status_file=status_file)
 
-    result = DataSyncControlService().start_scheduler(
-        dry_run=True,
-        max_cycles=1,
-        config_file=scheduler_config_file,
-        data_sync_config_file=data_sync_config_file,
-        status_file=status_file,
-        event_log_file=event_log_file,
-        process_file=process_file,
-        process_log_file=process_log_file,
-    )
-
-    saved_payload = json.loads(scheduler_config_file.read_text(encoding="utf-8"))
-    analytics_jobs = [
-        job for job in saved_payload["jobs"] if job.get("job_type") == "recommendation_pipeline"
-    ]
     assert result["status"] == "ok"
-    assert "--process-log-file" in popen_call["command"]
-    assert str(process_log_file) in popen_call["command"]
-    assert popen_call["kwargs"]["stdout"] is not None
-    assert popen_call["kwargs"]["stderr"] is not None
-    assert {job["params"]["universe_id"] for job in analytics_jobs} == {
-        "universe:merged:ashare:recommendation",
-        "universe:base:crypto:spot:binance",
-        "universe:base:crypto:future:binance",
-    }
+    assert result["data"]["managed_by"] == "docker-compose"
+    assert result["data"]["service"] == "finance-agent-scheduler"
+    assert result["data"]["running"] is True
 
 
-def test_start_scheduler_prefers_project_venv_python(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    """启动后台调度器时应优先使用项目 .venv，避免采集子进程跑到 Anaconda。"""
+def test_stop_scheduler_does_not_terminate_docker_service(tmp_path: Path) -> None:
+    """Web 停止接口不能把 Docker 调度器误当成本地进程终止。"""
 
-    data_sync_config_file = tmp_path / "data_sync_config.json"
-    scheduler_config_file = tmp_path / "base_data_scheduler.json"
     status_file = tmp_path / "status.json"
-    event_log_file = tmp_path / "events.jsonl"
-    process_file = tmp_path / "process.json"
-    process_log_file = tmp_path / "process.log"
-    venv_python = tmp_path / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    venv_python.parent.mkdir(parents=True)
-    venv_python.write_text("", encoding="utf-8")
-    save_data_sync_config(build_preset_config("personal-comprehensive"), data_sync_config_file)
-
-    popen_call: dict[str, Any] = {}
-
-    def fake_popen(command: list[str], **kwargs: Any) -> _FakeProcess:
-        popen_call["command"] = command
-        popen_call["kwargs"] = kwargs
-        return _FakeProcess()
-
-    monkeypatch.setattr(control_service, "ROOT_DIR", tmp_path)
-    monkeypatch.setattr(control_service.sys, "executable", "C:\\ProgramData\\anaconda3\\python.exe")
-    monkeypatch.setattr(control_service.subprocess, "Popen", fake_popen)
-
-    result = DataSyncControlService().start_scheduler(
-        dry_run=True,
-        max_cycles=1,
-        config_file=scheduler_config_file,
-        data_sync_config_file=data_sync_config_file,
-        status_file=status_file,
-        event_log_file=event_log_file,
-        process_file=process_file,
-        process_log_file=process_log_file,
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "running",
+                "updated_at": datetime.now(tz=timezone.utc).isoformat(),
+                "last_job_status": "executed",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
     )
 
+    result = DataSyncControlService().stop_scheduler(status_file=status_file)
+
     assert result["status"] == "ok"
-    assert popen_call["command"][0] == str(venv_python)
+    assert result["data"]["managed_by"] == "docker-compose"
+    assert result["data"]["service"] == "finance-agent-scheduler"
+    assert result["data"]["running"] is True
+
+
+def test_read_scheduler_status_ignores_stale_windows_process_metadata(tmp_path: Path) -> None:
+    """状态接口不能因旧 Windows PID 元数据把 Docker 服务显示为未启动。"""
+
+    status_file = tmp_path / "status.json"
+    process_file = tmp_path / "process.json"
+    updated_at = datetime.now(tz=timezone.utc).isoformat()
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "running",
+                "updated_at": updated_at,
+                "last_job_status": "executed",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    process_file.write_text(json.dumps({"pid": 54652}), encoding="utf-8")
+
+    result = DataSyncControlService().read_scheduler_status(
+        status_file=status_file,
+        process_file=process_file,
+    )
+
+    assert result["process"] == {
+        "managed_by": "docker-compose",
+        "service": "finance-agent-scheduler",
+        "running": True,
+        "state": "running",
+        "updated_at": updated_at,
+    }
 
 
 def test_save_config_persists_scheduler_concurrency(tmp_path: Path) -> None:

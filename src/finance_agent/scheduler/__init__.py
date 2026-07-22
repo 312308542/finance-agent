@@ -21,6 +21,7 @@ from finance_agent.scheduler.base_data_scheduler import (
     read_scheduler_health,
     write_scheduler_status_file,
 )
+from finance_agent.scheduler.persistent_task_queue import PersistentTaskQueue, TaskClaim
 
 __all__ = [
     "AssistantLoopScheduler",
@@ -40,4 +41,6 @@ __all__ = [
     "parse_scheduler_config",
     "read_scheduler_health",
     "write_scheduler_status_file",
+    "PersistentTaskQueue",
+    "TaskClaim",
 ]

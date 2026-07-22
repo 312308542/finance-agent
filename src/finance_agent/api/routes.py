@@ -1159,7 +1159,7 @@ def start_data_scheduler(
     request: DataSchedulerStartRequest,
     session: Session = SESSION_DEPENDENCY,
 ) -> JsonDict:
-    """从 Web 控制台启动基础数据调度器。"""
+    """读取 Docker 调度器状态；不在 Windows API 进程内启动 scheduler。"""
 
     _ = session
     try:
@@ -1173,7 +1173,7 @@ def start_data_scheduler(
 
 @router.post("/data/scheduler/stop")
 def stop_data_scheduler(session: Session = SESSION_DEPENDENCY) -> JsonDict:
-    """停止由 Web 控制台启动的基础数据调度器。"""
+    """读取 Docker 调度器状态；不在 Windows API 进程内停止 scheduler。"""
 
     _ = session
     try:

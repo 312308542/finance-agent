@@ -55,6 +55,8 @@ DEFAULT_EVENT_LOG_FILE = SCHEDULER_DIR / "events.jsonl"
 DEFAULT_PROCESS_FILE = SCHEDULER_DIR / "process.json"
 DEFAULT_PROCESS_LOG_FILE = SCHEDULER_DIR / "process.log"
 DEFAULT_FAILED_RERUN_DIR = SCHEDULER_DIR / "failed_reruns"
+DOCKER_SCHEDULER_MANAGER = "docker-compose"
+DOCKER_SCHEDULER_SERVICE = "finance-agent-scheduler"
 MANUAL_RUN_START_LOCK_STALE_SECONDS = 300
 MANUAL_RUN_PROGRESS_MAX_AGE_SECONDS = 300
 PROCESS_TERMINATION_VERIFY_TIMEOUT_SECONDS = 5.0
@@ -345,16 +347,18 @@ class DataSyncControlService:
         process_file: Path = DEFAULT_PROCESS_FILE,
         max_age_seconds: int | None = None,
     ) -> JsonDict:
-        """读取调度器健康状态和 Web 启动的进程状态。"""
+        """读取 Docker 调度器健康状态，不再暴露旧的 Windows 进程元数据。"""
 
         health = read_scheduler_health(status_file, max_age_seconds=max_age_seconds)
-        process = read_process_metadata(process_file)
-        if process:
-            process["running"] = is_process_running(int(process["pid"]))
-        else:
-            process = {"running": False}
+        process = docker_scheduler_process_metadata(health)
         status = "ok" if health.get("healthy") else health.get("status", "missing")
-        return {"status": status, "health": health, "process": process}
+        return {
+            "status": status,
+            "health": health,
+            "process": process,
+            "managed_by": DOCKER_SCHEDULER_MANAGER,
+            "service": DOCKER_SCHEDULER_SERVICE,
+        }
 
     def read_scheduler_progress(
         self,
@@ -955,116 +959,21 @@ class DataSyncControlService:
         process_file: Path = DEFAULT_PROCESS_FILE,
         process_log_file: Path = DEFAULT_PROCESS_LOG_FILE,
     ) -> JsonDict:
-        """启动本地基础数据调度器进程。"""
+        """返回 Docker 调度器状态，禁止从 Web API 拉起本地调度器。"""
 
-        existing = read_process_metadata(process_file)
-        if existing and is_process_running(int(existing["pid"])):
-            dry_run = bool(existing.get("dry_run"))
-            return {
-                "status": "ok",
-                "message": "基础数据调度器已在运行。",
-                "data": {
-                    "dry_run": dry_run,
-                    "writes_enabled": not dry_run,
-                    "process": existing | {"running": True},
-                },
-            }
-
-        config = (
-            load_data_sync_config(data_sync_config_file)
-            if data_sync_config_file.exists()
-            else build_preset_config()
-        )
-        scheduler_payload = export_scheduler_payload(config)
-        config_file.parent.mkdir(parents=True, exist_ok=True)
-        config_file.write_text(
-            json.dumps(scheduler_payload, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-
-        SCHEDULER_DIR.mkdir(parents=True, exist_ok=True)
-        command = [
-            project_python_executable(),
-            str(ROOT_DIR / "scripts" / "data" / "run_base_data_scheduler.py"),
-            "--config",
-            str(config_file),
-            "--loop",
-            "--status-file",
-            str(status_file),
-            "--event-log-file",
-            str(event_log_file),
-            "--process-log-file",
-            str(process_log_file),
-        ]
-        if dry_run:
-            command.append("--dry-run")
-        if max_cycles is not None:
-            command.extend(["--max-cycles", str(max_cycles)])
-
-        process_log_file.parent.mkdir(parents=True, exist_ok=True)
-        creationflags = 0
-        if os.name == "nt":
-            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        logger.info(
-            "启动基础数据调度器进程 dry_run=%s max_cycles=%s command=%s",
+        _ = (
             dry_run,
             max_cycles,
-            command,
+            data_sync_config_file,
+            config_file,
+            event_log_file,
+            process_file,
+            process_log_file,
         )
-        process = subprocess.Popen(
-            command,
-            cwd=ROOT_DIR,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            creationflags=creationflags,
+        return docker_scheduler_control_response(
+            status_file=status_file,
+            action="启动",
         )
-        log_deduper = _SchedulerLogForwardDeduper()
-        threading.Thread(
-            target=forward_scheduler_process_output,
-            args=(process,),
-            kwargs={"deduper": log_deduper},
-            name="base-data-scheduler-log-forwarder",
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=forward_scheduler_process_log_file,
-            args=(process, process_log_file),
-            kwargs={"deduper": log_deduper},
-            name="base-data-scheduler-file-log-forwarder",
-            daemon=True,
-        ).start()
-        metadata = {
-            "pid": process.pid,
-            "command": command,
-            "cwd": str(ROOT_DIR),
-            "dry_run": dry_run,
-            "max_cycles": max_cycles,
-            "started_at": datetime.now(tz=UTC).isoformat(),
-            "config_file": str(config_file),
-            "status_file": str(status_file),
-            "event_log_file": str(event_log_file),
-            "process_log_file": str(process_log_file),
-        }
-        write_process_metadata(process_file, metadata)
-        message = (
-            "已启动 1 轮预演调度：只生成执行计划，不会写入数据库。"
-            if dry_run
-            else "已启动真实数据同步：会调用采集器并写入数据库。"
-        )
-        return {
-            "status": "ok",
-            "message": message,
-            "data": {
-                "dry_run": dry_run,
-                "writes_enabled": not dry_run,
-                "process": metadata | {"running": True},
-            },
-        }
 
     def stop_scheduler(
         self,
@@ -1072,20 +981,57 @@ class DataSyncControlService:
         status_file: Path = DEFAULT_STATUS_FILE,
         process_file: Path = DEFAULT_PROCESS_FILE,
     ) -> JsonDict:
-        """停止由 Web 控制台启动的基础数据调度器进程。"""
+        """返回 Docker 调度器状态，禁止从 Web API 终止 Docker 服务或本地进程。"""
 
-        process = read_process_metadata(process_file)
-        if not process:
-            return {"status": "ok", "message": "没有找到 Web 控制台启动的调度器进程。", "data": {}}
+        _ = process_file
+        return docker_scheduler_control_response(
+            status_file=status_file,
+            action="停止",
+        )
 
-        pid = int(process["pid"])
-        if is_process_running(pid):
-            terminate_process(pid)
-        process["running"] = False
-        process["stopped_at"] = datetime.now(tz=UTC).isoformat()
-        write_process_metadata(process_file, process)
-        write_stopped_status(status_file, process)
-        return {"status": "ok", "data": {"process": process}}
+
+def docker_scheduler_process_metadata(health: JsonDict) -> JsonDict:
+    """把共享状态文件转换为 Docker 服务进程摘要，避免返回宿主机 PID。"""
+
+    return {
+        "managed_by": DOCKER_SCHEDULER_MANAGER,
+        "service": DOCKER_SCHEDULER_SERVICE,
+        "running": bool(health.get("healthy")),
+        "state": health.get("state"),
+        "updated_at": health.get("payload", {}).get("updated_at")
+        if isinstance(health.get("payload"), dict)
+        else None,
+    }
+
+
+def docker_scheduler_control_response(
+    *,
+    status_file: Path,
+    action: str,
+) -> JsonDict:
+    """生成 Docker 调度器控制提示，明确本机 API 不执行启停副作用。"""
+
+    health = read_scheduler_health(status_file)
+    running = bool(health.get("healthy"))
+    status = "ok" if running else health.get("status", "unavailable")
+    process = docker_scheduler_process_metadata(health)
+    message = (
+        f"Docker 调度器当前{'运行中' if running else '不可用'}；"
+        f"Windows API 不执行{action}操作，请使用 docker compose 管理服务。"
+    )
+    return {
+        "status": status,
+        "message": message,
+        "data": {
+            "managed_by": DOCKER_SCHEDULER_MANAGER,
+            "service": DOCKER_SCHEDULER_SERVICE,
+            "running": running,
+            "process": process,
+            "health": health,
+            "start_command": "docker compose up -d finance-agent-scheduler",
+            "stop_command": "docker compose stop finance-agent-scheduler",
+        },
+    }
 
 
 def build_config_response(
@@ -1214,6 +1160,10 @@ def merge_scheduler_job_dependencies(
             changed = True
     if changed:
         existing_job["depends_on"] = merged_depends_on
+    regenerated_mode = str(regenerated_job.get("dependency_mode") or "").strip()
+    if regenerated_mode and "dependency_mode" not in existing_job:
+        existing_job["dependency_mode"] = regenerated_mode
+        changed = True
     return changed
 
 
@@ -1714,7 +1664,7 @@ def enrich_scheduler_progress_concurrency(
 def serialize_scheduler_job(job: Any) -> JsonDict:
     """把调度任务 dataclass 转为前端可编辑结构。"""
 
-    return {
+    payload = {
         "name": job.name,
         "job_type": job.job_type,
         "group": list(job.group) if isinstance(job.group, tuple) else job.group,
@@ -1731,6 +1681,9 @@ def serialize_scheduler_job(job: Any) -> JsonDict:
         "resource_pool": job.resource_pool,
         "params": job.params,
     }
+    if str(getattr(job, "dependency_mode", "all_of")) != "all_of":
+        payload["dependency_mode"] = job.dependency_mode
+    return payload
 
 
 def safe_scheduler_job_name(job_name: str) -> str:

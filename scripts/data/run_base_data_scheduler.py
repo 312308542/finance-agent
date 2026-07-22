@@ -5,7 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import shlex
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -46,6 +50,22 @@ def configure_logging(*, log_level: str, process_log_file: str | None) -> None:
     os.environ["FINANCE_AGENT_LOG_LEVEL"] = logging.getLevelName(level)
     if process_log_file:
         os.environ["FINANCE_AGENT_PROCESS_LOG_FILE"] = str(Path(process_log_file))
+
+
+@contextmanager
+def persistent_task_queue_scope() -> Iterator[object]:
+    """为常驻调度器提供 PostgreSQL 任务队列事务。"""
+
+    from finance_agent.scheduler import PersistentTaskQueue
+    from finance_agent.storage.db import create_session_factory, session_scope
+    from finance_agent.storage.repositories import OutboxEventRepository
+
+    session_factory = create_session_factory()
+    with session_scope(session_factory) as session:
+        yield PersistentTaskQueue(
+            session,
+            outbox_repository=OutboxEventRepository(session),
+        )
 
 
 def main() -> None:
@@ -103,14 +123,16 @@ def main() -> None:
         status_file=args.status_file,
         event_log_file=args.event_log_file,
         scheduler_config_file=Path(args.config) if args.config else None,
+        persistent_task_queue_scope=persistent_task_queue_scope,
     )
 
-    if args.run_once:
-        result = scheduler.run_once(dry_run=args.dry_run)
-    elif args.loop:
-        result = scheduler.run_loop(dry_run=args.dry_run, max_cycles=args.max_cycles)
-    else:
-        result = scheduler.plan()
+    with build_gotdx_gateway_context(args):
+        if args.run_once:
+            result = scheduler.run_once(dry_run=args.dry_run)
+        elif args.loop:
+            result = scheduler.run_loop(dry_run=args.dry_run, max_cycles=args.max_cycles)
+        else:
+            result = scheduler.plan()
 
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
@@ -171,6 +193,49 @@ def parse_args() -> argparse.Namespace:
         help="同步写入调度器普通文本日志文件；不影响控制台输出",
     )
     parser.add_argument(
+        "--manage-gotdx-gateway",
+        action="store_true",
+        help="启动并监管本机的 gotdx Go 网关",
+    )
+    parser.add_argument(
+        "--gotdx-gateway-command",
+        default=None,
+        help="gotdx 网关启动命令；未提供时从环境变量或默认目录发现",
+    )
+    parser.add_argument(
+        "--gotdx-gateway-url",
+        default=None,
+        help="gotdx 网关健康检查地址",
+    )
+    parser.add_argument(
+        "--gotdx-gateway-working-dir",
+        default=None,
+        help="gotdx 网关工作目录，默认 prototypes/gotdx-gateway",
+    )
+    parser.add_argument(
+        "--gotdx-gateway-log-file",
+        default="runtime/gotdx_gateway/gateway.log",
+        help="gotdx 网关 stdout/stderr 日志文件",
+    )
+    parser.add_argument(
+        "--gotdx-gateway-startup-timeout-seconds",
+        type=float,
+        default=None,
+        help="gotdx 网关启动健康检查超时时间",
+    )
+    parser.add_argument(
+        "--gotdx-gateway-monitor-interval-seconds",
+        type=float,
+        default=None,
+        help="gotdx 网关后台探活周期",
+    )
+    parser.add_argument(
+        "--gotdx-gateway-max-restarts",
+        type=int,
+        default=None,
+        help="单次监管周期允许的 gotdx 网关最大重启次数",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -227,7 +292,50 @@ def parse_args() -> argparse.Namespace:
         parser.error("--health-check 需要 --status-file")
     if args.health_max_age_seconds is not None and args.health_max_age_seconds <= 0:
         parser.error("--health-max-age-seconds 必须大于 0")
+    if args.manage_gotdx_gateway and not (args.run_once or args.loop):
+        parser.error("--manage-gotdx-gateway 只能与 --run-once 或 --loop 一起使用")
+    if args.gotdx_gateway_startup_timeout_seconds is not None and args.gotdx_gateway_startup_timeout_seconds <= 0:
+        parser.error("--gotdx-gateway-startup-timeout-seconds 必须大于 0")
+    if args.gotdx_gateway_monitor_interval_seconds is not None and args.gotdx_gateway_monitor_interval_seconds <= 0:
+        parser.error("--gotdx-gateway-monitor-interval-seconds 必须大于 0")
+    if args.gotdx_gateway_max_restarts is not None and args.gotdx_gateway_max_restarts <= 0:
+        parser.error("--gotdx-gateway-max-restarts 必须大于 0")
     return args
+
+
+def build_gotdx_gateway_context(args: argparse.Namespace):
+    """按 CLI 参数构建 gotdx 网关生命周期上下文。"""
+
+    if not args.manage_gotdx_gateway:
+        return nullcontext()
+
+    from finance_agent.runtime import GotdxGatewayConfig, GotdxGatewaySupervisor
+
+    command = None
+    if args.gotdx_gateway_command:
+        command = tuple(shlex.split(args.gotdx_gateway_command, posix=os.name != "nt"))
+    working_dir = _resolve_project_path(args.gotdx_gateway_working_dir)
+    if working_dir is None:
+        working_dir = ROOT_DIR / "prototypes" / "gotdx-gateway"
+    log_file = _resolve_project_path(args.gotdx_gateway_log_file)
+    config = GotdxGatewayConfig.from_environment(
+        root_dir=ROOT_DIR,
+        command=command,
+        base_url=args.gotdx_gateway_url,
+        working_dir=working_dir,
+        log_file=log_file,
+        startup_timeout_seconds=args.gotdx_gateway_startup_timeout_seconds,
+        monitor_interval_seconds=args.gotdx_gateway_monitor_interval_seconds,
+        max_restart_attempts=args.gotdx_gateway_max_restarts,
+    )
+    return GotdxGatewaySupervisor(config)
+
+
+def _resolve_project_path(value: str | None) -> Path | None:
+    if value is None or not value.strip():
+        return None
+    path = Path(value)
+    return path if path.is_absolute() else ROOT_DIR / path
 
 
 if __name__ == "__main__":

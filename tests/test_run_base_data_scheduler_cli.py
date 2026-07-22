@@ -2,12 +2,25 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+
+
+def _load_scheduler_script():
+    path = ROOT_DIR / "scripts" / "data" / "run_base_data_scheduler.py"
+    spec = importlib.util.spec_from_file_location("run_base_data_scheduler_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_run_base_data_scheduler_only_runs_named_job(tmp_path: Path) -> None:
@@ -72,3 +85,39 @@ def test_run_base_data_scheduler_only_runs_named_job(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert [job["job"] for job in payload["jobs"]] == ["analytics.structural.ashare.daily"]
     assert payload["jobs"][0]["status"] == "planned"
+
+
+def test_build_gotdx_gateway_context_maps_cli_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_scheduler_script()
+    captured: list[object] = []
+
+    class _Supervisor:
+        def __init__(self, config: object) -> None:
+            captured.append(config)
+
+    import finance_agent.runtime as runtime
+
+    monkeypatch.setattr(runtime, "GotdxGatewaySupervisor", _Supervisor)
+    args = SimpleNamespace(
+        manage_gotdx_gateway=True,
+        gotdx_gateway_command="gotdx-gateway --read-timeout 3",
+        gotdx_gateway_url="http://127.0.0.1:18790",
+        gotdx_gateway_working_dir=str(tmp_path),
+        gotdx_gateway_log_file="runtime/test-gotdx.log",
+        gotdx_gateway_startup_timeout_seconds=9.0,
+        gotdx_gateway_monitor_interval_seconds=2.0,
+        gotdx_gateway_max_restarts=4,
+    )
+
+    context = module.build_gotdx_gateway_context(args)
+
+    assert isinstance(context, _Supervisor)
+    config = captured[0]
+    assert config.command == ("gotdx-gateway", "--read-timeout", "3")
+    assert config.base_url == "http://127.0.0.1:18790"
+    assert config.working_dir == tmp_path
+    assert config.log_file == ROOT_DIR / "runtime" / "test-gotdx.log"
+    assert config.max_restart_attempts == 4
