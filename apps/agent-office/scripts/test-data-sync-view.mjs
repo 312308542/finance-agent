@@ -74,6 +74,24 @@ assert.deepEqual(
   },
 );
 
+assert.deepEqual(
+  summarizeSchedulerStatus({
+    managed_by: "docker-compose",
+    service: "finance-agent-scheduler",
+    health: {
+      state: "running",
+      last_job: "ashare.realtime_quotes",
+      last_job_status: "executed",
+    },
+    process: { managed_by: "docker-compose", service: "finance-agent-scheduler", running: true },
+  }),
+  {
+    tone: "green",
+    label: "运行中",
+    detail: "Docker finance-agent-scheduler · ashare.realtime_quotes / executed",
+  },
+);
+
 assert.equal(processingStatusLabel("requires_universe_selection"), "需选择候选池");
 
 assert.deepEqual(
@@ -99,6 +117,19 @@ assert.deepEqual(
     statusText: "已启动真实数据同步：会调用采集器并写入数据库。",
     modeLabel: "真实同步",
     writePolicy: "会入库",
+  },
+);
+
+assert.deepEqual(
+  schedulerStartFeedback(false, {
+    status: "ok",
+    message: "Docker 调度器当前运行中；Windows API 不执行启动操作，请使用 docker compose 管理服务。",
+    data: { managed_by: "docker-compose", service: "finance-agent-scheduler", running: true },
+  }),
+  {
+    statusText: "Docker 调度器当前运行中；Windows API 不执行启动操作，请使用 docker compose 管理服务。",
+    modeLabel: "Docker 托管",
+    writePolicy: "容器执行",
   },
 );
 

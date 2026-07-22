@@ -78,13 +78,20 @@ export function summarizeSchedulerStatus(status: Record<string, any> | null | un
   const running = Boolean(process.running);
   const lastJob = health.last_job ?? "暂无任务";
   const lastJobStatus = health.last_job_status ?? health.status ?? "unknown";
-  const pid = process.pid ? `PID ${process.pid}` : "未启动进程";
+  const managedBy = status?.managed_by ?? process.managed_by;
+  const service = status?.service ?? process.service;
+  const processLabel =
+    managedBy === "docker-compose"
+      ? `Docker ${service ?? "finance-agent-scheduler"}`
+      : process.pid
+        ? `PID ${process.pid}`
+        : "未启动进程";
 
   if (running) {
     return {
       tone: "green",
       label: "运行中",
-      detail: `${pid} · ${lastJob} / ${lastJobStatus}`,
+      detail: `${processLabel} · ${lastJob} / ${lastJobStatus}`,
     };
   }
   if (health.status === "missing") {
@@ -98,13 +105,13 @@ export function summarizeSchedulerStatus(status: Record<string, any> | null | un
     return {
       tone: "blue",
       label: "最近健康",
-      detail: `${pid} · ${lastJob} / ${lastJobStatus}`,
+      detail: `${processLabel} · ${lastJob} / ${lastJobStatus}`,
     };
   }
   return {
     tone: "red",
     label: "需要处理",
-    detail: `${pid} · ${lastJob} / ${lastJobStatus}`,
+    detail: `${processLabel} · ${lastJob} / ${lastJobStatus}`,
   };
 }
 
@@ -126,6 +133,13 @@ export function schedulerStartFeedback(
       statusText: message || "启动失败",
       modeLabel: "启动失败",
       writePolicy: "未启动",
+    };
+  }
+  if (result.data?.managed_by === "docker-compose") {
+    return {
+      statusText: message || "Docker 调度器已由容器托管",
+      modeLabel: "Docker 托管",
+      writePolicy: "容器执行",
     };
   }
   if (dryRun || !writesEnabled) {
