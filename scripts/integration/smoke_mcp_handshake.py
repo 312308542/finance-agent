@@ -37,8 +37,12 @@ ALLOWED_INTERFACE_TOOL_PREFIXES = (
     "data_quality.",
     "recommendation.",
     "workflow.",
+    "profile.",
+    "advice.",
+    "structure.",
 )
 FORBIDDEN_INTERFACE_TOOL_KEYWORDS = ("order", "trade", "execute", "broker", "place")
+CONTROLLED_WRITE_TOOLS = {"profile.upsert": "investment_profile"}
 
 
 def project_root_from_script() -> Path:
@@ -50,10 +54,28 @@ def project_root_from_script() -> Path:
 def default_venv_python(project_root: Path) -> Path:
     """返回项目 venv Python。"""
 
-    windows_python = project_root / ".venv" / "Scripts" / "python.exe"
-    if windows_python.exists():
-        return windows_python
-    return project_root / ".venv" / "bin" / "python"
+    if os.name == "nt":
+        candidates = (
+            project_root / ".venv" / "Scripts" / "python.exe",
+            project_root / ".venv-wsl" / "bin" / "python",
+            project_root / ".venv" / "bin" / "python",
+        )
+    else:
+        candidates = (
+            project_root / ".venv-wsl" / "bin" / "python",
+            project_root / ".venv" / "bin" / "python",
+            project_root / ".venv" / "Scripts" / "python.exe",
+        )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def absolute_python_executable(path: str | Path) -> Path:
+    """将解释器路径绝对化，但保留软链接本身。"""
+
+    return Path(path).absolute()
 
 
 def validate_mcp_tool_names(tool_names: set[str]) -> None:
@@ -74,10 +96,17 @@ def validate_interface_tool_payload(payload: JsonDict) -> None:
         raise AssertionError("MCP list_tools 必须返回至少一个事实工具。")
     for tool in tools:
         name = str(tool.get("name") or "")
-        if tool.get("read_only") is not True:
+        if name not in CONTROLLED_WRITE_TOOLS and tool.get("read_only") is not True:
             raise AssertionError(f"{name} 缺少 read_only=true 元数据。")
         if not name.startswith(ALLOWED_INTERFACE_TOOL_PREFIXES):
             raise AssertionError(f"{name} 不在允许的只读工具命名空间内。")
+        if name in CONTROLLED_WRITE_TOOLS:
+            if tool.get("read_only") is not False:
+                raise AssertionError(f"{name} 必须明确标记为受控写工具")
+            if tool.get("requires_review") is not True:
+                raise AssertionError(f"{name} 必须要求人工复核")
+            if tool.get("write_scope") != CONTROLLED_WRITE_TOOLS[name]:
+                raise AssertionError(f"{name} 的写入范围不符合白名单")
         if any(keyword in name.lower() for keyword in FORBIDDEN_INTERFACE_TOOL_KEYWORDS):
             raise AssertionError(f"{name} 疑似交易/执行类工具，不应暴露给 Hermes。")
 
@@ -157,7 +186,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         result = asyncio.run(
             run_mcp_handshake(
                 project_root=Path(args.project_root).resolve(),
-                python_executable=Path(args.python_executable).resolve(),
+                python_executable=absolute_python_executable(args.python_executable),
             )
         )
     except Exception as exc:

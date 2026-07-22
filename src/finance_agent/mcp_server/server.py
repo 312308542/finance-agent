@@ -7,17 +7,19 @@ MCP 是正式给 Hermes-Agent、Codex 或其他长期运行 Agent 使用的工�
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import argparse
+from collections.abc import Callable, Iterable
 from typing import Any
-
-from finance_agent.agents.interfaces import FinanceAgentInterface, parse_datetime
-from finance_agent.storage.db import create_session_factory, session_scope
-from finance_agent.triggers import TriggerEvaluationRequest, TriggerService
 
 JsonDict = dict[str, Any]
 
 
-def create_mcp_server() -> Any:
+def create_mcp_server(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    streamable_http_path: str = "/mcp",
+) -> Any:
     """创建 MCP Server。
 
     需要安装 Python MCP SDK：`pip install "mcp[cli]"`。
@@ -31,7 +33,21 @@ def create_mcp_server() -> Any:
             '.venv\\Scripts\\python.exe -m pip install "mcp[cli]"'
         ) from exc
 
-    mcp = FastMCP("finance-agent")
+    mcp = FastMCP(
+        "finance-agent",
+        host=host,
+        port=port,
+        streamable_http_path=streamable_http_path,
+    )
+
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    @mcp.custom_route("/healthz", methods=["GET"])
+    async def healthz(_request: Request) -> JSONResponse:
+        """返回 MCP 服务存活状态，不触发数据库或外部数据源访问。"""
+
+        return JSONResponse({"status": "ok", "service": "finance-agent-mcp"})
 
     @mcp.tool()
     def list_workflows() -> JsonDict:
@@ -82,7 +98,7 @@ def create_mcp_server() -> Any:
                 workflow_run_id=workflow_run_id,
                 trigger_type=trigger_type,
                 trigger_ref=trigger_ref,
-                started_at=parse_datetime(started_at),
+                started_at=_parse_datetime(started_at),
                 initial_state=initial_state,
                 portfolio_id=portfolio_id,
                 watchlist_id=watchlist_id,
@@ -328,7 +344,7 @@ def create_mcp_server() -> Any:
             lambda service: service.dispatch_pending(
                 owner_id=owner_id,
                 limit=limit,
-                as_of=parse_datetime(as_of),
+                as_of=_parse_datetime(as_of),
             ).to_dict()
         )
 
@@ -369,8 +385,11 @@ def create_mcp_server() -> Any:
     return mcp
 
 
-def run_with_interface(callback: Callable[[FinanceAgentInterface], JsonDict]) -> JsonDict:
+def run_with_interface(callback: Callable[[Any], JsonDict]) -> JsonDict:
     """创建事务边界并执行 MCP 工具回调。"""
+
+    from finance_agent.agents.interfaces import FinanceAgentInterface
+    from finance_agent.storage.db import create_session_factory, session_scope
 
     session_factory = create_session_factory()
     with session_scope(session_factory) as session:
@@ -378,8 +397,11 @@ def run_with_interface(callback: Callable[[FinanceAgentInterface], JsonDict]) ->
         return callback(interface)
 
 
-def run_with_trigger_service(callback: Callable[[TriggerService], JsonDict]) -> JsonDict:
+def run_with_trigger_service(callback: Callable[[Any], JsonDict]) -> JsonDict:
     """创建事务边界并执行触发事件服务回调。"""
+
+    from finance_agent.storage.db import create_session_factory, session_scope
+    from finance_agent.triggers import TriggerService
 
     session_factory = create_session_factory()
     with session_scope(session_factory) as session:
@@ -404,6 +426,8 @@ def build_trigger_request(
 
     from datetime import UTC, datetime
     from decimal import Decimal
+    from finance_agent.agents.interfaces import parse_datetime
+    from finance_agent.triggers import TriggerEvaluationRequest
 
     return TriggerEvaluationRequest(
         owner_id=owner_id,
@@ -420,10 +444,43 @@ def build_trigger_request(
     )
 
 
-def main() -> None:
+def _parse_datetime(value: str | None) -> Any:
+    """按需加载时间解析器，避免 MCP 启动阶段导入完整 Agent。"""
+
+    from finance_agent.agents.interfaces import parse_datetime
+
+    return parse_datetime(value)
+
+
+def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
+    """解析 MCP stdio 和 Streamable HTTP 启动参数。"""
+
+    parser = argparse.ArgumentParser(description="finance-agent MCP Server")
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "streamable-http", "sse"),
+        default="stdio",
+        help="MCP 传输协议，默认使用 stdio 兼容本地调用",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="HTTP 监听地址")
+    parser.add_argument("--port", type=int, default=8000, help="HTTP 监听端口")
+    parser.add_argument(
+        "--streamable-http-path",
+        default="/mcp",
+        help="Streamable HTTP MCP 路径",
+    )
+    return parser.parse_args(list(argv) if argv is not None else None)
+
+
+def main(argv: Iterable[str] | None = None) -> None:
     """启动 MCP Server。"""
 
-    create_mcp_server().run()
+    args = parse_args(argv)
+    create_mcp_server(
+        host=args.host,
+        port=args.port,
+        streamable_http_path=args.streamable_http_path,
+    ).run(transport=args.transport)
 
 
 if __name__ == "__main__":

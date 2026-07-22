@@ -94,16 +94,18 @@ git clone https://github.com/312308542/finance-agent.git
 cd finance-agent
 ```
 
-### 2. 启动基础服务
+### 2. 启动运行环境
 
 ```powershell
-docker compose up -d postgres redis
+docker compose up -d --build
 ```
 
 默认会启动：
 
 - PostgreSQL + TimescaleDB：`localhost:5432`
 - Redis：`localhost:6379`
+- gotdx 通达信行情网关：仅在 Compose 内部网络提供 `8790` 端口
+- 基础数据调度器：等待 PostgreSQL、Redis 和 gotdx 网关健康后启动
 
 ### 3. 安装后端依赖
 
@@ -208,23 +210,14 @@ finance-agent data config export `
   --output runtime\base_data_scheduler\base_data_scheduler.json
 ```
 
-运行一次调度：
+启动统一 Docker 调度器：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\data\run_base_data_scheduler.py `
-  --config runtime\base_data_scheduler\base_data_scheduler.json `
-  --run-once
+docker compose up -d --build finance-agent-gotdx-gateway finance-agent-scheduler
+docker compose logs --since 10m finance-agent-scheduler
 ```
 
-常驻调度：
-
-```powershell
-.\.venv\Scripts\python.exe scripts\data\run_base_data_scheduler.py `
-  --config runtime\base_data_scheduler\base_data_scheduler.json `
-  --loop `
-  --status-file runtime\base_data_scheduler\status.json `
-  --event-log-file runtime\base_data_scheduler\events.jsonl
-```
+不要在 Windows、PyCharm 或 API 进程中运行 `run_base_data_scheduler.py --loop`；Web 的 scheduler 启停接口只读取 Docker 服务状态。容器内 gotdx 地址固定为 `http://finance-agent-gotdx-gateway:8790`。
 
 ### MCP Server
 

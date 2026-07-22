@@ -10,19 +10,15 @@ def read_template(name: str) -> str:
     return (WINDOWS_DEPLOY / name).read_text(encoding="utf-8")
 
 
-def test_windows_scheduler_task_template_registers_daemon_with_logs() -> None:
-    """Windows 调度器模板应注册常驻基础数据调度任务并保留状态文件和事件日志。"""
+def test_windows_scheduler_task_template_blocks_local_registration() -> None:
+    """Windows 调度器兼容入口必须阻止本地注册，避免形成双调度。"""
 
     content = read_template("register_scheduler_task.ps1")
 
-    assert "Register-ScheduledTask" in content
-    assert "New-ScheduledTaskTrigger -AtStartup" in content
-    assert "scripts\\data\\run_base_data_scheduler.py" in content
-    assert "--loop" in content
-    assert "--status-file" in content
-    assert "--event-log-file" in content
-    assert "New-ScheduledTaskSettingsSet" in content
-    assert "-RestartCount" in content
+    assert "Windows 本地基础数据调度器已废弃" in content
+    assert "docker compose up -d --build" in content
+    assert "throw $message" in content
+    assert "Register-ScheduledTask" not in content
     assert "SupportsShouldProcess" in content
 
 
@@ -45,10 +41,8 @@ def test_windows_api_task_template_binds_localhost_by_default() -> None:
 def test_windows_registration_errors_are_terminating() -> None:
     """计划任务注册失败时必须终止脚本，不能继续输出成功提示。"""
 
-    for name in ("register_scheduler_task.ps1", "register_api_task.ps1"):
-        content = read_template(name)
-
-        assert "-Force -ErrorAction Stop | Out-Null" in content
+    content = read_template("register_api_task.ps1")
+    assert "-Force -ErrorAction Stop | Out-Null" in content
 
 
 def test_windows_unregister_template_removes_both_tasks() -> None:

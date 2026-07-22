@@ -1,4 +1,20 @@
 services:
+  finance-agent-gotdx-gateway:
+    container_name: finance-agent-gotdx-gateway
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.gotdx-gateway
+    restart: unless-stopped
+    environment:
+      TDX_GATEWAY_ADDR: ${TDX_GATEWAY_ADDR:-0.0.0.0:8790}
+      TDX_TIMEOUT_SECONDS: ${TDX_TIMEOUT_SECONDS:-3}
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:8790/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
   finance-agent-scheduler:
     container_name: finance-agent-scheduler
     build:
@@ -11,6 +27,12 @@ services:
       FINANCE_AGENT_CACHE_BACKEND: ${FINANCE_AGENT_CACHE_BACKEND:-redis}
       FINANCE_AGENT_DB_POOL_SIZE: ${FINANCE_AGENT_DB_POOL_SIZE:-10}
       FINANCE_AGENT_DB_MAX_OVERFLOW: ${FINANCE_AGENT_DB_MAX_OVERFLOW:-20}
+      # 容器内固定使用 Compose 服务名，禁止宿主机 localhost 覆盖请求地址。
+      FINANCE_AGENT_GOTDX_GATEWAY_URL: http://finance-agent-gotdx-gateway:8790
+      FINANCE_AGENT_GOTDX_URL: http://finance-agent-gotdx-gateway:8790
+    depends_on:
+      finance-agent-gotdx-gateway:
+        condition: service_healthy
     volumes:
       - ../../runtime:/app/runtime
     command:
