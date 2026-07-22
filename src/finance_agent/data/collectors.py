@@ -296,6 +296,7 @@ def _persist_asset_identity_rows(
     raw_record_id: str,
     source: str,
     include_realtime_quote: bool = False,
+    realtime_quote_mode: str = "history",
 ) -> None:
     """批量写入资产主数据和附表。"""
 
@@ -398,12 +399,22 @@ def _persist_asset_identity_rows(
         "upsert_asset_status_snapshot",
         status_rows,
     )
-    _persist_rows(
-        repository,
-        "upsert_realtime_quote_snapshots",
-        "upsert_realtime_quote_snapshot",
-        quote_rows,
-    )
+    if realtime_quote_mode == "latest" and callable(
+        getattr(repository, "upsert_intraday_quote_latest", None)
+    ):
+        _persist_rows(
+            repository,
+            "upsert_intraday_quote_latest",
+            "upsert_intraday_quote_latest",
+            quote_rows,
+        )
+    else:
+        _persist_rows(
+            repository,
+            "upsert_realtime_quote_snapshots",
+            "upsert_realtime_quote_snapshot",
+            quote_rows,
+        )
 
 
 def build_ashare_spot_valuation_rows(
@@ -1010,6 +1021,7 @@ class AshareP0Collector:
             raw_record_id=raw_record_id,
             source="akshare:stock_zh_a_spot",
             include_realtime_quote=True,
+            realtime_quote_mode="latest",
         )
         _persist_rows(
             self.fundamentals,

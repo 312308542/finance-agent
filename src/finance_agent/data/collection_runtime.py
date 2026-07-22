@@ -235,6 +235,18 @@ def summarize_archive(
         return summarize_archives(task, archive)
 
     result = archive.result
+    diagnostic_payload = {
+        key: result.payload[key]
+        for key in (
+            "data_snapshot_id",
+            "evaluation_id",
+            "source_statuses",
+            "metrics",
+            "errors",
+            "temporary_storage",
+        )
+        if key in result.payload
+    }
     return CollectionTaskResult(
         task=task,
         status=result.status,
@@ -246,6 +258,7 @@ def summarize_archive(
             "fallback_used": result.payload.get("fallback_used"),
             "source_coverage": result.payload.get("source_coverage"),
             "rate_limited": result.payload.get("rate_limited"),
+            **diagnostic_payload,
         }
         | infer_time_range_payload(result),
     )

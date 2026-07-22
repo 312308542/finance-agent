@@ -37,6 +37,7 @@ from finance_agent.data.collection_runtime import (
     ProviderCircuitPolicy,
 )
 from finance_agent.data.collectors import (
+    ArchivedProviderResult,
     AshareP0Collector,
     AshareP1Collector,
     AshareP2Collector,
@@ -48,12 +49,16 @@ from finance_agent.data.freshness import (
     ASHARE_FINANCIAL_INDICATOR_SOURCE,
     expected_ashare_report_period,
 )
-from finance_agent.data.models import ProviderResult
+from finance_agent.data.models import AssetData, AssetListResult, ProviderResult
 from finance_agent.data.normalizers import (
     compact_crypto_symbol,
     normalize_ashare_symbol,
 )
-from finance_agent.data.providers import AkshareProvider
+from finance_agent.data.providers import (
+    AkshareProvider,
+    GotdxGatewayProvider,
+    ParallelQuoteEvaluator,
+)
 from finance_agent.data.providers.eastmoney_curl import eastmoney_kline_cookie_health_status
 from finance_agent.data.source_rate_limiter import (
     build_source_rate_limiter,
@@ -65,20 +70,24 @@ from finance_agent.storage.event_retention import DEFAULT_ARTICLE_FULL_TEXT_RETE
 from finance_agent.storage.event_validation import active_event_predicate
 from finance_agent.storage.orm import (
     AssetRecommendationORM,
+    AssistantTriggerEventORM,
     DataSyncWatermarkORM,
     EventRecordORM,
     FundamentalSnapshotORM,
     FundNavSnapshotORM,
     MarketBarORM,
     MarketCalendarORM,
+    PositionORM,
     WatchlistItemORM,
 )
 from finance_agent.storage.repositories import (
     AssetRepository,
+    DataSnapshotRepository,
     DataSyncWatermarkRepository,
     EventRepository,
     MarketCalendarRepository,
 )
+from finance_agent.storage.snapshot_contracts import build_data_snapshot
 
 JsonDict = dict[str, Any]
 logger = logging.getLogger(__name__)
@@ -656,7 +665,7 @@ def run_ashare_p0(
                     end=args.ashare_end,
                 ),
             ),
-            build_ashare_full_asset_refresh_task(collector, args, runtime),
+            build_ashare_parallel_realtime_task(session, args, runtime),
         ]
     if task_type in ASHARE_MARKET_BAR_TASK_TYPES:
         tasks = [
@@ -933,6 +942,16 @@ def run_ashare_p0(
             for index, result in enumerate(batch_results):
                 tasks.append(batch_enriched_results[index] or result)
             commit_session_if_possible(session)
+        if task_type == "market_bars_close_final":
+            statuses = {str(getattr(item, "status", "")) for item in tasks}
+            if statuses and statuses.issubset({"available", "skipped"}):
+                try:
+                    cleared = AssetRepository(session).clear_intraday_quote_latest(market="ashare")
+                    logger.info("收盘最终日 K 完成，已清理 A 股盘中临时行情 rows=%s", cleared)
+                except Exception as exc:  # noqa: BLE001 - 清理失败必须可观测但不掩盖日 K 结果
+                    logger.warning("收盘后清理盘中临时行情失败 error=%s", exc, exc_info=True)
+            else:
+                logger.warning("收盘最终日 K 存在失败结果，暂不清理盘中临时行情 statuses=%s", statuses)
         return tasks
     return [
         runtime.run_task(
@@ -974,6 +993,301 @@ def run_ashare_p0(
             ),
         ),
     ]
+
+
+def build_ashare_parallel_realtime_task(
+    session: Any,
+    args: argparse.Namespace,
+    runtime: CollectionRuntime,
+) -> CollectionTaskResult:
+    """执行重点标的 gotdx/AKShare 并行快照，只覆盖盘中临时行情。"""
+
+    max_symbols = max(1, int(getattr(args, "realtime_quote_limit", 100) or 100))
+    symbols = resolve_realtime_quote_symbols(session, max_symbols=max_symbols)
+    gotdx_url = str(
+        getattr(args, "gotdx_gateway_url", None)
+        or os.getenv("FINANCE_AGENT_GOTDX_URL", "http://127.0.0.1:8790")
+    ).strip()
+    parameters = {
+        "symbols": symbols,
+        "max_symbols": max_symbols,
+        "sources": ["gotdx:tdx_main", "akshare:stock_zh_a_spot"],
+    }
+
+    def collect() -> ArchivedProviderResult:
+        captured_at = datetime.now(tz=UTC)
+        evaluation_id = (
+            "snapshot:ashare_realtime_quotes:parallel:"
+            f"{captured_at.strftime('%Y%m%dT%H%M%S.%fZ')}"
+        )
+        gotdx_provider = GotdxGatewayProvider(base_url=gotdx_url)
+        akshare_provider = AkshareProvider()
+        evaluator = ParallelQuoteEvaluator(
+            lambda requested: _fetch_gotdx_quote_rows(gotdx_provider, requested),
+            lambda requested: _fetch_akshare_quote_rows(akshare_provider, requested),
+        )
+        result = evaluator.evaluate(symbols=tuple(symbols), data_snapshot_id=evaluation_id)
+        statuses = {
+            "gotdx:tdx_main": "error" if "gotdx:tdx_main" in result.errors else "available",
+            "akshare:stock_zh_a_spot": (
+                "error" if "akshare:stock_zh_a_spot" in result.errors else "available"
+            ),
+        }
+        status = parallel_quote_status(result=result, source_statuses=statuses)
+        as_of_candidates = [
+            row["as_of"] for row in result.rows if isinstance(row.get("as_of"), datetime)
+        ]
+        as_of = max(as_of_candidates, default=captured_at)
+        captured_at = max(captured_at, as_of)
+        snapshot = build_data_snapshot(
+            snapshot_type="ashare_realtime_quotes",
+            market="ashare",
+            as_of=as_of,
+            captured_at=captured_at,
+            provider="gotdx+akshare:parallel",
+            provider_version="parallel-v1",
+            quality_status=status,
+            payload={
+                "rows": list(result.rows),
+                "metrics": result.metrics,
+                "errors": result.errors,
+            },
+            metadata={
+                "source_statuses": statuses,
+                "symbols": list(symbols),
+                "evaluation_id": evaluation_id,
+                "temporary_storage": "intraday_quote_latest",
+            },
+        )
+        DataSnapshotRepository(session).insert_snapshot(snapshot)
+        persisted_rows = tuple(
+            dict(row, data_snapshot_id=snapshot.data_snapshot_id) for row in result.rows
+        )
+        rows_written = AssetRepository(session).upsert_intraday_quote_latest(persisted_rows)
+        assets = [
+            AssetData(
+                asset_id=str(row["asset_id"]),
+                symbol=str(row["symbol"]),
+                name=str(row["symbol"]),
+                market="ashare",
+                asset_type="stock",
+                payload=dict(row),
+            )
+            for row in result.rows
+        ]
+        provider_result = AssetListResult(
+            provider_name="gotdx+akshare:parallel",
+            status=status,
+            collected_at=captured_at,
+            assets=assets,
+            error_message=("; ".join(f"{key}: {value}" for key, value in result.errors.items()) or None),
+            payload={
+                "actual_source": list(statuses),
+                "source_statuses": statuses,
+                "data_snapshot_id": snapshot.data_snapshot_id,
+                "rows_written": rows_written,
+                "metrics": result.metrics,
+                "errors": result.errors,
+                "temporary_storage": "intraday_quote_latest",
+            },
+        )
+        return ArchivedProviderResult(result=provider_result, raw_record_id=None)
+
+    return runtime.run_task(
+        task="ashare_realtime_quotes_parallel",
+        provider_key="gotdx:tdx_main+akshare:stock_zh_a_spot",
+        parameters=parameters,
+        force=bool(getattr(args, "force_provider", False)),
+        collect=collect,
+    )
+
+
+def parallel_quote_status(*, result: Any, source_statuses: Mapping[str, str]) -> str:
+    """汇总双源质量；冲突优先于部分可用，避免闸门误放行。"""
+
+    if result.metrics.get("conflicts"):
+        return "conflict"
+    if not result.rows:
+        return "unavailable"
+    if result.errors or any(status != "available" for status in source_statuses.values()):
+        return "partial"
+    return "available"
+
+
+def resolve_realtime_quote_symbols(session: Any, *, max_symbols: int = 100) -> list[str]:
+    """从现有可交易资产中生成重点标的集合，控制双源请求量。"""
+
+    try:
+        assets = TradeableAssetEligibilityService().filter_tradeable_assets(
+            AssetRepository(session).find_by_market("ashare")
+        )
+    except Exception as exc:  # noqa: BLE001 - 资产池不可用时交由 Provider 质量门处理
+        logger.warning("解析实时重点标的失败 error=%s", exc)
+        return []
+    eligible_by_symbol = {
+        normalize_ashare_symbol(str(asset.symbol or "")): asset
+        for asset in assets
+        if normalize_ashare_symbol(str(asset.symbol or ""))
+    }
+    symbols: list[str] = []
+
+    def add_symbol(value: Any) -> None:
+        symbol = normalize_ashare_symbol(str(value or ""))
+        if symbol and symbol in eligible_by_symbol and symbol not in symbols:
+            symbols.append(symbol)
+
+    try:
+        for position in session.scalars(
+            select(PositionORM).where(
+                PositionORM.market == "ashare",
+                PositionORM.status.in_(("open", "available", "active")),
+            )
+        ):
+            add_symbol(position.symbol)
+        for item in session.scalars(
+            select(WatchlistItemORM).where(
+                WatchlistItemORM.market == "ashare",
+                WatchlistItemORM.status == "active",
+            )
+        ):
+            add_symbol(item.symbol)
+        recent_cutoff = datetime.now(tz=UTC) - timedelta(days=7)
+        for recommendation in session.scalars(
+            select(AssetRecommendationORM).where(
+                AssetRecommendationORM.market == "ashare",
+                AssetRecommendationORM.created_at >= recent_cutoff,
+                AssetRecommendationORM.action.in_(("buy_candidate", "strong_buy")),
+            )
+        ):
+            add_symbol(recommendation.symbol)
+        for event in session.scalars(
+            select(AssistantTriggerEventORM).where(
+                AssistantTriggerEventORM.asset_id.is_not(None),
+                AssistantTriggerEventORM.triggered_at >= recent_cutoff,
+                AssistantTriggerEventORM.status.in_(("pending", "dispatched")),
+            )
+        ):
+            asset_id = str(event.asset_id or "")
+            asset = next(
+                (
+                    candidate
+                    for candidate in eligible_by_symbol.values()
+                    if candidate.asset_id == asset_id
+                ),
+                None,
+            )
+            add_symbol(getattr(asset, "symbol", None))
+    except Exception as exc:  # noqa: BLE001 - 重点集合不可用时仍可用全量资产池
+        logger.warning("解析持仓/观察池/推荐重点标的失败，将回退资产池 error=%s", exc)
+
+    for asset in sorted(assets, key=lambda item: normalize_ashare_symbol(str(item.symbol or ""))):
+        symbol = normalize_ashare_symbol(str(asset.symbol or ""))
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+        if len(symbols) >= max(1, int(max_symbols)):
+            break
+    return symbols
+
+
+def _fetch_gotdx_quote_rows(
+    provider: GotdxGatewayProvider,
+    symbols: tuple[str, ...],
+) -> list[JsonDict]:
+    """把 gotdx 标准对象转换为临时行情表行。"""
+
+    rows: list[JsonDict] = []
+    for quote in provider.fetch_quotes(symbols):
+        rows.append(
+            {
+                "asset_id": quote.asset_id,
+                "symbol": quote.symbol,
+                "market": quote.market,
+                "as_of": quote.as_of,
+                "captured_at": quote.received_at,
+                "freshness_ms": max(
+                    0,
+                    int((quote.received_at - quote.server_timestamp).total_seconds() * 1000),
+                ),
+                "last_price": quote.last_price,
+                "prev_close": quote.prev_close,
+                "open": quote.open_price,
+                "high": quote.high,
+                "low": quote.low,
+                "volume": quote.volume,
+                "amount": quote.amount,
+                "turnover_rate": quote.turnover_rate,
+                "change_amount": quote.change_amount,
+                "change_percent": quote.change_percent,
+                "bid_price": quote.bid_price,
+                "ask_price": quote.ask_price,
+                "status": quote.status,
+                "quality_status": quote.quality_status,
+                "payload": quote.payload,
+            }
+        )
+    return rows
+
+
+def _fetch_akshare_quote_rows(
+    provider: AkshareProvider,
+    symbols: tuple[str, ...],
+) -> list[JsonDict]:
+    """把 AKShare 全市场截面过滤为重点标的临时行情行。"""
+
+    result = provider.fetch_assets(limit=None)
+    if result.status not in {"available", "partial"}:
+        raise RuntimeError(
+            f"AKShare 行情 Provider 不可用 status={result.status} error={result.error_message}"
+        )
+    wanted = {
+        normalize_ashare_symbol(str(symbol or ""))
+        for symbol in symbols
+        if normalize_ashare_symbol(str(symbol or ""))
+    }
+    rows: list[JsonDict] = []
+    for asset in result.assets:
+        symbol = normalize_ashare_symbol(str(asset.symbol or ""))
+        if symbol not in wanted:
+            continue
+        payload = dict(asset.payload or {})
+        rows.append(
+            {
+                "asset_id": asset.asset_id,
+                "symbol": symbol,
+                "market": "ashare",
+                "as_of": result.collected_at,
+                "captured_at": result.collected_at,
+                "freshness_ms": 0,
+                "last_price": _quote_decimal(payload, ("最新价", "最新")),
+                "prev_close": _quote_decimal(payload, ("昨收", "昨收价")),
+                "open": _quote_decimal(payload, ("今开", "开盘")),
+                "high": _quote_decimal(payload, ("最高",)),
+                "low": _quote_decimal(payload, ("最低",)),
+                "volume": _quote_decimal(payload, ("成交量",)),
+                "amount": _quote_decimal(payload, ("成交额",)),
+                "turnover_rate": _quote_decimal(payload, ("换手率",)),
+                "change_amount": _quote_decimal(payload, ("涨跌额",)),
+                "change_percent": _quote_decimal(payload, ("涨跌幅", "日增长率")),
+                "status": asset.status,
+                "quality_status": "available" if asset.status == "available" else asset.status,
+                "payload": payload,
+            }
+        )
+    return rows
+
+
+def _quote_decimal(payload: Mapping[str, Any], keys: tuple[str, ...]) -> Decimal | None:
+    """从 Provider payload 读取一个可选数值。"""
+
+    for key in keys:
+        value = payload.get(key)
+        if value is None or str(value).strip() in {"", "-", "--", "nan", "None"}:
+            continue
+        try:
+            return Decimal(str(value).replace(",", "").replace("%", "").strip())
+        except Exception:  # noqa: BLE001 - 单字段异常不应丢弃整批行情
+            continue
+    return None
 
 
 def build_ashare_full_asset_refresh_task(

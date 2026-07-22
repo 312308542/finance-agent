@@ -21,6 +21,17 @@ from finance_agent.data.providers.eastmoney_article_fetcher import (
     ArticleFetchResult,
     EastmoneyArticleFetcher,
 )
+from finance_agent.data.providers.gotdx_gateway import (
+    GotdxGatewayError,
+    GotdxGatewayProvider,
+    GotdxPersistenceResult,
+    GotdxQuote,
+    GotdxSnapshotResult,
+)
+from finance_agent.data.providers.parallel_quotes import (
+    ParallelQuoteEvaluator,
+    ParallelQuoteResult,
+)
 
 __all__ = [
     "AkshareProvider",
@@ -36,4 +47,11 @@ __all__ = [
     "BinanceNativeProvider",
     "CcxtBinanceProvider",
     "EastmoneyArticleFetcher",
+    "GotdxGatewayError",
+    "GotdxGatewayProvider",
+    "GotdxPersistenceResult",
+    "GotdxQuote",
+    "GotdxSnapshotResult",
+    "ParallelQuoteEvaluator",
+    "ParallelQuoteResult",
 ]

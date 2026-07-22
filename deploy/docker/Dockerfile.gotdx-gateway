@@ -1,0 +1,22 @@
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /src
+
+COPY prototypes/gotdx-gateway/go.mod prototypes/gotdx-gateway/go.sum ./
+RUN go mod download
+
+COPY prototypes/gotdx-gateway/*.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/gotdx-gateway .
+
+FROM alpine:3.22
+
+RUN apk add --no-cache ca-certificates
+
+COPY --from=builder /out/gotdx-gateway /usr/local/bin/gotdx-gateway
+
+ENV TDX_GATEWAY_ADDR=0.0.0.0:8790 \
+    TDX_TIMEOUT_SECONDS=3
+
+EXPOSE 8790
+
+ENTRYPOINT ["/usr/local/bin/gotdx-gateway"]

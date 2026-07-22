@@ -51,6 +51,8 @@ tmp/
 temp/
 .cache/
 runtime/
+!src/finance_agent/runtime/
+!src/finance_agent/runtime/*.py
 
 # 数据库与本地数据
 *.sqlite

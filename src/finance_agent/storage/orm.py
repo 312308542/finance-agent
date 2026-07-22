@@ -178,11 +178,13 @@ class RealtimeQuoteSnapshotORM(Base):
         Index("idx_realtime_quotes_asset_asof", "asset_id", "as_of"),
         Index("idx_realtime_quotes_market_symbol_asof", "market", "symbol", "as_of"),
         Index("idx_realtime_quotes_source", "source"),
+        Index("idx_realtime_quotes_snapshot", "data_snapshot_id"),
     )
 
     asset_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
     source: Mapped[str] = mapped_column(String(128), primary_key=True)
+    data_snapshot_id: Mapped[str | None] = mapped_column(String(255))
     symbol: Mapped[str] = mapped_column(String(64), nullable=False)
     market: Mapped[str] = mapped_column(String(32), nullable=False)
     last_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
@@ -204,6 +206,50 @@ class RealtimeQuoteSnapshotORM(Base):
         JSONB, server_default=text("'{}'::jsonb"), nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class IntradayQuoteLatestORM(Base):
+    """盘中临时行情，只保留每个资产和来源的最新值。"""
+
+    __tablename__ = "intraday_quote_latest"
+    __table_args__ = (
+        Index("idx_intraday_quote_latest_market", "market", "updated_at"),
+        Index("idx_intraday_quote_latest_snapshot", "data_snapshot_id"),
+        Index("idx_intraday_quote_latest_quality", "quality_status", "updated_at"),
+    )
+
+    asset_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    source: Mapped[str] = mapped_column(String(128), primary_key=True)
+    data_snapshot_id: Mapped[str | None] = mapped_column(String(255))
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    freshness_ms: Mapped[int | None] = mapped_column(Integer)
+    last_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    prev_close: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    open: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    high: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    low: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    volume: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(36, 10))
+    turnover_rate: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    change_amount: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    change_percent: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    bid_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    ask_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'available'"), nullable=False
+    )
+    quality_status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'available'"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
 
@@ -312,6 +358,46 @@ class RawRecordORM(Base):
     error_message: Mapped[str | None] = mapped_column(Text)
     as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class DataSnapshotORM(Base):
+    """跨链路不可变数据快照元数据和可重放输入。"""
+
+    __tablename__ = "data_snapshots"
+    __table_args__ = (
+        CheckConstraint(
+            "quality_status IN ('available', 'partial', 'stale', 'conflict', 'unavailable', "
+            "'invalid_server_time', 'after_hours_snapshot', 'clock_skew')",
+            name="ck_data_snapshots_quality_status",
+        ),
+        Index("idx_data_snapshots_type_asof", "snapshot_type", "as_of"),
+        Index("idx_data_snapshots_provider_captured", "provider", "captured_at"),
+        Index("idx_data_snapshots_quality", "quality_status"),
+        Index("idx_data_snapshots_content_hash", "content_hash"),
+    )
+
+    data_snapshot_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    snapshot_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    provider: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider_version: Mapped[str | None] = mapped_column(String(128))
+    quality_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    raw_record_ids: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    snapshot_metadata: Mapped[JsonDict] = mapped_column(
+        "metadata", JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
 
 
 class DataSyncWatermarkORM(Base):
@@ -1664,6 +1750,125 @@ class DecisionLogORM(Base):
     )
     payload: Mapped[JsonDict] = mapped_column(
         JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class DecisionGateORM(Base):
+    """决策闸门结果，记录每次建议是否允许进入动作层。"""
+
+    __tablename__ = "decision_gates"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('approved', 'rejected', 'pending_review', 'data_unavailable', 'expired')",
+            name="ck_decision_gates_status",
+        ),
+        Index("idx_decision_gates_snapshot", "data_snapshot_id"),
+        Index("idx_decision_gates_status_evaluated", "status", "evaluated_at"),
+        Index("idx_decision_gates_type_evaluated", "decision_type", "evaluated_at"),
+    )
+
+    decision_gate_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    decision_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    data_snapshot_id: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_codes: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    reasons: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    evidence_ids: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    rule_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    confirmed_by: Mapped[str | None] = mapped_column(String(128))
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
+class SchedulerTaskRunORM(Base):
+    """持久化任务运行记录，支持租约、幂等、重试和进程恢复。"""
+
+    __tablename__ = "scheduler_task_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'running', 'completed', 'failed', 'cancelled')",
+            name="ck_scheduler_task_runs_status",
+        ),
+        UniqueConstraint("idempotency_key", name="uq_scheduler_task_runs_idempotency"),
+        Index("idx_scheduler_task_runs_due", "status", "next_retry_at", "created_at"),
+        Index("idx_scheduler_task_runs_lease", "status", "lease_expires_at"),
+        Index("idx_scheduler_task_runs_job_created", "job_name", "created_at"),
+    )
+
+    task_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    job_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'pending'"), nullable=False
+    )
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    attempts: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
+    max_attempts: Mapped[int] = mapped_column(Integer, server_default=text("3"), nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_token: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class OutboxEventORM(Base):
+    """业务事件 Outbox，数据库提交后由独立发布器投递到 Redis Streams。"""
+
+    __tablename__ = "outbox_events"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_outbox_events_idempotency"),
+        CheckConstraint("attempts >= 0", name="ck_outbox_events_attempts"),
+        Index("idx_outbox_events_pending", "published_at", "available_at", "created_at"),
+        Index("idx_outbox_events_lease", "publish_lease_expires_at"),
+        Index("idx_outbox_events_type_created", "event_type", "created_at"),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    aggregate_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    aggregate_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_stream_id: Mapped[str | None] = mapped_column(String(64))
+    attempts: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
+    publish_lease_owner: Mapped[str | None] = mapped_column(String(128))
+    publish_lease_token: Mapped[str | None] = mapped_column(String(128))
+    publish_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
 
 

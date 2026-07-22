@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import uuid
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -44,7 +45,9 @@ from finance_agent.storage.orm import (
     CapitalFlowSnapshotORM,
     CryptoDerivativeSnapshotORM,
     DataQualitySnapshotORM,
+    DataSnapshotORM,
     DataSyncWatermarkORM,
+    DecisionGateORM,
     DecisionLogORM,
     EventRecordORM,
     EvidenceORM,
@@ -54,6 +57,7 @@ from finance_agent.storage.orm import (
     FundamentalSnapshotORM,
     FundNavSnapshotORM,
     IndicatorFrameORM,
+    IntradayQuoteLatestORM,
     MarketBarORM,
     MarketCalendarORM,
     MemoryEmbeddingORM,
@@ -62,6 +66,7 @@ from finance_agent.storage.orm import (
     ModelRoutingRuleORM,
     MonitoringAlertORM,
     OrderDraftORM,
+    OutboxEventORM,
     PortfolioORM,
     PortfolioSnapshotORM,
     PositionORM,
@@ -73,6 +78,7 @@ from finance_agent.storage.orm import (
     RetrievalProfileORM,
     ReviewTaskORM,
     RiskFindingORM,
+    SchedulerTaskRunORM,
     ScoringStrategyORM,
     ScreeningResultItemORM,
     ScreeningResultORM,
@@ -86,6 +92,7 @@ from finance_agent.storage.orm import (
     WatchlistItemORM,
     WatchlistORM,
 )
+from finance_agent.storage.snapshot_contracts import DataSnapshot
 
 JsonDict = dict[str, Any]
 FINAL_MARKET_BAR_STATUSES = ("available", "revised")
@@ -338,6 +345,45 @@ def _expired_article_delete_statement(
           )
         """
     ).bindparams(**params)
+
+
+class DataSnapshotRepository:
+    """不可变数据快照仓储，只允许幂等追加和读取。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def insert_snapshot(self, snapshot: DataSnapshot | JsonDict) -> DataSnapshotORM:
+        """按 `data_snapshot_id` 幂等追加快照，已存在版本不更新。"""
+
+        values = dict(snapshot.to_record()) if isinstance(snapshot, DataSnapshot) else dict(snapshot)
+        if "metadata" in values:
+            values["snapshot_metadata"] = values.pop("metadata")
+        statement = insert(DataSnapshotORM).values(**values)
+        self.session.execute(
+            statement.on_conflict_do_nothing(index_elements=[DataSnapshotORM.data_snapshot_id])
+        )
+        self.session.flush()
+        return self.session.get_one(DataSnapshotORM, values["data_snapshot_id"])
+
+    def get_snapshot(self, data_snapshot_id: str) -> DataSnapshotORM | None:
+        """读取指定不可变快照。"""
+
+        return self.session.get(DataSnapshotORM, data_snapshot_id)
+
+    def get_latest(self, *, snapshot_type: str, market: str) -> DataSnapshotORM | None:
+        """读取指定市场和类型最新捕获的快照。"""
+
+        statement = (
+            select(DataSnapshotORM)
+            .where(
+                DataSnapshotORM.snapshot_type == snapshot_type,
+                DataSnapshotORM.market == market,
+            )
+            .order_by(DataSnapshotORM.captured_at.desc())
+            .limit(1)
+        )
+        return self.session.scalars(statement).first()
 
 
 class AssetRepository:
@@ -804,6 +850,7 @@ class AssetRepository:
                     "asset_id": item["asset_id"],
                     "as_of": item["as_of"],
                     "source": item["source"],
+                    "data_snapshot_id": item.get("data_snapshot_id"),
                     "symbol": item["symbol"],
                     "market": item["market"],
                     "last_price": item.get("last_price"),
@@ -848,6 +895,105 @@ class AssetRepository:
             chunk_size=chunk_size,
             build_statement=build_statement,
         )
+
+    def upsert_intraday_quote_latest(
+        self,
+        snapshots: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """覆盖写入盘中临时行情，不按每个时间点保留历史。"""
+
+        rows = _dedupe_rows(
+            [
+                {
+                    "asset_id": item["asset_id"],
+                    "source": item["source"],
+                    "data_snapshot_id": item.get("data_snapshot_id"),
+                    "symbol": item["symbol"],
+                    "market": item["market"],
+                    "as_of": item["as_of"],
+                    "captured_at": item.get("captured_at", item["as_of"]),
+                    "freshness_ms": item.get("freshness_ms"),
+                    "last_price": item.get("last_price"),
+                    "prev_close": item.get("prev_close"),
+                    "open": item.get("open", item.get("open_price")),
+                    "high": item.get("high"),
+                    "low": item.get("low"),
+                    "volume": item.get("volume"),
+                    "amount": item.get("amount"),
+                    "turnover_rate": item.get("turnover_rate"),
+                    "change_amount": item.get("change_amount"),
+                    "change_percent": item.get("change_percent"),
+                    "bid_price": item.get("bid_price"),
+                    "ask_price": item.get("ask_price"),
+                    "status": item.get("status", "available"),
+                    "quality_status": item.get("quality_status", item.get("status", "available")),
+                    "payload": _json_safe(item.get("payload") or {}),
+                    "updated_at": item.get("captured_at", item["as_of"]),
+                }
+                for item in snapshots
+            ],
+            ("asset_id", "source"),
+        )
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(IntradayQuoteLatestORM).values(list(chunk))
+            update_values = {
+                key: statement.excluded[key]
+                for key in rows[0]
+                if key not in {"asset_id", "source"}
+            }
+            return statement.on_conflict_do_update(
+                index_elements=[IntradayQuoteLatestORM.asset_id, IntradayQuoteLatestORM.source],
+                set_=update_values,
+            )
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
+
+    def clear_intraday_quote_latest(self, *, market: str | None = None) -> int:
+        """收盘最终日 K 完成后清理盘中临时行情。"""
+
+        statement = delete(IntradayQuoteLatestORM)
+        if market:
+            statement = statement.where(IntradayQuoteLatestORM.market == str(market))
+        result = self.session.execute(statement)
+        self.session.flush()
+        return int(result.rowcount or 0)
+
+    def list_intraday_quote_latest(
+        self,
+        *,
+        asset_ids: Sequence[str] = (),
+        market: str | None = None,
+        sources: Sequence[str] = (),
+        quality_statuses: Sequence[str] = (),
+    ) -> list[IntradayQuoteLatestORM]:
+        """读取盘中每个资产和来源的最新行，供持仓、风险和 Agent 共用。"""
+
+        statement = select(IntradayQuoteLatestORM)
+        normalized_asset_ids = tuple(str(item).strip() for item in asset_ids if str(item).strip())
+        normalized_sources = tuple(str(item).strip() for item in sources if str(item).strip())
+        normalized_quality = tuple(
+            str(item).strip() for item in quality_statuses if str(item).strip()
+        )
+        if normalized_asset_ids:
+            statement = statement.where(IntradayQuoteLatestORM.asset_id.in_(normalized_asset_ids))
+        if market:
+            statement = statement.where(IntradayQuoteLatestORM.market == str(market))
+        if normalized_sources:
+            statement = statement.where(IntradayQuoteLatestORM.source.in_(normalized_sources))
+        if normalized_quality:
+            statement = statement.where(
+                IntradayQuoteLatestORM.quality_status.in_(normalized_quality)
+            )
+        statement = statement.order_by(IntradayQuoteLatestORM.asset_id, IntradayQuoteLatestORM.source)
+        return list(self.session.scalars(statement))
 
     def upsert_asset_profile(
         self,
@@ -999,6 +1145,7 @@ class AssetRepository:
         market: str,
         as_of: datetime,
         source: str,
+        data_snapshot_id: str | None = None,
         last_price: Decimal | None = None,
         prev_close: Decimal | None = None,
         open_price: Decimal | None = None,
@@ -1020,6 +1167,7 @@ class AssetRepository:
             "asset_id": asset_id,
             "as_of": as_of,
             "source": source,
+            "data_snapshot_id": data_snapshot_id,
             "symbol": symbol,
             "market": market,
             "last_price": last_price,
@@ -4349,6 +4497,459 @@ class AssistantTriggerRepository:
             dispatched_at=event.dispatched_at,
             payload=merged_payload,
         )
+
+
+class DecisionGateRepository:
+    """决策闸门结果仓储，按闸门 ID 追加且不覆盖历史判断。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def insert_gate(self, result: Any) -> DecisionGateORM:
+        """幂等写入 `DecisionGateResult.to_record()`。"""
+
+        if not hasattr(result, "to_record"):
+            raise TypeError("result 必须提供 to_record()")
+        values = dict(result.to_record())
+        statement = insert(DecisionGateORM).values(**values)
+        self.session.execute(
+            statement.on_conflict_do_nothing(index_elements=[DecisionGateORM.decision_gate_id])
+        )
+        self.session.flush()
+        return self.session.get_one(DecisionGateORM, values["decision_gate_id"])
+
+    def get_gate(self, decision_gate_id: str) -> DecisionGateORM | None:
+        """读取指定闸门结果。"""
+
+        return self.session.get(DecisionGateORM, decision_gate_id)
+
+
+class OutboxEventRepository:
+    """Outbox 事件仓储，负责幂等追加、租约领取和发布回写。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def append(
+        self,
+        *,
+        event_type: str,
+        aggregate_type: str,
+        aggregate_id: str,
+        idempotency_key: str,
+        payload: JsonDict | None = None,
+        occurred_at: datetime | None = None,
+        available_at: datetime | None = None,
+        event_id: str | None = None,
+    ) -> OutboxEventORM:
+        """追加业务事件；相同幂等键只保留一条事实记录。"""
+
+        normalized_type = str(event_type).strip()
+        normalized_aggregate_type = str(aggregate_type).strip()
+        normalized_aggregate_id = str(aggregate_id).strip()
+        normalized_key = str(idempotency_key).strip()
+        if not all(
+            (normalized_type, normalized_aggregate_type, normalized_aggregate_id, normalized_key)
+        ):
+            raise ValueError("event_type、aggregate_type、aggregate_id 和 idempotency_key 不能为空")
+        event_at = occurred_at or datetime.now().astimezone()
+        stable_event_id = event_id or (
+            "outbox:" + hashlib.sha256(normalized_key.encode("utf-8")).hexdigest()[:48]
+        )
+        values = {
+            "event_id": stable_event_id,
+            "event_type": normalized_type,
+            "aggregate_type": normalized_aggregate_type,
+            "aggregate_id": normalized_aggregate_id,
+            "idempotency_key": normalized_key,
+            "payload": _json_safe(payload or {}),
+            "occurred_at": event_at,
+            "available_at": available_at or event_at,
+            "updated_at": event_at,
+        }
+        statement = insert(OutboxEventORM).values(**values)
+        self.session.execute(
+            statement.on_conflict_do_nothing(constraint="uq_outbox_events_idempotency")
+        )
+        self.session.flush()
+        return self.session.get_one(OutboxEventORM, stable_event_id)
+
+    def claim_pending(
+        self,
+        *,
+        publisher_id: str,
+        limit: int = 100,
+        lease_seconds: int = 60,
+        now: datetime | None = None,
+    ) -> list[OutboxEventORM]:
+        """使用行锁领取待发布事件，允许多个发布进程并行工作。"""
+
+        normalized_publisher = str(publisher_id).strip()
+        if not normalized_publisher:
+            raise ValueError("publisher_id 不能为空")
+        if limit < 1 or lease_seconds < 1:
+            raise ValueError("limit 和 lease_seconds 必须大于 0")
+        occurred_at = now or datetime.now().astimezone()
+        statement = (
+            select(OutboxEventORM)
+            .where(
+                OutboxEventORM.published_at.is_(None),
+                OutboxEventORM.available_at <= occurred_at,
+                or_(
+                    OutboxEventORM.publish_lease_expires_at.is_(None),
+                    OutboxEventORM.publish_lease_expires_at <= occurred_at,
+                ),
+            )
+            .order_by(OutboxEventORM.available_at.asc(), OutboxEventORM.created_at.asc())
+            .with_for_update(skip_locked=True)
+            .limit(limit)
+        )
+        events = list(self.session.scalars(statement).all())
+        for event in events:
+            event.attempts = int(event.attempts or 0) + 1
+            event.publish_lease_owner = normalized_publisher
+            event.publish_lease_token = uuid.uuid4().hex
+            event.publish_lease_expires_at = occurred_at + timedelta(seconds=lease_seconds)
+            event.updated_at = occurred_at
+        self.session.flush()
+        return events
+
+    def mark_published(
+        self,
+        *,
+        event_id: str,
+        lease_token: str | None,
+        stream_id: str,
+        now: datetime | None = None,
+    ) -> bool:
+        """以当前发布租约确认 Redis Stream ID。"""
+
+        occurred_at = now or datetime.now().astimezone()
+        result = self.session.execute(
+            update(OutboxEventORM)
+            .where(
+                OutboxEventORM.event_id == event_id,
+                OutboxEventORM.published_at.is_(None),
+                OutboxEventORM.publish_lease_token == lease_token,
+                OutboxEventORM.publish_lease_expires_at > occurred_at,
+            )
+            .values(
+                published_at=occurred_at,
+                published_stream_id=str(stream_id),
+                publish_lease_owner=None,
+                publish_lease_token=None,
+                publish_lease_expires_at=None,
+                last_error=None,
+                updated_at=occurred_at,
+            )
+        )
+        self.session.flush()
+        return bool(result.rowcount)
+
+    def mark_failed(
+        self,
+        *,
+        event_id: str,
+        lease_token: str | None,
+        error_message: str,
+        retry_after: timedelta = timedelta(seconds=30),
+        now: datetime | None = None,
+    ) -> bool:
+        """回写发布错误并安排下一次补发。"""
+
+        occurred_at = now or datetime.now().astimezone()
+        result = self.session.execute(
+            update(OutboxEventORM)
+            .where(
+                OutboxEventORM.event_id == event_id,
+                OutboxEventORM.published_at.is_(None),
+                OutboxEventORM.publish_lease_token == lease_token,
+                OutboxEventORM.publish_lease_expires_at > occurred_at,
+            )
+            .values(
+                available_at=occurred_at + retry_after,
+                publish_lease_owner=None,
+                publish_lease_token=None,
+                publish_lease_expires_at=None,
+                last_error=str(error_message),
+                updated_at=occurred_at,
+            )
+        )
+        self.session.flush()
+        return bool(result.rowcount)
+
+
+class SchedulerTaskRepository:
+    """持久化任务运行仓储，封装租约和幂等状态转换。"""
+
+    def __init__(
+        self,
+        session: Session,
+        *,
+        outbox_repository: OutboxEventRepository | None = None,
+    ) -> None:
+        self.session = session
+        self.outbox_repository = outbox_repository
+
+    def _append_task_event(
+        self,
+        *,
+        event_type: str,
+        task: Any,
+        payload: JsonDict,
+        occurred_at: datetime,
+    ) -> None:
+        """在同一事务追加调度任务事件；未配置 Outbox 时保持旧调用方兼容。"""
+
+        if self.outbox_repository is None:
+            return
+        self.outbox_repository.append(
+            event_type=event_type,
+            aggregate_type="scheduler_task",
+            aggregate_id=str(task.task_id),
+            idempotency_key=f"{event_type}:{task.task_id}:{int(task.attempts or 0)}",
+            payload=payload,
+            occurred_at=occurred_at,
+        )
+
+    def enqueue(
+        self,
+        *,
+        job_name: str,
+        idempotency_key: str,
+        payload: JsonDict | None = None,
+        max_attempts: int = 3,
+        task_id: str | None = None,
+        now: datetime | None = None,
+    ) -> SchedulerTaskRunORM:
+        """按幂等键创建任务，重复提交只返回同一任务。"""
+
+        normalized_job = str(job_name).strip()
+        normalized_key = str(idempotency_key).strip()
+        if not normalized_job or not normalized_key:
+            raise ValueError("job_name 和 idempotency_key 不能为空")
+        if max_attempts < 1:
+            raise ValueError("max_attempts 必须大于 0")
+        stable_id = task_id or f"task:{hashlib.sha256(normalized_key.encode('utf-8')).hexdigest()[:48]}"
+        occurred_at = now or datetime.now().astimezone()
+        values = {
+            "task_id": stable_id,
+            "job_name": normalized_job,
+            "idempotency_key": normalized_key,
+            "status": "pending",
+            "payload": _json_safe(payload or {}),
+            "attempts": 0,
+            "max_attempts": max_attempts,
+            "next_retry_at": occurred_at,
+            "updated_at": occurred_at,
+        }
+        statement = insert(SchedulerTaskRunORM).values(**values)
+        self.session.execute(
+            statement.on_conflict_do_nothing(constraint="uq_scheduler_task_runs_idempotency")
+        )
+        self.session.flush()
+        task = self.session.get_one(SchedulerTaskRunORM, stable_id)
+        self._append_task_event(
+            event_type="scheduler.task.enqueued",
+            task=task,
+            payload={"job_name": normalized_job, "idempotency_key": normalized_key},
+            occurred_at=occurred_at,
+        )
+        return task
+
+    def claim(
+        self,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+        job_name: str | None = None,
+        idempotency_key: str | None = None,
+        now: datetime | None = None,
+    ) -> SchedulerTaskRunORM | None:
+        """使用 `SKIP LOCKED` 领取一个到期任务并创建租约。
+
+        调度器可以同时传入任务名和幂等键，确保 worker 只领取自己刚刚持久化的
+        任务；未传过滤条件时保留通用队列消费者按时间顺序领取的行为。
+        """
+
+        if not str(worker_id).strip():
+            raise ValueError("worker_id 不能为空")
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds 必须大于 0")
+        occurred_at = now or datetime.now().astimezone()
+        filters = [
+            SchedulerTaskRunORM.status == "pending",
+            or_(
+                SchedulerTaskRunORM.next_retry_at.is_(None),
+                SchedulerTaskRunORM.next_retry_at <= occurred_at,
+            ),
+        ]
+        if job_name is not None:
+            normalized_job_name = str(job_name).strip()
+            if not normalized_job_name:
+                raise ValueError("job_name 不能为空字符串")
+            filters.append(SchedulerTaskRunORM.job_name == normalized_job_name)
+        if idempotency_key is not None:
+            normalized_idempotency_key = str(idempotency_key).strip()
+            if not normalized_idempotency_key:
+                raise ValueError("idempotency_key 不能为空字符串")
+            filters.append(
+                SchedulerTaskRunORM.idempotency_key == normalized_idempotency_key
+            )
+        statement = (
+            select(SchedulerTaskRunORM)
+            .where(*filters)
+            .order_by(SchedulerTaskRunORM.created_at.asc())
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        task = self.session.scalars(statement).first()
+        if task is None:
+            return None
+        task.status = "running"
+        task.attempts = int(task.attempts or 0) + 1
+        task.lease_owner = str(worker_id).strip()
+        task.lease_token = uuid.uuid4().hex
+        task.lease_expires_at = occurred_at + timedelta(seconds=lease_seconds)
+        task.started_at = task.started_at or occurred_at
+        task.updated_at = occurred_at
+        self.session.flush()
+        return task
+
+    def heartbeat(
+        self,
+        *,
+        task_id: str,
+        lease_token: str,
+        lease_seconds: int = 60,
+        now: datetime | None = None,
+    ) -> bool:
+        """延长当前租约，旧租约或非 running 任务不会被更新。"""
+
+        occurred_at = now or datetime.now().astimezone()
+        result = self.session.execute(
+            update(SchedulerTaskRunORM)
+            .where(
+                SchedulerTaskRunORM.task_id == task_id,
+                SchedulerTaskRunORM.status == "running",
+                SchedulerTaskRunORM.lease_token == lease_token,
+                SchedulerTaskRunORM.lease_expires_at > occurred_at,
+            )
+            .values(
+                lease_expires_at=occurred_at + timedelta(seconds=lease_seconds),
+                updated_at=occurred_at,
+            )
+        )
+        self.session.flush()
+        if result.rowcount:
+            task = self.session.get(SchedulerTaskRunORM, task_id)
+            if task is not None:
+                self._append_task_event(
+                    event_type="scheduler.task.completed",
+                    task=task,
+                    payload={"status": "completed"},
+                    occurred_at=occurred_at,
+                )
+        return bool(result.rowcount)
+
+    def complete(
+        self,
+        *,
+        task_id: str,
+        lease_token: str,
+        now: datetime | None = None,
+    ) -> bool:
+        """完成当前租约任务，重复完成或旧租约返回 False。"""
+
+        occurred_at = now or datetime.now().astimezone()
+        result = self.session.execute(
+            update(SchedulerTaskRunORM)
+            .where(
+                SchedulerTaskRunORM.task_id == task_id,
+                SchedulerTaskRunORM.status == "running",
+                SchedulerTaskRunORM.lease_token == lease_token,
+                SchedulerTaskRunORM.lease_expires_at > occurred_at,
+            )
+            .values(
+                status="completed",
+                lease_owner=None,
+                lease_token=None,
+                lease_expires_at=None,
+                next_retry_at=None,
+                error_message=None,
+                finished_at=occurred_at,
+                updated_at=occurred_at,
+            )
+        )
+        self.session.flush()
+        return bool(result.rowcount)
+
+    def fail(
+        self,
+        *,
+        task_id: str,
+        lease_token: str,
+        error_message: str,
+        retry_after: timedelta = timedelta(seconds=30),
+        now: datetime | None = None,
+    ) -> bool:
+        """记录失败并按最大尝试次数决定重试或终态。"""
+
+        occurred_at = now or datetime.now().astimezone()
+        task = self.session.get(SchedulerTaskRunORM, task_id)
+        if (
+            task is None
+            or task.status != "running"
+            or task.lease_token != lease_token
+            or task.lease_expires_at is None
+            or task.lease_expires_at <= occurred_at
+        ):
+            return False
+        retryable = int(task.attempts or 0) < int(task.max_attempts or 0)
+        task.status = "pending" if retryable else "failed"
+        task.lease_owner = None
+        task.lease_token = None
+        task.lease_expires_at = None
+        task.next_retry_at = occurred_at + retry_after if retryable else None
+        task.error_message = str(error_message)
+        task.finished_at = None if retryable else occurred_at
+        task.updated_at = occurred_at
+        self.session.flush()
+        self._append_task_event(
+            event_type="scheduler.task.failed" if not retryable else "scheduler.task.retry_scheduled",
+            task=task,
+            payload={
+                "status": task.status,
+                "error_message": str(error_message),
+                "retryable": retryable,
+            },
+            occurred_at=occurred_at,
+        )
+        return True
+
+    def recover_expired(self, *, now: datetime | None = None) -> int:
+        """将租约过期的 running 任务恢复为 pending。"""
+
+        occurred_at = now or datetime.now().astimezone()
+        result = self.session.execute(
+            update(SchedulerTaskRunORM)
+            .where(
+                SchedulerTaskRunORM.status == "running",
+                SchedulerTaskRunORM.lease_expires_at.is_not(None),
+                SchedulerTaskRunORM.lease_expires_at <= occurred_at,
+            )
+            .values(
+                status="pending",
+                lease_owner=None,
+                lease_token=None,
+                lease_expires_at=None,
+                next_retry_at=occurred_at,
+                error_message="lease_expired",
+                updated_at=occurred_at,
+            )
+        )
+        self.session.flush()
+        return int(result.rowcount or 0)
 
 
 class DecisionLogRepository:
