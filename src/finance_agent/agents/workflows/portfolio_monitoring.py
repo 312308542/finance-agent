@@ -6,9 +6,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from finance_agent.storage.orm import (
     AssistantMemoryORM,
@@ -30,6 +31,10 @@ class PortfolioMonitoringInput:
     risks_by_asset: dict[str, tuple[RiskFindingORM, ...]]
     memories_by_asset: dict[str, tuple[AssistantMemoryORM, ...]]
     as_of: datetime
+    data_snapshot_id: str | None = None
+    decision_gate_id: str | None = None
+    decision_gate_status: str | None = None
+    intraday_quotes_by_asset: dict[str, tuple[dict[str, Any], ...]] | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +55,10 @@ class PortfolioMonitoringDecision:
     signal_ids: tuple[str, ...]
     risk_ids: tuple[str, ...]
     evidence_ids: tuple[str, ...]
+    data_snapshot_id: str | None = None
+    decision_gate_id: str | None = None
+    decision_gate_status: str | None = None
+    intraday_quotes: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -60,6 +69,9 @@ class PortfolioMonitoringResult:
     portfolio_id: str
     as_of: datetime
     decisions: tuple[PortfolioMonitoringDecision, ...]
+    data_snapshot_id: str | None = None
+    decision_gate_id: str | None = None
+    decision_gate_status: str | None = None
 
 
 class PortfolioMonitoringWorkflow:
@@ -74,14 +86,25 @@ class PortfolioMonitoringWorkflow:
                 signal=workflow_input.signals_by_asset.get(position.asset_id),
                 risks=workflow_input.risks_by_asset.get(position.asset_id, ()),
                 memories=workflow_input.memories_by_asset.get(position.asset_id, ()),
+                intraday_quotes=(workflow_input.intraday_quotes_by_asset or {}).get(
+                    position.asset_id, ()
+                ),
             )
             for position in workflow_input.positions
         )
+        if workflow_input.decision_gate_status and workflow_input.decision_gate_status != "approved":
+            decisions = tuple(
+                apply_decision_gate(decision, workflow_input=workflow_input)
+                for decision in decisions
+            )
         return PortfolioMonitoringResult(
             owner_id=workflow_input.owner_id,
             portfolio_id=workflow_input.portfolio.portfolio_id,
             as_of=workflow_input.as_of,
             decisions=decisions,
+            data_snapshot_id=workflow_input.data_snapshot_id,
+            decision_gate_id=workflow_input.decision_gate_id,
+            decision_gate_status=workflow_input.decision_gate_status,
         )
 
     def _decide_for_position(
@@ -91,6 +114,7 @@ class PortfolioMonitoringWorkflow:
         signal: SignalSnapshotORM | None,
         risks: tuple[RiskFindingORM, ...],
         memories: tuple[AssistantMemoryORM, ...],
+        intraday_quotes: tuple[dict[str, Any], ...],
     ) -> PortfolioMonitoringDecision:
         """根据单个持仓的信号、风险和记忆生成建议。"""
 
@@ -118,6 +142,7 @@ class PortfolioMonitoringWorkflow:
         evidence_ids = tuple(
             sorted({evidence_id for risk in risks for evidence_id in risk.evidence_ids})
         )
+
         signal_ids = (signal.signal_id,) if signal else ()
         return PortfolioMonitoringDecision(
             asset_id=position.asset_id,
@@ -142,7 +167,34 @@ class PortfolioMonitoringWorkflow:
             signal_ids=signal_ids,
             risk_ids=risk_ids,
             evidence_ids=evidence_ids,
+            intraday_quotes=intraday_quotes,
         )
+
+
+def apply_decision_gate(
+    decision: PortfolioMonitoringDecision,
+    *,
+    workflow_input: PortfolioMonitoringInput,
+) -> PortfolioMonitoringDecision:
+    """数据闸门未放行时阻止减仓动作，但继续保留风险提醒。"""
+
+    status = workflow_input.decision_gate_status or "data_unavailable"
+    if decision.suggested_action not in {"reduce", "sell", "swap", "buy"}:
+        return replace(
+            decision,
+            data_snapshot_id=workflow_input.data_snapshot_id,
+            decision_gate_id=workflow_input.decision_gate_id,
+            decision_gate_status=status,
+        )
+    return replace(
+        decision,
+        suggested_action="wait",
+        decision_type=f"{decision.decision_type}_gate_wait",
+        summary=f"{decision.summary} 当前闸门状态为 {status}，暂不进入可执行动作。",
+        data_snapshot_id=workflow_input.data_snapshot_id,
+        decision_gate_id=workflow_input.decision_gate_id,
+        decision_gate_status=status,
+    )
 
 
 def positive_decimal(value: Decimal | None) -> bool:

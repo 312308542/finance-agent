@@ -42,6 +42,7 @@ from finance_agent.storage.orm import (
     WatchlistItemORM,
 )
 from finance_agent.storage.repositories import (
+    AssetRepository,
     AssetScoreRepository,
     DataQualityRepository,
     EventRepository,
@@ -390,12 +391,17 @@ class FinanceToolRuntime:
         signal = self.signals.get_latest_signal(asset_id=asset_id, horizon=horizon)
         risks = self.risks.list_recent_risks(asset_id=asset_id, limit=risk_limit)
         qualities = self.data_quality.list_latest_quality(asset_id=asset_id, limit=quality_limit)
+        quotes = AssetRepository(self.session).list_intraday_quote_latest(
+            asset_ids=(asset_id,),
+            quality_statuses=("available", "partial", "conflict"),
+        )
         return {
             "asset_id": asset_id,
             "horizon": horizon,
             "signal": serialize_signal(signal) if signal else None,
             "risks": [serialize_risk(risk) for risk in risks],
             "data_quality": [serialize_data_quality(item) for item in qualities],
+            "intraday_quotes": [serialize_intraday_quote(item) for item in quotes],
         }
 
     def get_asset_factor_context(
@@ -1025,6 +1031,31 @@ def serialize_data_quality(item: DataQualitySnapshotORM) -> JsonDict:
         "checked_at": json_value(item.checked_at),
         "missing_items": json_value(item.missing_items or []),
         "issue_count": item.issue_count,
+        "payload": json_value(item.payload or {}),
+    }
+
+
+def serialize_intraday_quote(item: Any) -> JsonDict:
+    """序列化盘中最新行情，保留来源、快照和质量状态供风险复核。"""
+
+    return {
+        "asset_id": item.asset_id,
+        "source": item.source,
+        "symbol": item.symbol,
+        "market": item.market,
+        "data_snapshot_id": item.data_snapshot_id,
+        "as_of": json_value(item.as_of),
+        "captured_at": json_value(item.captured_at),
+        "freshness_ms": item.freshness_ms,
+        "last_price": json_value(item.last_price),
+        "prev_close": json_value(item.prev_close),
+        "change_percent": json_value(item.change_percent),
+        "volume": json_value(item.volume),
+        "amount": json_value(item.amount),
+        "bid_price": json_value(item.bid_price),
+        "ask_price": json_value(item.ask_price),
+        "status": item.status,
+        "quality_status": item.quality_status,
         "payload": json_value(item.payload or {}),
     }
 

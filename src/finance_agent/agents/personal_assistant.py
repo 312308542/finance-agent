@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from finance_agent.agents.runtime import LangGraphWorkflowAdapter, WorkflowNodeEvent
+from finance_agent.agents.tools.runtime import serialize_intraday_quote
 from finance_agent.agents.workflows import (
     LangGraphWorkflowBuilder,
     PortfolioMonitoringInput,
@@ -35,6 +36,7 @@ from finance_agent.application import (
     WorkflowService,
 )
 from finance_agent.storage.repositories import (
+    AssetRepository,
     MemoryRepository,
     RecommendationRepository,
     RiskRepository,
@@ -113,6 +115,7 @@ class PersonalFinanceAgentService:
         self.risks = RiskRepository(session)
         self.recommendations = RecommendationRepository(session)
         self.memories = MemoryRepository(session)
+        self.assets = AssetRepository(session)
         self.portfolio_workflow = PortfolioMonitoringWorkflow()
         self.watchlist_workflow = WatchlistManagementWorkflow()
         self.recommendation_decision_workflow = RecommendationDecisionWorkflow()
@@ -152,6 +155,14 @@ class PersonalFinanceAgentService:
             payload={"portfolio_id": portfolio_id},
         )
 
+        intraday_rows = self.assets.list_intraday_quote_latest(
+            asset_ids=[position.asset_id for position in snapshot.positions],
+            quality_statuses=("available", "partial", "conflict"),
+        )
+        intraday_quotes_by_asset: dict[str, list[dict[str, Any]]] = {}
+        for row in intraday_rows:
+            intraday_quotes_by_asset.setdefault(row.asset_id, []).append(serialize_intraday_quote(row))
+
         workflow_input = PortfolioMonitoringInput(
             owner_id=owner_id,
             portfolio=snapshot.portfolio,
@@ -180,6 +191,9 @@ class PersonalFinanceAgentService:
                 for position in snapshot.positions
             },
             as_of=as_of,
+            intraday_quotes_by_asset={
+                asset_id: tuple(rows) for asset_id, rows in intraday_quotes_by_asset.items()
+            },
         )
         result = self.portfolio_workflow.run(workflow_input)
         decision_ids: list[str] = []

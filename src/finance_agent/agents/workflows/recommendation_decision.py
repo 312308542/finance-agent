@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -37,6 +37,9 @@ class RecommendationDecisionInput:
     risks_by_asset: dict[str, tuple[RiskFindingORM, ...]]
     memories_by_asset: dict[str, tuple[AssistantMemoryORM, ...]]
     as_of: datetime
+    data_snapshot_id: str | None = None
+    decision_gate_id: str | None = None
+    decision_gate_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +69,9 @@ class RecommendationDecision:
     signal_ids: tuple[str, ...]
     risk_ids: tuple[str, ...]
     evidence_ids: tuple[str, ...]
+    data_snapshot_id: str | None = None
+    decision_gate_id: str | None = None
+    decision_gate_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +84,9 @@ class RecommendationDecisionResult:
     watchlist_id: str
     as_of: datetime
     decisions: tuple[RecommendationDecision, ...]
+    data_snapshot_id: str | None = None
+    decision_gate_id: str | None = None
+    decision_gate_status: str | None = None
 
 
 class RecommendationDecisionWorkflow:
@@ -116,6 +125,11 @@ class RecommendationDecisionWorkflow:
             )
             for recommendation in workflow_input.recommendations
         )
+        if workflow_input.decision_gate_status and workflow_input.decision_gate_status != "approved":
+            decisions = tuple(
+                apply_decision_gate(decision, workflow_input=workflow_input)
+                for decision in decisions
+            )
         return RecommendationDecisionResult(
             owner_id=workflow_input.owner_id,
             recommendation_run_id=workflow_input.recommendation_run_id,
@@ -123,6 +137,9 @@ class RecommendationDecisionWorkflow:
             watchlist_id=workflow_input.watchlist.watchlist_id,
             as_of=workflow_input.as_of,
             decisions=decisions,
+            data_snapshot_id=workflow_input.data_snapshot_id,
+            decision_gate_id=workflow_input.decision_gate_id,
+            decision_gate_status=workflow_input.decision_gate_status,
         )
 
     def _decide_for_recommendation(
@@ -309,6 +326,34 @@ def is_buy_candidate(
         and recommendation.confidence >= RecommendationDecisionWorkflow.buy_confidence_threshold
         and recommendation.conviction == "high"
         and signal_ok
+    )
+
+
+def apply_decision_gate(
+    decision: RecommendationDecision,
+    *,
+    workflow_input: RecommendationDecisionInput,
+) -> RecommendationDecision:
+    """把未放行的交易动作降级为等待，同时保留研究和风险上下文。"""
+
+    if decision.trade_action not in {"buy", "sell", "swap", "reduce"}:
+        return replace(
+            decision,
+            data_snapshot_id=workflow_input.data_snapshot_id,
+            decision_gate_id=workflow_input.decision_gate_id,
+            decision_gate_status=workflow_input.decision_gate_status,
+        )
+    status = workflow_input.decision_gate_status or "data_unavailable"
+    return replace(
+        decision,
+        agent_action="wait_for_decision_gate",
+        trade_action="wait",
+        decision_type=f"{decision.decision_type}_gate_wait",
+        summary=f"{decision.summary} 当前闸门状态为 {status}，暂不进入可执行动作。",
+        should_alert=True,
+        data_snapshot_id=workflow_input.data_snapshot_id,
+        decision_gate_id=workflow_input.decision_gate_id,
+        decision_gate_status=status,
     )
 
 

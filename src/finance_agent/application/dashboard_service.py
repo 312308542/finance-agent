@@ -14,6 +14,7 @@ from finance_agent.agents.runtime import load_model_registry
 from finance_agent.agents.tools.runtime import (
     json_value,
     serialize_asset_recommendation,
+    serialize_intraday_quote,
     serialize_portfolio,
     serialize_position,
     serialize_recommendation_run,
@@ -30,6 +31,7 @@ from finance_agent.storage.orm import (
     RiskFindingORM,
 )
 from finance_agent.storage.repositories import (
+    AssetRepository,
     DataQualityRepository,
     DecisionLogRepository,
     MemoryRepository,
@@ -57,6 +59,7 @@ class DashboardService:
         self.memories = MemoryRepository(session)
         self.data_quality = DataQualityRepository(session)
         self.models = ModelRuntimeConfigRepository(session)
+        self.assets = AssetRepository(session)
 
     def build_summary(self, *, owner_id: str) -> JsonDict:
         """构建控制台总览快照。"""
@@ -102,6 +105,17 @@ class DashboardService:
             }
         active = portfolios[0]
         positions = self.portfolios.list_positions(active.portfolio_id)
+        quote_rows = (
+            self.assets.list_intraday_quote_latest(
+                asset_ids=[position.asset_id for position in positions],
+                quality_statuses=("available", "partial", "conflict"),
+            )
+            if getattr(self, "assets", None) is not None
+            else []
+        )
+        quotes_by_asset: dict[str, list[JsonDict]] = {}
+        for row in quote_rows:
+            quotes_by_asset.setdefault(row.asset_id, []).append(serialize_intraday_quote(row))
         positive_count = sum(
             1 for position in positions if (position.unrealized_pnl or Decimal("0")) > 0
         )
@@ -119,7 +133,13 @@ class DashboardService:
             "status": "ok",
             "active_portfolio_id": active.portfolio_id,
             "portfolios": [serialize_portfolio(item) for item in portfolios],
-            "positions": [serialize_position(item) for item in positions],
+            "positions": [
+                {
+                    **serialize_position(item),
+                    "intraday_quotes": quotes_by_asset.get(item.asset_id, []),
+                }
+                for item in positions
+            ],
             "concentration_warnings": concentration["warnings"],
             "metrics": {
                 "position_count": len(positions),
@@ -211,6 +231,14 @@ class DashboardService:
         alerts = self._list_recent_alerts(owner_id=owner_id, limit=limit)
         risk_findings = self._list_recent_risk_findings(limit=limit)
         qualities = self.data_quality.list_latest_quality(limit=limit)
+        intraday_quotes = (
+            self.assets.list_intraday_quote_latest(
+                market="ashare",
+                quality_statuses=("available", "partial", "conflict"),
+            )[:limit]
+            if getattr(self, "assets", None) is not None
+            else []
+        )
         severity_breakdown = build_risk_severity_breakdown(risk_findings)
         status = "ok" if triggers or alerts or risk_findings or qualities else "empty"
         return {
@@ -219,12 +247,17 @@ class DashboardService:
             "alerts": [serialize_alert(item) for item in alerts],
             "risk_findings": [serialize_risk_finding(item) for item in risk_findings],
             "data_quality": [serialize_data_quality(item) for item in qualities],
+            "intraday_quotes": [serialize_intraday_quote(item) for item in intraday_quotes],
             "metrics": {
                 "trigger_count": len(triggers),
                 "alert_count": len(alerts),
                 "risk_finding_count": len(risk_findings),
                 "risk_severity_breakdown": severity_breakdown,
                 "data_issue_count": sum(item.issue_count for item in qualities),
+                "intraday_quote_count": len(intraday_quotes),
+                "intraday_conflict_count": sum(
+                    1 for item in intraday_quotes if item.quality_status == "conflict"
+                ),
                 "high_severity_count": sum(
                     1 for item in [*triggers, *alerts] if item.severity == "high"
                 )

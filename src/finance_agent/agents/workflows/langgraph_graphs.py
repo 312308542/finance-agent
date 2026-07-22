@@ -1227,6 +1227,9 @@ def serialize_recommendation_decision(decision: Any) -> dict[str, Any]:
         "signal_ids": list(decision.signal_ids),
         "risk_ids": list(decision.risk_ids),
         "evidence_ids": list(decision.evidence_ids),
+        "data_snapshot_id": getattr(decision, "data_snapshot_id", None),
+        "decision_gate_id": getattr(decision, "decision_gate_id", None),
+        "decision_gate_status": getattr(decision, "decision_gate_status", None),
     }
 
 
@@ -1281,6 +1284,10 @@ def serialize_portfolio_monitoring_decision(
         "risk_ids": list(decision.risk_ids),
         "evidence_ids": list(decision.evidence_ids),
         "review_questions": list(decision.review_questions),
+        "data_snapshot_id": getattr(decision, "data_snapshot_id", None),
+        "decision_gate_id": getattr(decision, "decision_gate_id", None),
+        "decision_gate_status": getattr(decision, "decision_gate_status", None),
+        "intraday_quotes": list(getattr(decision, "intraday_quotes", ()) or ()),
     }
 
 

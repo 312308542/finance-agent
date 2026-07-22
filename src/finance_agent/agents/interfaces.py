@@ -8,7 +8,7 @@ CLI、MCP、Scheduler 或后续 API 都应通过这里调用 `FinanceAssistantSe
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, is_dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -16,22 +16,63 @@ from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy.orm import Session
 
 from finance_agent.agents.personal_assistant import FinanceAssistantService
-from finance_agent.agents.tools.runtime import FinanceToolRuntime, json_value
+from finance_agent.agents.tools.runtime import (
+    FinanceToolRuntime,
+    json_value,
+    serialize_intraday_quote,
+)
 from finance_agent.agents.workflows.portfolio_monitoring import PortfolioMonitoringInput
 from finance_agent.agents.workflows.recommendation_decision import RecommendationDecisionInput
 from finance_agent.agents.workflows.watchlist_management import WatchlistManagementInput
 from finance_agent.application import PortfolioService, WatchlistService
+from finance_agent.application.decision_gate import DecisionGateInput, DecisionGateService
 from finance_agent.graph import GraphSyncService
 from finance_agent.graph.stores import DryRunGraphStore
 from finance_agent.storage.orm import AgentWorkflowEventORM, AgentWorkflowRunORM
 from finance_agent.storage.repositories import (
+    AssetRepository,
+    DataSnapshotRepository,
+    DecisionGateRepository,
     MemoryRepository,
     RecommendationRepository,
     RiskRepository,
     SignalSnapshotRepository,
 )
+from finance_agent.storage.snapshot_contracts import snapshot_from_orm
 
 JsonDict = dict[str, Any]
+
+
+def build_workflow_gate_context(
+    *,
+    session: Session,
+    workflow_type: str,
+    as_of: datetime,
+) -> JsonDict:
+    """从最新 A 股事实快照构造 Workflow 的可拒绝闸门上下文。"""
+
+    max_age = timedelta(minutes=10)
+    if workflow_type == "recommendation_decision":
+        max_age = timedelta(hours=24)
+    latest = DataSnapshotRepository(session).get_latest(
+        snapshot_type="ashare_realtime_quotes",
+        market="ashare",
+    )
+    snapshot = snapshot_from_orm(latest) if latest is not None else None
+    gate = DecisionGateService(max_age=max_age).evaluate(
+        DecisionGateInput(
+            decision_type=workflow_type,
+            action="analysis",
+            snapshot=snapshot,
+            evaluated_at=as_of,
+        )
+    )
+    DecisionGateRepository(session).insert_gate(gate)
+    return {
+        "data_snapshot_id": gate.data_snapshot_id,
+        "decision_gate_id": gate.decision_gate_id,
+        "decision_gate_status": gate.status,
+    }
 
 
 @dataclass(frozen=True)
@@ -313,6 +354,13 @@ class FinanceAgentInterface:
         state = dict(initial_state or {})
         state["session"] = self.session
         state.setdefault("tool_runtime", self.tool_runtime)
+        gate_context = state.get("decision_gate_context")
+        if workflow_type in {"portfolio_monitoring", "recommendation_decision"}:
+            gate_context = gate_context or build_workflow_gate_context(
+                session=self.session,
+                workflow_type=workflow_type,
+                as_of=as_of,
+            )
 
         if workflow_type == "portfolio_monitoring":
             if not portfolio_id:
@@ -323,6 +371,7 @@ class FinanceAgentInterface:
                 portfolio_id=portfolio_id,
                 as_of=as_of,
                 horizon=horizon,
+                gate_context=gate_context,
             )
         elif workflow_type == "watchlist_management":
             if not watchlist_id:
@@ -350,6 +399,7 @@ class FinanceAgentInterface:
                 as_of=as_of,
                 limit=recommendation_limit,
                 horizon=horizon,
+                gate_context=gate_context,
             )
         else:
             state.update(
@@ -454,6 +504,7 @@ def build_portfolio_monitoring_input(
     portfolio_id: str,
     as_of: datetime,
     horizon: str,
+    gate_context: JsonDict | None = None,
 ) -> PortfolioMonitoringInput:
     """从事实库组装持仓监控 Workflow 输入。"""
 
@@ -463,6 +514,13 @@ def build_portfolio_monitoring_input(
     memories = MemoryRepository(session)
     snapshot = portfolios.load_portfolio_snapshot(portfolio_id)
     asset_ids = [position.asset_id for position in snapshot.positions]
+    intraday_rows = AssetRepository(session).list_intraday_quote_latest(
+        asset_ids=asset_ids,
+        quality_statuses=("available", "partial", "conflict"),
+    )
+    intraday_quotes_by_asset: dict[str, list[dict[str, Any]]] = {}
+    for row in intraday_rows:
+        intraday_quotes_by_asset.setdefault(row.asset_id, []).append(serialize_intraday_quote(row))
     return PortfolioMonitoringInput(
         owner_id=owner_id,
         portfolio=snapshot.portfolio,
@@ -486,6 +544,12 @@ def build_portfolio_monitoring_input(
             for asset_id in asset_ids
         },
         as_of=as_of,
+        data_snapshot_id=str(gate_context.get("data_snapshot_id")) if gate_context else None,
+        decision_gate_id=str(gate_context.get("decision_gate_id")) if gate_context else None,
+        decision_gate_status=str(gate_context.get("decision_gate_status")) if gate_context else None,
+        intraday_quotes_by_asset={
+            asset_id: tuple(rows) for asset_id, rows in intraday_quotes_by_asset.items()
+        },
     )
 
 
@@ -546,6 +610,7 @@ def build_recommendation_decision_input(
     as_of: datetime,
     limit: int,
     horizon: str,
+    gate_context: JsonDict | None = None,
 ) -> RecommendationDecisionInput:
     """从事实库组装推荐决策 Workflow 输入。"""
 
@@ -598,6 +663,9 @@ def build_recommendation_decision_input(
             for asset_id in asset_ids
         },
         as_of=as_of,
+        data_snapshot_id=str(gate_context.get("data_snapshot_id")) if gate_context else None,
+        decision_gate_id=str(gate_context.get("decision_gate_id")) if gate_context else None,
+        decision_gate_status=str(gate_context.get("decision_gate_status")) if gate_context else None,
     )
 
 

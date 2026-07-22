@@ -21,6 +21,7 @@ from finance_agent.application import PortfolioService, WatchlistService
 from finance_agent.storage.orm import (
     AssistantTriggerEventORM,
     DataQualitySnapshotORM,
+    IntradayQuoteLatestORM,
     PositionORM,
     RealtimeQuoteSnapshotORM,
     RecommendationRunORM,
@@ -590,11 +591,15 @@ class TriggerService:
                 since=request.as_of - timedelta(minutes=request.intraday_quote_window_minutes),
             )
             latest, previous = first_two_price_snapshots(snapshots)
-            if latest is None or previous is None:
+            if latest is None:
                 skipped_no_data_count += 1
                 continue
             latest_price = decimal_or_none(latest.last_price)
-            previous_price = decimal_or_none(previous.last_price)
+            previous_price = decimal_or_none(previous.last_price) if previous is not None else None
+            if previous_price is None:
+                # 覆盖式临时表只保留最新值，使用同一行的昨收计算当前跌幅；
+                # 这条路径只用于风险提醒，成交量突增仍要求有历史样本。
+                previous_price = decimal_or_none(getattr(latest, "prev_close", None))
             if latest_price is None or previous_price is None or previous_price <= 0:
                 skipped_no_data_count += 1
                 continue
@@ -637,7 +642,9 @@ class TriggerService:
                             "previous_price": json_value(previous_price),
                             "price_change_ratio": format_decimal_ratio(price_change_ratio),
                             "latest_quote_at": json_value(latest.as_of),
-                            "previous_quote_at": json_value(previous.as_of),
+                            "previous_quote_at": json_value(previous.as_of)
+                            if previous is not None
+                            else None,
                             "rule": "intraday_sharp_drop",
                         },
                     )
@@ -645,7 +652,7 @@ class TriggerService:
 
             volume_result = intraday_volume_surge_ratio(
                 latest=latest,
-                history=snapshots[1:21],
+                history=snapshots[1:21] if previous is not None else [],
             )
             if volume_result is None:
                 if len(drafts) == draft_count_before:
@@ -698,7 +705,7 @@ class TriggerService:
         *,
         asset_id: str,
         since: datetime,
-    ) -> list[RealtimeQuoteSnapshotORM]:
+    ) -> list[Any]:
         """读取单个标的最近实时行情快照。"""
 
         statement = (
@@ -711,7 +718,21 @@ class TriggerService:
             .order_by(RealtimeQuoteSnapshotORM.as_of.desc())
             .limit(21)
         )
-        return list(self.session.scalars(statement))
+        rows = list(self.session.scalars(statement))
+        if rows:
+            return rows
+
+        latest_statement = (
+            select(IntradayQuoteLatestORM)
+            .where(
+                IntradayQuoteLatestORM.asset_id == asset_id,
+                IntradayQuoteLatestORM.updated_at >= since,
+                IntradayQuoteLatestORM.status == "available",
+                IntradayQuoteLatestORM.quality_status == "available",
+            )
+            .order_by(IntradayQuoteLatestORM.updated_at.desc())
+        )
+        return list(self.session.scalars(latest_statement))
 
     def _persist_drafts(
         self,
