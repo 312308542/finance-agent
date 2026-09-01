@@ -86,6 +86,7 @@ def test_claim_uses_skip_locked_and_sets_lease() -> None:
         lease_token=None,
         lease_expires_at=None,
         started_at=None,
+        error_message="scheduler_restarted",
     )
     session = _Session(task=task)
 
@@ -99,6 +100,7 @@ def test_claim_uses_skip_locked_and_sets_lease() -> None:
     assert task.lease_token
     assert task.lease_expires_at == NOW + timedelta(seconds=60)
     assert task.attempts == 1
+    assert task.error_message is None
 
 
 def test_claim_can_target_one_scheduler_idempotency_key() -> None:
@@ -497,6 +499,7 @@ def test_claim_many_uses_priority_due_time_and_skip_locked() -> None:
             lease_token=None,
             lease_expires_at=None,
             started_at=None,
+            error_message="scheduler_restarted",
             priority=index,
         )
         for index in range(2)
@@ -516,6 +519,7 @@ def test_claim_many_uses_priority_due_time_and_skip_locked() -> None:
     assert "scheduled_for" in sql
     assert len(claimed) == 2
     assert all(task.status == "running" for task in claimed)
+    assert all(task.error_message is None for task in claimed)
 
 
 def test_claim_many_rechecks_resource_pool_and_mutex_in_transaction() -> None:

@@ -1082,7 +1082,7 @@ def build_realtime_quote_coverage_metrics(
     *,
     target_symbols: Collection[str],
     requested_symbols: Collection[str],
-    rows: Collection[Mapping[str, Any]],
+    rows: Collection[object],
     written_count: int,
     captured_at: datetime,
     freshness_seconds: int,
@@ -1097,8 +1097,12 @@ def build_realtime_quote_coverage_metrics(
     }
     latest_lag_by_asset: dict[str, float] = {}
     for row in rows:
-        asset_id = str(row.get("asset_id") or "").strip()
-        as_of = row.get("as_of")
+        if isinstance(row, Mapping):
+            asset_id = str(row.get("asset_id") or "").strip()
+            as_of = row.get("as_of")
+        else:
+            asset_id = str(getattr(row, "asset_id", "") or "").strip()
+            as_of = getattr(row, "as_of", None)
         if asset_id not in target_ids or not isinstance(as_of, datetime):
             continue
         normalized_as_of = as_of if as_of.tzinfo else as_of.replace(tzinfo=UTC)

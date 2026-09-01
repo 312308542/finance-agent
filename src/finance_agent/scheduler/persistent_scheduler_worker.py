@@ -37,6 +37,7 @@ class PersistentSchedulerWorker:
         lease_seconds: int,
         retry_backoff_seconds: int = 30,
         resource_pool_limits: Mapping[str, int] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.queue_scope = queue_scope
         self.jobs = dict(jobs)
@@ -44,6 +45,7 @@ class PersistentSchedulerWorker:
         self.worker_id = str(worker_id)
         self.lease_seconds = max(1, int(lease_seconds))
         self.retry_backoff_seconds = max(0, int(retry_backoff_seconds))
+        self.clock = clock or (lambda: datetime.now(tz=UTC))
         self.resource_pool_limits = {
             str(pool): max(1, int(limit))
             for pool, limit in (resource_pool_limits or {}).items()
@@ -101,7 +103,7 @@ class PersistentSchedulerWorker:
         try:
             result = self.execute_job(job)
         except Exception as exc:
-            self._fail(claim, error_message=str(exc), now=occurred_at)
+            self._fail(claim, error_message=str(exc), now=self.clock())
             return {
                 "status": "failed",
                 "job": claim.job_name,
@@ -111,24 +113,25 @@ class PersistentSchedulerWorker:
         succeeded = str(result.get("status") or "") in {"executed", "completed", "ok"}
         if not succeeded:
             error = str(result.get("error_message") or "scheduler_job_failed")
-            self._fail(claim, error_message=error, now=occurred_at)
+            self._fail(claim, error_message=error, now=self.clock())
             return dict(result) | {
                 "persistent_task_id": claim.task_id,
                 "status": "failed",
                 "error_message": error,
             }
         next_partition = next_partition_payload_from_result(result)
+        finished_at = self.clock()
         if isinstance(next_partition, dict):
             self._schedule_next_partition(
                 claim,
                 payload=next_partition,
-                now=occurred_at,
+                now=finished_at,
             )
         with self.queue_scope() as queue:
             queue.complete(
                 task_id=claim.task_id,
                 lease_token=claim.lease_token,
-                now=occurred_at,
+                now=finished_at,
             )
         return dict(result) | {
             "persistent_task_id": claim.task_id,
@@ -183,7 +186,7 @@ class PersistentSchedulerWorker:
             **dict(payload),
         }
         with self.queue_scope() as queue:
-            next_task = queue.schedule(
+            queue.schedule(
                 job_name=claim.job_name,
                 idempotency_key=f"{claim.task_id}:{digest}:partition:{cursor}",
                 schedule_type="manual",
@@ -191,14 +194,13 @@ class PersistentSchedulerWorker:
                 payload=next_payload,
                 priority=claim.priority,
                 resource_pool=claim.resource_pool,
-                mutex_key=claim.mutex_key,
+                mutex_key=claim.mutex_key or f"scheduler.job:{claim.job_name}",
                 dependency_generation=claim.dependency_generation,
                 required_data_domains=claim.required_data_domains,
                 config_digest=claim.config_digest,
                 max_attempts=max(1, claim.max_attempts),
                 now=now,
             )
-            queue.set_admission(task_id=next_task.task_id, allowed=True, now=now)
 
 
 def next_partition_payload_from_result(result: Mapping[str, Any]) -> JsonDict | None:

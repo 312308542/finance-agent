@@ -83,3 +83,27 @@ def test_realtime_coverage_counts_unique_fresh_assets_and_max_lag() -> None:
     assert metrics["coverage_ratio"] == pytest.approx(1 / 3)
     assert metrics["max_lag_seconds"] == 700
     assert metrics["source_statuses"]["akshare:stock_zh_a_spot"] == "partial"
+
+
+def test_realtime_coverage_accepts_repository_orm_rows() -> None:
+    """仓储返回 ORM 对象时也必须读取资产和时间字段。"""
+
+    module = import_collection_module()
+    metrics = module.build_realtime_quote_coverage_metrics(
+        target_symbols=("600519.SH",),
+        requested_symbols=("600519.SH",),
+        rows=(
+            SimpleNamespace(
+                asset_id="ashare:600519",
+                as_of=NOW - timedelta(seconds=30),
+            ),
+        ),
+        written_count=1,
+        captured_at=NOW,
+        freshness_seconds=120,
+        source_statuses={"gotdx:tdx_main": "available"},
+    )
+
+    assert metrics["fresh_count"] == 1
+    assert metrics["coverage_ratio"] == 1
+    assert metrics["max_lag_seconds"] == 30

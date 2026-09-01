@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -71,7 +71,7 @@ def _claim(
     )
 
 
-def _worker(queue: _Queue, execute):
+def _worker(queue: _Queue, execute, *, clock=lambda: NOW):
     @contextmanager
     def queue_scope() -> Iterator[_Queue]:
         yield queue
@@ -89,6 +89,7 @@ def _worker(queue: _Queue, execute):
         worker_id="scheduler:1",
         lease_seconds=600,
         resource_pool_limits={"realtime": 2},
+        clock=clock,
     )
 
 
@@ -142,7 +143,33 @@ def test_worker_failure_releases_lease_through_queue() -> None:
     assert queue.failed[0]["error_message"] == "provider unavailable"
 
 
+def test_worker_writes_actual_completion_time_after_execution() -> None:
+    finished_at = NOW + timedelta(seconds=45)
+    queue = _Queue([_claim()])
+
+    _worker(
+        queue,
+        lambda _job: {"status": "executed"},
+        clock=lambda: finished_at,
+    ).run_once(now=NOW)
+
+    assert queue.completed[0]["now"] == finished_at
+
+
+def test_worker_writes_actual_failure_time_after_execution() -> None:
+    failed_at = NOW + timedelta(seconds=30)
+    queue = _Queue([_claim()])
+
+    def fail(_job):
+        raise RuntimeError("provider unavailable")
+
+    _worker(queue, fail, clock=lambda: failed_at).run_once(now=NOW)
+
+    assert queue.failed[0]["now"] == failed_at
+
+
 def test_worker_persists_next_partition_before_completing_current() -> None:
+    finished_at = NOW + timedelta(seconds=20)
     queue = _Queue([_claim(payload={"params": {"partition_cursor": 2}})])
     worker = _worker(
         queue,
@@ -150,6 +177,7 @@ def test_worker_persists_next_partition_before_completing_current() -> None:
             "status": "executed",
             "next_partition_payload": {"partition_cursor": 3, "partition_count": 10},
         },
+        clock=lambda: finished_at,
     )
 
     result = worker.run_once(now=NOW)
@@ -157,6 +185,9 @@ def test_worker_persists_next_partition_before_completing_current() -> None:
     assert result.completed == 1
     assert queue.scheduled[0]["payload"]["params"]["partition_cursor"] == 3
     assert queue.scheduled[0]["idempotency_key"].endswith(":partition:3")
+    assert queue.scheduled[0]["now"] == finished_at
+    assert queue.scheduled[0]["mutex_key"] == "scheduler.job:ashare.news_articles"
+    assert queue.admitted == []
     assert queue.completed
 
 

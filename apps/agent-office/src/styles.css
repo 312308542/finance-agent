@@ -4561,6 +4561,30 @@ p {
   background: var(--blue);
 }
 
+.task-progress-bar.is-indeterminate span {
+  width: 36%;
+  min-width: 0;
+  animation: task-progress-indeterminate 1.4s ease-in-out infinite;
+}
+
+@keyframes task-progress-indeterminate {
+  0% {
+    transform: translateX(-110%);
+  }
+
+  100% {
+    transform: translateX(310%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .task-progress-bar.is-indeterminate span {
+    width: 100%;
+    opacity: 0.45;
+    animation: none;
+  }
+}
+
 
 
 .task-progress-bar.tone-green span {

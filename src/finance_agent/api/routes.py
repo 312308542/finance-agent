@@ -997,17 +997,16 @@ def data_scheduler_status(
 
 
 @router.get("/data/scheduler/progress")
-def data_scheduler_progress(
-    event_limit: int = 80,
-    session: Session = SESSION_DEPENDENCY,
-) -> JsonDict:
+def data_scheduler_progress(event_limit: int = 80) -> JsonDict:
     """读取基础数据调度器运行态进度。"""
 
     try:
-        return DataSyncControlService().read_scheduler_progress(
-            session=session,
-            event_limit=event_limit,
-        )
+        session_factory = create_session_factory()
+        with session_scope(session_factory) as session:
+            return DataSyncControlService().read_scheduler_progress(
+                session=session,
+                event_limit=event_limit,
+            )
     except Exception as exc:
         return {"status": "error", "message": str(exc)[:400], "data": {}}
 

@@ -5081,6 +5081,7 @@ class SchedulerTaskRepository:
             task.lease_token = uuid.uuid4().hex
             task.lease_expires_at = occurred_at + timedelta(seconds=int(lease_seconds))
             task.started_at = task.started_at or occurred_at
+            task.error_message = None
             task.updated_at = occurred_at
             self._append_task_event(
                 event_type="scheduler.task.claimed",
@@ -5146,6 +5147,7 @@ class SchedulerTaskRepository:
         task.lease_token = uuid.uuid4().hex
         task.lease_expires_at = occurred_at + timedelta(seconds=lease_seconds)
         task.started_at = task.started_at or occurred_at
+        task.error_message = None
         task.updated_at = occurred_at
         self.session.flush()
         return task

@@ -1,4 +1,14 @@
-export type TaskMonitorStatus = "running" | "paused" | "waiting" | "completed" | "failed" | "skipped" | "locked" | "unknown";
+export type TaskMonitorStatus =
+  | "running"
+  | "paused"
+  | "waiting"
+  | "blocked"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "skipped"
+  | "locked"
+  | "unknown";
 export type TaskMonitorFilter = "all" | "running" | "paused" | "waiting" | "completed" | "failed";
 export type TaskMonitorTone = "green" | "amber" | "blue" | "red";
 
@@ -64,6 +74,7 @@ export type TaskMonitorItem = {
   updatedAt: string;
   finishedAt: string;
   progressRatio: number;
+  progressAvailable: boolean;
   batchIndex: number;
   batchCount: number;
   batchSize: number;
@@ -146,8 +157,10 @@ const statusMeta: Record<TaskMonitorStatus, { label: string; tone: TaskMonitorTo
   running: { label: "运行中", tone: "blue" },
   paused: { label: "已暂停", tone: "amber" },
   waiting: { label: "等待中", tone: "amber" },
+  blocked: { label: "已阻塞", tone: "amber" },
   completed: { label: "已完成", tone: "green" },
   failed: { label: "失败", tone: "red" },
+  cancelled: { label: "已取消", tone: "amber" },
   skipped: { label: "已跳过", tone: "amber" },
   locked: { label: "排队中", tone: "amber" },
   unknown: { label: "未知", tone: "amber" },
@@ -381,7 +394,7 @@ export function buildTaskMonitorModel(
     metrics: {
       runningCount: firstNumber(rawMetrics.running_count, countByStatus(items, "running")),
       pausedCount: firstNumber(rawMetrics.paused_count, countByStatus(items, "paused")),
-      waitingCount: firstNumber(rawMetrics.waiting_count, countByStatus(items, "waiting")),
+      waitingCount: firstNumber(rawMetrics.waiting_count, countWaitingItems(items)),
       failedCount: firstNumber(rawMetrics.failed_count, countByStatus(items, "failed")),
       completedRecentCount: firstNumber(
         rawMetrics.completed_recent_count,
@@ -398,7 +411,10 @@ export function filterTaskMonitorItems(
 ): TaskMonitorItem[] {
   const normalizedQuery = query.trim().toLowerCase();
   return items.filter((item) => {
-    const matchesStatus = statusFilter === "all" || item.status === statusFilter;
+    const matchesStatus =
+      statusFilter === "all" ||
+      item.status === statusFilter ||
+      (statusFilter === "waiting" && ["blocked", "locked"].includes(item.status));
     const matchesQuery =
       !normalizedQuery ||
       item.jobName.toLowerCase().includes(normalizedQuery) ||
@@ -520,6 +536,68 @@ export function formatPercent(ratio: unknown): string {
   return `${Math.round(clampRatio(firstNumber(ratio, 0)) * 100)}%`;
 }
 
+export function taskProgressLabel(
+  task: Pick<TaskMonitorItem, "progressAvailable" | "progressRatio" | "status">,
+): string {
+  if (task.progressAvailable) {
+    return formatPercent(task.progressRatio);
+  }
+  if (task.status === "running") {
+    return "执行中";
+  }
+  if (task.status === "completed") {
+    return "已完成";
+  }
+  if (task.status === "failed") {
+    return "失败";
+  }
+  if (task.status === "cancelled") {
+    return "已取消";
+  }
+  return "待执行";
+}
+
+type SerialPollingClock = {
+  setTimeout(callback: () => void, delay: number): number;
+  clearTimeout(handle: number): void;
+};
+
+export function startSerialPolling(
+  poll: () => Promise<unknown>,
+  intervalMs: number,
+  clock: SerialPollingClock = window,
+): () => void {
+  let stopped = false;
+  let timer: number | null = null;
+  const delay = Math.max(0, Math.round(intervalMs));
+
+  const run = async () => {
+    try {
+      await poll();
+    } catch (error) {
+      if (!stopped) {
+        console.error("任务监控轮询失败", error);
+      }
+    } finally {
+      if (!stopped) {
+        timer = clock.setTimeout(() => {
+          timer = null;
+          void run();
+        }, delay);
+      }
+    }
+  };
+
+  void run();
+  return () => {
+    stopped = true;
+    if (timer !== null) {
+      clock.clearTimeout(timer);
+      timer = null;
+    }
+  };
+}
+
 export function formatCompactNumber(value: unknown): string {
   const numeric = firstNumber(value, 0);
   return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 }).format(numeric);
@@ -537,22 +615,44 @@ export function formatDateTime(value: string | undefined): string {
 }
 
 function normalizeTaskItem(raw: Record<string, any>, isRealtime: boolean): TaskMonitorItem {
-  const rawSummary = raw.summary ?? raw;
-  const jobName = String(raw.job_name ?? raw.jobName ?? raw.name ?? raw.task_key ?? "").trim();
+  const rawProgress =
+    raw.progress && typeof raw.progress === "object" && !Array.isArray(raw.progress)
+      ? raw.progress as Record<string, any>
+      : {};
+  const rawSummary = rawProgress.summary ?? raw.summary ?? raw;
+  const jobName = String(
+    raw.job_name ??
+      raw.jobName ??
+      rawProgress.job_name ??
+      rawProgress.jobName ??
+      raw.name ??
+      raw.task_key ??
+      "",
+  ).trim();
   const jobDescription = lookupSchedulerJobMetadata(jobName);
-  const rawTitle = String(raw.title ?? "").trim();
+  const rawTitle = String(raw.title ?? rawProgress.title ?? "").trim();
   const title =
     !rawTitle || rawTitle === jobName
       ? String(jobDescription.title ?? (jobName || "未命名任务"))
       : rawTitle;
-  const description = String(raw.description ?? raw.detail ?? jobDescription.description ?? "");
+  const description = String(
+    raw.description ??
+      rawProgress.description ??
+      raw.detail ??
+      rawProgress.detail ??
+      jobDescription.description ??
+      "",
+  );
   const searchText = [
     jobName,
     title,
     description,
     raw.task_type,
     raw.taskType,
+    rawProgress.task_type,
+    rawProgress.taskType,
     raw.market,
+    rawProgress.market,
   ]
     .filter(Boolean)
     .join(" ");
@@ -571,7 +671,8 @@ function normalizeTaskItem(raw: Record<string, any>, isRealtime: boolean): TaskM
     summary.runningItems <= 0 &&
     summary.remainingItems <= 0 &&
     summary.failedItems <= 0;
-  const explicitProgressSource = rawSummary.progress_ratio ?? raw.progress_ratio;
+  const explicitProgressSource =
+    rawProgress.progress_ratio ?? rawSummary.progress_ratio ?? raw.progress_ratio;
   const derivedProgress = summary.totalItems > 0 ? summary.completedItems / summary.totalItems : 0;
   const progressRatio = countsCompleted
     ? 1
@@ -580,42 +681,94 @@ function normalizeTaskItem(raw: Record<string, any>, isRealtime: boolean): TaskM
           ? derivedProgress
           : firstNumber(explicitProgressSource, derivedProgress),
       );
-  const status = normalizeTaskStatus(raw.status, summary, progressRatio);
+  const progressAvailable =
+    summary.totalItems > 0 ||
+    countsCompleted ||
+    (
+      explicitProgressSource !== undefined &&
+      explicitProgressSource !== null &&
+      explicitProgressSource !== "" &&
+      firstNumber(explicitProgressSource, 0) > 0
+    );
+  const status = normalizeTaskStatus(raw.status ?? rawProgress.status, summary, progressRatio);
   return {
-    id: String(raw.run_id ?? raw.runId ?? jobName ?? title),
+    id: String(
+      raw.task_id ??
+        raw.taskId ??
+        raw.run_id ??
+        raw.runId ??
+        rawProgress.task_id ??
+        rawProgress.taskId ??
+        rawProgress.run_id ??
+        rawProgress.runId ??
+        jobName ??
+        title,
+    ),
     jobName,
-    runId: String(raw.run_id ?? raw.runId ?? ""),
+    runId: String(raw.run_id ?? raw.runId ?? rawProgress.run_id ?? rawProgress.runId ?? ""),
     title,
     description,
     searchText,
     searchKeywords,
-    market: String(raw.market ?? ""),
-    taskType: String(raw.task_type ?? raw.taskType ?? ""),
-    priority: firstNumber(raw.priority, raw.metrics?.priority, 100),
-    resourcePool: String(raw.resource_pool ?? raw.resourcePool ?? raw.metrics?.resource_pool ?? "default"),
+    market: String(raw.market ?? rawProgress.market ?? ""),
+    taskType: String(raw.task_type ?? raw.taskType ?? rawProgress.task_type ?? rawProgress.taskType ?? ""),
+    priority: firstNumber(raw.priority, raw.metrics?.priority, rawProgress.metrics?.priority, 100),
+    resourcePool: String(
+      raw.resource_pool ??
+        raw.resourcePool ??
+        raw.metrics?.resource_pool ??
+        rawProgress.resource_pool ??
+        rawProgress.resourcePool ??
+        rawProgress.metrics?.resource_pool ??
+        "default",
+    ),
     status,
     statusLabel: statusMeta[status].label,
     tone: statusMeta[status].tone,
-    intervalSeconds: firstNumber(raw.interval_seconds, raw.intervalSeconds, 0),
-    startedAt: String(raw.started_at ?? raw.startedAt ?? ""),
-    updatedAt: String(raw.updated_at ?? raw.updatedAt ?? ""),
-    finishedAt: String(raw.finished_at ?? raw.finishedAt ?? ""),
+    intervalSeconds: firstNumber(
+      raw.interval_seconds,
+      raw.intervalSeconds,
+      rawProgress.interval_seconds,
+      rawProgress.intervalSeconds,
+      0,
+    ),
+    startedAt: String(raw.started_at ?? raw.startedAt ?? rawProgress.started_at ?? rawProgress.startedAt ?? ""),
+    updatedAt: String(raw.updated_at ?? raw.updatedAt ?? rawProgress.updated_at ?? rawProgress.updatedAt ?? ""),
+    finishedAt: String(
+      raw.finished_at ?? raw.finishedAt ?? rawProgress.finished_at ?? rawProgress.finishedAt ?? "",
+    ),
     progressRatio,
-    batchIndex: firstNumber(raw.batch_index, raw.batchIndex, 0),
-    batchCount: firstNumber(raw.batch_count, raw.batchCount, 0),
-    batchSize: firstNumber(raw.batch_size, raw.batchSize, 0),
-    maxWorkers: firstNumber(raw.max_workers, raw.maxWorkers, raw.metrics?.max_workers, 0),
+    progressAvailable,
+    batchIndex: firstNumber(raw.batch_index, raw.batchIndex, rawProgress.batch_index, rawProgress.batchIndex, 0),
+    batchCount: firstNumber(raw.batch_count, raw.batchCount, rawProgress.batch_count, rawProgress.batchCount, 0),
+    batchSize: firstNumber(raw.batch_size, raw.batchSize, rawProgress.batch_size, rawProgress.batchSize, 0),
+    maxWorkers: firstNumber(
+      raw.max_workers,
+      raw.maxWorkers,
+      raw.metrics?.max_workers,
+      rawProgress.max_workers,
+      rawProgress.maxWorkers,
+      rawProgress.metrics?.max_workers,
+      0,
+    ),
     throughputPerMinute: firstNumber(
       raw.throughput_per_minute,
       raw.throughputPerMinute,
       raw.metrics?.throughput_per_minute,
+      rawProgress.throughput_per_minute,
+      rawProgress.throughputPerMinute,
+      rawProgress.metrics?.throughput_per_minute,
       0,
     ),
-    errorMessage: String(raw.error_message ?? raw.errorMessage ?? ""),
+    errorMessage: String(
+      raw.error_message ?? raw.errorMessage ?? rawProgress.error_message ?? rawProgress.errorMessage ?? "",
+    ),
     summary,
-    stages: asArray(raw.stages).map(normalizeStage),
-    events: asArray(raw.recent_events ?? raw.events).map(normalizeEvent),
-    metrics: raw.metrics ?? {},
+    stages: asArray(rawProgress.stages ?? raw.stages).map(normalizeStage),
+    events: asArray(
+      rawProgress.recent_events ?? rawProgress.events ?? raw.recent_events ?? raw.events,
+    ).map(normalizeEvent),
+    metrics: rawProgress.metrics ?? raw.metrics ?? {},
     isRealtime,
   };
 }
@@ -772,11 +925,17 @@ function normalizeStatus(status: string | undefined): TaskMonitorStatus {
   if (["waiting", "queued", "pending", "idle", "scheduled"].includes(value)) {
     return "waiting";
   }
+  if (value === "blocked") {
+    return "blocked";
+  }
   if (["completed", "success", "succeeded", "done", "finished"].includes(value)) {
     return "completed";
   }
   if (["failed", "error", "errored", "failure"].includes(value)) {
     return "failed";
+  }
+  if (["cancelled", "canceled"].includes(value)) {
+    return "cancelled";
   }
   if (["skipped", "skip"].includes(value)) {
     return "skipped";
@@ -794,7 +953,17 @@ function normalizeTaskStatus(
 ): TaskMonitorStatus {
   const normalized = normalizeStatus(status);
   if (
-    ["running", "paused", "waiting", "completed", "failed", "skipped", "locked"].includes(
+    [
+      "running",
+      "paused",
+      "waiting",
+      "blocked",
+      "completed",
+      "failed",
+      "cancelled",
+      "skipped",
+      "locked",
+    ].includes(
       normalized,
     )
   ) {
@@ -858,9 +1027,18 @@ function formatTime(value: string): string {
 }
 
 function dedupeTaskItems(items: TaskMonitorItem[]): TaskMonitorItem[] {
+  const concreteJobNames = new Set(
+    items
+      .filter((item) => item.id && item.id !== item.jobName)
+      .map((item) => item.jobName)
+      .filter(Boolean),
+  );
   const seen = new Set<string>();
   return items.filter((item) => {
-    const key = item.jobName || item.id;
+    if (item.id === item.jobName && concreteJobNames.has(item.jobName)) {
+      return false;
+    }
+    const key = item.id || item.jobName;
     if (!key || seen.has(key)) {
       return false;
     }
@@ -871,6 +1049,10 @@ function dedupeTaskItems(items: TaskMonitorItem[]): TaskMonitorItem[] {
 
 function countByStatus(items: TaskMonitorItem[], status: TaskMonitorStatus): number {
   return items.filter((item) => item.status === status).length;
+}
+
+function countWaitingItems(items: TaskMonitorItem[]): number {
+  return items.filter((item) => ["waiting", "blocked", "locked"].includes(item.status)).length;
 }
 
 function clampRatio(value: number): number {

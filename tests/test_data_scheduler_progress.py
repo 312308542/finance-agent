@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1002,28 +1003,41 @@ def test_api_registers_scheduler_progress_route() -> None:
     assert "get" in paths["/api/data/scheduler/progress"]
 
 
-def test_api_scheduler_progress_passes_database_session_to_control_service(monkeypatch) -> None:
-    """API 不得再丢弃 session，否则运行态会退回 Redis 推导队列。"""
+def test_api_scheduler_progress_closes_owned_session_before_return(monkeypatch) -> None:
+    """高频进度请求必须在返回前归还数据库连接，避免轮询耗尽连接池。"""
 
     from finance_agent.api import routes
 
     session = object()
+    session_factory = object()
     observed: dict[str, Any] = {}
+    lifecycle: list[str] = []
+
+    @contextmanager
+    def fake_session_scope(factory):
+        assert factory is session_factory
+        lifecycle.append("entered")
+        yield session
+        lifecycle.append("closed")
 
     def fake_read_scheduler_progress(self, **kwargs: Any) -> dict[str, Any]:
+        lifecycle.append("read")
         observed.update(kwargs)
         return {"status": "ok", "data": {"source": "postgresql"}}
 
+    monkeypatch.setattr(routes, "create_session_factory", lambda: session_factory)
+    monkeypatch.setattr(routes, "session_scope", fake_session_scope)
     monkeypatch.setattr(
         DataSyncControlService,
         "read_scheduler_progress",
         fake_read_scheduler_progress,
     )
 
-    result = routes.data_scheduler_progress(event_limit=33, session=session)
+    result = routes.data_scheduler_progress(event_limit=33)
 
     assert result["data"]["source"] == "postgresql"
     assert observed == {"session": session, "event_limit": 33}
+    assert lifecycle == ["entered", "read", "closed"]
 
 
 def test_api_scheduler_status_passes_database_session_to_control_service(monkeypatch) -> None:

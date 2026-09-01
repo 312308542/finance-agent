@@ -34,6 +34,7 @@ import { StatusCard } from "./components/consoleCommon";
 import type { ChatLine, NavId } from "./consoleTypes";
 import { DetailPage } from "./pages/DetailPage";
 import { OverviewPage } from "./pages/OverviewPage";
+import { startSerialPolling } from "./taskMonitorView";
 import "./styles.css";
 
 const ownerId = "default-owner";
@@ -321,11 +322,12 @@ function App() {
   }, []);
 
   React.useEffect(() => {
-    void refreshTaskMonitor();
-    const timer = window.setInterval(() => {
-      void refreshTaskMonitor(true);
+    let firstPoll = true;
+    return startSerialPolling(async () => {
+      const silent = !firstPoll;
+      firstPoll = false;
+      await refreshTaskMonitor(silent);
     }, 2000);
-    return () => window.clearInterval(timer);
   }, [refreshTaskMonitor]);
 
   const refreshModelPreview = React.useCallback(async () => {

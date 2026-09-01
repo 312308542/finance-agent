@@ -143,7 +143,7 @@ class SchedulerPlanner:
             payload=_task_payload(job, scheduled_for=scheduled_for),
             priority=int(job.priority),
             resource_pool=str(job.resource_pool),
-            mutex_key=job.mutex_key,
+            mutex_key=_job_mutex_key(job),
             required_data_domains=tuple(
                 str(item)
                 for item in job.params.get("requires_data_domains", ())
@@ -166,6 +166,8 @@ class SchedulerPlanner:
             for row in downstream
             for generation in (getattr(row, "dependency_generation", None) or ())
         }
+        if any(row.status in (*QUEUED_STATES, "running") for row in downstream):
+            return 0
         candidates: dict[str, list[Any]] = {}
         for dependency in job.depends_on:
             completed = self.repository.list_tasks(
@@ -204,7 +206,7 @@ class SchedulerPlanner:
             payload=_task_payload(job, scheduled_for=scheduled_for),
             priority=int(job.priority),
             resource_pool=str(job.resource_pool),
-            mutex_key=job.mutex_key,
+            mutex_key=_job_mutex_key(job),
             dependency_generation=generation_ids,
             required_data_domains=tuple(
                 str(item)
@@ -295,6 +297,11 @@ def _task_payload(job: Any, *, scheduled_for: datetime) -> dict[str, Any]:
 
 def _normalized_schedule_type(value: str) -> str:
     return "fixed_interval" if value == "interval" else str(value)
+
+
+def _job_mutex_key(job: Any) -> str:
+    explicit = str(getattr(job, "mutex_key", None) or "").strip()
+    return explicit or f"scheduler.job:{job.name}"
 
 
 def _time_idempotency_key(job_name: str, scheduled_for: datetime) -> str:

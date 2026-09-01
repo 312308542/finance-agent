@@ -7,6 +7,8 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from finance_agent.scheduler.base_data_scheduler import (
     BaseDataSchedulerConfig,
     BaseDataSchedulerJob,
@@ -36,6 +38,7 @@ class _PlannerRepository:
         task_id: str | None = None,
         dependency_generation: tuple[str, ...] = (),
         coalesced_count: int = 0,
+        mutex_key: str | None = None,
     ) -> SimpleNamespace:
         row = SimpleNamespace(
             task_id=task_id or f"task:{len(self.rows) + 1}",
@@ -47,6 +50,7 @@ class _PlannerRepository:
             coalesced_count=coalesced_count,
             payload={},
             created_at=scheduled_for,
+            mutex_key=mutex_key,
         )
         self.rows.append(row)
         return row
@@ -75,6 +79,7 @@ class _PlannerRepository:
             task_id=f"task:planned:{len(self.rows) + 1}",
             dependency_generation=tuple(kwargs.get("dependency_generation") or ()),
             coalesced_count=int(kwargs.get("coalesced_count") or 0),
+            mutex_key=kwargs.get("mutex_key"),
         )
         row.idempotency_key = kwargs["idempotency_key"]
         row.payload = dict(kwargs.get("payload") or {})
@@ -160,6 +165,25 @@ def test_running_tick_keeps_only_one_new_pending_tick() -> None:
     assert len([row for row in repo.rows if row.status != "running"]) == 1
 
 
+def test_planned_task_uses_stable_job_mutex_by_default() -> None:
+    repo = _PlannerRepository()
+
+    SchedulerPlanner(repo).reconcile(now=NOW, config=_config(_interval_job()))
+
+    assert repo.rows[0].mutex_key == "scheduler.job:ashare.realtime_quotes"
+
+
+def test_planned_task_preserves_explicit_mutex() -> None:
+    repo = _PlannerRepository()
+
+    SchedulerPlanner(repo).reconcile(
+        now=NOW,
+        config=_config(_interval_job(mutex_key="ashare.realtime_quotes.explicit")),
+    )
+
+    assert repo.rows[0].mutex_key == "ashare.realtime_quotes.explicit"
+
+
 def _dependency_job(mode: str = "all_of") -> BaseDataSchedulerJob:
     return BaseDataSchedulerJob(
         name="consumer",
@@ -187,6 +211,40 @@ def test_after_success_generation_survives_new_planner_instance() -> None:
     assert consumers[0].dependency_generation == ["a:1", "b:1"]
 
 
+@pytest.mark.parametrize("active_status", ["scheduled", "blocked", "pending", "running"])
+def test_after_success_waits_while_same_job_has_active_task(active_status: str) -> None:
+    repo = _PlannerRepository()
+    repo.add(job_name="source-a", status="completed", scheduled_for=NOW, task_id="a:1")
+    repo.add(job_name="source-b", status="completed", scheduled_for=NOW, task_id="b:1")
+    repo.add(
+        job_name="consumer",
+        status=active_status,
+        scheduled_for=NOW,
+        task_id="consumer:active",
+        dependency_generation=("a:1", "b:1"),
+    )
+    repo.add(
+        job_name="source-a",
+        status="completed",
+        scheduled_for=NOW + timedelta(minutes=1),
+        task_id="a:2",
+    )
+    repo.add(
+        job_name="source-b",
+        status="completed",
+        scheduled_for=NOW + timedelta(minutes=1),
+        task_id="b:2",
+    )
+
+    summary = SchedulerPlanner(repo).reconcile(
+        now=NOW + timedelta(minutes=1),
+        config=_config(_dependency_job()),
+    )
+
+    assert summary.dependency_created == 0
+    assert [row.task_id for row in repo.rows if row.job_name == "consumer"] == ["consumer:active"]
+
+
 def test_all_of_waits_until_each_dependency_has_an_unconsumed_generation() -> None:
     repo = _PlannerRepository()
     repo.add(job_name="source-a", status="completed", scheduled_for=NOW, task_id="a:1")
@@ -209,6 +267,7 @@ def test_all_of_waits_until_each_dependency_has_an_unconsumed_generation() -> No
         scheduled_for=NOW + timedelta(minutes=2),
         task_id="b:2",
     )
+    next(row for row in repo.rows if row.job_name == "consumer").status = "completed"
     assert planner.reconcile(now=NOW + timedelta(minutes=2), config=config).dependency_created == 1
 
 

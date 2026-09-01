@@ -7,6 +7,7 @@ const source = await readFile(new URL("../src/taskMonitorView.ts", import.meta.u
 const styleSource = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
 const appSource = await readFile(new URL("../src/pages/TaskMonitorPage.tsx", import.meta.url), "utf8");
 const apiSource = await readFile(new URL("../src/api.ts", import.meta.url), "utf8");
+const mainSource = await readFile(new URL("../src/main.tsx", import.meta.url), "utf8");
 const dataSyncPanelSource = await readFile(new URL("../src/pages/DataSyncControlPanel.tsx", import.meta.url), "utf8");
 const { outputText } = ts.transpileModule(source, {
   compilerOptions: {
@@ -24,7 +25,9 @@ const {
   filterTaskMonitorItems,
   formatDuration,
   formatTaskLogLine,
+  startSerialPolling,
   statusTone,
+  taskProgressLabel,
 } = await import(moduleUrl);
 
 const progress = buildTaskMonitorModel({
@@ -221,6 +224,96 @@ assert.equal(progress.items[0].throughputPerMinute, 704.8);
 assert.equal(progress.items[0].events.length, 2);
 assert.equal(progress.items[0].events[1].nextRetryAt, "2026-06-03T15:50:12+08:00");
 assert.equal(progress.items[0].events[1].providerKey, "akshare:stock_zh_a_hist_tx");
+
+const persistentInstances = buildTaskMonitorModel({
+  status: "ok",
+  data: {
+    tasks: [
+      {
+        task_id: "task:instance-1",
+        job_name: "ashare.events",
+        status: "running",
+        progress: {
+          run_id: "ashare.events:run-1",
+          title: "刷新 A 股新闻和公告",
+          summary: {
+            total_items: 200,
+            completed_items: 66,
+            running_items: 134,
+            failed_items: 0,
+            remaining_items: 134,
+            progress_ratio: 0.33,
+          },
+        },
+      },
+      {
+        task_id: "task:instance-2",
+        job_name: "ashare.events",
+        status: "running",
+        progress: {
+          run_id: "ashare.events:run-2",
+          title: "刷新 A 股新闻和公告",
+          summary: {
+            total_items: 200,
+            completed_items: 80,
+            running_items: 120,
+            failed_items: 0,
+            remaining_items: 120,
+            progress_ratio: 0.4,
+          },
+        },
+      },
+    ],
+    waiting: [],
+  },
+});
+assert.deepEqual(
+  persistentInstances.items.map((item) => [item.id, item.runId, item.progressRatio]),
+  [
+    ["task:instance-1", "ashare.events:run-1", 0.33],
+    ["task:instance-2", "ashare.events:run-2", 0.4],
+  ],
+);
+assert.equal(persistentInstances.items[0].summary.completedItems, 66);
+assert.equal(persistentInstances.items[0].progressAvailable, true);
+assert.equal(taskProgressLabel(persistentInstances.items[0]), "33%");
+
+const atomicRunningTask = buildTaskMonitorModel({
+  status: "ok",
+  data: {
+    tasks: [
+      {
+        task_id: "task:atomic",
+        job_name: "analytics.universe.rebuild_avoid_pool.ashare",
+        status: "running",
+      },
+    ],
+    waiting: [],
+  },
+});
+assert.equal(atomicRunningTask.items[0].progressAvailable, false);
+assert.equal(taskProgressLabel(atomicRunningTask.items[0]), "执行中");
+
+const persistentStates = buildTaskMonitorModel({
+  status: "ok",
+  data: {
+    tasks: [
+      { task_id: "task:scheduled", job_name: "scheduled.job", status: "scheduled" },
+      { task_id: "task:blocked", job_name: "blocked.job", status: "blocked" },
+      { task_id: "task:pending", job_name: "pending.job", status: "pending" },
+      { task_id: "task:cancelled", job_name: "cancelled.job", status: "cancelled" },
+    ],
+  },
+});
+assert.deepEqual(
+  persistentStates.items.map((item) => [item.status, item.statusLabel]),
+  [
+    ["waiting", "等待中"],
+    ["blocked", "已阻塞"],
+    ["waiting", "等待中"],
+    ["cancelled", "已取消"],
+  ],
+);
 assert.deepEqual(progress.sourceRateStates, [
   {
     sourceKey: "stock_zh_a_hist_tx",
@@ -368,7 +461,7 @@ assert.match(
 assert.doesNotMatch(styleSource, /\.task-list-item\s*>\s*span/);
 assert.match(
   appSource,
-  /<TaskProgressBar ratio={task\.progressRatio} tone={task\.tone} \/>\s*<\/div>\s*<\/div>\s*<div className="task-card-actions">[\s\S]*?<div className="task-card-meta">/,
+  /<TaskProgressBar[\s\S]*?ratio={task\.progressRatio}[\s\S]*?tone={task\.tone}[\s\S]*?indeterminate={!task\.progressAvailable && task\.status === "running"}[\s\S]*?<\/div>\s*<\/div>\s*<div className="task-card-actions">[\s\S]*?<div className="task-card-meta">/,
 );
 assert.match(appSource, /label="待重试"[\s\S]*?task\.summary\.retryItems/);
 assert.match(appSource, /const \[logFilter, setLogFilter\]/);
@@ -428,6 +521,16 @@ assert.match(apiSource, /runDataSchedulerJob/);
 assert.match(apiSource, /rerunFailedDataSchedulerJob/);
 assert.match(apiSource, /\/rerun-failed/);
 assert.match(apiSource, /updateDataSchedulerJob/);
+assert.doesNotMatch(mainSource, /setInterval\s*\(/);
+assert.match(mainSource, /startSerialPolling\s*\(/);
+assert.match(apiSource, /TASK_MONITOR_REQUEST_TIMEOUT_MS/);
+assert.match(apiSource, /taskMonitorRequestErrorMessage/);
+assert.match(appSource, /taskProgressLabel\(task\)/);
+assert.match(appSource, /indeterminate={!task\.progressAvailable/);
+assert.match(
+  appSource,
+  /waiting:\s*model\.items\.filter\(\(item\) => \["waiting", "blocked", "locked"\]\.includes\(item\.status\)\)\.length/,
+);
 assert.match(apiSource, /resource_pools\?: Record<string, DataSyncResourcePoolPayload>/);
 assert.match(dataSyncPanelSource, /资源池配置/);
 assert.match(dataSyncPanelSource, /resourcePools/);
@@ -567,3 +670,88 @@ assert.deepEqual(
   degraded.items.map((item) => [item.jobName, item.status, item.isRealtime]),
   [["ashare.events", "waiting", false]],
 );
+
+let firstPollResolve;
+let secondPollResolve;
+const firstPoll = new Promise((resolve) => {
+  firstPollResolve = resolve;
+});
+const secondPoll = new Promise((resolve) => {
+  secondPollResolve = resolve;
+});
+const scheduledPolls = [];
+const clearedPolls = [];
+let pollCount = 0;
+const stopPolling = startSerialPolling(
+  () => {
+    pollCount += 1;
+    return pollCount === 1 ? firstPoll : secondPoll;
+  },
+  2000,
+  {
+    setTimeout(callback, delay) {
+      scheduledPolls.push({ callback, delay });
+      return scheduledPolls.length;
+    },
+    clearTimeout(handle) {
+      clearedPolls.push(handle);
+    },
+  },
+);
+assert.equal(pollCount, 1);
+assert.equal(scheduledPolls.length, 0);
+firstPollResolve();
+await firstPoll;
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(scheduledPolls.length, 1);
+assert.equal(scheduledPolls[0].delay, 2000);
+scheduledPolls[0].callback();
+assert.equal(pollCount, 2);
+assert.equal(scheduledPolls.length, 1);
+stopPolling();
+secondPollResolve();
+await secondPoll;
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(scheduledPolls.length, 1);
+assert.deepEqual(clearedPolls, []);
+
+const executableApiSource = apiSource
+  .replace("import.meta.env.VITE_FINANCE_AGENT_API_BASE", "undefined");
+const { outputText: apiOutputText } = ts.transpileModule(executableApiSource, {
+  compilerOptions: {
+    module: ts.ModuleKind.ES2022,
+    target: ts.ScriptTarget.ES2022,
+  },
+});
+const apiModuleUrl = `data:text/javascript;base64,${Buffer.from(apiOutputText).toString("base64")}`;
+const apiModule = await import(apiModuleUrl);
+assert.equal(
+  apiModule.taskMonitorRequestErrorMessage(new Error("signal is aborted without reason")),
+  "任务监控请求超时，本页会继续自动重试。",
+);
+assert.equal(
+  apiModule.taskMonitorRequestErrorMessage(new Error("网络连接失败")),
+  "网络连接失败",
+);
+const originalFetch = globalThis.fetch;
+const originalWindow = globalThis.window;
+let schedulerProgressTimeout = 0;
+globalThis.window = {
+  setTimeout(_callback, delay) {
+    schedulerProgressTimeout = delay;
+    return 1;
+  },
+  clearTimeout() {},
+};
+globalThis.fetch = async () => {
+  throw new Error("signal is aborted without reason");
+};
+try {
+  const unavailableProgress = await apiModule.loadDataSchedulerProgress(2);
+  assert.equal(schedulerProgressTimeout, 20000);
+  assert.equal(unavailableProgress.status, "unavailable");
+  assert.equal(unavailableProgress.message, "任务监控请求超时，本页会继续自动重试。");
+} finally {
+  globalThis.fetch = originalFetch;
+  globalThis.window = originalWindow;
+}

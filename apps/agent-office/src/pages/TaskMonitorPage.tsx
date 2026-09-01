@@ -3,7 +3,7 @@ import { AlertTriangle, Check, CheckCircle2, CircleDot, Clock3, Database, ListCh
 import { cancelDataSchedulerJob, pauseDataSchedulerJob, rerunFailedDataSchedulerJob, resumeDataSchedulerJob, runDataSchedulerJob, updateDataSchedulerJob } from "../api";
 import type { ConsolePageProps } from "../consoleTypes";
 import { MetricBlock } from "../components/consoleCommon";
-import { buildTaskMonitorModel, estimateRemainingSeconds, extractFallbackWaitingTasks, extractSchedulerJobTasks, filterTaskMonitorItems, formatCompactNumber, formatDateTime, formatDuration, formatPercent, formatTaskLogLine, statusTone, taskMonitorFilters, type TaskMonitorFilter, type TaskMonitorItem, type TaskMonitorSourceRateState } from "../taskMonitorView";
+import { buildTaskMonitorModel, estimateRemainingSeconds, extractFallbackWaitingTasks, extractSchedulerJobTasks, filterTaskMonitorItems, formatCompactNumber, formatDateTime, formatDuration, formatPercent, formatTaskLogLine, statusTone, taskMonitorFilters, taskProgressLabel, type TaskMonitorFilter, type TaskMonitorItem, type TaskMonitorSourceRateState } from "../taskMonitorView";
 
 export function TaskMonitorPage({
   taskSchedulerProgress,
@@ -59,7 +59,7 @@ export function TaskMonitorPage({
     all: model.items.length,
     running: model.items.filter((item) => item.status === "running").length,
     paused: model.items.filter((item) => item.status === "paused").length,
-    waiting: model.items.filter((item) => item.status === "waiting").length,
+    waiting: model.items.filter((item) => ["waiting", "blocked", "locked"].includes(item.status)).length,
     completed: model.items.filter((item) => item.status === "completed").length,
     failed: model.items.filter((item) => item.status === "failed").length,
   };
@@ -170,7 +170,7 @@ export function TaskMonitorPage({
                 <div className="task-card-main">
                   <div className="task-list-title">
                     <strong>{task.title}</strong>
-                    <em>{formatPercent(task.progressRatio)}</em>
+                    <em>{taskProgressLabel(task)}</em>
                   </div>
                   {task.description ? (
                     <span
@@ -191,7 +191,11 @@ export function TaskMonitorPage({
                     <span>任务 ID：{task.jobName || "未命名 job"}</span>
                   </span>
                   <div className="task-list-progress">
-                    <TaskProgressBar ratio={task.progressRatio} tone={task.tone} />
+                    <TaskProgressBar
+                      ratio={task.progressRatio}
+                      tone={task.tone}
+                      indeterminate={!task.progressAvailable && task.status === "running"}
+                    />
                   </div>
                 </div>
                 <div className="task-card-actions">
@@ -953,9 +957,13 @@ function TaskDetailView({
       <section className="task-overall-card">
         <div className="task-section-title">
           <strong>整体进度</strong>
-          <span>{formatPercent(task.progressRatio)}</span>
+          <span>{taskProgressLabel(task)}</span>
         </div>
-        <TaskProgressBar ratio={task.progressRatio} tone="blue" />
+        <TaskProgressBar
+          ratio={task.progressRatio}
+          tone="blue"
+          indeterminate={!task.progressAvailable && task.status === "running"}
+        />
         <div className="task-progress-meta">
           <span>{completedText} 已完成</span>
           <span>预计剩余时间 {remainingSeconds === null ? "--" : formatDuration(remainingSeconds)}</span>
@@ -1248,10 +1256,21 @@ function TaskStatusPill({ task }: { task: TaskMonitorItem }) {
   return <span className={`status-pill task-status-pill tone-${task.tone}`}>{task.statusLabel}</span>;
 }
 
-function TaskProgressBar({ ratio, tone }: { ratio: number; tone: string }) {
+function TaskProgressBar({
+  ratio,
+  tone,
+  indeterminate = false,
+}: {
+  ratio: number;
+  tone: string;
+  indeterminate?: boolean;
+}) {
   return (
-    <div className={`task-progress-bar tone-${tone}`} aria-label={`进度 ${formatPercent(ratio)}`}>
-      <span style={{ width: formatPercent(ratio) }} />
+    <div
+      className={`task-progress-bar tone-${tone}${indeterminate ? " is-indeterminate" : ""}`}
+      aria-label={indeterminate ? "进度不可量化，任务执行中" : `进度 ${formatPercent(ratio)}`}
+    >
+      <span style={indeterminate ? undefined : { width: formatPercent(ratio) }} />
     </div>
   );
 }

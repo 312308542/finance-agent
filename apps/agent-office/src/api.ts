@@ -147,6 +147,21 @@ const apiBase = (import.meta.env.VITE_FINANCE_AGENT_API_BASE || "http://127.0.0.
   "",
 );
 const requestTimeoutMs = 8000;
+export const TASK_MONITOR_REQUEST_TIMEOUT_MS = 20000;
+
+export function taskMonitorRequestErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  const normalized = message.toLowerCase();
+  if (
+    (error instanceof Error && ["AbortError", "TimeoutError"].includes(error.name)) ||
+    normalized.includes("aborted") ||
+    normalized.includes("aborterror") ||
+    normalized.includes("signal is aborted")
+  ) {
+    return "任务监控请求超时，本页会继续自动重试。";
+  }
+  return message || "任务监控请求失败，本页会继续自动重试。";
+}
 
 export async function loadDashboardSummary(ownerId: string): Promise<DashboardSummary> {
   try {
@@ -531,12 +546,29 @@ export async function loadDataSchedulerStatus(): Promise<Record<string, any>> {
 
 export async function loadDataSchedulerProgress(eventLimit = 120): Promise<Record<string, any>> {
   const normalizedLimit = Math.min(200, Math.max(1, Math.round(eventLimit)));
-  return getJson(`/api/data/scheduler/progress?event_limit=${normalizedLimit}`, {
+  const fallbackData = {
     cache_backend: "null",
     tasks: [],
     waiting: [],
     metrics: {},
-  });
+  };
+  try {
+    const response = await fetchWithTimeout(
+      `${apiBase}/api/data/scheduler/progress?event_limit=${normalizedLimit}`,
+      { timeoutMs: TASK_MONITOR_REQUEST_TIMEOUT_MS },
+    );
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data?.message || `HTTP ${response.status}`);
+    }
+    return data;
+  } catch (error) {
+    return {
+      status: "unavailable",
+      message: taskMonitorRequestErrorMessage(error),
+      data: fallbackData,
+    };
+  }
 }
 
 export async function loadDataSchedulerJobs(): Promise<Record<string, any>> {
