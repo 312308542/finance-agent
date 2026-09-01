@@ -104,6 +104,16 @@ export type DataSchedulerJobRunPayload = {
   dry_run: boolean;
 };
 
+export type DataRecoveryApprovePayload = {
+  plan_hash: string;
+  approved_by: string;
+};
+
+export type DataRecoveryControlPayload = {
+  action: "pause" | "resume" | "cancel";
+  actor: string;
+};
+
 export type DecisionConfirmationPayload = {
   feedback: "accepted" | "rejected" | "modified" | "deferred";
   comment?: string;
@@ -600,6 +610,48 @@ export async function startDataScheduler(payload: DataSchedulerStartPayload): Pr
 
 export async function stopDataScheduler(): Promise<Record<string, any>> {
   return postJson("/api/data/scheduler/stop", {});
+}
+
+export async function dataRecoveryPreview(): Promise<Record<string, any>> {
+  return requestJson("POST", "/api/data/recovery/preview", {}, 45000);
+}
+
+export async function dataRecoveryListRuns(): Promise<Record<string, any>> {
+  return getJson("/api/data/recovery/runs", { runs: [] });
+}
+
+export async function dataRecoveryGetRun(runId: string): Promise<Record<string, any>> {
+  return getJson(`/api/data/recovery/runs/${encodeURIComponent(runId)}`, {
+    run_id: runId,
+    status: "unknown",
+    gate_status: "unknown",
+    steps: [],
+    exceptions: [],
+  });
+}
+
+export async function dataRecoveryApprove(
+  runId: string,
+  payload: DataRecoveryApprovePayload,
+): Promise<Record<string, any>> {
+  return requestJson(
+    "POST",
+    `/api/data/recovery/runs/${encodeURIComponent(runId)}/approve`,
+    payload,
+    45000,
+  );
+}
+
+export async function dataRecoveryControl(
+  runId: string,
+  payload: DataRecoveryControlPayload,
+): Promise<Record<string, any>> {
+  return requestJson(
+    "POST",
+    `/api/data/recovery/runs/${encodeURIComponent(runId)}/control`,
+    payload,
+    45000,
+  );
 }
 
 async function getJson(path: string, fallbackData: Record<string, any>): Promise<Record<string, any>> {

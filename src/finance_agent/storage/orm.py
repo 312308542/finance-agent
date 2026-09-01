@@ -1800,12 +1800,21 @@ class SchedulerTaskRunORM(Base):
     __tablename__ = "scheduler_task_runs"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'running', 'completed', 'failed', 'cancelled')",
+            "status IN ('scheduled', 'blocked', 'pending', 'running', "
+            "'completed', 'failed', 'cancelled')",
             name="ck_scheduler_task_runs_status",
         ),
         UniqueConstraint("idempotency_key", name="uq_scheduler_task_runs_idempotency"),
         Index("idx_scheduler_task_runs_due", "status", "next_retry_at", "created_at"),
+        Index(
+            "idx_scheduler_task_runs_scheduled",
+            "status",
+            "scheduled_for",
+            "priority",
+        ),
         Index("idx_scheduler_task_runs_lease", "status", "lease_expires_at"),
+        Index("idx_scheduler_task_runs_pool", "status", "resource_pool"),
+        Index("idx_scheduler_task_runs_mutex", "status", "mutex_key"),
         Index("idx_scheduler_task_runs_job_created", "job_name", "created_at"),
     )
 
@@ -1818,6 +1827,31 @@ class SchedulerTaskRunORM(Base):
     payload: Mapped[JsonDict] = mapped_column(
         JSONB, server_default=text("'{}'::jsonb"), nullable=False
     )
+    schedule_type: Mapped[str] = mapped_column(
+        String(32), server_default=text("'manual'"), nullable=False
+    )
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    priority: Mapped[int] = mapped_column(Integer, server_default=text("100"), nullable=False)
+    resource_pool: Mapped[str] = mapped_column(
+        String(64), server_default=text("'default'"), nullable=False
+    )
+    mutex_key: Mapped[str | None] = mapped_column(String(160))
+    dependency_generation: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    required_data_domains: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    blocked_reason: Mapped[str | None] = mapped_column(String(64))
+    blocked_detail: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    blocked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    config_digest: Mapped[str | None] = mapped_column(String(64))
+    coalesced_count: Mapped[int] = mapped_column(
+        Integer, server_default=text("0"), nullable=False
+    )
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     attempts: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
     max_attempts: Mapped[int] = mapped_column(Integer, server_default=text("3"), nullable=False)
     lease_owner: Mapped[str | None] = mapped_column(String(128))
@@ -2398,6 +2432,154 @@ class RetrievalProfileORM(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class DataRecoveryRunORM(Base):
+    """停跑恢复补跑批次表：保存冻结范围、计划哈希、状态机与门控事实。"""
+
+    __tablename__ = "data_recovery_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('draft', 'approved', 'running', 'paused', 'verifying', "
+            "'attention_required', 'completed', 'completed_with_exceptions', 'cancelled')",
+            name="ck_data_recovery_runs_status",
+        ),
+        CheckConstraint(
+            "gate_status IN ('recovering', 'degraded', 'open')",
+            name="ck_data_recovery_runs_gate_status",
+        ),
+        Index("idx_data_recovery_runs_market_created", "market", "created_at"),
+        Index("idx_data_recovery_runs_status", "status"),
+        Index("idx_data_recovery_runs_plan_hash", "plan_hash"),
+    )
+
+    run_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    universe_id: Mapped[str | None] = mapped_column(String(160))
+    universe_snapshot_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    universe_snapshot_hash: Mapped[str | None] = mapped_column(String(128))
+    gap_start_date: Mapped[date | None] = mapped_column(Date)
+    cutoff_date: Mapped[date] = mapped_column(Date, nullable=False)
+    plan_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'draft'"), nullable=False
+    )
+    gate_status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'degraded'"), nullable=False
+    )
+    requested_by: Mapped[str | None] = mapped_column(String(128))
+    approved_by: Mapped[str | None] = mapped_column(String(128))
+    summary: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    quality_result: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class DataRecoveryStepORM(Base):
+    """补跑批次逻辑阶段表：一个步骤可对应多个持久化调度任务分区。"""
+
+    __tablename__ = "data_recovery_steps"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'running', 'completed', 'failed', 'skipped', 'cancelled')",
+            name="ck_data_recovery_steps_status",
+        ),
+        UniqueConstraint(
+            "run_id", "phase", "data_domain", name="uq_data_recovery_steps_scope"
+        ),
+        Index("idx_data_recovery_steps_run_status", "run_id", "status"),
+    )
+
+    step_id: Mapped[str] = mapped_column(String(224), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(192), nullable=False)
+    phase: Mapped[str] = mapped_column(String(16), nullable=False)
+    data_domain: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'pending'"), nullable=False
+    )
+    depends_on: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    target_count: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
+    completed_count: Mapped[int] = mapped_column(
+        Integer, server_default=text("0"), nullable=False
+    )
+    retryable_count: Mapped[int] = mapped_column(
+        Integer, server_default=text("0"), nullable=False
+    )
+    exception_count: Mapped[int] = mapped_column(
+        Integer, server_default=text("0"), nullable=False
+    )
+    task_params: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    attempt_round: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class DataRecoveryTargetORM(Base):
+    """补跑缺口目标区间表：区间压缩保存缺口，不逐资产逐日期展开。"""
+
+    __tablename__ = "data_recovery_targets"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'running', 'completed', 'failed', 'exception', 'excluded')",
+            name="ck_data_recovery_targets_status",
+        ),
+        # 市场级目标 asset_id 允许为空，唯一性用 coalesce 归一后判定。
+        Index(
+            "uq_data_recovery_targets_scope",
+            "run_id",
+            "data_domain",
+            text("coalesce(asset_id, '')"),
+            "gap_start_at",
+            "gap_end_at",
+            "granularity",
+            unique=True,
+        ),
+        Index("idx_data_recovery_targets_run_status", "run_id", "status"),
+        Index("idx_data_recovery_targets_step_status", "step_id", "status"),
+        Index("idx_data_recovery_targets_retry", "run_id", "next_retry_at"),
+    )
+
+    target_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(192), nullable=False)
+    step_id: Mapped[str] = mapped_column(String(224), nullable=False)
+    data_domain: Mapped[str] = mapped_column(String(64), nullable=False)
+    asset_id: Mapped[str | None] = mapped_column(String(128))
+    gap_start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    gap_end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    granularity: Mapped[str] = mapped_column(
+        String(32), server_default=text("'1d'"), nullable=False
+    )
+    expected_count: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'pending'"), nullable=False
+    )
+    exception_code: Mapped[str | None] = mapped_column(String(32))
+    exception_evidence: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    last_error: Mapped[str | None] = mapped_column(Text)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), nullable=False
     )

@@ -1,4 +1,5 @@
 import * as React from "react";
+import { Button } from "antd";
 import { GitBranch, History, Sparkles } from "lucide-react";
 import { loadRecentMemories } from "../api";
 import { buildMemoryPageModel } from "../consolePagesView";
@@ -40,10 +41,11 @@ export function MemoryPage({ ownerId, initialPayload = null }: MemoryPageProps) 
         <div>
           <p className="eyebrow">Finance Memory</p>
           <h2>Finance Memory</h2>
+          <p>决策摘要、复盘结论与用户反馈的时间线。</p>
         </div>
-        <button className="button" onClick={() => void refresh()} disabled={loading}>
+        <Button onClick={() => void refresh()} loading={loading}>
           刷新
-        </button>
+        </Button>
       </header>
       {error ? <div className="notice notice-red">{error}</div> : null}
       <div className="real-metric-grid">

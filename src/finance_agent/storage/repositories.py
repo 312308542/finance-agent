@@ -10,7 +10,7 @@ import hashlib
 import json
 import math
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -4242,6 +4242,7 @@ class AssistantTriggerRepository:
         self,
         *,
         owner_id: str | None = None,
+        agent_runtime: str | None = None,
         limit: int = 50,
     ) -> list[AssistantTriggerEventORM]:
         """查询待派发触发事件。"""
@@ -4251,12 +4252,17 @@ class AssistantTriggerRepository:
         )
         if owner_id:
             statement = statement.where(AssistantTriggerEventORM.owner_id == owner_id)
+        if agent_runtime:
+            statement = statement.where(AssistantTriggerEventORM.agent_runtime == agent_runtime)
         return list(
             self.session.scalars(
                 statement.order_by(
                     AssistantTriggerEventORM.triggered_at.asc(),
                     AssistantTriggerEventORM.severity.desc(),
-                ).limit(limit)
+                )
+                .limit(limit)
+                # 触发器可能被多个 scheduler 副本同时运行，跳过已被其他副本锁定的事件。
+                .with_for_update(skip_locked=True)
             )
         )
 
@@ -4338,6 +4344,30 @@ class AssistantTriggerRepository:
             dispatched_at=dispatched_at,
             payload=merged_payload,
         )
+
+    def mark_dispatch_failed(
+        self,
+        *,
+        trigger_event_id: str,
+        failed_at: datetime,
+        retry_at: datetime,
+        error_message: str,
+    ) -> AssistantTriggerEventORM:
+        """记录 Webhook 派发失败并保留 pending 状态，供后续重试。"""
+
+        event = self.session.get_one(AssistantTriggerEventORM, trigger_event_id)
+        payload = dict(event.payload or {})
+        payload.update(
+            {
+                "dispatch_status": "retry_scheduled",
+                "dispatch_retry_at": retry_at.isoformat(),
+                "last_dispatch_failed_at": failed_at.isoformat(),
+                "last_dispatch_error": str(error_message),
+            }
+        )
+        event.payload = _json_safe(payload)
+        self.session.flush()
+        return event
 
     def mark_skipped(
         self,
@@ -4757,6 +4787,310 @@ class SchedulerTaskRepository:
         )
         return task
 
+    def schedule(
+        self,
+        *,
+        job_name: str,
+        idempotency_key: str,
+        schedule_type: str,
+        scheduled_for: datetime,
+        payload: JsonDict | None = None,
+        priority: int = 100,
+        resource_pool: str = "default",
+        mutex_key: str | None = None,
+        dependency_generation: Sequence[str] = (),
+        required_data_domains: Sequence[str] = (),
+        config_digest: str | None = None,
+        max_attempts: int = 3,
+        task_id: str | None = None,
+        coalesced_count: int = 0,
+        now: datetime | None = None,
+    ) -> SchedulerTaskRunORM:
+        """幂等持久化一个尚未准入的逻辑运行。"""
+
+        normalized_job = str(job_name).strip()
+        normalized_key = str(idempotency_key).strip()
+        normalized_type = str(schedule_type).strip()
+        normalized_pool = str(resource_pool).strip()
+        if not all((normalized_job, normalized_key, normalized_type, normalized_pool)):
+            raise ValueError("job_name、idempotency_key、schedule_type 和 resource_pool 不能为空")
+        if max_attempts < 1:
+            raise ValueError("max_attempts 必须大于 0")
+        if int(priority) < 0 or int(coalesced_count) < 0:
+            raise ValueError("priority 和 coalesced_count 不能小于 0")
+        stable_id = task_id or (
+            "task:" + hashlib.sha256(normalized_key.encode("utf-8")).hexdigest()[:48]
+        )
+        occurred_at = now or datetime.now().astimezone()
+        values = {
+            "task_id": stable_id,
+            "job_name": normalized_job,
+            "idempotency_key": normalized_key,
+            "status": "scheduled",
+            "payload": _json_safe(payload or {}),
+            "schedule_type": normalized_type,
+            "scheduled_for": scheduled_for,
+            "priority": int(priority),
+            "resource_pool": normalized_pool,
+            "mutex_key": str(mutex_key).strip() if mutex_key else None,
+            "dependency_generation": _json_safe(list(dependency_generation)),
+            "required_data_domains": _json_safe(list(required_data_domains)),
+            "config_digest": str(config_digest).strip() if config_digest else None,
+            "coalesced_count": int(coalesced_count),
+            "attempts": 0,
+            "max_attempts": int(max_attempts),
+            "updated_at": occurred_at,
+        }
+        statement = insert(SchedulerTaskRunORM).values(**values)
+        self.session.execute(
+            statement.on_conflict_do_nothing(constraint="uq_scheduler_task_runs_idempotency")
+        )
+        self.session.flush()
+        task = self.session.get_one(SchedulerTaskRunORM, stable_id)
+        self._append_task_event(
+            event_type="scheduler.task.planned",
+            task=task,
+            payload={
+                "job_name": normalized_job,
+                "scheduled_for": scheduled_for.isoformat(),
+                "schedule_type": normalized_type,
+            },
+            occurred_at=occurred_at,
+        )
+        return task
+
+    def set_admission(
+        self,
+        *,
+        task_id: str,
+        allowed: bool,
+        reason_code: str | None = None,
+        reason_detail: JsonDict | None = None,
+        recheck_at: datetime | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """将计划任务原子转换为 blocked 或 pending。"""
+
+        occurred_at = now or datetime.now().astimezone()
+        normalized_reason = str(reason_code).strip() if reason_code else None
+        if not allowed and not normalized_reason:
+            raise ValueError("阻塞准入必须提供 reason_code")
+        target_status = "pending" if allowed else "blocked"
+        result = self.session.execute(
+            update(SchedulerTaskRunORM)
+            .where(
+                SchedulerTaskRunORM.task_id == str(task_id),
+                SchedulerTaskRunORM.status.in_(["scheduled", "blocked"]),
+            )
+            .values(
+                status=target_status,
+                blocked_reason=None if allowed else normalized_reason,
+                blocked_detail={} if allowed else _json_safe(reason_detail or {}),
+                blocked_until=None if allowed else recheck_at,
+                next_retry_at=occurred_at if allowed else None,
+                updated_at=occurred_at,
+            )
+        )
+        self.session.flush()
+        if result.rowcount:
+            task = self.session.get(SchedulerTaskRunORM, str(task_id))
+            if task is not None:
+                self._append_task_event(
+                    event_type=(
+                        "scheduler.task.admitted" if allowed else "scheduler.task.blocked"
+                    ),
+                    task=task,
+                    payload={
+                        "status": target_status,
+                        "reason_code": normalized_reason,
+                        "reason_detail": reason_detail or {},
+                    },
+                    occurred_at=occurred_at,
+                )
+        return bool(result.rowcount)
+
+    def coalesce_task(
+        self,
+        *,
+        task_id: str,
+        scheduled_for: datetime,
+        coalesced_count_delta: int,
+        payload: JsonDict,
+        now: datetime | None = None,
+    ) -> bool:
+        """把错过的固定节拍合并到一个尚未执行的逻辑运行。"""
+
+        delta = int(coalesced_count_delta)
+        if delta < 1:
+            raise ValueError("coalesced_count_delta 必须大于 0")
+        occurred_at = now or datetime.now().astimezone()
+        result = self.session.execute(
+            update(SchedulerTaskRunORM)
+            .where(
+                SchedulerTaskRunORM.task_id == str(task_id),
+                SchedulerTaskRunORM.status.in_(["scheduled", "blocked", "pending"]),
+            )
+            .values(
+                scheduled_for=scheduled_for,
+                payload=_json_safe(payload),
+                coalesced_count=SchedulerTaskRunORM.coalesced_count + delta,
+                updated_at=occurred_at,
+            )
+        )
+        self.session.flush()
+        return bool(result.rowcount)
+
+    def claim_many(
+        self,
+        *,
+        worker_id: str,
+        limit: int,
+        lease_seconds: int = 60,
+        resource_pool: str | None = None,
+        job_names: Sequence[str] | None = None,
+        resource_pool_limits: Mapping[str, int] | None = None,
+        now: datetime | None = None,
+    ) -> list[SchedulerTaskRunORM]:
+        """按优先级批量领取整个持久队列中的到期 pending 任务。"""
+
+        normalized_worker = str(worker_id).strip()
+        if not normalized_worker:
+            raise ValueError("worker_id 不能为空")
+        if int(limit) < 1 or int(lease_seconds) < 1:
+            raise ValueError("limit 和 lease_seconds 必须大于 0")
+        occurred_at = now or datetime.now().astimezone()
+        normalized_limits: dict[str, int] = {}
+        if resource_pool_limits is not None:
+            for pool, raw_limit in resource_pool_limits.items():
+                normalized_pool = str(pool).strip()
+                normalized_limit = int(raw_limit)
+                if not normalized_pool or normalized_limit < 1:
+                    raise ValueError("resource_pool_limits 必须使用非空池名和正整数额度")
+                normalized_limits[normalized_pool] = normalized_limit
+
+        constrained_claim = resource_pool_limits is not None
+        is_postgresql = False
+        get_bind = getattr(self.session, "get_bind", None)
+        if callable(get_bind):
+            bind = get_bind()
+            is_postgresql = getattr(getattr(bind, "dialect", None), "name", None) == "postgresql"
+        if is_postgresql:
+            # 资源池锁把“读取 running 数量 + 批量加租约”收敛为同一串行临界区，
+            # 避免多个 scheduler 同时观察到相同剩余额度。
+            for pool in sorted(normalized_limits):
+                self.session.execute(
+                    select(
+                        func.pg_advisory_xact_lock(
+                            func.hashtext(f"finance-agent:scheduler:pool:{pool}")
+                        )
+                    )
+                )
+
+        active_pool_counts: dict[str, int] = {}
+        active_mutex_keys: set[str] = set()
+        if constrained_claim:
+            active_statement = select(SchedulerTaskRunORM).where(
+                SchedulerTaskRunORM.status == "running"
+            )
+            active_tasks = list(self.session.scalars(active_statement).all())
+            for active in active_tasks:
+                if str(getattr(active, "status", "")) != "running":
+                    continue
+                pool = str(getattr(active, "resource_pool", "default") or "default")
+                active_pool_counts[pool] = active_pool_counts.get(pool, 0) + 1
+                mutex = str(getattr(active, "mutex_key", None) or "").strip()
+                if mutex:
+                    active_mutex_keys.add(mutex)
+        filters = [
+            SchedulerTaskRunORM.status == "pending",
+            or_(
+                SchedulerTaskRunORM.next_retry_at.is_(None),
+                SchedulerTaskRunORM.next_retry_at <= occurred_at,
+            ),
+            or_(
+                SchedulerTaskRunORM.scheduled_for.is_(None),
+                SchedulerTaskRunORM.scheduled_for <= occurred_at,
+            ),
+        ]
+        if resource_pool is not None:
+            normalized_pool = str(resource_pool).strip()
+            if not normalized_pool:
+                raise ValueError("resource_pool 不能为空字符串")
+            filters.append(SchedulerTaskRunORM.resource_pool == normalized_pool)
+        if job_names is not None:
+            normalized_jobs = tuple(
+                sorted({str(job).strip() for job in job_names if str(job).strip()})
+            )
+            if not normalized_jobs:
+                return []
+            filters.append(SchedulerTaskRunORM.job_name.in_(normalized_jobs))
+        statement = (
+            select(SchedulerTaskRunORM)
+            .where(*filters)
+            .order_by(
+                SchedulerTaskRunORM.priority.desc(),
+                SchedulerTaskRunORM.scheduled_for.asc().nullsfirst(),
+                SchedulerTaskRunORM.created_at.asc(),
+            )
+            .with_for_update(skip_locked=True)
+            .limit(
+                max(int(limit) * 8, int(limit) + 32)
+                if constrained_claim
+                else int(limit)
+            )
+        )
+        candidates = list(self.session.scalars(statement).all())
+        tasks: list[SchedulerTaskRunORM] = []
+        for task in candidates:
+            if len(tasks) >= int(limit):
+                break
+            pool = str(getattr(task, "resource_pool", "default") or "default")
+            pool_limit = normalized_limits.get(pool)
+            if pool_limit is not None and active_pool_counts.get(pool, 0) >= pool_limit:
+                continue
+            mutex = str(getattr(task, "mutex_key", None) or "").strip()
+            if mutex and mutex in active_mutex_keys:
+                continue
+            if mutex and is_postgresql:
+                self.session.execute(
+                    select(
+                        func.pg_advisory_xact_lock(
+                            func.hashtext(f"finance-agent:scheduler:mutex:{mutex}")
+                        )
+                    )
+                )
+                conflicting = self.session.scalars(
+                    select(SchedulerTaskRunORM)
+                    .where(
+                        SchedulerTaskRunORM.status == "running",
+                        SchedulerTaskRunORM.mutex_key == mutex,
+                    )
+                    .limit(1)
+                ).first()
+                if conflicting is not None:
+                    active_mutex_keys.add(mutex)
+                    continue
+            tasks.append(task)
+            active_pool_counts[pool] = active_pool_counts.get(pool, 0) + 1
+            if mutex:
+                active_mutex_keys.add(mutex)
+        for task in tasks:
+            task.status = "running"
+            task.attempts = int(task.attempts or 0) + 1
+            task.lease_owner = normalized_worker
+            task.lease_token = uuid.uuid4().hex
+            task.lease_expires_at = occurred_at + timedelta(seconds=int(lease_seconds))
+            task.started_at = task.started_at or occurred_at
+            task.updated_at = occurred_at
+            self._append_task_event(
+                event_type="scheduler.task.claimed",
+                task=task,
+                payload={"status": "running", "worker_id": normalized_worker},
+                occurred_at=occurred_at,
+            )
+        self.session.flush()
+        return tasks
+
     def claim(
         self,
         *,
@@ -4845,9 +5179,9 @@ class SchedulerTaskRepository:
             task = self.session.get(SchedulerTaskRunORM, task_id)
             if task is not None:
                 self._append_task_event(
-                    event_type="scheduler.task.completed",
+                    event_type="scheduler.task.heartbeat",
                     task=task,
-                    payload={"status": "completed"},
+                    payload={"status": "running", "lease_extended": True},
                     occurred_at=occurred_at,
                 )
         return bool(result.rowcount)
@@ -4950,6 +5284,151 @@ class SchedulerTaskRepository:
         )
         self.session.flush()
         return int(result.rowcount or 0)
+
+    def recover_orphaned(
+        self,
+        *,
+        worker_prefix: str,
+        current_worker_id: str | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        """回收同一 scheduler 服务前一实例遗留的运行租约。
+
+        scheduler 进程由 Compose 保证单实例运行；新实例启动时用服务前缀
+        精确回收旧实例的租约，并清除旧 token，防止旧执行器越过租约栅栏回写。
+        普通过期扫描仍由 :meth:`recover_expired` 负责。
+        """
+
+        prefix = str(worker_prefix).strip().rstrip(":")
+        if not prefix:
+            raise ValueError("worker_prefix 不能为空")
+        occurred_at = now or datetime.now().astimezone()
+        filters = [
+            SchedulerTaskRunORM.status == "running",
+            SchedulerTaskRunORM.lease_owner.is_not(None),
+            SchedulerTaskRunORM.lease_owner.like(f"{prefix}:%"),
+        ]
+        if current_worker_id:
+            filters.append(SchedulerTaskRunORM.lease_owner != str(current_worker_id).strip())
+        result = self.session.execute(
+            update(SchedulerTaskRunORM)
+            .where(*filters)
+            .values(
+                status="pending",
+                lease_owner=None,
+                lease_token=None,
+                lease_expires_at=None,
+                next_retry_at=occurred_at,
+                error_message="scheduler_restarted",
+                updated_at=occurred_at,
+            )
+        )
+        self.session.flush()
+        return int(result.rowcount or 0)
+
+    def find_active_work_unit_conflicts(self, work_units: Sequence[str]) -> list[str]:
+        """返回与活动 pending/running 任务实际相交的工作单元键。
+
+        H9 / 规格 10.4：补跑与普通调度共享的规范化工作单元键存于 JSONB
+        payload.work_units；查询用 JSONB 包含（@>）做交集匹配，未携带
+        work_units 字段的任务（NULL）不会命中。
+        """
+
+        units = sorted(
+            {str(unit).strip() for unit in work_units if str(unit).strip()}
+        )
+        if not units:
+            return []
+        requested = set(units)
+        work_units_column = SchedulerTaskRunORM.payload["work_units"]
+        statement = select(work_units_column).where(
+            SchedulerTaskRunORM.status.in_(["pending", "running"]),
+            or_(*(work_units_column.contains([unit]) for unit in units)),
+        )
+        rows = self.session.execute(statement).scalars().all()
+        conflicts: set[str] = set()
+        for row_units in rows:
+            if not isinstance(row_units, (list, tuple)):
+                continue
+            conflicts.update(
+                normalized
+                for unit in row_units
+                if (normalized := str(unit).strip()) in requested
+            )
+        return sorted(conflicts)
+
+    def list_tasks(
+        self,
+        *,
+        job_name: str | None = None,
+        statuses: Sequence[str] = ("pending",),
+        payload_key: str | None = None,
+        payload_value: str | None = None,
+        limit: int = 200,
+    ) -> list[SchedulerTaskRunORM]:
+        """按任务名/状态/负载键值查询持久任务（任务观测 API）。"""
+
+        statement = (
+            select(SchedulerTaskRunORM)
+            .order_by(SchedulerTaskRunORM.created_at.desc())
+            .limit(max(1, int(limit)))
+        )
+        conditions = [SchedulerTaskRunORM.status.in_([str(s) for s in statuses])]
+        if job_name is not None:
+            conditions.append(SchedulerTaskRunORM.job_name == str(job_name))
+        if payload_key is not None:
+            ref = SchedulerTaskRunORM.payload[str(payload_key)].astext
+            conditions.append(ref == str(payload_value if payload_value is not None else ""))
+        rows = self.session.execute(statement.where(*conditions)).scalars().all()
+        return list(rows)
+
+    def cancel_tasks(
+        self,
+        *,
+        task_ids: Sequence[str],
+        reason: str | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        """取消未领取的 pending 任务并追加取消事件；返回实际取消数。
+
+        规格 12.3：取消只停止未领取的分区任务，不回滚已写事实；
+        已领取任务由租约过期与完成回调语义处理。
+        """
+
+        occurred_at = now or datetime.now().astimezone()
+        ids = [str(task_id) for task_id in task_ids if str(task_id)]
+        if not ids:
+            return 0
+        rows = (
+            self.session.execute(
+                select(SchedulerTaskRunORM).where(
+                    SchedulerTaskRunORM.task_id.in_(ids),
+                    SchedulerTaskRunORM.status == "pending",
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not rows:
+            return 0
+        cancelled_ids = [row.task_id for row in rows]
+        self.session.execute(
+            update(SchedulerTaskRunORM)
+            .where(
+                SchedulerTaskRunORM.task_id.in_(cancelled_ids),
+                SchedulerTaskRunORM.status == "pending",
+            )
+            .values(status="cancelled", updated_at=occurred_at),
+        )
+        self.session.flush()
+        for row in rows:
+            self._append_task_event(
+                event_type="scheduler.task.cancelled",
+                task=row,
+                payload={"reason": reason or ""},
+                occurred_at=occurred_at,
+            )
+        return len(cancelled_ids)
 
 
 class DecisionLogRepository:

@@ -7,6 +7,8 @@
 .pytest_cache
 .ruff_cache
 .ai
+.agents
+.codex
 .gitnexus
 .idea
 .claude
@@ -34,3 +36,4 @@ __pycache__
 *.log
 *.tmp
 *.bak
+nul

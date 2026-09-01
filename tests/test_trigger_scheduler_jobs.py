@@ -15,8 +15,8 @@ def _jobs_by_name(jobs: list[dict]) -> dict[str, dict]:
     return {str(job["name"]): job for job in jobs}
 
 
-def test_build_trigger_scheduler_jobs_exports_evaluate_and_consume_jobs() -> None:
-    """触发评估和 Agent 消费应作为两类 analytics 调度任务导出。"""
+def test_build_trigger_scheduler_jobs_exports_programmatic_evaluation_jobs() -> None:
+    """默认计划只负责程序触发评估，由 Hermes Webhook 按事件唤醒模型。"""
 
     config = build_preset_config("personal-comprehensive")
 
@@ -25,9 +25,6 @@ def test_build_trigger_scheduler_jobs_exports_evaluate_and_consume_jobs() -> Non
     assert set(jobs) == {
         "analytics.triggers.evaluate.daily",
         "analytics.triggers.evaluate.intraday",
-        "agent.loop.consume.after_trigger",
-        "agent.loop.consume.sweep",
-        "analytics.high_risk_reviews.after_agent",
         "analytics.high_risk_reviews.sweep",
         "analytics.reviews.due",
     }
@@ -41,6 +38,7 @@ def test_build_trigger_scheduler_jobs_exports_evaluate_and_consume_jobs() -> Non
     assert daily["params"]["sync_task_type"] == "analytics.triggers.evaluate"
     assert daily["params"]["owner_id"] == "default-owner"
     assert daily["params"]["dispatch"] is True
+    assert daily["params"]["agent_runtime"] == "hermes_agent"
     assert daily["params"]["max_events_per_run"] == 50
     assert daily["params"]["trigger_groups"] == [
         "position",
@@ -61,33 +59,6 @@ def test_build_trigger_scheduler_jobs_exports_evaluate_and_consume_jobs() -> Non
     assert intraday["params"]["intraday_sharp_drop_threshold"] == "-0.04"
     assert intraday["params"]["intraday_volume_surge_multiplier"] == "3"
     assert intraday["params"]["cooldown_minutes"] == 120
-
-    consume_after_trigger = jobs["agent.loop.consume.after_trigger"]
-    assert consume_after_trigger["job_type"] == "agent_loop_consume"
-    assert consume_after_trigger["group"] == "agent"
-    assert consume_after_trigger["schedule_type"] == "after_success"
-    assert consume_after_trigger["depends_on"] == [
-        "analytics.triggers.evaluate.daily",
-        "analytics.triggers.evaluate.intraday",
-    ]
-    assert consume_after_trigger["params"]["sync_task_type"] == "agent.loop.consume"
-    assert consume_after_trigger["params"]["owner_id"] == "default-owner"
-    assert consume_after_trigger["params"]["limit"] == 10
-    assert consume_after_trigger["params"]["use_model_planner"] is True
-
-    sweep = jobs["agent.loop.consume.sweep"]
-    assert sweep["job_type"] == "agent_loop_consume"
-    assert sweep["interval_seconds"] == 30 * 60
-    assert sweep["params"]["limit"] == 10
-
-    high_risk_after_agent = jobs["analytics.high_risk_reviews.after_agent"]
-    assert high_risk_after_agent["job_type"] == "high_risk_reviews"
-    assert high_risk_after_agent["group"] == "analytics"
-    assert high_risk_after_agent["schedule_type"] == "after_success"
-    assert high_risk_after_agent["depends_on"] == ["agent.loop.consume.after_trigger"]
-    assert high_risk_after_agent["params"]["sync_task_type"] == "analytics.high_risk_reviews"
-    assert high_risk_after_agent["params"]["owner_id"] == "default-owner"
-    assert high_risk_after_agent["params"]["limit"] == 10
 
     high_risk_sweep = jobs["analytics.high_risk_reviews.sweep"]
     assert high_risk_sweep["job_type"] == "high_risk_reviews"
@@ -120,12 +91,5 @@ def test_scheduler_payload_includes_trigger_jobs_with_intraday_enabled() -> None
     ]
     assert jobs["analytics.triggers.evaluate.intraday"]["enabled"] is True
     assert jobs["analytics.triggers.evaluate.intraday"]["schedule_type"] == "interval"
-    assert jobs["agent.loop.consume.after_trigger"]["depends_on"] == [
-        "analytics.triggers.evaluate.daily",
-        "analytics.triggers.evaluate.intraday",
-    ]
-    assert jobs["analytics.high_risk_reviews.after_agent"]["depends_on"] == [
-        "agent.loop.consume.after_trigger"
-    ]
     assert jobs["analytics.high_risk_reviews.sweep"]["interval_seconds"] == 60 * 60
     assert jobs["analytics.reviews.due"]["job_type"] == "reviews_due"

@@ -56,7 +56,11 @@ class InternalFinanceAgentLoopRunner:
         processed: list[AgentLoopTaskResult] = []
         skipped: list[AgentLoopTaskResult] = []
         failed: list[AgentLoopTaskResult] = []
-        events = self.triggers.list_agent_wakeup_events(owner_id=owner_id, limit=limit)
+        events = self.triggers.list_agent_wakeup_events(
+            owner_id=owner_id,
+            agent_runtime="internal_agent_loop",
+            limit=limit,
+        )
         for event in events:
             result = self._handle_event(event=event, as_of=run_at, use_graph=use_graph)
             if result.status == "workflow_completed":

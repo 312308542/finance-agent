@@ -17,6 +17,35 @@ def test_personal_ashare_is_the_default_preset_without_crypto() -> None:
     assert preset_label(config.preset) == "私人助手 A 股与基金模式"
 
 
+def test_scheduler_exports_fixed_session_realtime_priority_and_market_sweep() -> None:
+    """高频 A 股任务使用固定交易时段，实时行情拆成重点池与全市场 sweep。"""
+
+    payload = export_scheduler_payload(build_preset_config())
+    jobs = {str(job["name"]): job for job in payload["jobs"]}
+    windows = ["09:25-11:35", "12:55-15:10"]
+
+    priority = jobs["ashare.realtime_quotes"]
+    sweep = jobs["ashare.realtime_quotes.market_sweep"]
+    assert priority["limit"] == 200
+    assert priority["params"]["scope"] == "priority"
+    assert sweep["limit"] is None
+    assert sweep["params"]["scope"] == "market_sweep"
+    assert sweep["params"]["partition_cursor"] == 0
+    assert priority["priority"] > sweep["priority"]
+
+    for name in (
+        "ashare.realtime_quotes",
+        "ashare.realtime_quotes.market_sweep",
+        "ashare.capital_flow",
+        "ashare.risk_sentiment",
+    ):
+        assert jobs[name]["schedule_type"] == "trading_session"
+        assert jobs[name]["session_windows"] == windows
+        assert jobs[name]["timezone"] == "Asia/Shanghai"
+
+    assert "realtime_quote_limit" not in str(payload)
+
+
 def test_personal_comprehensive_remains_backward_compatible() -> None:
     """旧全面预设仍应保留 A 股、基金和两类数字货币市场。"""
 
@@ -48,7 +77,8 @@ def test_personal_ashare_recommendation_job_exports_three_strategy_observation()
     jobs = {str(job["name"]): job for job in payload["jobs"]}
     recommendation = jobs["analytics.recommendations.ashare.all_a"]
 
-    assert len(payload["jobs"]) == 36
+    # 默认触发链路已改为 Webhook 唤醒 Hermes，不再导出 3 个内部 Agent 消费任务。
+    assert len(payload["jobs"]) == 34
     assert all("crypto" not in name for name in jobs)
     assert recommendation["job_type"] == "recommendation_pipeline"
     assert recommendation["params"]["strategy_ids"] == [
@@ -93,18 +123,18 @@ def test_scheduler_exports_timely_ashare_event_tasks_every_five_minutes() -> Non
 
 
 def test_scheduler_exports_intraday_ashare_jobs_with_explicit_policies() -> None:
-    """盘中持续任务需要显式导出 interval 类型和交易日策略，避免依赖隐式默认值。"""
+    """盘中持续任务需要显式导出交易时段和交易日策略。"""
 
     config = build_preset_config("personal-comprehensive")
 
     scheduler_payload = export_scheduler_payload(config)
     jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
 
-    assert jobs["ashare.realtime_quotes"]["schedule_type"] == "interval"
+    assert jobs["ashare.realtime_quotes"]["schedule_type"] == "trading_session"
     assert jobs["ashare.realtime_quotes"]["trading_day_policy"] == "trading_day_only"
     assert jobs["ashare.realtime_quotes"]["interval_seconds"] == 5 * 60
 
-    assert jobs["ashare.capital_flow"]["schedule_type"] == "interval"
+    assert jobs["ashare.capital_flow"]["schedule_type"] == "trading_session"
     assert jobs["ashare.capital_flow"]["trading_day_policy"] == "trading_day_only"
     assert jobs["ashare.capital_flow"]["interval_seconds"] == 30 * 60
 
@@ -112,7 +142,7 @@ def test_scheduler_exports_intraday_ashare_jobs_with_explicit_policies() -> None
     assert jobs["ashare.events"]["trading_day_policy"] == "any_day"
     assert jobs["ashare.events"]["interval_seconds"] == 5 * 60
 
-    assert jobs["ashare.risk_sentiment"]["schedule_type"] == "interval"
+    assert jobs["ashare.risk_sentiment"]["schedule_type"] == "trading_session"
     assert jobs["ashare.risk_sentiment"]["trading_day_policy"] == "trading_day_only"
     assert jobs["ashare.risk_sentiment"]["interval_seconds"] == 5 * 60
 
@@ -456,6 +486,8 @@ def test_ashare_scheduler_jobs_export_priority_and_resource_pool() -> None:
 
     assert jobs["ashare.realtime_quotes"]["resource_pool"] == "realtime"
     assert jobs["ashare.realtime_quotes"]["priority"] == 800
+    assert jobs["ashare.realtime_quotes.market_sweep"]["resource_pool"] == "realtime"
+    assert jobs["ashare.realtime_quotes.market_sweep"]["priority"] == 750
     assert jobs["ashare.risk_sentiment"]["resource_pool"] == "realtime"
     assert jobs["ashare.risk_sentiment"]["priority"] == 700
     assert jobs["ashare.bars.1d.close_final"]["resource_pool"] == "collection_heavy"

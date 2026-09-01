@@ -16,6 +16,7 @@ import threading
 import time
 from collections.abc import Callable, Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -98,6 +99,7 @@ ASHARE_MARKET_BAR_DATA_DOMAIN = "market_bars"
 ASHARE_FUNDAMENTAL_DATA_DOMAIN = "fundamentals"
 ASHARE_VALUATION_DATA_DOMAIN = "valuation"
 ASHARE_CAPITAL_FLOW_DATA_DOMAIN = "capital_flow"
+ASHARE_EVENT_DATA_DOMAIN = "events"
 ASHARE_RISK_SENTIMENT_DATA_DOMAIN = "risk_sentiment"
 ASHARE_FINANCIAL_INDICATORS_PROVIDER = "stock_financial_analysis_indicator_em"
 ASHARE_VALUATION_PROVIDER = "stock_value_em"
@@ -145,6 +147,9 @@ COLLECTION_ARG_DEFAULTS: JsonDict = {
     "max_workers": 4,
     "source_limit": None,
     "priority_symbol_limit": None,
+    "scope": "priority",
+    "partition_cursor": 0,
+    "partition_count": None,
     "news_scope": "priority",
     "article_retention_days": DEFAULT_ARTICLE_FULL_TEXT_RETENTION_DAYS,
     "progress_job_name": None,
@@ -995,6 +1000,131 @@ def run_ashare_p0(
     ]
 
 
+@dataclass(frozen=True)
+class RealtimeQuotePartition:
+    """一次实时行情执行对应的稳定目标分区。"""
+
+    symbols: tuple[str, ...]
+    target_symbols: tuple[str, ...]
+    metrics: JsonDict
+    next_partition_payload: JsonDict | None
+
+
+def build_realtime_quote_partition(
+    *,
+    universe: Collection[str],
+    scope: str,
+    limit: int | None,
+    batch_size: int,
+    partition_cursor: int,
+) -> RealtimeQuotePartition:
+    """按 scope 生成重点池或全市场稳定分区。"""
+
+    normalized_scope = str(scope).strip()
+    if normalized_scope not in {"priority", "market_sweep"}:
+        raise ValueError("实时行情 scope 只能是 priority 或 market_sweep")
+    normalized_batch_size = int(batch_size)
+    normalized_cursor = int(partition_cursor)
+    if normalized_batch_size < 1 or normalized_cursor < 0:
+        raise ValueError("batch_size 必须大于 0，partition_cursor 不能小于 0")
+    if limit is not None and int(limit) < 1:
+        raise ValueError("实时行情 limit 必须为正整数或 null")
+    normalized_universe = tuple(
+        sorted({str(symbol).strip() for symbol in universe if str(symbol).strip()})
+    )
+    if normalized_scope == "priority":
+        selected = normalized_universe[: int(limit) if limit is not None else len(normalized_universe)]
+        return RealtimeQuotePartition(
+            symbols=selected,
+            target_symbols=selected,
+            metrics={
+                "scope": normalized_scope,
+                "partition_cursor": 0,
+                "partition_count": 1 if selected else 0,
+                "target_count": len(selected),
+            },
+            next_partition_payload=None,
+        )
+
+    target_count = len(normalized_universe)
+    partition_count = (
+        (target_count + normalized_batch_size - 1) // normalized_batch_size
+        if target_count
+        else 0
+    )
+    if normalized_cursor >= partition_count:
+        selected = ()
+    else:
+        start = normalized_cursor * normalized_batch_size
+        selected = normalized_universe[start : start + normalized_batch_size]
+    next_payload = (
+        {
+            "partition_cursor": normalized_cursor + 1,
+            "partition_count": partition_count,
+        }
+        if normalized_cursor + 1 < partition_count
+        else None
+    )
+    return RealtimeQuotePartition(
+        symbols=selected,
+        target_symbols=normalized_universe,
+        metrics={
+            "scope": normalized_scope,
+            "partition_cursor": normalized_cursor,
+            "partition_count": partition_count,
+            "target_count": target_count,
+        },
+        next_partition_payload=next_payload,
+    )
+
+
+def build_realtime_quote_coverage_metrics(
+    *,
+    target_symbols: Collection[str],
+    requested_symbols: Collection[str],
+    rows: Collection[Mapping[str, Any]],
+    written_count: int,
+    captured_at: datetime,
+    freshness_seconds: int,
+    source_statuses: Mapping[str, str],
+) -> JsonDict:
+    """按唯一资产统计覆盖与滞后，避免双源行数虚增覆盖率。"""
+
+    target_ids = {
+        f"ashare:{symbol}"
+        for raw_symbol in target_symbols
+        if (symbol := normalize_ashare_symbol(str(raw_symbol)))
+    }
+    latest_lag_by_asset: dict[str, float] = {}
+    for row in rows:
+        asset_id = str(row.get("asset_id") or "").strip()
+        as_of = row.get("as_of")
+        if asset_id not in target_ids or not isinstance(as_of, datetime):
+            continue
+        normalized_as_of = as_of if as_of.tzinfo else as_of.replace(tzinfo=UTC)
+        lag = max(0.0, (captured_at - normalized_as_of.astimezone(UTC)).total_seconds())
+        previous = latest_lag_by_asset.get(asset_id)
+        latest_lag_by_asset[asset_id] = lag if previous is None else min(previous, lag)
+    fresh_count = sum(
+        lag <= max(1, int(freshness_seconds))
+        for lag in latest_lag_by_asset.values()
+    )
+    target_count = len(target_ids)
+    return {
+        "target_count": target_count,
+        "requested_count": len({str(item) for item in requested_symbols}),
+        "written_count": max(0, int(written_count)),
+        "fresh_count": fresh_count,
+        "coverage_ratio": fresh_count / target_count if target_count else 0.0,
+        "max_lag_seconds": (
+            round(max(latest_lag_by_asset.values()), 3)
+            if latest_lag_by_asset
+            else None
+        ),
+        "source_statuses": dict(source_statuses),
+    }
+
+
 def build_ashare_parallel_realtime_task(
     session: Any,
     args: argparse.Namespace,
@@ -1002,20 +1132,62 @@ def build_ashare_parallel_realtime_task(
 ) -> CollectionTaskResult:
     """执行重点标的 gotdx/AKShare 并行快照，只覆盖盘中临时行情。"""
 
-    max_symbols = max(1, int(getattr(args, "realtime_quote_limit", 100) or 100))
-    symbols = resolve_realtime_quote_symbols(session, max_symbols=max_symbols)
+    scope = str(getattr(args, "scope", "priority") or "priority").strip()
+    limit = getattr(args, "limit", None)
+    batch_size = max(1, int(getattr(args, "batch_size", 200) or 200))
+    partition_cursor = max(0, int(getattr(args, "partition_cursor", 0) or 0))
+    if scope == "priority":
+        max_symbols = max(1, int(limit if limit is not None else batch_size))
+        universe = resolve_realtime_quote_symbols(session, max_symbols=max_symbols)
+    else:
+        universe = resolve_realtime_market_sweep_symbols(session)
+    partition = build_realtime_quote_partition(
+        universe=universe,
+        scope=scope,
+        limit=limit,
+        batch_size=batch_size,
+        partition_cursor=partition_cursor,
+    )
+    symbols = list(partition.symbols)
     gotdx_url = str(
         getattr(args, "gotdx_gateway_url", None)
         or os.getenv("FINANCE_AGENT_GOTDX_URL", "http://127.0.0.1:8790")
     ).strip()
     parameters = {
         "symbols": symbols,
-        "max_symbols": max_symbols,
+        "limit": limit,
+        **partition.metrics,
         "sources": ["gotdx:tdx_main", "akshare:stock_zh_a_spot"],
     }
 
     def collect() -> ArchivedProviderResult:
         captured_at = datetime.now(tz=UTC)
+        if not symbols:
+            return ArchivedProviderResult(
+                result=AssetListResult(
+                    provider_name="gotdx+akshare:parallel",
+                    status="unavailable",
+                    collected_at=captured_at,
+                    assets=[],
+                    error_message="实时行情目标资产池为空。",
+                    payload={
+                        "actual_source": [],
+                        "source_statuses": {},
+                        "rows_written": 0,
+                        "metrics": {
+                            **partition.metrics,
+                            "requested_count": 0,
+                            "written_count": 0,
+                            "fresh_count": 0,
+                            "coverage_ratio": 0.0,
+                            "max_lag_seconds": None,
+                            "source_statuses": {},
+                        },
+                        "temporary_storage": "intraday_quote_latest",
+                    },
+                ),
+                raw_record_id=None,
+            )
         evaluation_id = (
             "snapshot:ashare_realtime_quotes:parallel:"
             f"{captured_at.strftime('%Y%m%dT%H%M%S.%fZ')}"
@@ -1039,6 +1211,43 @@ def build_ashare_parallel_realtime_task(
         ]
         as_of = max(as_of_candidates, default=captured_at)
         captured_at = max(captured_at, as_of)
+        repository = AssetRepository(session)
+        coverage_rows: Collection[Mapping[str, Any]] = result.rows
+        list_latest = getattr(repository, "list_intraday_quote_latest", None)
+        if callable(list_latest):
+            try:
+                coverage_rows = (
+                    *list_latest(
+                        asset_ids=tuple(
+                            f"ashare:{symbol}"
+                            for raw_symbol in partition.target_symbols
+                            if (symbol := normalize_ashare_symbol(str(raw_symbol)))
+                        ),
+                        market="ashare",
+                    ),
+                    *result.rows,
+                )
+            except Exception as exc:  # noqa: BLE001 - 覆盖查询失败不丢弃本轮采集事实
+                logger.warning("读取实时行情累计覆盖失败，回退本轮返回行 error=%s", exc)
+        freshness_seconds = 120 if scope == "priority" else 10 * 60
+        coverage_metrics = build_realtime_quote_coverage_metrics(
+            target_symbols=partition.target_symbols,
+            requested_symbols=symbols,
+            rows=coverage_rows,
+            written_count=len(result.rows),
+            captured_at=captured_at,
+            freshness_seconds=freshness_seconds,
+            source_statuses=statuses,
+        )
+        metrics = {**result.metrics, **partition.metrics, **coverage_metrics}
+        if (
+            status == "available"
+            and coverage_metrics["max_lag_seconds"] is not None
+            and coverage_metrics["max_lag_seconds"] > freshness_seconds
+        ):
+            status = "stale"
+        elif status == "available" and coverage_metrics["coverage_ratio"] < 1.0:
+            status = "partial"
         snapshot = build_data_snapshot(
             snapshot_type="ashare_realtime_quotes",
             market="ashare",
@@ -1049,7 +1258,7 @@ def build_ashare_parallel_realtime_task(
             quality_status=status,
             payload={
                 "rows": list(result.rows),
-                "metrics": result.metrics,
+                "metrics": metrics,
                 "errors": result.errors,
             },
             metadata={
@@ -1063,7 +1272,7 @@ def build_ashare_parallel_realtime_task(
         persisted_rows = tuple(
             dict(row, data_snapshot_id=snapshot.data_snapshot_id) for row in result.rows
         )
-        rows_written = AssetRepository(session).upsert_intraday_quote_latest(persisted_rows)
+        rows_written = repository.upsert_intraday_quote_latest(persisted_rows)
         assets = [
             AssetData(
                 asset_id=str(row["asset_id"]),
@@ -1086,19 +1295,34 @@ def build_ashare_parallel_realtime_task(
                 "source_statuses": statuses,
                 "data_snapshot_id": snapshot.data_snapshot_id,
                 "rows_written": rows_written,
-                "metrics": result.metrics,
+                "metrics": metrics,
                 "errors": result.errors,
                 "temporary_storage": "intraday_quote_latest",
             },
         )
         return ArchivedProviderResult(result=provider_result, raw_record_id=None)
 
-    return runtime.run_task(
+    task_result = runtime.run_task(
         task="ashare_realtime_quotes_parallel",
         provider_key="gotdx:tdx_main+akshare:stock_zh_a_spot",
         parameters=parameters,
         force=bool(getattr(args, "force_provider", False)),
         collect=collect,
+    )
+    if partition.next_partition_payload is None or not isinstance(
+        task_result, CollectionTaskResult
+    ):
+        return task_result
+    return CollectionTaskResult(
+        task=task_result.task,
+        status=task_result.status,
+        raw_record_id=task_result.raw_record_id,
+        item_count=task_result.item_count,
+        error_message=task_result.error_message,
+        payload={
+            **task_result.payload,
+            "next_partition_payload": partition.next_partition_payload,
+        },
     )
 
 
@@ -1187,6 +1411,26 @@ def resolve_realtime_quote_symbols(session: Any, *, max_symbols: int = 100) -> l
         if len(symbols) >= max(1, int(max_symbols)):
             break
     return symbols
+
+
+def resolve_realtime_market_sweep_symbols(session: Any) -> list[str]:
+    """从资产主数据解析稳定排序的全量可交易 A 股标的。"""
+
+    try:
+        assets = TradeableAssetEligibilityService().filter_tradeable_assets(
+            AssetRepository(session).find_by_market("ashare")
+        )
+    except Exception as exc:  # noqa: BLE001 - 资产池故障由采集结果显式降级
+        logger.warning("解析实时行情全市场标的失败 error=%s", exc, exc_info=True)
+        return []
+    return sorted(
+        {
+            symbol
+            for asset in assets
+            if (symbol := normalize_ashare_symbol(str(getattr(asset, "symbol", "") or "")))
+            and is_tradeable_ashare_symbol(symbol)
+        }
+    )
 
 
 def _fetch_gotdx_quote_rows(
@@ -1369,6 +1613,40 @@ def run_ashare_p1(
     task_type = task_type_name(args)
     if task_type == "universe_refresh":
         return build_ashare_p1_universe_tasks(collector, args, runtime)
+    if task_type == "capital_flow_backfill":
+        symbol = normalize_ashare_symbol(str(args.ashare_symbol or ""))
+        if not symbol:
+            return [
+                CollectionTaskResult(
+                    task="ashare_p1_individual_flow",
+                    status="failed",
+                    raw_record_id=None,
+                    item_count=0,
+                    error_message="资金流历史补跑缺少股票代码。",
+                    payload={"provider_key": "stock_individual_fund_flow"},
+                )
+            ]
+        start_at = parse_ashare_datetime_or_none(args.ashare_start)
+        end_at = parse_ashare_datetime_or_none(args.ashare_end)
+        return [
+            runtime.run_task(
+                task="ashare_p1_individual_flow",
+                provider_key="stock_individual_fund_flow",
+                parameters={
+                    "symbol": symbol,
+                    "start": args.ashare_start,
+                    "end": args.ashare_end,
+                    "limit": args.limit,
+                },
+                force=args.force_provider,
+                collect=lambda: collector.collect_individual_flow(
+                    symbol=symbol,
+                    start_date=start_at.date() if start_at else None,
+                    end_date=end_at.date() if end_at else None,
+                    limit=args.limit,
+                ),
+            )
+        ]
     if task_type == "capital_flow_refresh":
         source_limit = list_source_limit(args)
         if not ashare_capital_flow_watermark_allows_collection(session, indicator=args.flow_window):
@@ -1435,7 +1713,7 @@ def run_ashare_p1(
         return results
     if task_type == "event_refresh":
         source_limit = list_source_limit(args)
-        return [
+        results = [
             *build_ashare_stock_news_tasks(
                 session,
                 collector,
@@ -1458,6 +1736,8 @@ def run_ashare_p1(
                 ),
             ),
         ]
+        record_ashare_event_watermark(session, results=results)
+        return results
     if task_type == "event_article_enrichment":
         return build_ashare_news_article_enrichment_tasks(
             session,
@@ -2161,6 +2441,40 @@ def run_ashare_p2(
 
     collector = AshareP2Collector(session)
     task_type = task_type_name(args)
+    if task_type == "valuation_backfill":
+        symbol = normalize_ashare_symbol(str(args.ashare_symbol or ""))
+        if not symbol:
+            return [
+                CollectionTaskResult(
+                    task="ashare_p2_valuation",
+                    status="failed",
+                    raw_record_id=None,
+                    item_count=0,
+                    error_message="估值历史补跑缺少股票代码。",
+                    payload={"provider_key": ASHARE_VALUATION_PROVIDER},
+                )
+            ]
+        asset_name = asset_name_for_symbol(session, symbol)
+        result = runtime.run_task(
+            task="ashare_p2_valuation",
+            provider_key=ASHARE_VALUATION_PROVIDER,
+            parameters={"symbol": symbol, "limit": args.limit},
+            force=args.force_provider,
+            collect=lambda: collector.collect_valuation(
+                symbol=symbol,
+                asset_name=asset_name,
+                limit=args.limit,
+            ),
+        )
+        record_ashare_fundamental_watermark(
+            session,
+            symbol=symbol,
+            data_domain=ASHARE_VALUATION_DATA_DOMAIN,
+            provider=ASHARE_VALUATION_PROVIDER,
+            result=result,
+            session_factory=session_factory,
+        )
+        return [result]
     if task_type == "fundamental_refresh":
         preflight_tasks: list[CollectionTaskResult] = []
         if should_refresh_asset_universe_before_incremental(session, market="ashare"):
@@ -5597,6 +5911,60 @@ def ashare_risk_sentiment_watermark_allows_collection(
         )
         return True
     return _watermark_allows_collection(watermarks.get(asset_id), now=now or datetime.now(tz=UTC))
+
+
+def record_ashare_event_watermark(
+    session: Any,
+    *,
+    results: list[Any],
+    occurred_at: datetime | None = None,
+) -> None:
+    """仅在事件刷新全部成功后推进市场级 events 水位。"""
+
+    if not results:
+        return
+    statuses = [
+        str(getattr(result, "status", "") or "").strip().lower()
+        for result in results
+    ]
+    now = occurred_at or datetime.now(tz=UTC)
+    provider = "event_refresh"
+    payload = {
+        "status": "available" if all(item == "available" for item in statuses) else "failed",
+        "task_statuses": statuses,
+        "item_count": sum(result_item_count(result) for result in results),
+        "provider": provider,
+    }
+    try:
+        repository = DataSyncWatermarkRepository(session)
+        if payload["status"] == "available":
+            repository.record_success(
+                asset_id="market:ashare:events",
+                symbol="events",
+                market="ashare",
+                data_domain=ASHARE_EVENT_DATA_DOMAIN,
+                provider=provider,
+                timeframe="window",
+                watermark_at=now,
+                occurred_at=now,
+                payload=payload,
+            )
+            return
+        repository.record_failure(
+            asset_id="market:ashare:events",
+            symbol="events",
+            market="ashare",
+            data_domain=ASHARE_EVENT_DATA_DOMAIN,
+            provider=provider,
+            timeframe="window",
+            occurred_at=now,
+            retry_after=timedelta(minutes=15),
+            error_message="event_refresh_incomplete",
+            payload=payload,
+        )
+    except Exception as exc:
+        rollback_session_if_possible(session)
+        logger.warning("事件域水位记录失败，已回滚当前事务 error=%s", exc, exc_info=True)
 
 
 def record_ashare_risk_sentiment_watermark(

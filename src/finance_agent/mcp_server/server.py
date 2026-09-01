@@ -341,11 +341,12 @@ def create_mcp_server(
         """派发待处理触发事件到 Agent 唤醒队列。"""
 
         return run_with_trigger_service(
-            lambda service: service.dispatch_pending(
+            lambda service: _dispatch_with_hermes_publisher(
+                service,
                 owner_id=owner_id,
                 limit=limit,
                 as_of=_parse_datetime(as_of),
-            ).to_dict()
+            )
         )
 
     @mcp.tool()
@@ -378,8 +379,66 @@ def create_mcp_server(
                     cooldown_minutes=cooldown_minutes,
                     recommendation_limit=recommendation_limit,
                     drawdown_threshold=drawdown_threshold,
-                )
+                ),
+                publisher=_hermes_publisher_callback(),
             )
+        )
+
+    # ------------------------------------------------------------------
+    # 停跑恢复补跑（DataRecoveryModule 门面；独立会话，不经过 Interface）
+    # ------------------------------------------------------------------
+
+    def _run_recovery(callback):
+        from finance_agent.storage.db import create_session_factory, session_scope
+
+        factory = create_session_factory()
+        with session_scope(factory) as session:
+            from finance_agent.data_recovery.assembly import (
+                build_default_recovery_module,
+            )
+
+            return callback(build_default_recovery_module(session))
+
+    @mcp.tool()
+    def data_recovery_preview(requested_by: str | None = None) -> JsonDict:
+        """A 股停跑恢复：只读扫描缺口并生成或复用补跑计划草稿。"""
+
+        return _run_recovery(lambda module: module.preview(requested_by=requested_by))
+
+    @mcp.tool()
+    def data_recovery_list_runs(limit: int = 20) -> JsonDict:
+        """A 股停跑恢复：列出补跑批次（最新在前）。"""
+
+        return _run_recovery(lambda module: {"runs": module.list_runs(limit=limit)})
+
+    @mcp.tool()
+    def data_recovery_run_status(run_id: str) -> JsonDict:
+        """A 股停跑恢复：查看批次稳定状态、步骤进度与例外清单。"""
+
+        return _run_recovery(lambda module: module.get(run_id).to_dict())
+
+    @mcp.tool()
+    def data_recovery_approve(
+        run_id: str,
+        plan_hash: str,
+        approved_by: str | None = None,
+    ) -> JsonDict:
+        """A 股停跑恢复：用户确认执行补跑；plan_hash 用于过期检测。"""
+
+        return _run_recovery(
+            lambda module: module.approve(
+                run_id=run_id,
+                plan_hash=plan_hash,
+                approved_by=approved_by,
+            ).to_dict()
+        )
+
+    @mcp.tool()
+    def data_recovery_control(run_id: str, action: str, actor: str | None = None) -> JsonDict:
+        """A 股停跑恢复：pause / resume / cancel 控制补跑批次。"""
+
+        return _run_recovery(
+            lambda module: module.control(run_id, action, actor=actor).to_dict()
         )
 
     return mcp
@@ -408,6 +467,32 @@ def run_with_trigger_service(callback: Callable[[Any], JsonDict]) -> JsonDict:
         return callback(TriggerService(session))
 
 
+def _hermes_publisher_callback() -> Callable[[Any], None] | None:
+    """返回环境配置的 Hermes 发布回调。"""
+
+    from finance_agent.triggers.webhook import HermesWebhookPublisher
+
+    publisher = HermesWebhookPublisher.from_environment()
+    return publisher.publish if publisher else None
+
+
+def _dispatch_with_hermes_publisher(
+    service: Any,
+    *,
+    owner_id: str | None,
+    limit: int,
+    as_of: Any,
+) -> JsonDict:
+    """使用 Hermes 发布器派发事件，避免 MCP 调用绕过 HMAC 门控。"""
+
+    return service.dispatch_pending(
+        owner_id=owner_id,
+        limit=limit,
+        as_of=as_of,
+        publisher=_hermes_publisher_callback(),
+    ).to_dict()
+
+
 def build_trigger_request(
     *,
     owner_id: str,
@@ -421,11 +506,12 @@ def build_trigger_request(
     cooldown_minutes: int,
     recommendation_limit: int,
     drawdown_threshold: str,
-) -> TriggerEvaluationRequest:
+) -> Any:
     """构建 MCP 触发评估请求。"""
 
     from datetime import UTC, datetime
     from decimal import Decimal
+
     from finance_agent.agents.interfaces import parse_datetime
     from finance_agent.triggers import TriggerEvaluationRequest
 

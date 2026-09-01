@@ -5259,6 +5259,47 @@ def test_ashare_risk_sentiment_skips_only_source_in_failure_cooldown(
     assert [call["provider"] for call in watermark_calls] == run_calls
 
 
+def test_record_ashare_event_watermark_requires_all_tasks_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collect_base_data = import_collection_module()
+    calls: list[dict[str, Any]] = []
+
+    class FakeWatermarkRepository:
+        def __init__(self, session: Any) -> None:
+            self.session = session
+
+        def record_success(self, **kwargs: Any) -> None:
+            calls.append({"kind": "success", **kwargs})
+
+        def record_failure(self, **kwargs: Any) -> None:
+            calls.append({"kind": "failure", **kwargs})
+
+    monkeypatch.setattr(collect_base_data, "DataSyncWatermarkRepository", FakeWatermarkRepository)
+
+    collect_base_data.record_ashare_event_watermark(
+        object(),
+        results=[
+            Namespace(status="available", item_count=2),
+            Namespace(status="available", item_count=3),
+        ],
+    )
+    assert calls[0]["kind"] == "success"
+    assert calls[0]["data_domain"] == "events"
+    assert calls[0]["asset_id"] == "market:ashare:events"
+    assert calls[0]["payload"]["item_count"] == 5
+
+    collect_base_data.record_ashare_event_watermark(
+        object(),
+        results=[
+            Namespace(status="available", item_count=2),
+            Namespace(status="unavailable", item_count=0),
+        ],
+    )
+    assert calls[1]["kind"] == "failure"
+    assert calls[1]["error_message"] == "event_refresh_incomplete"
+
+
 def test_record_ashare_risk_sentiment_watermark_records_success_and_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6808,6 +6849,7 @@ def test_batch_ashare_fundamental_symbols_uses_watermarks_for_resume(
     symbols = collect_base_data.batch_ashare_fundamental_symbols(
         object(),
         fallback_symbol="000001",
+        now=datetime(2026, 6, 5, tzinfo=UTC),
         only_failed_or_stale=True,
         stale_before=stale_before,
     )

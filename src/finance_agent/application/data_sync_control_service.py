@@ -41,12 +41,135 @@ from finance_agent.scheduler.base_data_progress import (
     build_progress_snapshot_response,
 )
 from finance_agent.scheduler.base_data_scheduler import parse_scheduler_resource_pools
+from finance_agent.scheduler.config_identity import load_config_identity
+from finance_agent.scheduler.runtime_reporter import (
+    SCHEDULER_TASK_STATUSES,
+    SchedulerRuntimeReporter,
+)
 
 JsonDict = dict[str, Any]
 logger = logging.getLogger(__name__)
 
-ROOT_DIR = Path(__file__).resolve().parents[3]
-RUNTIME_DIR = ROOT_DIR / "runtime"
+
+def _resolve_configured_path(environment_name: str, default: Path) -> Path:
+    """解析显式部署目录；未配置时保留源码运行的默认路径。"""
+
+    configured = os.getenv(environment_name, "").strip()
+    if not configured:
+        return default
+    return Path(configured).expanduser().resolve()
+
+
+def scheduler_runtime_options(scheduler_config_file: Path) -> JsonDict:
+    """读取 API 当前配置身份和并发上限，供 PostgreSQL 快照比对。"""
+
+    scheduler_config = None
+    try:
+        scheduler_config = load_scheduler_config(scheduler_config_file)
+    except Exception as exc:
+        logger.warning("读取 API 调度配置失败，配置摘要将标记为 unknown：%s", exc)
+    try:
+        api_config_digest = load_config_identity(scheduler_config_file).digest
+    except Exception:
+        api_config_digest = None
+
+    resource_pool_limits: dict[str, int] = {}
+    max_concurrent_jobs = 4
+    if scheduler_config is not None:
+        max_concurrent_jobs = max(1, int(scheduler_config.max_concurrent_jobs))
+        for pool_name, raw_pool in dict(scheduler_config.resource_pools or {}).items():
+            if isinstance(raw_pool, dict):
+                raw_limit = raw_pool.get("max_concurrent_jobs")
+            else:
+                raw_limit = raw_pool
+            try:
+                resource_pool_limits[str(pool_name)] = max(1, int(raw_limit))
+            except (TypeError, ValueError):
+                continue
+    return {
+        "api_config_digest": api_config_digest,
+        "resource_pool_limits": resource_pool_limits,
+        "max_concurrent_jobs": max_concurrent_jobs,
+    }
+
+
+def merge_persistent_scheduler_progress(
+    response: JsonDict,
+    *,
+    session: Any | None,
+    scheduler_config: Any | None,
+    scheduler_config_file: Path,
+) -> JsonDict:
+    """以 PostgreSQL 七状态替换推导队列，Redis 只保留运行中内部进度。"""
+
+    if session is None:
+        return response
+    try:
+        options = scheduler_runtime_options(scheduler_config_file)
+        if scheduler_config is not None:
+            options["max_concurrent_jobs"] = max(
+                1,
+                int(scheduler_config.max_concurrent_jobs),
+            )
+        snapshot = SchedulerRuntimeReporter.from_session(session).snapshot(
+            redis_progress=response,
+            **options,
+        )
+    except Exception as exc:
+        logger.warning("读取 PostgreSQL 调度进度失败：%s", exc)
+        redis_data = response.get("data") if isinstance(response.get("data"), dict) else {}
+        empty_counts = {status: 0 for status in SCHEDULER_TASK_STATUSES}
+        return {
+            "status": "degraded",
+            "message": "PostgreSQL 调度快照不可用，任务事实暂不可用。",
+            "data": {
+                "source": "unavailable",
+                "database_status": "error",
+                "database_error": str(exc)[:400],
+                "redis_status": response.get("status", "unknown"),
+                "cache_backend": redis_data.get("cache_backend"),
+                "source_rate_states": list(redis_data.get("source_rate_states") or []),
+                "status_counts": empty_counts,
+                "listed_status_counts": dict(empty_counts),
+                "task_list": {
+                    "listed_count": 0,
+                    "active_count": 0,
+                    "terminal_count": 0,
+                    "terminal_total_count": 0,
+                    "terminal_limit": None,
+                    "truncated": False,
+                },
+                "tasks": [],
+                "waiting": [],
+                "waiting_jobs": [],
+                "running_jobs": [],
+                "resource_pools": {},
+                "metrics": {},
+            },
+        }
+
+    data = snapshot.to_dict()
+    redis_data = response.get("data") if isinstance(response.get("data"), dict) else {}
+    data["cache_backend"] = redis_data.get("cache_backend")
+    data["source_rate_states"] = list(redis_data.get("source_rate_states") or [])
+    data["redis_status"] = response.get("status", "unknown")
+    merged = {
+        "status": "ok" if response.get("status") == "ok" else "degraded",
+        "data": data,
+    }
+    if response.get("status") != "ok":
+        merged["message"] = "PostgreSQL 调度状态可用，Redis 内部进度不可用。"
+    return merged
+
+
+ROOT_DIR = _resolve_configured_path(
+    "FINANCE_AGENT_PROJECT_ROOT",
+    Path(__file__).resolve().parents[3],
+)
+RUNTIME_DIR = _resolve_configured_path(
+    "FINANCE_AGENT_RUNTIME_DIR",
+    ROOT_DIR / "runtime",
+)
 SCHEDULER_DIR = RUNTIME_DIR / "base_data_scheduler"
 DEFAULT_DATA_SYNC_CONFIG = RUNTIME_DIR / "data_sync_config.json"
 DEFAULT_SCHEDULER_CONFIG = SCHEDULER_DIR / "base_data_scheduler.json"
@@ -343,15 +466,92 @@ class DataSyncControlService:
     def read_scheduler_status(
         self,
         *,
+        session: Any | None = None,
         status_file: Path = DEFAULT_STATUS_FILE,
         process_file: Path = DEFAULT_PROCESS_FILE,
+        scheduler_config_file: Path = DEFAULT_SCHEDULER_CONFIG,
         max_age_seconds: int | None = None,
     ) -> JsonDict:
-        """读取 Docker 调度器健康状态，不再暴露旧的 Windows 进程元数据。"""
+        """优先读取 PostgreSQL 调度快照，数据库异常时降级到状态文件。"""
 
-        health = read_scheduler_health(status_file, max_age_seconds=max_age_seconds)
+        liveness = dict(
+            read_scheduler_health(status_file, max_age_seconds=max_age_seconds)
+        )
+        if session is not None:
+            try:
+                options = scheduler_runtime_options(scheduler_config_file)
+                snapshot = SchedulerRuntimeReporter.from_session(session).snapshot(**options)
+                runtime = snapshot.to_dict()
+                running_names = [task["job_name"] for task in snapshot.running_jobs]
+                pending_names = [task["job_name"] for task in snapshot.waiting_jobs]
+                runtime_metrics = runtime.get("metrics") or {}
+                health = dict(liveness)
+                health_payload = (
+                    dict(health.get("payload") or {})
+                    if isinstance(health.get("payload"), dict)
+                    else {}
+                )
+                health_payload.update(
+                    {
+                        "running_jobs": running_names,
+                        "queued_jobs": pending_names,
+                        "max_concurrent_jobs": runtime_metrics.get("max_concurrent_jobs", 4),
+                        "resource_pools": runtime.get("resource_pools") or {},
+                        "config_digest": snapshot.scheduler_config_digest,
+                        "api_config_digest": snapshot.api_config_digest,
+                        "config_drift": snapshot.config_drift,
+                    }
+                )
+                health.update(
+                    {
+                        "source": "status_file",
+                        "task_source": "postgresql",
+                        "database_status": "available",
+                        "task_state": "running" if running_names else "idle",
+                        "payload": health_payload,
+                    }
+                )
+                expired_lease_count = int(runtime_metrics.get("expired_lease_count") or 0)
+                if expired_lease_count > 0:
+                    health.update(
+                        {
+                            "status": "unhealthy",
+                            "healthy": False,
+                            "message": f"检测到 {expired_lease_count} 个过期任务租约。",
+                        }
+                    )
+                return {
+                    "status": "ok" if health.get("healthy") else "degraded",
+                    "health": health,
+                    "process": docker_scheduler_process_metadata(health)
+                    | {"telemetry": "status_file_liveness"},
+                    "runtime": runtime,
+                    "managed_by": DOCKER_SCHEDULER_MANAGER,
+                    "service": DOCKER_SCHEDULER_SERVICE,
+                }
+            except Exception as exc:
+                logger.warning("读取 PostgreSQL 调度快照失败，降级到状态文件：%s", exc)
+                database_error = str(exc)[:400]
+        else:
+            database_error = None
+
+        health = dict(liveness)
+        if database_error is not None:
+            health.update(
+                {
+                    "source": "status_file",
+                    "database_status": "error",
+                    "database_error": database_error,
+                }
+            )
         process = docker_scheduler_process_metadata(health)
-        status = "ok" if health.get("healthy") else health.get("status", "missing")
+        status = (
+            "degraded"
+            if database_error is not None
+            else "ok"
+            if health.get("healthy")
+            else health.get("status", "missing")
+        )
         return {
             "status": status,
             "health": health,
@@ -363,6 +563,7 @@ class DataSyncControlService:
     def read_scheduler_progress(
         self,
         *,
+        session: Any | None = None,
         event_limit: int = 80,
         cache: Any | None = None,
         cache_backend: str = "auto",
@@ -408,7 +609,12 @@ class DataSyncControlService:
                 event_limit=event_limit,
             )
             enrich_scheduler_progress_concurrency(response, scheduler_config=scheduler_config)
-            return response
+            return merge_persistent_scheduler_progress(
+                response,
+                session=session,
+                scheduler_config=scheduler_config,
+                scheduler_config_file=scheduler_config_file,
+            )
         if cache_status is not None and getattr(cache_status, "status", "available") != "available":
             response = {
                 "status": "degraded",
@@ -426,7 +632,12 @@ class DataSyncControlService:
                 event_limit=event_limit,
             )
             enrich_scheduler_progress_concurrency(response, scheduler_config=scheduler_config)
-            return response
+            return merge_persistent_scheduler_progress(
+                response,
+                session=session,
+                scheduler_config=scheduler_config,
+                scheduler_config_file=scheduler_config_file,
+            )
         response = build_progress_snapshot_response(
             cache=cache,
             cache_backend=cache_backend,
@@ -441,7 +652,12 @@ class DataSyncControlService:
             event_limit=event_limit,
         )
         enrich_scheduler_progress_concurrency(response, scheduler_config=scheduler_config)
-        return response
+        return merge_persistent_scheduler_progress(
+            response,
+            session=session,
+            scheduler_config=scheduler_config,
+            scheduler_config_file=scheduler_config_file,
+        )
 
     def read_scheduler_jobs(
         self,
@@ -1076,7 +1292,9 @@ def ensure_scheduler_payload(
             except Exception as exc:  # pragma: no cover - 旧配置仍应可读，迁移失败只降级
                 logger.warning("补齐可再生成调度任务失败，继续使用现有运行时配置：%s", exc)
             else:
-                if merge_regenerable_scheduler_jobs(payload, regenerated_payload):
+                changed = sync_scheduler_runtime_limits(payload, regenerated_payload)
+                changed = merge_regenerable_scheduler_jobs(payload, regenerated_payload) or changed
+                if changed:
                     parse_scheduler_config(payload)
                     write_scheduler_payload(scheduler_config_file, payload)
         return payload
@@ -1089,6 +1307,19 @@ def ensure_scheduler_payload(
     payload = export_scheduler_payload(config)
     write_scheduler_payload(scheduler_config_file, payload)
     return payload
+
+
+def sync_scheduler_runtime_limits(payload: JsonDict, regenerated_payload: JsonDict) -> bool:
+    """同步全局和资源池并发额度，保留任务级运行控制字段。"""
+
+    changed = False
+    for key in ("max_concurrent_jobs", "resource_pools"):
+        regenerated_value = regenerated_payload.get(key)
+        if regenerated_value is None or payload.get(key) == regenerated_value:
+            continue
+        payload[key] = deepcopy(regenerated_value)
+        changed = True
+    return changed
 
 
 def should_merge_regenerable_scheduler_jobs(

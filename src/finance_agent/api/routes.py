@@ -6,6 +6,7 @@ import json
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from pathlib import Path
 from queue import Empty, Queue
 from time import perf_counter, sleep
 from typing import Any
@@ -26,6 +27,9 @@ from finance_agent.agents.runtime.model_config import (
 from finance_agent.api.deps import get_session
 from finance_agent.api.schemas import (
     ChatRequest,
+    DataRecoveryApproveRequest,
+    DataRecoveryControlRequest,
+    DataRecoveryPreviewRequest,
     DataSchedulerFailedRerunRequest,
     DataSchedulerJobRunRequest,
     DataSchedulerJobUpdateRequest,
@@ -983,13 +987,13 @@ def data_scheduler_status(
 ) -> JsonDict:
     """读取基础数据调度器健康状态。"""
 
-    _ = session
-    if status_file == "runtime/base_data_scheduler/status.json":
-        return DataSyncControlService().read_scheduler_status(max_age_seconds=max_age_seconds)
-    return DashboardService(session).read_scheduler_status(
-        status_file=status_file,
-        max_age_seconds=max_age_seconds,
-    )
+    options: JsonDict = {
+        "session": session,
+        "max_age_seconds": max_age_seconds,
+    }
+    if status_file != "runtime/base_data_scheduler/status.json":
+        options["status_file"] = Path(status_file)
+    return DataSyncControlService().read_scheduler_status(**options)
 
 
 @router.get("/data/scheduler/progress")
@@ -999,9 +1003,11 @@ def data_scheduler_progress(
 ) -> JsonDict:
     """读取基础数据调度器运行态进度。"""
 
-    _ = session
     try:
-        return DataSyncControlService().read_scheduler_progress(event_limit=event_limit)
+        return DataSyncControlService().read_scheduler_progress(
+            session=session,
+            event_limit=event_limit,
+        )
     except Exception as exc:
         return {"status": "error", "message": str(exc)[:400], "data": {}}
 
@@ -1426,3 +1432,99 @@ def compact_chat_recommendation(item: JsonDict) -> JsonDict:
         if key in item:
             compact[key] = item[key]
     return compact
+
+
+# ---------------------------------------------------------------------------
+# 停跑恢复补跑（DataRecoveryModule 门面；规格 5.1）
+# ---------------------------------------------------------------------------
+
+
+def _data_recovery_module(session: Session):
+    """构造补跑门面；统一走生产装配（含日历只读刷新，规格 6.1）。"""
+
+    from finance_agent.data_recovery.assembly import build_default_recovery_module
+
+    return build_default_recovery_module(session)
+
+
+@router.post("/data/recovery/preview")
+def data_recovery_preview(
+    request: DataRecoveryPreviewRequest,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """只读扫描生产资产池缺口并生成或复用计划草稿（不采集）。"""
+
+    try:
+        return _data_recovery_module(session).preview(requested_by=request.requested_by)
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400]}
+
+
+@router.get("/data/recovery/runs")
+def data_recovery_runs(
+    limit: int = 20,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """列出补跑批次（最新在前）。"""
+
+    try:
+        return {"runs": _data_recovery_module(session).list_runs(limit=limit)}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400], "runs": []}
+
+
+@router.get("/data/recovery/runs/{run_id}")
+def data_recovery_run_detail(
+    run_id: str,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """返回批次稳定状态：步骤进度、例外清单与质量结论。"""
+
+    try:
+        return _data_recovery_module(session).get(run_id).to_dict()
+    except LookupError as exc:
+        return {"status": "not_found", "message": str(exc)[:200]}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400]}
+
+
+@router.post("/data/recovery/runs/{run_id}/approve")
+def data_recovery_approve(
+    run_id: str,
+    request: DataRecoveryApproveRequest,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """用户确认补跑；plan_hash 不一致时拒绝（规格 6.2 stale_plan）。"""
+
+    try:
+        view = _data_recovery_module(session).approve(
+            run_id=run_id,
+            plan_hash=request.plan_hash,
+            approved_by=request.approved_by,
+        )
+        session.flush()
+        return view.to_dict()
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400]}
+
+
+@router.post("/data/recovery/runs/{run_id}/control")
+def data_recovery_control(
+    run_id: str,
+    request: DataRecoveryControlRequest,
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """暂停、继续或取消补跑批次（规格 12.3）。"""
+
+    try:
+        view = _data_recovery_module(session).control(
+            run_id,
+            request.action,
+            actor=request.actor,
+        )
+        session.flush()
+        return view.to_dict()
+    except ValueError as exc:
+        return {"status": "invalid_action", "message": str(exc)[:200]}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:400]}

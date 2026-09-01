@@ -507,6 +507,48 @@ def fetch_fund_flow_rank(indicator: str, *, limit: int | None = None) -> pd.Data
         return _fetch_ths_fund_flow_rank(indicator, limit=limit)
 
 
+def fetch_individual_fund_flow(symbol: str, market: str) -> pd.DataFrame:
+    """使用 curl_cffi 获取单只股票历史资金流。"""
+
+    market_map = {"sh": 1, "sz": 0, "bj": 0}
+    if market not in market_map:
+        raise ValueError(f"不支持的资金流市场: {market}")
+    payload = _curl_get_json(
+        "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
+        params={
+            "lmt": "0",
+            "klt": "101",
+            "secid": f"{market_map[market]}.{symbol}",
+            "fields1": "f1,f2,f3,f7",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+            "ut": "b2884a393a59ad64002292a3e90d46a5",
+            "_": int(time.time() * 1000),
+        },
+    )
+    klines = ((payload.get("data") or {}).get("klines") or [])
+    columns = [
+        "日期",
+        "主力净流入-净额",
+        "小单净流入-净额",
+        "中单净流入-净额",
+        "大单净流入-净额",
+        "超大单净流入-净额",
+        "主力净流入-净占比",
+        "小单净流入-净占比",
+        "中单净流入-净占比",
+        "大单净流入-净占比",
+        "超大单净流入-净占比",
+        "收盘价",
+        "涨跌幅",
+        "-1",
+        "-2",
+    ]
+    rows = [str(item).split(",") for item in klines]
+    frame = pd.DataFrame(rows, columns=columns) if rows else pd.DataFrame(columns=columns)
+    frame.attrs["actual_source"] = "eastmoney:curl_cffi:stock_individual_fund_flow"
+    return frame
+
+
 def fetch_stop_list(*, limit: int | None = None) -> pd.DataFrame:
     """获取两网及退市/交易状态异常列表。"""
 

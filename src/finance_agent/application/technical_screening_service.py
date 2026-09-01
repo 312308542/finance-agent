@@ -475,8 +475,16 @@ def calculate_metrics(bars: Sequence[Any]) -> JsonDict:
         "ma20": mean(closes[-20:]),
         "ma60": mean(closes[-60:]),
         "ma120": mean(closes[-120:]),
-        "return_20d": latest_close / closes[-21] - 1.0 if closes[-21] > 0 else 0.0,
-        "return_60d": latest_close / closes[-61] - 1.0 if closes[-61] > 0 else 0.0,
+        "return_20d": (
+            latest_close / closes[-21] - 1.0
+            if len(closes) >= 21 and closes[-21] > 0
+            else 0.0
+        ),
+        "return_60d": (
+            latest_close / closes[-61] - 1.0
+            if len(closes) >= 61 and closes[-61] > 0
+            else 0.0
+        ),
         "max_drawdown_120d": max_drawdown(closes[-120:]),
         "volatility_20d": (pstdev(returns[-20:]) * sqrt(252)) if len(returns) >= 20 else 0.0,
         "amount_avg_20d": mean(amounts[-20:]),

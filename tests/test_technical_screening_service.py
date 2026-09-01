@@ -93,6 +93,24 @@ def test_technical_screening_scores_trend_momentum_risk_and_liquidity() -> None:
     assert candidate.payload["metrics"]["bar_count"] == 260
 
 
+def test_technical_screening_short_history_does_not_crash_on_metrics() -> None:
+    """min_bars 边界数据（恰好满足但不足 61 根）不应因 return_60d 越界崩溃。"""
+
+    as_of = datetime(2026, 6, 9, 15, 30, tzinfo=UTC)
+    service = TechnicalScreeningService(session=None)
+    result = service.screen_assets(
+        assets=[asset("ashare:000001", "000001")],
+        bars_by_asset_id={"ashare:000001": rising_bars("000001", as_of=as_of, count=60)},
+        as_of=as_of,
+        min_bars=60,
+        persist=False,
+    )
+    candidate = result.candidates[0]
+    assert candidate.data_status == "available"
+    assert candidate.passed is False
+    assert candidate.payload["metrics"]["bar_count"] == 60
+
+
 def test_technical_screening_persists_screening_result_items() -> None:
     """技术初筛应写入 screening_results / screening_result_items 作为池子快照。"""
 

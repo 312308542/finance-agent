@@ -55,6 +55,20 @@ services:
       retries: 3
       start_period: 10s
 
+  # 数据库 schema 必须在所有消费者启动前完成迁移，避免新版本调度器访问缺失的表。
+  finance-agent-migrate:
+    container_name: finance-agent-migrate
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.scheduler
+    restart: "no"
+    environment:
+      FINANCE_AGENT_DATABASE_URL: ${FINANCE_AGENT_DOCKER_DATABASE_URL:-postgresql+psycopg://finance_agent:finance_agent@postgres:5432/finance_agent}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: python -m alembic -c /app/alembic.ini upgrade head
+
   finance-agent-scheduler:
     container_name: finance-agent-scheduler
     build:
@@ -67,26 +81,42 @@ services:
       FINANCE_AGENT_CACHE_BACKEND: ${FINANCE_AGENT_CACHE_BACKEND:-redis}
       FINANCE_AGENT_DB_POOL_SIZE: ${FINANCE_AGENT_DB_POOL_SIZE:-10}
       FINANCE_AGENT_DB_MAX_OVERFLOW: ${FINANCE_AGENT_DB_MAX_OVERFLOW:-20}
+      FINANCE_AGENT_PROJECT_ROOT: /app
+      FINANCE_AGENT_RUNTIME_DIR: ${FINANCE_AGENT_DOCKER_RUNTIME_DIR:-/app/runtime}
+      PYTHONPATH: /app/src
       # 容器内固定使用 Compose 服务名，禁止宿主机 localhost 覆盖请求地址。
       FINANCE_AGENT_GOTDX_GATEWAY_URL: http://finance-agent-gotdx-gateway:8790
       FINANCE_AGENT_GOTDX_URL: http://finance-agent-gotdx-gateway:8790
+      # 只有程序触发器产生事件时才唤醒宿主机上的 Hermes Gateway。
+      FINANCE_AGENT_HERMES_WEBHOOK_URL: ${FINANCE_AGENT_HERMES_WEBHOOK_URL:-http://host.docker.internal:8644/webhooks/finance-agent}
+      FINANCE_AGENT_HERMES_WEBHOOK_SECRET: ${FINANCE_AGENT_HERMES_WEBHOOK_SECRET:-}
+      FINANCE_AGENT_HERMES_WEBHOOK_TIMEOUT_SECONDS: ${FINANCE_AGENT_HERMES_WEBHOOK_TIMEOUT_SECONDS:-10}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
+      finance-agent-migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       finance-agent-gotdx-gateway:
         condition: service_healthy
     volumes:
-      - ./runtime:/app/runtime
+      - type: bind
+        source: ./runtime
+        target: ${FINANCE_AGENT_DOCKER_RUNTIME_DIR:-/app/runtime}
+      - ./src:/app/src:ro
     command:
       - python
       - scripts/data/run_base_data_scheduler.py
       - --loop
+      - --config
+      - ${FINANCE_AGENT_DOCKER_RUNTIME_DIR:-/app/runtime}/base_data_scheduler/base_data_scheduler.json
       - --status-file
-      - runtime/base_data_scheduler/status.json
+      - ${FINANCE_AGENT_DOCKER_RUNTIME_DIR:-/app/runtime}/base_data_scheduler/status.json
       - --event-log-file
-      - runtime/base_data_scheduler/events.jsonl
+      - ${FINANCE_AGENT_DOCKER_RUNTIME_DIR:-/app/runtime}/base_data_scheduler/events.jsonl
 
   finance-agent-mcp:
     container_name: finance-agent-mcp
@@ -105,6 +135,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      finance-agent-migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       finance-agent-gotdx-gateway:
@@ -129,6 +161,78 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+
+  finance-agent-api:
+    container_name: finance-agent-api
+    image: finance-agent-backend:local
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.backend
+      args:
+        PIP_INDEX_URL: ${FINANCE_AGENT_PIP_INDEX_URL:-https://pypi.org/simple}
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TZ: Asia/Shanghai
+      FINANCE_AGENT_PROJECT_ROOT: /app
+      FINANCE_AGENT_RUNTIME_DIR: ${FINANCE_AGENT_DOCKER_RUNTIME_DIR:-/app/runtime}
+      FINANCE_AGENT_DATABASE_URL: ${FINANCE_AGENT_DOCKER_DATABASE_URL:-postgresql+psycopg://finance_agent:finance_agent@postgres:5432/finance_agent}
+      FINANCE_AGENT_REDIS_URL: ${FINANCE_AGENT_DOCKER_REDIS_URL:-redis://redis:6379/0}
+      FINANCE_AGENT_CACHE_BACKEND: ${FINANCE_AGENT_CACHE_BACKEND:-redis}
+      FINANCE_AGENT_DB_POOL_SIZE: ${FINANCE_AGENT_DB_POOL_SIZE:-10}
+      FINANCE_AGENT_DB_MAX_OVERFLOW: ${FINANCE_AGENT_DB_MAX_OVERFLOW:-20}
+      FINANCE_AGENT_GRAPH_CONFIG_FILE: ${FINANCE_AGENT_DOCKER_GRAPH_CONFIG_FILE:-config/graph.neo4j.example.toml}
+      FINANCE_AGENT_GOTDX_GATEWAY_URL: http://finance-agent-gotdx-gateway:8790
+      FINANCE_AGENT_GOTDX_URL: http://finance-agent-gotdx-gateway:8790
+      FINANCE_AGENT_HERMES_WEBHOOK_URL: ${FINANCE_AGENT_HERMES_WEBHOOK_URL:-http://host.docker.internal:8644/webhooks/finance-agent}
+      FINANCE_AGENT_HERMES_WEBHOOK_SECRET: ${FINANCE_AGENT_HERMES_WEBHOOK_SECRET:-}
+      FINANCE_AGENT_HERMES_WEBHOOK_TIMEOUT_SECONDS: ${FINANCE_AGENT_HERMES_WEBHOOK_TIMEOUT_SECONDS:-10}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${FINANCE_AGENT_API_BIND_HOST:-127.0.0.1}:${FINANCE_AGENT_API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      finance-agent-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      finance-agent-gotdx-gateway:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ./runtime
+        target: ${FINANCE_AGENT_DOCKER_RUNTIME_DIR:-/app/runtime}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/api/health | grep -q '\"status\":\"ok\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  finance-agent-web:
+    container_name: finance-agent-web
+    image: finance-agent-frontend:local
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.frontend
+      args:
+        VITE_FINANCE_AGENT_API_BASE: ${FINANCE_AGENT_WEB_API_BASE:-/}
+    restart: unless-stopped
+    ports:
+      - "${FINANCE_AGENT_WEB_BIND_HOST:-127.0.0.1}:${FINANCE_AGENT_WEB_PORT:-5173}:80"
+    depends_on:
+      finance-agent-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
 volumes:
   finance_agent_postgres_data:

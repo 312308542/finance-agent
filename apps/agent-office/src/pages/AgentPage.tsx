@@ -1,4 +1,5 @@
 import * as React from "react";
+import { Button } from "antd";
 import { Brain, CheckCircle2, Clock3, Workflow } from "lucide-react";
 import { loadWorkflowOverview } from "../api";
 import { buildAgentPageModel } from "../consolePagesView";
@@ -40,10 +41,11 @@ export function AgentPage({ ownerId, initialPayload = null }: AgentPageProps) {
         <div>
           <p className="eyebrow">Agent Runtime</p>
           <h2>Agent 运行</h2>
+          <p>Workflow 目录、运行审计与模型路由状态。</p>
         </div>
-        <button className="button" onClick={() => void refresh()} disabled={loading}>
+        <Button onClick={() => void refresh()} loading={loading}>
           刷新
-        </button>
+        </Button>
       </header>
       {error ? <div className="notice notice-red">{error}</div> : null}
       <div className="real-metric-grid">

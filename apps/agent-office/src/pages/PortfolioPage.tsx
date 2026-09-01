@@ -1,5 +1,6 @@
 import * as React from "react";
 import { AlertTriangle, BriefcaseBusiness, ClipboardList, Wallet } from "lucide-react";
+import { Button, Input, Select } from "antd";
 import {
   loadExecutionRecords,
   loadOrderDrafts,
@@ -126,10 +127,11 @@ export function PortfolioPage({ ownerId, initialPayload = null }: PortfolioPageP
         <div>
           <p className="eyebrow">Portfolio Monitor</p>
           <h2>持仓监控</h2>
+          <p>持仓体检、集中度提示与执行登记闭环。</p>
         </div>
-        <button className="button" onClick={() => void refresh()} disabled={loading}>
+        <Button onClick={() => void refresh()} loading={loading}>
           刷新
-        </button>
+        </Button>
       </header>
       {error ? <div className="notice notice-red">{error}</div> : null}
       {notice ? <div className="notice recommendation-notice">{notice}</div> : null}
@@ -239,60 +241,69 @@ function ExecutionRegistrationPanel({
       <div className="action-loop-form">
         <label>
           <span>来源草案</span>
-          <select value={values.orderDraftId} onChange={(event) => onSelectDraft(event.target.value)}>
-            <option value="">自主登记或暂不关联</option>
-            {drafts.map((draft) => (
-              <option key={draft.orderDraftId} value={draft.orderDraftId}>
-                {draft.assetLabel} · {draft.actionLabel} · {draft.priceRangeDisplay}
-              </option>
-            ))}
-          </select>
+          <Select
+            value={values.orderDraftId || undefined}
+            onChange={(value) => onSelectDraft(value ?? "")}
+            options={[
+              { value: "", label: "自主登记或暂不关联" },
+              ...drafts.map((draft) => ({
+                value: draft.orderDraftId,
+                label: `${draft.assetLabel} · ${draft.actionLabel} · ${draft.priceRangeDisplay}`,
+              })),
+            ]}
+            showSearch
+            optionFilterProp="label"
+          />
         </label>
         <label>
           <span>组合 ID</span>
-          <input value={values.portfolioId} onChange={(event) => onChange("portfolioId", event.target.value)} />
+          <Input value={values.portfolioId} onChange={(event) => onChange("portfolioId", event.target.value)} />
         </label>
         <label>
           <span>资产 ID</span>
-          <input placeholder="ashare:600519" value={values.assetId} onChange={(event) => onChange("assetId", event.target.value)} />
+          <Input placeholder="ashare:600519" value={values.assetId} onChange={(event) => onChange("assetId", event.target.value)} />
         </label>
         <label>
           <span>市场</span>
-          <input value={values.market} onChange={(event) => onChange("market", event.target.value)} />
+          <Input value={values.market} onChange={(event) => onChange("market", event.target.value)} />
         </label>
         <label>
           <span>动作</span>
-          <select value={values.action} onChange={(event) => onChange("action", event.target.value)}>
-            <option value="buy">买入</option>
-            <option value="add">加仓</option>
-            <option value="sell">卖出</option>
-            <option value="reduce">减仓</option>
-          </select>
+          <Select
+            value={values.action}
+            onChange={(value) => onChange("action", value)}
+            options={[
+              { value: "buy", label: "买入" },
+              { value: "add", label: "加仓" },
+              { value: "sell", label: "卖出" },
+              { value: "reduce", label: "减仓" },
+            ]}
+          />
         </label>
         <label>
           <span>执行价格</span>
-          <input value={values.executedPrice} onChange={(event) => onChange("executedPrice", event.target.value)} />
+          <Input value={values.executedPrice} onChange={(event) => onChange("executedPrice", event.target.value)} />
         </label>
         <label>
           <span>执行数量</span>
-          <input value={values.executedQuantity} onChange={(event) => onChange("executedQuantity", event.target.value)} />
+          <Input value={values.executedQuantity} onChange={(event) => onChange("executedQuantity", event.target.value)} />
         </label>
         <label>
           <span>执行时间</span>
-          <input placeholder="2026-06-13T10:05:00+08:00" value={values.executedAt} onChange={(event) => onChange("executedAt", event.target.value)} />
+          <Input placeholder="2026-06-13T10:05:00+08:00" value={values.executedAt} onChange={(event) => onChange("executedAt", event.target.value)} />
         </label>
         <label>
           <span>费用</span>
-          <input value={values.fee} onChange={(event) => onChange("fee", event.target.value)} />
+          <Input value={values.fee} onChange={(event) => onChange("fee", event.target.value)} />
         </label>
         <label className="action-loop-form-wide">
           <span>备注</span>
-          <textarea value={values.note} onChange={(event) => onChange("note", event.target.value)} />
+          <Input.TextArea value={values.note} onChange={(event) => onChange("note", event.target.value)} />
         </label>
       </div>
-      <button className="button button-primary" type="button" disabled={disabled} onClick={onSubmit}>
+      <Button type="primary" disabled={disabled} loading={saving} onClick={onSubmit}>
         {saving ? "保存中" : "保存执行登记"}
-      </button>
+      </Button>
     </article>
   );
 }

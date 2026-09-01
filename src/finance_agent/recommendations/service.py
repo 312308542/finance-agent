@@ -628,6 +628,15 @@ def build_backtest_evidence(
         status="available",
     )
     if row is None:
+        # 回测执行成功落库为 completed，而非 available；二者都应视为
+        # 有效回测证据，否则推荐就绪度会误报 missing_backtest_evidence。
+        row = backtests.get_latest_result(
+            market=market,
+            strategy_id=strategy_id,
+            universe_id=universe_id,
+            status="completed",
+        )
+    if row is None:
         return build_missing_backtest_evidence(
             market=market,
             strategy_id=strategy_id,

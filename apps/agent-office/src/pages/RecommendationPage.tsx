@@ -1,4 +1,5 @@
 import React from "react";
+import { Button, Input, Modal, Segmented } from "antd";
 import { BarChart3, ChevronRight, GitBranch, MessageSquareText, RefreshCcw, ShieldAlert } from "lucide-react";
 import {
   confirmDecision,
@@ -396,29 +397,23 @@ function RecommendationExpanded({
       ) : null}
       <div className="recommendation-expanded-actions">
         {item.reportWorkflowRunId ? (
-          <a className="button button-ghost" href={`#report:${encodeURIComponent(item.reportWorkflowRunId)}`}>
+          <Button type="link" href={`#report:${encodeURIComponent(item.reportWorkflowRunId)}`}>
             查看报告
-          </a>
+          </Button>
         ) : (
           <span>暂无关联报告</span>
         )}
-        <button
-          className="button button-primary"
-          type="button"
+        <Button
+          type="primary"
+          icon={<MessageSquareText size={15} />}
           disabled={!item.pendingDecision}
           onClick={() => onFeedback(item)}
         >
-          <MessageSquareText size={15} />
           {item.pendingDecision ? "反馈确认" : "无待确认决策"}
-        </button>
-        <button
-          className="button button-ghost"
-          type="button"
-          disabled={!canCreateDraft || savingDraft}
-          onClick={() => onGenerateDraft(item, confirmedDecisionId)}
-        >
+        </Button>
+        <Button disabled={!canCreateDraft || savingDraft} onClick={() => onGenerateDraft(item, confirmedDecisionId)}>
           {savingDraft ? "生成中" : "生成订单草案"}
-        </button>
+        </Button>
       </div>
       {draft ? <OrderDraftCard draft={draft} /> : null}
     </section>
@@ -539,59 +534,62 @@ function FeedbackDialog({
   onSubmit: () => void;
 }) {
   return (
-    <div className="feedback-dialog-backdrop" role="presentation">
-      <section className="feedback-dialog" role="dialog" aria-modal="true" aria-label="推荐反馈">
-        <header>
-          <div>
-            <span className="eyebrow">Decision Feedback</span>
-            <h2>{item.assetLabel}</h2>
-            <p>{item.pendingDecision?.summary || item.summary || "反馈会写入决策日志和 Finance Memory。"}</p>
-          </div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label="关闭反馈">
-            ×
-          </button>
-        </header>
-        <div className="feedback-options">
-          {[
-            ["accepted", "采纳"],
-            ["rejected", "拒绝"],
-            ["modified", "修改"],
-            ["deferred", "暂缓"],
-          ].map(([value, label]) => (
-            <button
-              key={value}
-              className={feedbackType === value ? "is-active" : ""}
-              type="button"
-              onClick={() => setFeedbackType(value as DecisionFeedbackType)}
-            >
-              {label}
-            </button>
-          ))}
+    <Modal
+      open
+      width={480}
+      onCancel={onClose}
+      maskClosable={!saving}
+      keyboard={!saving}
+      footer={null}
+      destroyOnClose
+      title={
+        <div>
+          <span className="eyebrow">Decision Feedback</span>
+          <h2 className="feedback-modal-title">{item.assetLabel}</h2>
+        </div>
+      }
+    >
+      <section className="feedback-dialog-body" aria-label="推荐反馈">
+        <p className="feedback-summary">
+          {item.pendingDecision?.summary || item.summary || "反馈会写入决策日志和 Finance Memory。"}
+        </p>
+        <div className="feedback-field">
+          <span>反馈类型</span>
+          <Segmented
+            block
+            value={feedbackType}
+            onChange={(value) => setFeedbackType(value as DecisionFeedbackType)}
+            options={[
+              { label: "采纳", value: "accepted" },
+              { label: "拒绝", value: "rejected" },
+              { label: "修改", value: "modified" },
+              { label: "暂缓", value: "deferred" },
+            ]}
+          />
         </div>
         {feedbackType === "modified" ? (
           <label className="feedback-field">
             <span>修改后的动作</span>
-            <input value={modifiedAction} onChange={(event) => setModifiedAction(event.target.value)} />
+            <Input value={modifiedAction} onChange={(event) => setModifiedAction(event.target.value)} />
           </label>
         ) : null}
         <label className="feedback-field">
           <span>备注</span>
-          <textarea
+          <Input.TextArea
             value={comment}
             onChange={(event) => setComment(event.target.value)}
             placeholder="记录你的确认理由、保留条件或暂缓原因。"
+            autoSize={{ minRows: 3, maxRows: 6 }}
           />
         </label>
-        <footer>
-          <button className="button button-ghost" type="button" onClick={onClose}>
-            取消
-          </button>
-          <button className="button button-primary" type="button" disabled={saving} onClick={onSubmit}>
-            {saving ? "提交中" : "提交反馈"}
-          </button>
+        <footer className="feedback-footer">
+          <Button onClick={onClose}>取消</Button>
+          <Button type="primary" loading={saving} onClick={onSubmit}>
+            提交反馈
+          </Button>
         </footer>
       </section>
-    </div>
+    </Modal>
   );
 }
 

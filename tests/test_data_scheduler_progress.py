@@ -997,11 +997,89 @@ def test_api_registers_scheduler_progress_route() -> None:
     from finance_agent.api.app import create_app
 
     app = create_app()
+    paths = app.openapi()["paths"]
 
-    assert any(
-        route.path == "/api/data/scheduler/progress" and "GET" in route.methods
-        for route in app.routes
+    assert "get" in paths["/api/data/scheduler/progress"]
+
+
+def test_api_scheduler_progress_passes_database_session_to_control_service(monkeypatch) -> None:
+    """API 不得再丢弃 session，否则运行态会退回 Redis 推导队列。"""
+
+    from finance_agent.api import routes
+
+    session = object()
+    observed: dict[str, Any] = {}
+
+    def fake_read_scheduler_progress(self, **kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        return {"status": "ok", "data": {"source": "postgresql"}}
+
+    monkeypatch.setattr(
+        DataSyncControlService,
+        "read_scheduler_progress",
+        fake_read_scheduler_progress,
     )
+
+    result = routes.data_scheduler_progress(event_limit=33, session=session)
+
+    assert result["data"]["source"] == "postgresql"
+    assert observed == {"session": session, "event_limit": 33}
+
+
+def test_api_scheduler_status_passes_database_session_to_control_service(monkeypatch) -> None:
+    """状态接口必须把 PostgreSQL session 交给统一 Reporter。"""
+
+    from finance_agent.api import routes
+
+    session = object()
+    observed: dict[str, Any] = {}
+
+    def fake_read_scheduler_status(self, **kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        return {"status": "ok", "runtime": {"source": "postgresql"}}
+
+    monkeypatch.setattr(
+        DataSyncControlService,
+        "read_scheduler_status",
+        fake_read_scheduler_status,
+    )
+
+    result = routes.data_scheduler_status(max_age_seconds=45, session=session)
+
+    assert result["runtime"]["source"] == "postgresql"
+    assert observed == {"session": session, "max_age_seconds": 45}
+
+
+def test_api_scheduler_status_keeps_postgresql_reporter_for_custom_status_file(monkeypatch) -> None:
+    """自定义心跳文件只能改变 liveness 输入，不能绕过 PostgreSQL Reporter。"""
+
+    from finance_agent.api import routes
+
+    session = object()
+    observed: dict[str, Any] = {}
+
+    def fake_read_scheduler_status(self, **kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        return {"status": "degraded", "runtime": {"source": "postgresql"}}
+
+    monkeypatch.setattr(
+        DataSyncControlService,
+        "read_scheduler_status",
+        fake_read_scheduler_status,
+    )
+
+    result = routes.data_scheduler_status(
+        status_file="runtime/custom/scheduler.json",
+        max_age_seconds=30,
+        session=session,
+    )
+
+    assert result["runtime"]["source"] == "postgresql"
+    assert observed == {
+        "session": session,
+        "status_file": Path("runtime/custom/scheduler.json"),
+        "max_age_seconds": 30,
+    }
 
 
 def test_api_registers_scheduler_job_control_routes() -> None:
@@ -1010,21 +1088,10 @@ def test_api_registers_scheduler_job_control_routes() -> None:
     from finance_agent.api.app import create_app
 
     app = create_app()
+    paths = app.openapi()["paths"]
 
-    assert any(route.path == "/api/data/scheduler/jobs" and "GET" in route.methods for route in app.routes)
-    assert any(
-        route.path == "/api/data/scheduler/jobs/{job_name}" and "PUT" in route.methods
-        for route in app.routes
-    )
-    assert any(
-        route.path == "/api/data/scheduler/jobs/{job_name}/run" and "POST" in route.methods
-        for route in app.routes
-    )
-    assert any(
-        route.path == "/api/data/scheduler/jobs/{job_name}/rerun-failed" and "POST" in route.methods
-        for route in app.routes
-    )
-    assert any(
-        route.path == "/api/data/scheduler/jobs/{job_name}/cancel" and "POST" in route.methods
-        for route in app.routes
-    )
+    assert "get" in paths["/api/data/scheduler/jobs"]
+    assert "put" in paths["/api/data/scheduler/jobs/{job_name}"]
+    assert "post" in paths["/api/data/scheduler/jobs/{job_name}/run"]
+    assert "post" in paths["/api/data/scheduler/jobs/{job_name}/rerun-failed"]
+    assert "post" in paths["/api/data/scheduler/jobs/{job_name}/cancel"]

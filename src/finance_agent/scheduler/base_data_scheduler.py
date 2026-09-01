@@ -33,8 +33,19 @@ from finance_agent.data.sync_config import (
     export_scheduler_payload,
     load_data_sync_config,
 )
+from finance_agent.scheduler.admission import (
+    AdmissionSnapshot,
+    SchedulerAdmissionController,
+)
 from finance_agent.scheduler.base_data_progress import BaseDataTaskProgressRecorder
+from finance_agent.scheduler.config_identity import (
+    SchedulerConfigIdentity,
+    load_config_identity,
+)
+from finance_agent.scheduler.persistent_scheduler_worker import PersistentSchedulerWorker
 from finance_agent.scheduler.persistent_task_queue import PersistentTaskQueue, TaskClaim
+from finance_agent.scheduler.planner import SchedulerPlanner
+from finance_agent.scheduler.recovery_bridge import RecoverySchedulerMixin
 
 JsonDict = dict[str, Any]
 logger = logging.getLogger(__name__)
@@ -71,6 +82,7 @@ DEFAULT_JOB_PRIORITY = 100
 DEFAULT_JOB_RESOURCE_POOL = "default"
 STATUS_REPLACE_MAX_ATTEMPTS = 5
 STATUS_REPLACE_RETRY_SECONDS = 0.05
+PERSISTENT_TASK_RECOVERY_SWEEP_INTERVAL_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -690,12 +702,15 @@ def read_scheduler_health(
     )
     state = str(payload.get("state") or "unknown")
     last_job_status = payload.get("last_job_status")
-    healthy = age_seconds <= stale_after and state not in {"failed", "stale"}
+    terminal_states = {"stopped", "completed", "disabled", "interrupted", "cancelled"}
+    healthy = age_seconds <= stale_after and state not in {"failed", "stale", *terminal_states}
     if last_job_status == "failed":
         healthy = False
     status = "healthy" if healthy else "unhealthy"
     if age_seconds > stale_after:
         status = "stale"
+    elif state in terminal_states:
+        status = state
     return {
         "healthy": healthy,
         "status": status,
@@ -968,7 +983,7 @@ def parse_scheduler_job(payload: Any, *, index: int) -> BaseDataSchedulerJob:
     )
 
 
-class BaseDataScheduler:
+class BaseDataScheduler(RecoverySchedulerMixin):
     """按配置运行基础数据采集任务。"""
 
     def __init__(
@@ -1016,9 +1031,18 @@ class BaseDataScheduler:
         self.status_file = Path(status_file) if status_file else None
         self.event_log_file = Path(event_log_file) if event_log_file else None
         self.scheduler_config_file = Path(scheduler_config_file) if scheduler_config_file else None
+        self.config_identity: SchedulerConfigIdentity | None = (
+            load_config_identity(self.scheduler_config_file)
+            if self.scheduler_config_file is not None
+            else None
+        )
+        self.config_reload_error: str | None = None
         self.service_name = service_name
         self._persistent_task_queue_scope = persistent_task_queue_scope
         self._worker_id = f"{service_name}:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+        # 停跑恢复补跑：在飞分区任务计数（受 max_concurrent_jobs 预算约束）。
+        self._recovery_lock = threading.Lock()
+        self._recovery_inflight_count = 0
         self.started_at: datetime | None = None
         self._status_lock = threading.Lock()
         self._event_lock = threading.Lock()
@@ -1106,15 +1130,49 @@ class BaseDataScheduler:
                 now=occurred_at,
             )
 
-    def _recover_expired_persistent_tasks(self) -> int:
-        """启动常驻循环前释放上次进程留下的过期租约。"""
+    def _recover_expired_persistent_tasks(self, *, force: bool = False) -> int:
+        """周期释放过期租约，使启动后才到期的任务也能重新领取。"""
 
         if self._persistent_task_queue_scope is None:
             return 0
+        now_monotonic = time.monotonic()
+        last_sweep = float(
+            getattr(self, "_persistent_recovery_last_sweep", 0.0) or 0.0
+        )
+        if (
+            not force
+            and last_sweep > 0
+            and now_monotonic - last_sweep
+            < PERSISTENT_TASK_RECOVERY_SWEEP_INTERVAL_SECONDS
+        ):
+            return 0
+        self._persistent_recovery_last_sweep = now_monotonic
         with self._persistent_task_queue_scope() as task_queue:
             recovered_count = task_queue.recover_expired()
         if recovered_count:
             logger.warning("已恢复过期持久化任务 count=%s", recovered_count)
+        return recovered_count
+
+    def _recover_orphaned_persistent_tasks(self) -> int:
+        """启动时回收同一 scheduler 前一实例留下的运行租约。"""
+
+        if self._persistent_task_queue_scope is None:
+            return 0
+        recover = None
+        worker_prefix = self._worker_id.rsplit(":", 2)[0]
+        with self._persistent_task_queue_scope() as task_queue:
+            recover = getattr(task_queue, "recover_orphaned", None)
+            if not callable(recover):
+                return 0
+            recovered_count = int(
+                recover(
+                    worker_prefix=worker_prefix,
+                    current_worker_id=self._worker_id,
+                )
+                or 0
+            )
+        if recovered_count:
+            logger.warning("已回收前一 scheduler 实例遗留租约 count=%s", recovered_count)
         return recovered_count
 
     def _finish_persistent_task(
@@ -1252,6 +1310,329 @@ class BaseDataScheduler:
         )
         return result
 
+    def _supports_persistent_loop(self, *, dry_run: bool) -> bool:
+        """仅在队列提供完整持久调度 interface 时启用新闭环。"""
+
+        if dry_run or self._persistent_task_queue_scope is None:
+            return False
+        with self._persistent_task_queue_scope() as task_queue:
+            required_methods = (
+                "list_tasks",
+                "schedule",
+                "set_admission",
+                "coalesce_task",
+                "claim_many",
+            )
+            return all(callable(getattr(task_queue, name, None)) for name in required_methods)
+
+    def _persistent_recovery_blocked_domains(self, task_queue: Any) -> Mapping[str, Any]:
+        """读取活动补跑批次的阻塞数据域，测试 adapter 可直接提供快照。"""
+
+        provider = getattr(task_queue, "recovery_blocked_domains", None)
+        if callable(provider):
+            return provider()
+        repository = getattr(task_queue, "repository", None)
+        session = getattr(repository, "session", None)
+        if session is None:
+            return {}
+        from finance_agent.data_recovery.gate import RecoveryGate
+        from finance_agent.data_recovery.repository import RecoveryRepository
+
+        return RecoveryGate(RecoveryRepository(session)).blocked_domains()
+
+    def _admit_persistent_tasks(self, *, now: datetime) -> JsonDict:
+        """重评估全部 planned/blocked 任务，并为本轮预留资源池和互斥键。"""
+
+        if self._persistent_task_queue_scope is None:
+            return {"admitted": 0, "blocked": 0}
+        enabled_jobs = {job.name: job for job in self.enabled_jobs()}
+        with self._persistent_task_queue_scope() as task_queue:
+            running = task_queue.list_tasks(statuses=("running",), limit=10_000)
+            candidates = task_queue.list_tasks(
+                statuses=("scheduled", "blocked"),
+                limit=10_000,
+            )
+            pool_running: dict[str, int] = {}
+            active_mutex_keys: set[str] = set()
+            for task in running:
+                pool = str(getattr(task, "resource_pool", "default") or "default")
+                pool_running[pool] = pool_running.get(pool, 0) + 1
+                mutex_key = str(getattr(task, "mutex_key", None) or "").strip()
+                if mutex_key:
+                    active_mutex_keys.add(mutex_key)
+            pool_names = {
+                str(getattr(task, "resource_pool", "default") or "default")
+                for task in candidates
+            } | {job.resource_pool for job in enabled_jobs.values()}
+            pool_limits = {
+                pool: scheduler_resource_pool_limit(self.config, pool)
+                for pool in pool_names
+            }
+            blocked_domains = self._persistent_recovery_blocked_domains(task_queue)
+            controller = SchedulerAdmissionController()
+            admitted = 0
+            blocked = 0
+            candidates.sort(
+                key=lambda task: (
+                    -int(getattr(task, "priority", DEFAULT_JOB_PRIORITY) or 0),
+                    getattr(task, "scheduled_for", None) or now,
+                    str(getattr(task, "task_id", "")),
+                )
+            )
+            for task in candidates:
+                job = enabled_jobs.get(str(task.job_name))
+                if job is None:
+                    decision_allowed = False
+                    reason_code = "config_disabled"
+                    reason_detail: JsonDict = {}
+                    recheck_at = None
+                else:
+                    snapshot = AdmissionSnapshot(
+                        now=now,
+                        recovery_blocked_domains=blocked_domains,
+                        active_mutex_keys=set(active_mutex_keys),
+                        resource_pool_limits=pool_limits,
+                        resource_pool_running=dict(pool_running),
+                    )
+                    decision = controller.evaluate(task, snapshot)
+                    decision_allowed = decision.allowed
+                    reason_code = decision.reason_code
+                    reason_detail = decision.reason_detail
+                    recheck_at = decision.recheck_at
+                # 资源池持续满载时，blocked 任务可能连续多轮得到完全相同的准入结论。
+                # 不重复写入相同状态和 Outbox 事件，避免大量积压任务拖慢补位循环。
+                if (
+                    not decision_allowed
+                    and str(getattr(task, "status", "")) == "blocked"
+                    and str(getattr(task, "blocked_reason", "") or "") == str(reason_code or "")
+                    and dict(getattr(task, "blocked_detail", None) or {}) == dict(reason_detail or {})
+                    and getattr(task, "blocked_until", None) == recheck_at
+                ):
+                    blocked += 1
+                    continue
+                changed = task_queue.set_admission(
+                    task_id=task.task_id,
+                    allowed=decision_allowed,
+                    reason_code=reason_code,
+                    reason_detail=reason_detail,
+                    recheck_at=recheck_at,
+                    now=now,
+                )
+                if not changed:
+                    continue
+                if decision_allowed:
+                    admitted += 1
+                    pool = str(getattr(task, "resource_pool", "default") or "default")
+                    pool_running[pool] = pool_running.get(pool, 0) + 1
+                    mutex_key = str(getattr(task, "mutex_key", None) or "").strip()
+                    if mutex_key:
+                        active_mutex_keys.add(mutex_key)
+                else:
+                    blocked += 1
+            return {"admitted": admitted, "blocked": blocked}
+
+    def _run_persistent_loop(
+        self,
+        *,
+        started_at: datetime,
+        max_cycles: int | None,
+    ) -> JsonDict:
+        """以 PostgreSQL 为唯一任务事实源运行 Planner/Admission/Worker 闭环。"""
+
+        cycles = 0
+        executed: list[JsonDict] = []
+        running_jobs: list[str] = []
+        inflight: dict[Future[Any], str] = {}
+        scheduler_config_mtime_ns = (
+            self.scheduler_config_file.stat().st_mtime_ns
+            if self.scheduler_config_file and self.scheduler_config_file.exists()
+            else None
+        )
+        lease_seconds = max(60, int(self.config.job_timeout_seconds or 0) + 60)
+
+        def reload_runtime_config_if_changed() -> None:
+            nonlocal scheduler_config_mtime_ns
+            if self.scheduler_config_file is None or not self.scheduler_config_file.exists():
+                return
+            current_mtime_ns = self.scheduler_config_file.stat().st_mtime_ns
+            if scheduler_config_mtime_ns == current_mtime_ns:
+                return
+            try:
+                self.config = load_scheduler_config(self.scheduler_config_file)
+                self.config_identity = load_config_identity(self.scheduler_config_file)
+            except Exception as exc:  # noqa: BLE001 - 文件可能处于原子替换窗口
+                self.config_reload_error = f"{type(exc).__name__}: {exc}"
+                logger.warning("持久调度配置热重载失败，将在下一轮重试：%s", exc)
+                return
+            self.config_reload_error = None
+            scheduler_config_mtime_ns = current_mtime_ns
+
+        try:
+            self._recover_orphaned_persistent_tasks()
+            self._recover_expired_persistent_tasks(force=True)
+            self._run_recovery_startup_scan()
+            with ThreadPoolExecutor(
+                max_workers=max(DEFAULT_THREAD_POOL_MAX_WORKERS, self.config.max_concurrent_jobs),
+                thread_name_prefix="persistent-scheduler-job",
+            ) as executor:
+                while self.config.enabled:
+                    completed_futures = [future for future in inflight if future.done()]
+                    for future in completed_futures:
+                        job_name = inflight.pop(future)
+                        try:
+                            executed.append(future.result())
+                        except Exception as exc:  # noqa: BLE001 - 单任务异常不能拖住其他任务
+                            executed.append(
+                                {
+                                    "job": job_name,
+                                    "status": "failed",
+                                    "error_message": str(exc),
+                                    "finished_at": datetime.now(tz=UTC).isoformat(),
+                                }
+                            )
+                            logger.exception(
+                                "持久调度任务执行异常 job=%s，继续运行其他任务",
+                                job_name,
+                            )
+
+                    reload_runtime_config_if_changed()
+                    if not self.config.enabled:
+                        break
+                    now = datetime.now(tz=UTC)
+                    self._recover_expired_persistent_tasks()
+                    with self._persistent_task_queue_scope() as task_queue:
+                        planning = SchedulerPlanner(
+                            task_queue,
+                            config_digest=(
+                                self.config_identity.digest
+                                if self.config_identity is not None
+                                else None
+                            ),
+                        ).reconcile(now=now, config=self.config)
+                    admission = self._admit_persistent_tasks(now=now)
+                    self._claim_recovery_tasks(
+                        executor,
+                        free_slots=max(
+                            0,
+                            int(self.config.max_concurrent_jobs) - self._recovery_inflight(),
+                        ),
+                    )
+                    worker = PersistentSchedulerWorker(
+                        queue_scope=self._persistent_task_queue_scope,
+                        jobs={job.name: job for job in self.enabled_jobs()},
+                        execute_job=lambda job: self.run_job(job, dry_run=False),
+                        worker_id=self._worker_id,
+                        lease_seconds=lease_seconds,
+                        retry_backoff_seconds=self.config.retry_backoff_seconds,
+                        resource_pool_limits={
+                            pool: scheduler_resource_pool_limit(self.config, pool)
+                            for pool in {
+                                job.resource_pool for job in self.enabled_jobs()
+                            }
+                        },
+                    )
+                    claims = worker.claim(
+                        free_slots=max(
+                            0,
+                            int(self.config.max_concurrent_jobs)
+                            - self._recovery_inflight()
+                            - len(inflight),
+                        ),
+                        now=now,
+                    )
+                    for claim in claims:
+                        future = executor.submit(worker.execute, claim, now=now)
+                        inflight[future] = claim.job_name
+                    running_jobs = list(inflight.values())
+                    self.write_status(
+                        state="running",
+                        mode="loop",
+                        dry_run=False,
+                        started_at=started_at,
+                        cycles=cycles,
+                        running_jobs=running_jobs,
+                        queued_jobs=[],
+                        max_concurrent_jobs=self.config.max_concurrent_jobs,
+                        planning=asdict(planning),
+                        admission=admission,
+                    )
+                    cycles += 1
+
+                    # 只等待一个完成事件，给刚释放的槽位尽快重新准入和领取，
+                    # 避免长任务阻塞整个批次的调度补位。
+                    if inflight:
+                        done, _ = wait(
+                            tuple(inflight),
+                            timeout=max(0.01, float(self.config.loop_idle_seconds)),
+                            return_when=FIRST_COMPLETED,
+                        )
+                        for future in done:
+                            job_name = inflight.pop(future)
+                            try:
+                                executed.append(future.result())
+                            except Exception as exc:  # noqa: BLE001 - 单任务异常隔离
+                                executed.append(
+                                    {
+                                        "job": job_name,
+                                        "status": "failed",
+                                        "error_message": str(exc),
+                                        "finished_at": datetime.now(tz=UTC).isoformat(),
+                                    }
+                                )
+                                logger.exception(
+                                    "持久调度任务执行异常 job=%s，继续运行其他任务",
+                                    job_name,
+                                )
+                    running_jobs = list(inflight.values())
+                    if max_cycles is not None and cycles >= max_cycles:
+                        break
+                    self._sleep(float(self.config.loop_idle_seconds))
+        except KeyboardInterrupt:
+            result = {
+                "mode": "loop",
+                "started_at": started_at.isoformat(),
+                "finished_at": datetime.now(tz=UTC).isoformat(),
+                "enabled": True,
+                "dry_run": False,
+                "interrupted": True,
+                "cycles": cycles,
+                "jobs": executed,
+                "running_jobs": list(inflight.values()) or running_jobs,
+                "queued_jobs": [],
+            }
+            self.stop_scheduler(result=result, state="interrupted")
+            return result
+        except Exception as exc:  # noqa: BLE001 - 主循环边界必须落盘失败状态
+            result = {
+                "mode": "loop",
+                "started_at": started_at.isoformat(),
+                "finished_at": datetime.now(tz=UTC).isoformat(),
+                "enabled": True,
+                "dry_run": False,
+                "failed": True,
+                "error_message": str(exc),
+                "cycles": cycles,
+                "jobs": executed,
+                "running_jobs": list(inflight.values()) or running_jobs,
+                "queued_jobs": [],
+            }
+            self.stop_scheduler(result=result, state="failed")
+            logger.exception("持久调度循环异常退出 cycles=%s", cycles)
+            return result
+
+        result = {
+            "mode": "loop",
+            "started_at": started_at.isoformat(),
+            "finished_at": datetime.now(tz=UTC).isoformat(),
+            "enabled": True,
+            "dry_run": False,
+            "interrupted": False,
+            "cycles": cycles,
+            "jobs": executed,
+        }
+        self.stop_scheduler(result=result, state="completed")
+        return result
+
     def run_loop(self, *, dry_run: bool = False, max_cycles: int | None = None) -> JsonDict:
         """进入轻量循环模式，按 interval_seconds 调度任务。"""
 
@@ -1286,7 +1667,14 @@ class BaseDataScheduler:
             logger.info("基础数据调度器已禁用 mode=loop")
             return result
 
-        self._recover_expired_persistent_tasks()
+        if self._supports_persistent_loop(dry_run=dry_run):
+            return self._run_persistent_loop(
+                started_at=started_at,
+                max_cycles=max_cycles,
+            )
+
+        self._recover_expired_persistent_tasks(force=True)
+        self._run_recovery_startup_scan()
         states = [
             ScheduledJobState(job=job, next_run_at=next_run_at_for_job(job, now=started_at))
             for job in self.enabled_jobs()
@@ -1318,7 +1706,9 @@ class BaseDataScheduler:
                 return
             try:
                 new_config = load_scheduler_config(self.scheduler_config_file)
+                new_identity = load_config_identity(self.scheduler_config_file)
             except Exception as exc:  # noqa: BLE001 - 配置文件可能正处于保存替换窗口
+                self.config_reload_error = f"{type(exc).__name__}: {exc}"
                 logger.warning("调度配置热重载失败，将保留当前配置并在下一轮重试：%s", exc)
                 return
             if not new_config.enabled:
@@ -1330,6 +1720,8 @@ class BaseDataScheduler:
             )
             queued = [state for state in states if state.queued]
             self.config = new_config
+            self.config_identity = new_identity
+            self.config_reload_error = None
             scheduler_config_mtime_ns = current_mtime_ns
             logger.info(
                 "调度配置已热重载 max_concurrent_jobs=%s resource_pools=%s enabled_jobs=%s",
@@ -1339,6 +1731,16 @@ class BaseDataScheduler:
             )
 
         def fill_worker_slots(executor: ThreadPoolExecutor) -> None:
+            self._claim_recovery_tasks(
+                executor,
+                free_slots=max(
+                    0,
+                    int(self.config.max_concurrent_jobs)
+                    - len(running)
+                    - len(queued)
+                    - self._recovery_inflight(),
+                ),
+            )
             while queued and len(running) < self.config.max_concurrent_jobs:
                 pool_counts = scheduler_resource_pool_counts(list(running.values()))
                 selected_index: int | None = None
@@ -1453,6 +1855,7 @@ class BaseDataScheduler:
                         )
 
                     reload_runtime_config_if_changed()
+                    self._recover_expired_persistent_tasks()
                     fill_worker_slots(executor)
 
                     if max_cycles is not None and cycles >= max_cycles and not running:
@@ -1513,6 +1916,17 @@ class BaseDataScheduler:
                             "同一互斥键任务正在运行或排队，暂缓本轮调度 blocked_jobs=%s active_jobs=%s",
                             [state.job.name for state in mutex_blocked_states],
                             [state.job.name for state in [*running.values(), *queued]],
+                        )
+                    due_states, recovery_blocked_pairs = self._filter_by_recovery_gate(
+                        due_states
+                    )
+                    if recovery_blocked_pairs:
+                        blocked_due_states.extend(
+                            state for state, _decision in recovery_blocked_pairs
+                        )
+                        logger.info(
+                            "补跑门控拦截派生任务 blocked_jobs=%s reason=blocked_by_recovery",
+                            [state.job.name for state, _decision in recovery_blocked_pairs],
                         )
                     if blocked_due_states and not due_states:
                         write_loop_status()
@@ -2171,6 +2585,7 @@ class BaseDataScheduler:
             "timeframe",
             "intraday_sharp_drop_threshold",
             "intraday_volume_surge_multiplier",
+            "agent_runtime",
         ):
             value = job.params.get(key)
             if value is not None:
@@ -2515,6 +2930,7 @@ class BaseDataScheduler:
 
         owner_id = str(kwargs.pop("owner_id"))
         dispatch = as_bool(kwargs.pop("dispatch", True), field_name="dispatch")
+        agent_runtime = str(kwargs.pop("agent_runtime", "hermes_agent"))
         max_events_per_run = int(kwargs.pop("max_events_per_run", 50))
         cooldown_minutes = int(kwargs.pop("cooldown_minutes", 15))
         trigger_groups = tuple(str(item) for item in kwargs.pop("trigger_groups", []))
@@ -2546,11 +2962,16 @@ class BaseDataScheduler:
         with session_scope(session_factory) as session:
             service = TriggerService(session)
             evaluation = service.evaluate(request)
+            from finance_agent.triggers.webhook import HermesWebhookPublisher
+
+            publisher = HermesWebhookPublisher.from_environment()
             dispatch_result = (
                 service.dispatch_pending(
                     owner_id=owner_id,
                     limit=max(max_events_per_run, 1),
                     as_of=request.as_of,
+                    agent_runtime=agent_runtime,
+                    publisher=publisher.publish if publisher else None,
                 )
                 if dispatch
                 else None
@@ -2568,11 +2989,13 @@ class BaseDataScheduler:
             "max_events_per_run": max_events_per_run,
             "trigger_groups": list(trigger_groups),
             "dispatch": dispatch,
+            "agent_runtime": agent_runtime,
             "evaluation": evaluation.to_dict(),
         }
         if dispatch_result is not None:
             payload["dispatched_count"] = len(dispatch_result.dispatched_events)
             payload["skipped_count"] = len(dispatch_result.skipped_events)
+            payload["failed_count"] = len(dispatch_result.failed_events)
             payload["dispatch_result"] = dispatch_result.to_dict()
         else:
             payload["dispatched_count"] = 0
@@ -2754,7 +3177,10 @@ class BaseDataScheduler:
                 "job_count": len(self.config.jobs),
                 "enabled_job_count": len(self.enabled_jobs()),
                 "health_stale_seconds": self.config.health_stale_seconds,
+                "config_reload_error": self.config_reload_error,
             }
+            if self.config_identity is not None:
+                status.update(self.config_identity.to_status_dict())
             if self.status_file.exists():
                 try:
                     previous_status = json.loads(self.status_file.read_text(encoding="utf-8"))
@@ -2770,6 +3196,9 @@ class BaseDataScheduler:
                     status["job_count"] = len(self.config.jobs)
                     status["enabled_job_count"] = len(self.enabled_jobs())
                     status["health_stale_seconds"] = self.config.health_stale_seconds
+                    status["config_reload_error"] = self.config_reload_error
+                    if self.config_identity is not None:
+                        status.update(self.config_identity.to_status_dict())
             if status.get("state") == "running":
                 status.pop("stopped_process", None)
             for key, value in payload.items():

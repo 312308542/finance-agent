@@ -6,7 +6,7 @@ P1 侧重让选股推荐具备行业/主题、资金流和事件证据。
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import akshare as ak
@@ -21,6 +21,7 @@ from finance_agent.data.normalizers import (
     normalize_ashare_board_members,
     normalize_ashare_fund_flow_rank,
     normalize_ashare_index_members,
+    normalize_ashare_individual_fund_flow,
     normalize_ashare_northbound_individual_flow,
     normalize_ashare_northbound_market_flow,
     normalize_ashare_notice_reports,
@@ -571,6 +572,85 @@ class AshareCapitalFlowProvider:
     """A 股资金流 Provider。"""
 
     provider_name = "akshare"
+
+    def fetch_individual_flow(
+        self,
+        *,
+        symbol: str,
+        market: str | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        limit: int | None = None,
+    ) -> CapitalFlowSnapshotsResult:
+        """获取单只 A 股的历史资金流明细。"""
+
+        collected_at = datetime.now(tz=UTC)
+        clean_symbol = strip_ashare_exchange_prefix(symbol)
+        market_code = str(market or "").strip().lower()
+        if market_code not in {"sh", "sz"}:
+            market_code = "sh" if clean_symbol.startswith(("5", "6", "9")) else "sz"
+        source = "akshare:stock_individual_fund_flow"
+        fallback_trace: list[dict[str, str]] = []
+        try:
+            df = ak.stock_individual_fund_flow(
+                stock=clean_symbol,
+                market=market_code,
+            )
+        except Exception as exc:
+            fallback_trace.append({"source": source, "error_message": str(exc)})
+            try:
+                df = eastmoney_curl.fetch_individual_fund_flow(
+                    clean_symbol,
+                    market_code,
+                )
+                source = str(
+                    df.attrs.get(
+                        "actual_source",
+                        "eastmoney:curl_cffi:stock_individual_fund_flow",
+                    )
+                )
+            except Exception as fallback_exc:
+                fallback_trace.append(
+                    {
+                        "source": "eastmoney:curl_cffi:stock_individual_fund_flow",
+                        "error_message": str(fallback_exc),
+                    }
+                )
+                return CapitalFlowSnapshotsResult(
+                    provider_name=self.provider_name,
+                    status="error",
+                    collected_at=collected_at,
+                    error_message=str(fallback_exc),
+                    payload={
+                        "endpoint": "stock_individual_fund_flow",
+                        "symbol": clean_symbol,
+                        "market": market_code,
+                        "fallback_trace": fallback_trace,
+                    },
+                )
+        snapshots = normalize_ashare_individual_fund_flow(
+            df,
+            source=source,
+            symbol=clean_symbol,
+            as_of=collected_at,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+        )
+        return CapitalFlowSnapshotsResult(
+            provider_name=self.provider_name,
+            status="available" if snapshots else "unavailable",
+            collected_at=collected_at,
+            snapshots=snapshots,
+            payload={
+                "endpoint": "stock_individual_fund_flow",
+                "symbol": clean_symbol,
+                "market": market_code,
+                "row_count": len(snapshots),
+                "actual_source": source,
+                "fallback_trace": fallback_trace,
+            },
+        )
 
     def fetch_flow_rank(
         self,

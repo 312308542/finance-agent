@@ -1,4 +1,5 @@
 import * as React from "react";
+import { Button } from "antd";
 import { AlertTriangle, Bell, ClipboardCheck, ShieldAlert } from "lucide-react";
 import { loadRiskOverview, loadUpcomingReviews } from "../api";
 import { buildUpcomingReviewsModel } from "../actionLoopView";
@@ -48,10 +49,11 @@ export function RiskPage({ ownerId, initialPayload = null }: RiskPageProps) {
         <div>
           <p className="eyebrow">Risk Center</p>
           <h2>风险中心</h2>
+          <p>风险提醒、触发事件、数据质量与到期复盘。</p>
         </div>
-        <button className="button" onClick={() => void refresh()} disabled={loading}>
+        <Button onClick={() => void refresh()} loading={loading}>
           刷新
-        </button>
+        </Button>
       </header>
       {error ? <div className="notice notice-red">{error}</div> : null}
       <div className="real-metric-grid">

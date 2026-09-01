@@ -16,6 +16,38 @@ export type SchedulerQueueSummary = {
   queuedJobs: string[];
 };
 
+export const schedulerRuntimeStatuses = [
+  "scheduled",
+  "blocked",
+  "pending",
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+] as const;
+
+export type SchedulerRuntimeStatus = (typeof schedulerRuntimeStatuses)[number];
+
+export type SchedulerRuntimeTask = Record<string, any> & {
+  task_id: string;
+  job_name: string;
+  status: SchedulerRuntimeStatus;
+};
+
+export type SchedulerRuntimeSummary = {
+  source: string;
+  statusCounts: Record<SchedulerRuntimeStatus, number>;
+  listedStatusCounts: Record<SchedulerRuntimeStatus, number>;
+  taskList: Record<string, any>;
+  tasks: SchedulerRuntimeTask[];
+  configDrift: boolean;
+  configDriftStatus: string;
+  schedulerConfigDigest: string | null;
+  apiConfigDigest: string | null;
+  resourcePools: Record<string, Record<string, any>>;
+  metrics: Record<string, any>;
+};
+
 const marketOrder = ["ashare", "fund", "crypto_spot", "crypto_future"];
 const presetMarketDefaults: Record<string, string[]> = {
   "personal-ashare": ["ashare", "fund"],
@@ -87,6 +119,13 @@ export function summarizeSchedulerStatus(status: Record<string, any> | null | un
         ? `PID ${process.pid}`
         : "未启动进程";
 
+  if (status?.status === "degraded" && health.database_status === "error") {
+    return {
+      tone: "red",
+      label: "状态降级",
+      detail: `${processLabel} · PostgreSQL 状态不可用，调度器存活未知`,
+    };
+  }
   if (running) {
     return {
       tone: "green",
@@ -97,8 +136,8 @@ export function summarizeSchedulerStatus(status: Record<string, any> | null | un
   if (health.status === "missing") {
     return {
       tone: "amber",
-      label: "未启动",
-      detail: "还没有调度器状态文件",
+      label: "存活未知",
+      detail: `${processLabel} · 未收到调度器心跳`,
     };
   }
   if (health.healthy) {
@@ -206,6 +245,136 @@ export function summarizeSchedulerQueue(
     runningJobs: normalizeJobNames(payload.running_jobs),
     queuedJobs: normalizeJobNames(payload.queued_jobs),
   };
+}
+
+export function summarizeSchedulerRuntime(
+  payload: Record<string, any> | null | undefined,
+): SchedulerRuntimeSummary {
+  const runtime = payload?.runtime ?? payload?.data ?? {};
+  const rawCounts = runtime.status_counts ?? {};
+  const statusCounts = Object.fromEntries(
+    schedulerRuntimeStatuses.map((status) => [status, Math.max(0, Number(rawCounts[status] ?? 0) || 0)]),
+  ) as Record<SchedulerRuntimeStatus, number>;
+  const tasks = Array.isArray(runtime.tasks)
+    ? runtime.tasks.filter(
+        (task: any): task is SchedulerRuntimeTask =>
+          task &&
+          typeof task === "object" &&
+          schedulerRuntimeStatuses.includes(task.status as SchedulerRuntimeStatus),
+      )
+    : [];
+  const rawListedCounts = runtime.listed_status_counts ?? {};
+  const listedStatusCounts = Object.fromEntries(
+    schedulerRuntimeStatuses.map((status) => [
+      status,
+      Math.max(
+        0,
+        Number(
+          rawListedCounts[status] ??
+            tasks.filter((task: SchedulerRuntimeTask) => task.status === status).length,
+        ) || 0,
+      ),
+    ]),
+  ) as Record<SchedulerRuntimeStatus, number>;
+  return {
+    source: String(runtime.source ?? "unavailable"),
+    statusCounts,
+    listedStatusCounts,
+    taskList: runtime.task_list && typeof runtime.task_list === "object" ? runtime.task_list : {},
+    tasks,
+    configDrift: runtime.config_drift === true,
+    configDriftStatus: String(runtime.config_drift_status ?? "unknown"),
+    schedulerConfigDigest: runtime.scheduler_config_digest ? String(runtime.scheduler_config_digest) : null,
+    apiConfigDigest: runtime.api_config_digest ? String(runtime.api_config_digest) : null,
+    resourcePools:
+      runtime.resource_pools && typeof runtime.resource_pools === "object"
+        ? runtime.resource_pools
+        : {},
+    metrics: runtime.metrics && typeof runtime.metrics === "object" ? runtime.metrics : {},
+  };
+}
+
+const schedulerBlockedReasonLabels: Record<string, string> = {
+  scheduler_paused: "调度器已暂停",
+  config_disabled: "配置已禁用",
+  retry_backoff: "等待重试退避",
+  dependency_not_satisfied: "依赖任务未完成",
+  outside_trading_session: "当前不在交易时段",
+  recovery_domain_blocked: "数据补跑门控",
+  mutex_busy: "互斥任务运行中",
+  resource_pool_full: "资源池额度已满",
+};
+
+function schedulerDetailList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map((item) => String(item ?? "").trim()).filter(Boolean)
+    : [];
+}
+
+export function schedulerRuntimeTaskDetail(task: SchedulerRuntimeTask): string {
+  if (task.status === "blocked") {
+    const detail = task.blocked_detail && typeof task.blocked_detail === "object"
+      ? task.blocked_detail
+      : {};
+    const parts: string[] = [];
+    const reason = String(task.blocked_reason ?? "").trim();
+    if (reason) {
+      parts.push(schedulerBlockedReasonLabels[reason] ?? reason);
+    }
+    const domains = schedulerDetailList(detail.domains);
+    if (domains.length > 0) {
+      parts.push(`数据域 ${domains.join("、")}`);
+    }
+    const blockingTaskIds = schedulerDetailList(detail.blocking_task_ids);
+    if (blockingTaskIds.length > 0) {
+      parts.push(`依赖 ${blockingTaskIds.join("、")}`);
+    }
+    const mutexKey = String(detail.mutex_key ?? task.mutex_key ?? "").trim();
+    if (mutexKey) {
+      parts.push(`互斥键 ${mutexKey}`);
+    }
+    const resourcePool = String(detail.resource_pool ?? "").trim();
+    if (resourcePool) {
+      parts.push(`资源池 ${resourcePool} ${detail.running ?? "?"} / ${detail.limit ?? "?"}`);
+    }
+    if (task.blocked_until) {
+      parts.push(`复查时间 ${task.blocked_until}`);
+    }
+    const recoveryBlockers = Array.isArray(detail.blockers)
+      ? detail.blockers
+          .filter((item: unknown) => item && typeof item === "object")
+          .map((item: Record<string, unknown>) =>
+            [item.run_id, item.step_id, item.target_id]
+              .map((value) => String(value ?? "").trim())
+              .filter(Boolean)
+              .join(" / "),
+          )
+          .filter(Boolean)
+      : [];
+    if (recoveryBlockers.length > 0) {
+      parts.push(`补跑阻塞 ${recoveryBlockers.join("、")}`);
+    }
+    return parts.join(" · ") || "等待阻塞条件解除";
+  }
+  if (task.status === "running") {
+    const lease = task.lease_owner ? `租约 ${task.lease_owner}` : "租约未登记";
+    const progress = Number(task.progress?.summary?.progress_ratio);
+    return Number.isFinite(progress) ? `${lease} · ${Math.round(progress * 100)}%` : lease;
+  }
+  if (task.status === "failed") {
+    return String(task.error_message ?? "执行失败，暂无错误摘要");
+  }
+  if (task.status === "pending") {
+    return task.scheduled_for ? `计划 ${task.scheduled_for}` : "已准入，等待 worker 领取";
+  }
+  return String(task.updated_at ?? task.finished_at ?? task.scheduled_for ?? "-");
+}
+
+export function filterSchedulerRuntimeTasks(
+  tasks: SchedulerRuntimeTask[],
+  status: SchedulerRuntimeStatus | "all",
+): SchedulerRuntimeTask[] {
+  return status === "all" ? tasks : tasks.filter((task) => task.status === status);
 }
 
 export function summarizeProcessingPlan(preview: Record<string, any> | undefined): {

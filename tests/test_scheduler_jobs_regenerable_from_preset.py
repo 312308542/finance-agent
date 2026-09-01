@@ -10,9 +10,6 @@ from finance_agent.data.sync_config import build_preset_config, export_scheduler
 REQUIRED_BATCH5_PREREQUISITE_JOBS = {
     "analytics.triggers.evaluate.daily",
     "analytics.triggers.evaluate.intraday",
-    "agent.loop.consume.after_trigger",
-    "agent.loop.consume.sweep",
-    "analytics.high_risk_reviews.after_agent",
     "analytics.high_risk_reviews.sweep",
     "analytics.reviews.due",
     "analytics.backtest.weekly",
@@ -35,13 +32,6 @@ def test_personal_comprehensive_preset_regenerates_batch5_prerequisite_jobs() ->
 
     jobs = {str(job["name"]): job for job in payload["jobs"]}
     assert jobs["analytics.triggers.evaluate.daily"]["schedule_type"] == "after_success"
-    assert jobs["agent.loop.consume.after_trigger"]["depends_on"] == [
-        "analytics.triggers.evaluate.daily",
-        "analytics.triggers.evaluate.intraday",
-    ]
-    assert jobs["analytics.high_risk_reviews.after_agent"]["depends_on"] == [
-        "agent.loop.consume.after_trigger"
-    ]
     assert jobs["analytics.backtest.weekly"]["depends_on"] == [
         "analytics.recommendations.ashare.all_a"
     ]

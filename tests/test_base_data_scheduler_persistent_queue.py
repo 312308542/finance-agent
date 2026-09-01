@@ -35,6 +35,10 @@ class _FakeQueue:
         return SimpleNamespace(task_id="task:fake")
 
     def claim(self, **kwargs: Any) -> TaskClaim | None:
+        # 忠实模拟真实队列的 job_name 过滤：本夹具不含补跑分区任务。
+        if str(kwargs.get("job_name") or "").startswith("recovery."):
+            self.claim_calls.append(kwargs)
+            return None
         self.claim_calls.append(kwargs)
         if kwargs.get("idempotency_key") is None:
             return self.recovered_claim
@@ -109,9 +113,19 @@ def test_scheduler_persistent_queue_claims_and_completes_job() -> None:
     assert len(queue.enqueued) == 1
     assert queue.enqueued[0]["job_name"] == "ashare.realtime_quotes"
     assert queue.enqueued[0]["idempotency_key"].startswith("scheduler:ashare.realtime_quotes:")
-    assert len(queue.claim_calls) == 2
-    assert queue.claim_calls[0].get("idempotency_key") is None
-    assert queue.claim_calls[1]["idempotency_key"].startswith("scheduler:ashare.realtime_quotes:")
+    # 补跑分区任务（recovery.*）会额外轮询领取；普通任务的领取行为不变。
+    normal_claims = [
+        call
+        for call in queue.claim_calls
+        if not str(call.get("job_name") or "").startswith("recovery.")
+    ]
+    recovery_claims = [
+        call for call in queue.claim_calls if str(call.get("job_name") or "").startswith("recovery.")
+    ]
+    assert len(normal_claims) == 2
+    assert normal_claims[0].get("idempotency_key") is None
+    assert normal_claims[1]["idempotency_key"].startswith("scheduler:ashare.realtime_quotes:")
+    assert all(call.get("idempotency_key") is None for call in recovery_claims)
     assert queue.recovered_count == 1
     assert queue.completed == [{"task_id": "task:fake", "lease_token": "lease:fake"}]
     assert queue.failed == []
@@ -215,3 +229,29 @@ def test_scheduler_reuses_recovered_pending_task_before_new_enqueue() -> None:
     assert started == ["ashare.realtime_quotes"]
     assert queue.enqueued == []
     assert queue.completed == [{"task_id": "task:recovered", "lease_token": "lease:recovered"}]
+
+
+def test_scheduler_recovers_expired_tasks_periodically(monkeypatch) -> None:
+    queue = _FakeQueue(claim=None)
+
+    @contextmanager
+    def queue_scope() -> Iterator[_FakeQueue]:
+        yield queue
+
+    scheduler = BaseDataScheduler(
+        _config(),
+        collect_base_data_func=lambda args: {"status": "ok"},
+        default_collection_args_func=lambda **kwargs: SimpleNamespace(**kwargs),
+        persistent_task_queue_scope=queue_scope,
+        sleep_func=lambda _: None,
+    )
+    ticks = iter([10.0, 20.0, 41.0])
+    monkeypatch.setattr(
+        "finance_agent.scheduler.base_data_scheduler.time.monotonic",
+        lambda: next(ticks),
+    )
+
+    assert scheduler._recover_expired_persistent_tasks(force=True) == 1
+    assert scheduler._recover_expired_persistent_tasks() == 0
+    assert scheduler._recover_expired_persistent_tasks() == 1
+    assert queue.recovered_count == 2

@@ -1,7 +1,10 @@
 import json
 import logging
 import os
-from datetime import datetime, timezone
+import subprocess
+import sys
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,11 +14,14 @@ from finance_agent.application.data_sync_control_service import (
     DataSyncControlService,
     _SchedulerLogForwardDeduper,
     attach_running_manual_scheduler_log_forwarders,
+    ensure_scheduler_payload,
     forward_scheduler_process_log_file,
+    merge_persistent_scheduler_progress,
     read_scheduler_job_control,
     write_stopped_status,
 )
 from finance_agent.data.sync_config import build_preset_config, save_data_sync_config
+from finance_agent.scheduler.base_data_scheduler import read_scheduler_health
 
 
 class _FakeProcess:
@@ -35,6 +41,290 @@ class _FinishedProcess:
 
     def poll(self) -> int:
         return 0
+
+
+def test_explicit_runtime_paths_drive_default_scheduler_status(tmp_path: Path) -> None:
+    """安装到 site-packages 后，显式目录仍应驱动默认调度器状态读取。"""
+
+    project_root = tmp_path / "image-root"
+    runtime_dir = tmp_path / "shared-runtime"
+    status_file = runtime_dir / "base_data_scheduler" / "status.json"
+    status_file.parent.mkdir(parents=True)
+    status_file.write_text(
+        json.dumps(
+            {
+                "service": "base_data_scheduler",
+                "state": "running",
+                "updated_at": datetime.now(UTC).isoformat(),
+                "health_stale_seconds": 300,
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "FINANCE_AGENT_PROJECT_ROOT": str(project_root),
+            "FINANCE_AGENT_RUNTIME_DIR": str(runtime_dir),
+        }
+    )
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    env["PYTHONPATH"] = os.pathsep.join(
+        value
+        for value in (str(source_root), env.get("PYTHONPATH", ""))
+        if value
+    )
+    script = """
+import json
+from finance_agent.application.data_sync_control_service import (
+    DEFAULT_STATUS_FILE,
+    ROOT_DIR,
+    RUNTIME_DIR,
+    DataSyncControlService,
+)
+
+print(json.dumps({
+    "root_dir": str(ROOT_DIR),
+    "runtime_dir": str(RUNTIME_DIR),
+    "default_status_file": str(DEFAULT_STATUS_FILE),
+    "scheduler_status": DataSyncControlService().read_scheduler_status(),
+}))
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout)
+
+    assert payload["root_dir"] == str(project_root.resolve())
+    assert payload["runtime_dir"] == str(runtime_dir.resolve())
+    assert payload["default_status_file"] == str(status_file.resolve())
+    assert payload["scheduler_status"]["status"] == "ok"
+    assert payload["scheduler_status"]["health"]["status_file"] == str(status_file.resolve())
+
+
+def test_scheduler_status_keeps_postgresql_tasks_but_marks_missing_heartbeat_degraded(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """PostgreSQL 任务可读不等于 scheduler 存活，心跳缺失必须降级。"""
+
+    class FakeSnapshot:
+        status_counts = {
+            "scheduled": 1,
+            "blocked": 1,
+            "pending": 2,
+            "running": 1,
+            "completed": 3,
+            "failed": 0,
+            "cancelled": 0,
+        }
+        running_jobs = [{"job_name": "running.job"}]
+        waiting_jobs = [{"job_name": "pending.job"}]
+        scheduler_config_digest = "scheduler-digest"
+        api_config_digest = "api-digest"
+        config_drift = True
+
+        def to_dict(self) -> dict[str, Any]:
+            return {
+                "source": "postgresql",
+                "status_counts": self.status_counts,
+                "tasks": self.running_jobs + self.waiting_jobs,
+                "running_jobs": self.running_jobs,
+                "waiting": self.waiting_jobs,
+                "scheduler_config_digest": self.scheduler_config_digest,
+                "api_config_digest": self.api_config_digest,
+                "config_drift": self.config_drift,
+                "metrics": {"max_concurrent_jobs": 4, "expired_lease_count": 0},
+            }
+
+    class FakeReporter:
+        def snapshot(self, **kwargs: Any) -> FakeSnapshot:
+            return FakeSnapshot()
+
+    monkeypatch.setattr(
+        "finance_agent.application.data_sync_control_service.SchedulerRuntimeReporter.from_session",
+        lambda session: FakeReporter(),
+    )
+
+    result = DataSyncControlService().read_scheduler_status(
+        session=object(),
+        status_file=tmp_path / "missing.json",
+        scheduler_config_file=tmp_path / "missing-config.json",
+    )
+
+    assert result["status"] == "degraded"
+    assert result["health"]["status"] == "missing"
+    assert result["health"]["healthy"] is False
+    assert result["health"]["source"] == "status_file"
+    assert result["health"]["task_source"] == "postgresql"
+    assert result["health"]["database_status"] == "available"
+    assert result["runtime"]["status_counts"]["pending"] == 2
+    assert result["runtime"]["config_drift"] is True
+    assert result["process"]["running"] is False
+
+
+def test_scheduler_health_marks_terminal_state_not_running(tmp_path: Path) -> None:
+    """新鲜但已停止的状态文件不能被误判为调度器存活。"""
+
+    status_file = tmp_path / "status.json"
+    status_file.write_text(
+        json.dumps(
+            {
+                "service": "base_data_scheduler",
+                "state": "stopped",
+                "updated_at": datetime.now(UTC).isoformat(),
+                "health_stale_seconds": 300,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    health = read_scheduler_health(status_file)
+
+    assert health["healthy"] is False
+    assert health["status"] == "stopped"
+
+
+def test_scheduler_status_marks_expired_lease_unhealthy_with_fresh_heartbeat(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """存在过期运行租约时，不能仅凭新鲜状态文件返回 healthy。"""
+
+    status_file = tmp_path / "status.json"
+    status_file.write_text(
+        json.dumps(
+            {
+                "service": "base_data_scheduler",
+                "state": "running",
+                "updated_at": datetime.now(UTC).isoformat(),
+                "health_stale_seconds": 300,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeSnapshot:
+        running_jobs = [{"job_name": "stale.running"}]
+        waiting_jobs: list[dict[str, Any]] = []
+        scheduler_config_digest = "digest"
+        api_config_digest = "digest"
+        config_drift = False
+
+        def to_dict(self) -> dict[str, Any]:
+            return {
+                "source": "postgresql",
+                "generated_at": datetime.now(UTC).isoformat(),
+                "running_jobs": self.running_jobs,
+                "waiting": [],
+                "resource_pools": {},
+                "metrics": {"max_concurrent_jobs": 4, "expired_lease_count": 1},
+            }
+
+    class FakeReporter:
+        def snapshot(self, **kwargs: Any) -> FakeSnapshot:
+            return FakeSnapshot()
+
+    monkeypatch.setattr(
+        "finance_agent.application.data_sync_control_service.SchedulerRuntimeReporter.from_session",
+        lambda session: FakeReporter(),
+    )
+
+    result = DataSyncControlService().read_scheduler_status(
+        session=object(),
+        status_file=status_file,
+        scheduler_config_file=tmp_path / "missing-config.json",
+    )
+
+    assert result["status"] == "degraded"
+    assert result["health"]["status"] == "unhealthy"
+    assert result["health"]["healthy"] is False
+    assert "过期任务租约" in result["health"]["message"]
+
+
+def test_scheduler_progress_database_failure_drops_redis_task_facts(monkeypatch) -> None:
+    """数据库不可用时 Redis 只能保留基础遥测，不能继续充当任务事实源。"""
+
+    class BrokenReporter:
+        def snapshot(self, **kwargs: Any) -> None:
+            raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        "finance_agent.application.data_sync_control_service.SchedulerRuntimeReporter.from_session",
+        lambda session: BrokenReporter(),
+    )
+    response = {
+        "status": "ok",
+        "data": {
+            "cache_backend": "redis",
+            "tasks": [{"job_name": "redis.only", "status": "running"}],
+            "waiting": [{"job_name": "redis.waiting"}],
+            "running_jobs": [{"job_name": "redis.only"}],
+            "source_rate_states": [{"source": "akshare", "state": "closed"}],
+        },
+    }
+
+    result = merge_persistent_scheduler_progress(
+        response,
+        session=object(),
+        scheduler_config=None,
+        scheduler_config_file=Path("missing.json"),
+    )
+
+    assert result["status"] == "degraded"
+    assert result["data"]["source"] == "unavailable"
+    assert result["data"]["database_status"] == "error"
+    assert result["data"]["tasks"] == []
+    assert result["data"]["waiting"] == []
+    assert result["data"]["running_jobs"] == []
+    assert result["data"]["source_rate_states"] == [
+        {"source": "akshare", "state": "closed"}
+    ]
+
+
+def test_scheduler_status_marks_database_failure_and_falls_back_to_status_file(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """数据库异常时允许读状态文件，但必须显式暴露降级来源和错误。"""
+
+    status_file = tmp_path / "status.json"
+    status_file.write_text(
+        json.dumps(
+            {
+                "service": "base_data_scheduler",
+                "state": "running",
+                "updated_at": datetime.now(UTC).isoformat(),
+                "health_stale_seconds": 300,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class BrokenReporter:
+        def snapshot(self, **kwargs: Any) -> None:
+            raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        "finance_agent.application.data_sync_control_service.SchedulerRuntimeReporter.from_session",
+        lambda session: BrokenReporter(),
+    )
+
+    result = DataSyncControlService().read_scheduler_status(
+        session=object(),
+        status_file=status_file,
+    )
+
+    assert result["status"] == "degraded"
+    assert result["health"]["source"] == "status_file"
+    assert result["health"]["database_status"] == "error"
+    assert "database unavailable" in result["health"]["database_error"]
 
 
 def test_forward_scheduler_process_log_file_emits_file_lines(
@@ -355,7 +645,7 @@ def test_start_scheduler_reports_docker_manager_without_spawning_local_process(
     """Web 启动接口只能报告 Docker 调度器，不能再次拉起 Windows Python 进程。"""
 
     status_file = tmp_path / "status.json"
-    updated_at = datetime.now(tz=timezone.utc).isoformat()
+    updated_at = datetime.now(tz=UTC).isoformat()
     status_file.write_text(
         json.dumps(
             {
@@ -389,7 +679,7 @@ def test_stop_scheduler_does_not_terminate_docker_service(tmp_path: Path) -> Non
         json.dumps(
             {
                 "state": "running",
-                "updated_at": datetime.now(tz=timezone.utc).isoformat(),
+                "updated_at": datetime.now(tz=UTC).isoformat(),
                 "last_job_status": "executed",
             },
             ensure_ascii=False,
@@ -410,7 +700,7 @@ def test_read_scheduler_status_ignores_stale_windows_process_metadata(tmp_path: 
 
     status_file = tmp_path / "status.json"
     process_file = tmp_path / "process.json"
-    updated_at = datetime.now(tz=timezone.utc).isoformat()
+    updated_at = datetime.now(tz=UTC).isoformat()
     status_file.write_text(
         json.dumps(
             {
@@ -496,6 +786,48 @@ def test_save_config_persists_scheduler_resource_pools(tmp_path: Path) -> None:
     assert result["data"]["scheduler_payload"]["resource_pools"]["default"][
         "max_concurrent_jobs"
     ] == 4
+
+
+def test_ensure_scheduler_payload_syncs_runtime_concurrency_limits(tmp_path: Path) -> None:
+    """调度配置存在时，也必须同步数据同步配置中的全局和资源池并发闸门。"""
+
+    data_config_file = tmp_path / "data_sync_config.json"
+    scheduler_config_file = tmp_path / "base_data_scheduler.json"
+    resource_pools = {
+        "analytics": {"max_concurrent_jobs": 3, "description": "分析计算"},
+        "collection_heavy": {"max_concurrent_jobs": 3, "description": "外部采集"},
+        "default": {"max_concurrent_jobs": 5, "description": "默认兜底"},
+    }
+    config = replace(
+        build_preset_config("personal-ashare"),
+        max_concurrent_jobs=10,
+        resource_pools=resource_pools,
+    )
+    save_data_sync_config(config, data_config_file)
+
+    stale_payload = control_service.export_scheduler_payload(
+        replace(config, max_concurrent_jobs=4, resource_pools={
+            "analytics": {"max_concurrent_jobs": 1},
+            "collection_heavy": {"max_concurrent_jobs": 2},
+            "default": {"max_concurrent_jobs": 4},
+        })
+    )
+    scheduler_config_file.write_text(
+        json.dumps(stale_payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    payload = ensure_scheduler_payload(
+        data_sync_config_file=data_config_file,
+        scheduler_config_file=scheduler_config_file,
+    )
+
+    assert payload["max_concurrent_jobs"] == 10
+    assert payload["resource_pools"]["analytics"]["max_concurrent_jobs"] == 3
+    assert payload["resource_pools"]["collection_heavy"]["max_concurrent_jobs"] == 3
+    persisted = json.loads(scheduler_config_file.read_text(encoding="utf-8"))
+    assert persisted["max_concurrent_jobs"] == 10
+    assert persisted["resource_pools"]["default"]["max_concurrent_jobs"] == 5
 
 
 def test_read_scheduler_jobs_returns_visual_task_catalog(tmp_path: Path) -> None:

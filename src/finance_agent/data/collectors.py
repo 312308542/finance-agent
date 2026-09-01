@@ -10,7 +10,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -1802,6 +1802,77 @@ class AshareP1Collector:
             result,
             endpoint="stock_individual_fund_flow_rank",
             request_params={"indicator": indicator, "limit": limit},
+        )
+        if result.status != "available":
+            return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+        _persist_rows(
+            self.assets,
+            "ensure_assets",
+            "ensure_asset",
+            [
+                {
+                    "asset_id": snapshot.asset_id,
+                    "symbol": snapshot.symbol,
+                    "name": snapshot.symbol,
+                    "market": snapshot.market,
+                    "asset_type": "stock",
+                    "payload": {"source": snapshot.source},
+                }
+                for snapshot in result.snapshots
+            ],
+        )
+        _persist_rows(
+            self.capital_flows,
+            "upsert_capital_flow_snapshots",
+            "upsert_capital_flow_snapshot",
+            [
+                {
+                    "snapshot_id": snapshot.snapshot_id,
+                    "asset_id": snapshot.asset_id,
+                    "symbol": snapshot.symbol,
+                    "market": snapshot.market,
+                    "main_net_inflow": snapshot.main_net_inflow,
+                    "northbound_net_inflow": snapshot.northbound_net_inflow,
+                    "turnover_rate": snapshot.turnover_rate,
+                    "amount": snapshot.amount,
+                    "window": snapshot.window,
+                    "source": snapshot.source,
+                    "status": snapshot.status,
+                    "as_of": snapshot.as_of,
+                    "payload": snapshot.payload | {"raw_record_id": raw_record_id},
+                }
+                for snapshot in result.snapshots
+            ],
+        )
+        return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)
+
+    def collect_individual_flow(
+        self,
+        *,
+        symbol: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        limit: int | None = None,
+    ) -> ArchivedProviderResult:
+        """采集单只 A 股历史资金流，并写入资金流快照。"""
+
+        result = self.flow_provider.fetch_individual_flow(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+        )
+        raw_record_id = archive_provider_result(
+            self.raw_records,
+            result,
+            endpoint="stock_individual_fund_flow",
+            request_params={
+                "symbol": symbol,
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "limit": limit,
+            },
         )
         if result.status != "available":
             return ArchivedProviderResult(result=result, raw_record_id=raw_record_id)

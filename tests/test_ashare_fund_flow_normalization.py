@@ -1,10 +1,11 @@
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pandas as pd
 
 from finance_agent.data.normalizers import (
     is_main_board_ashare_stock_symbol,
     normalize_ashare_fund_flow_rank,
+    normalize_ashare_individual_fund_flow,
     normalize_ashare_spot,
 )
 
@@ -90,3 +91,42 @@ def test_fund_flow_rank_keeps_only_main_board_stock_symbols() -> None:
     )
 
     assert [item.symbol for item in snapshots] == ["000001", "600519"]
+
+
+def test_individual_fund_flow_filters_history_and_uses_stable_daily_ids() -> None:
+    rows = pd.DataFrame(
+        [
+            {"日期": "2026-07-26", "主力净流入-净额": "100"},
+            {"日期": "2026-07-27", "主力净流入-净额": "200"},
+            {"日期": "2026-07-28", "主力净流入-净额": "-50"},
+            {"日期": "2026-07-29", "主力净流入-净额": "300"},
+            {"日期": "2026-07-28", "主力净流入-净额": None},
+        ]
+    )
+    kwargs = {
+        "source": "eastmoney:curl_cffi:stock_individual_fund_flow",
+        "symbol": "002011",
+        "as_of": datetime(2026, 8, 25, tzinfo=UTC),
+    }
+
+    narrowed = normalize_ashare_individual_fund_flow(
+        rows,
+        start_date=date(2026, 7, 27),
+        end_date=date(2026, 7, 28),
+        **kwargs,
+    )
+    widened = normalize_ashare_individual_fund_flow(
+        rows,
+        start_date=date(2026, 7, 26),
+        end_date=date(2026, 7, 29),
+        **kwargs,
+    )
+
+    assert [item.as_of.date() for item in narrowed] == [
+        date(2026, 7, 27),
+        date(2026, 7, 28),
+    ]
+    assert [str(item.main_net_inflow) for item in narrowed] == ["200", "-50"]
+    assert all(item.window == "daily" for item in narrowed)
+    assert narrowed[0].snapshot_id == widened[1].snapshot_id
+    assert narrowed[1].snapshot_id == widened[2].snapshot_id

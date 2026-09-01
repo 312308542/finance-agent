@@ -168,6 +168,7 @@ class DataSyncTaskPreview:
     enabled: bool = True
     schedule_type: str = "interval"
     run_at: list[str] = field(default_factory=list)
+    session_windows: list[str] = field(default_factory=list)
     timezone: str | None = None
     trading_day_policy: str | None = None
     depends_on: list[str] = field(default_factory=list)
@@ -814,6 +815,8 @@ def build_scheduler_job(task: DataSyncTaskPreview) -> JsonDict:
     }
     if task.run_at:
         job["run_at"] = task.run_at
+    if task.session_windows:
+        job["session_windows"] = task.session_windows
     if task.timezone:
         job["timezone"] = task.timezone
     if task.trading_day_policy:
@@ -845,7 +848,12 @@ def scheduler_job_resource_pool(job: JsonDict) -> str:
         return "maintenance"
     if name == "ashare.news_articles":
         return "article_enrichment"
-    if name in {"ashare.realtime_quotes", "ashare.risk_sentiment", "analytics.triggers.evaluate.intraday"}:
+    if name in {
+        "ashare.realtime_quotes",
+        "ashare.realtime_quotes.market_sweep",
+        "ashare.risk_sentiment",
+        "analytics.triggers.evaluate.intraday",
+    }:
         return "realtime"
     if job_type == "collection":
         return "collection_heavy"
@@ -876,6 +884,8 @@ def scheduler_job_priority(job: JsonDict) -> int:
         return 900
     if name in {"ashare.realtime_quotes", "analytics.triggers.evaluate.intraday"}:
         return 800
+    if name == "ashare.realtime_quotes.market_sweep":
+        return 750
     if name == "ashare.risk_sentiment":
         return 700
     if name == "ashare.bars.1d.close_final":
@@ -1269,6 +1279,7 @@ def build_trigger_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
                         "sync_task_type": "analytics.triggers.evaluate",
                         "owner_id": "default-owner",
                         "dispatch": True,
+                        "agent_runtime": "hermes_agent",
                         "max_events_per_run": 50,
                         "trigger_groups": [
                             "position",
@@ -1292,6 +1303,7 @@ def build_trigger_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
                         "sync_task_type": "analytics.triggers.evaluate",
                         "owner_id": "default-owner",
                         "dispatch": True,
+                        "agent_runtime": "hermes_agent",
                         "max_events_per_run": 50,
                         "trigger_groups": ["intraday_volatility", "position"],
                         "intraday_sharp_drop_threshold": "-0.04",
@@ -1303,58 +1315,6 @@ def build_trigger_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
         )
 
     jobs: list[JsonDict] = [*trigger_jobs]
-    if trigger_jobs:
-        jobs.append(
-            {
-                "name": "agent.loop.consume.after_trigger",
-                "job_type": "agent_loop_consume",
-                "group": "agent",
-                "enabled": True,
-                "interval_seconds": 0,
-                "schedule_type": "after_success",
-                "depends_on": [
-                    "analytics.triggers.evaluate.daily",
-                    "analytics.triggers.evaluate.intraday",
-                ],
-                "params": {
-                    "sync_task_type": "agent.loop.consume",
-                    "owner_id": "default-owner",
-                    "limit": 10,
-                    "use_model_planner": True,
-                },
-            }
-        )
-        jobs.append(
-            {
-                "name": "analytics.high_risk_reviews.after_agent",
-                "job_type": "high_risk_reviews",
-                "group": "analytics",
-                "enabled": True,
-                "interval_seconds": 0,
-                "schedule_type": "after_success",
-                "depends_on": ["agent.loop.consume.after_trigger"],
-                "params": {
-                    "sync_task_type": "analytics.high_risk_reviews",
-                    "owner_id": "default-owner",
-                    "limit": 10,
-                },
-            }
-        )
-    jobs.append(
-        {
-            "name": "agent.loop.consume.sweep",
-            "job_type": "agent_loop_consume",
-            "group": "agent",
-            "enabled": True,
-            "interval_seconds": 30 * 60,
-            "params": {
-                "sync_task_type": "agent.loop.consume",
-                "owner_id": "default-owner",
-                "limit": 10,
-                "use_model_planner": True,
-            },
-        }
-    )
     jobs.append(
         {
             "name": "analytics.high_risk_reviews.sweep",
@@ -1710,6 +1670,7 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                     )
                 )
     if "realtime_quotes" in config.data_packages:
+        session_windows = ["09:25-11:35", "12:55-15:10"]
         tasks.append(
             DataSyncTaskPreview(
                 task_key="ashare.realtime_quotes",
@@ -1718,12 +1679,38 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 title="刷新 A 股实时行情快照",
                 interval_seconds=config.interval_seconds.get("realtime_quotes", 5 * 60),
                 mode="incremental_snapshot",
-                batch_size=config.batch_size,
-                schedule_type="interval",
+                batch_size=200,
+                schedule_type="trading_session",
+                session_windows=session_windows,
+                timezone="Asia/Shanghai",
                 trading_day_policy="trading_day_only",
                 sources=["stock_zh_a_spot"],
                 data_packages=["realtime_quotes"],
+                extra_params={"scope": "priority"},
                 notes=["复用 A 股实时行情资产接口刷新价格和交易状态快照。"],
+            )
+        )
+        tasks.append(
+            DataSyncTaskPreview(
+                task_key="ashare.realtime_quotes.market_sweep",
+                market="ashare",
+                task_type="realtime_quote_refresh",
+                title="轮询 A 股全市场实时行情",
+                interval_seconds=config.interval_seconds.get("realtime_quotes", 5 * 60),
+                mode="partitioned_market_sweep",
+                batch_size=None,
+                schedule_type="trading_session",
+                session_windows=session_windows,
+                timezone="Asia/Shanghai",
+                trading_day_policy="trading_day_only",
+                sources=["stock_zh_a_spot"],
+                data_packages=["realtime_quotes"],
+                extra_params={
+                    "scope": "market_sweep",
+                    "batch_size": config.batch_size,
+                    "partition_cursor": 0,
+                },
+                notes=["按稳定排序的可交易资产池分区续跑，完成全市场盘中覆盖。"],
             )
         )
     if "fundamentals" in config.data_packages or "valuation" in config.data_packages:
@@ -1756,7 +1743,9 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 title="刷新 A 股资金流",
                 interval_seconds=config.interval_seconds.get("capital_flow", 30 * 60),
                 mode="incremental_snapshot",
-                schedule_type="interval",
+                schedule_type="trading_session",
+                session_windows=["09:25-11:35", "12:55-15:10"],
+                timezone="Asia/Shanghai",
                 trading_day_policy="trading_day_only",
                 batch_size=config.batch_size,
                 lookback=f"{config.lookback_days}d",
@@ -1913,7 +1902,9 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                     ASHARE_TIMELY_EVENT_INTERVAL_SECONDS,
                 ),
                 mode="incremental_snapshot",
-                schedule_type="interval",
+                schedule_type="trading_session",
+                session_windows=["09:25-11:35", "12:55-15:10"],
+                timezone="Asia/Shanghai",
                 trading_day_policy="trading_day_only",
                 batch_size=config.batch_size,
                 lookback=f"{config.lookback_days}d",

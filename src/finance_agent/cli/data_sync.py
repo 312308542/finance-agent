@@ -45,6 +45,37 @@ def add_data_arguments(subparsers: argparse._SubParsersAction[argparse.ArgumentP
     data = subparsers.add_parser("data", help="基础数据同步配置与预览。")
     data_commands = data.add_subparsers(dest="command", required=True)
 
+
+    recovery = data_commands.add_parser("recovery", help="A 股停跑恢复补跑批次。")
+    recovery_commands = recovery.add_subparsers(dest="subcommand", required=True)
+
+    recovery_preview = recovery_commands.add_parser(
+        "preview", help="只读扫描缺口并生成或复用计划草稿。"
+    )
+    recovery_preview.add_argument("--requested-by", default=None, help="操作人标识。")
+
+    recovery_list = recovery_commands.add_parser("list", help="列出补跑批次。")
+    recovery_list.add_argument("--limit", type=int, default=20, help="返回条数上限。")
+
+    recovery_status = recovery_commands.add_parser("status", help="查看批次状态。")
+    recovery_status.add_argument("--run-id", required=True, help="补跑批次 ID。")
+
+    recovery_approve = recovery_commands.add_parser(
+        "approve", help="确认执行补跑；plan_hash 用于过期检测。"
+    )
+    recovery_approve.add_argument("--run-id", required=True, help="补跑批次 ID。")
+    recovery_approve.add_argument("--plan-hash", required=True, help="preview 返回的计划哈希。")
+    recovery_approve.add_argument("--approved-by", default=None, help="确认人标识。")
+
+    recovery_control = recovery_commands.add_parser(
+        "control", help="暂停、继续或取消补跑批次。"
+    )
+    recovery_control.add_argument("--run-id", required=True, help="补跑批次 ID。")
+    recovery_control.add_argument(
+        "--action", required=True, choices=["pause", "resume", "cancel"], help="控制动作。"
+    )
+    recovery_control.add_argument("--actor", default=None, help="操作人标识。")
+
     config = data_commands.add_parser("config", help="数据同步配置中心。")
     config_commands = config.add_subparsers(dest="subcommand", required=True)
 
@@ -192,6 +223,8 @@ def add_data_arguments(subparsers: argparse._SubParsersAction[argparse.ArgumentP
 def dispatch_data(args: argparse.Namespace) -> JsonDict:
     """执行数据同步配置命令。"""
 
+    if args.command == "recovery":
+        return dispatch_data_recovery(args)
     if args.command == "production":
         return dispatch_data_production(args)
     if args.command == "strategy":
@@ -448,3 +481,55 @@ def serialize_scoring_strategy(strategy: Any) -> JsonDict:
         "missing_penalty": dict(strategy.missing_penalty),
         "status": strategy.status,
     }
+
+
+def _recovery_session_module():
+    """打开独立会话并构造补跑门面（CLI 无请求级依赖）。"""
+
+    from contextlib import contextmanager
+
+    from finance_agent.storage.db import create_session_factory
+    from finance_agent.storage.db import session_scope as scope
+
+    factory = create_session_factory()
+
+    @contextmanager
+    def ctx():
+        with scope(factory) as session:
+            from finance_agent.data_recovery.assembly import (
+                build_default_recovery_module,
+            )
+
+            yield build_default_recovery_module(session)
+
+    return ctx()
+
+
+def dispatch_data_recovery(args: argparse.Namespace) -> JsonDict:
+    """分发 `finance-agent data recovery ...` 子命令。"""
+
+    subcommand = str(getattr(args, "subcommand", ""))
+    with _recovery_session_module() as module:
+        if subcommand == "preview":
+            return module.preview(requested_by=getattr(args, "requested_by", None))
+        if subcommand == "list":
+            return {"runs": module.list_runs(limit=int(getattr(args, "limit", 20)))}
+        if subcommand == "status":
+            return module.get(str(args.run_id)).to_dict()
+        if subcommand == "approve":
+            view = module.approve(
+                run_id=str(args.run_id),
+                plan_hash=str(args.plan_hash),
+                approved_by=getattr(args, "approved_by", None),
+            )
+            module.session.flush()
+            return view.to_dict()
+        if subcommand == "control":
+            view = module.control(
+                str(args.run_id),
+                str(args.action),
+                actor=getattr(args, "actor", None),
+            )
+            module.session.flush()
+            return view.to_dict()
+    raise ValueError(f"未知补跑子命令: {subcommand}")

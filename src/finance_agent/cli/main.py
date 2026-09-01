@@ -724,16 +724,26 @@ def dispatch_triggers(session: Any, args: argparse.Namespace) -> JsonDict:
             "data": service.evaluate(build_trigger_request(args)).to_dict(),
         }
     if args.command == "dispatch":
+        from finance_agent.triggers.webhook import HermesWebhookPublisher
+
+        publisher = HermesWebhookPublisher.from_environment()
         result = service.dispatch_pending(
             owner_id=args.owner_id,
             limit=args.limit,
             as_of=parse_datetime(args.as_of),
+            publisher=publisher.publish if publisher else None,
         )
         return {"status": "ok", "data": result.to_dict()}
     if args.command == "run-once":
+        from finance_agent.triggers.webhook import HermesWebhookPublisher
+
+        publisher = HermesWebhookPublisher.from_environment()
         return {
             "status": "ok",
-            "data": service.run_once(build_trigger_request(args)),
+            "data": service.run_once(
+                build_trigger_request(args),
+                publisher=publisher.publish if publisher else None,
+            ),
         }
     if args.command == "assistant-loop":
         scheduler = AssistantLoopScheduler(

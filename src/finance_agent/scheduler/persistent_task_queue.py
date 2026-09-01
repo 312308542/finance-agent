@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -28,6 +29,13 @@ class TaskClaim:
     payload: JsonDict
     attempts: int
     max_attempts: int
+    scheduled_for: datetime | None = None
+    priority: int = 100
+    resource_pool: str = "default"
+    mutex_key: str | None = None
+    dependency_generation: tuple[str, ...] = ()
+    required_data_domains: tuple[str, ...] = ()
+    config_digest: str | None = None
 
     @classmethod
     def from_orm(cls, task: SchedulerTaskRunORM) -> TaskClaim:
@@ -42,6 +50,17 @@ class TaskClaim:
             payload=dict(task.payload or {}),
             attempts=int(task.attempts or 0),
             max_attempts=int(task.max_attempts or 0),
+            scheduled_for=getattr(task, "scheduled_for", None),
+            priority=(
+                100
+                if getattr(task, "priority", None) is None
+                else int(task.priority)
+            ),
+            resource_pool=str(getattr(task, "resource_pool", "default") or "default"),
+            mutex_key=getattr(task, "mutex_key", None),
+            dependency_generation=tuple(getattr(task, "dependency_generation", None) or ()),
+            required_data_domains=tuple(getattr(task, "required_data_domains", None) or ()),
+            config_digest=getattr(task, "config_digest", None),
         )
 
 
@@ -98,6 +117,45 @@ class PersistentTaskQueue:
         )
         return TaskClaim.from_orm(task) if task is not None else None
 
+    def schedule(self, **kwargs: Any) -> SchedulerTaskRunORM:
+        """持久化尚未准入的逻辑运行。"""
+
+        return self.repository.schedule(**kwargs)
+
+    def set_admission(self, **kwargs: Any) -> bool:
+        """持久化准入结论。"""
+
+        return self.repository.set_admission(**kwargs)
+
+    def coalesce_task(self, **kwargs: Any) -> bool:
+        """合并一个尚未执行的固定节拍运行。"""
+
+        return self.repository.coalesce_task(**kwargs)
+
+    def claim_many(
+        self,
+        *,
+        worker_id: str,
+        limit: int,
+        lease_seconds: int = 60,
+        resource_pool: str | None = None,
+        job_names: Sequence[str] | None = None,
+        resource_pool_limits: Mapping[str, int] | None = None,
+        now: datetime | None = None,
+    ) -> list[TaskClaim]:
+        """批量领取所有已到期且已准入的任务。"""
+
+        tasks = self.repository.claim_many(
+            worker_id=worker_id,
+            limit=limit,
+            lease_seconds=lease_seconds,
+            resource_pool=resource_pool,
+            job_names=job_names,
+            resource_pool_limits=resource_pool_limits,
+            now=now,
+        )
+        return [TaskClaim.from_orm(task) for task in tasks]
+
     def heartbeat(
         self,
         *,
@@ -143,3 +201,52 @@ class PersistentTaskQueue:
         """恢复所有过期租约。"""
 
         return self.repository.recover_expired(now=now)
+
+    def recover_orphaned(
+        self,
+        *,
+        worker_prefix: str,
+        current_worker_id: str | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        """回收同一 scheduler 前一实例留下的运行租约。"""
+
+        return self.repository.recover_orphaned(
+            worker_prefix=worker_prefix,
+            current_worker_id=current_worker_id,
+            now=now,
+        )
+
+    def list_tasks(
+        self,
+        *,
+        job_name: str | None = None,
+        statuses: Sequence[str] = ("pending",),
+        payload_key: str | None = None,
+        payload_value: str | None = None,
+        limit: int = 200,
+    ) -> list[SchedulerTaskRunORM]:
+        """按任务名/状态/负载键值查询持久任务（任务观测 API）。"""
+
+        return self.repository.list_tasks(
+            job_name=job_name,
+            statuses=statuses,
+            payload_key=payload_key,
+            payload_value=payload_value,
+            limit=limit,
+        )
+
+    def cancel_tasks(
+        self,
+        *,
+        task_ids: Sequence[str],
+        reason: str | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        """取消未领取的 pending 任务；返回实际取消数（规格 12.3）。"""
+
+        return self.repository.cancel_tasks(
+            task_ids=task_ids,
+            reason=reason,
+            now=now,
+        )

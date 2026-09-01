@@ -527,6 +527,65 @@ def normalize_ashare_fund_flow_rank(
     return snapshots
 
 
+def normalize_ashare_individual_fund_flow(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    symbol: str,
+    as_of: datetime,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    limit: int | None = None,
+) -> list[CapitalFlowSnapshotData]:
+    """归一化 AKShare 个股历史资金流明细。"""
+
+    clean_symbol = normalize_ashare_symbol(symbol)
+    if not is_main_board_ashare_stock_symbol(clean_symbol):
+        return []
+    snapshots: list[CapitalFlowSnapshotData] = []
+    rows = df.to_dict("records")
+    for row in rows:
+        snapshot_at = parse_ashare_datetime(
+            _first_present(row, ["日期", "数据日期", "date"])
+        ) or as_of
+        day = snapshot_at.astimezone(ASHARE_TIMEZONE).date()
+        if start_date is not None and day < start_date:
+            continue
+        if end_date is not None and day > end_date:
+            continue
+        main_net_inflow = _first_decimal(
+            row,
+            [
+                "主力净流入-净额",
+                "主力净流入净额",
+                "主力净流入",
+                "主力净额",
+            ],
+        )
+        if main_net_inflow is None:
+            continue
+        snapshots.append(
+            CapitalFlowSnapshotData(
+                snapshot_id=stable_id(
+                    "capital_flow", source, clean_symbol, "daily", snapshot_at.isoformat()
+                ),
+                asset_id=f"ashare:{clean_symbol}",
+                symbol=clean_symbol,
+                market="ashare",
+                window="daily",
+                source=source,
+                as_of=snapshot_at,
+                main_net_inflow=main_net_inflow,
+                amount=_first_decimal(row, ["成交额", "当日成交额"]),
+                turnover_rate=_first_decimal(row, ["换手率", "当日换手率"]),
+                status="available",
+                payload={"raw": row},
+            )
+        )
+    snapshots.sort(key=lambda item: item.as_of)
+    return snapshots[-limit:] if limit else snapshots
+
+
 def normalize_ashare_northbound_market_flow(
     df: pd.DataFrame,
     *,

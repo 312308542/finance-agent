@@ -2,12 +2,15 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    FINANCE_AGENT_PROJECT_ROOT=/app \
+    FINANCE_AGENT_RUNTIME_DIR=/app/runtime
 
 WORKDIR /app
 
 # TA-Lib Python 包依赖 TA-Lib C 库；slim 镜像中通常没有预装。
 ARG TA_LIB_VERSION=0.4.0
+ARG PIP_INDEX_URL=https://pypi.org/simple
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
@@ -27,7 +30,7 @@ RUN apt-get update \
     && apt-get purge -y --auto-remove wget make \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md alembic.ini ./
 COPY src ./src
 COPY scripts ./scripts
 
@@ -36,4 +39,4 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 RUN mkdir -p /app/runtime/base_data_scheduler
 
-CMD ["python", "scripts/data/run_base_data_scheduler.py", "--loop", "--status-file", "runtime/base_data_scheduler/status.json", "--event-log-file", "runtime/base_data_scheduler/events.jsonl"]
+CMD ["sh", "-c", "exec python scripts/data/run_base_data_scheduler.py --loop --config \"$FINANCE_AGENT_RUNTIME_DIR/base_data_scheduler/base_data_scheduler.json\" --status-file \"$FINANCE_AGENT_RUNTIME_DIR/base_data_scheduler/status.json\" --event-log-file \"$FINANCE_AGENT_RUNTIME_DIR/base_data_scheduler/events.jsonl\""]

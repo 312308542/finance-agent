@@ -44,7 +44,18 @@ $env:VITE_FINANCE_AGENT_API_BASE="http://127.0.0.1:8000"
 - `GET /api/data/scheduler/status`
 - `POST /api/chat`
 
-## 运行
+## Docker 运行
+
+在仓库根目录构建并启动完整系统：
+
+```powershell
+Copy-Item .env.example .env
+docker compose up -d --build
+```
+
+浏览器访问 `http://127.0.0.1:5173`。生产前端由 Nginx 提供静态资源，并将同源 `/api` 请求转发到 Compose 内的 `finance-agent-api:8000`。
+
+## 源码开发
 
 先启动后端：
 
@@ -59,12 +70,6 @@ cd D:\Code\aiAgents\finance-agent
 cd D:\Code\aiAgents\finance-agent\apps\agent-office
 npm install
 npm run dev -- --host 127.0.0.1 --port 5173
-```
-
-默认地址：
-
-```text
-http://127.0.0.1:5173
 ```
 
 ## 验证

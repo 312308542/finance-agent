@@ -176,3 +176,23 @@ class DataSchedulerFailedRerunRequest(BaseModel):
     """单个基础数据调度任务失败项重跑请求。"""
 
     dry_run: bool = False
+
+
+class DataRecoveryPreviewRequest(BaseModel):
+    """停跑恢复缺口扫描与计划草稿请求。"""
+
+    requested_by: str | None = None
+
+
+class DataRecoveryApproveRequest(BaseModel):
+    """补跑计划确认请求；plan_hash 用于过期检测（规格 6.2）。"""
+
+    plan_hash: str
+    approved_by: str | None = None
+
+
+class DataRecoveryControlRequest(BaseModel):
+    """补跑批次控制请求：pause / resume / cancel。"""
+
+    action: str
+    actor: str | None = None

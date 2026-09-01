@@ -6,4 +6,13 @@ export default defineConfig({
   server: {
     port: 5177,
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          antd: ["antd"],
+        },
+      },
+    },
+  },
 });

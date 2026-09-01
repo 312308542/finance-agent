@@ -1,7 +1,17 @@
 # Hermes 金融助手 Skill 规范
 
-> 版本：2026-07-22（对应 Hermes Skill 2.0.0）
+> 版本：2026-07-23（对应 Hermes Skill 3.0.0）
 > 准源：本仓库版本为准源；Hermes 侧 `finance-agent-recommendation` skill 如有调整，必须同步回本文档。
+
+## 0. 最新决策边界
+
+Hermes 是独立的研究与决策编排者，不是 `finance-agent` 的被动转述器。Hermes 可以基于联网证据、Python 只读分析、Finance Memory、图谱和 Workflow 形成独立判断，也可以明确反驳或否决项目给出的推荐；但 Hermes 不得伪造、改写或绕过 `finance-agent` 的确定性事实、评分、信号、风险字段和数据闸门。任何买入、卖出、减仓或换仓只输出待确认建议，交易动作仍由用户确认。
+
+每次最终推荐都必须同时结合 `finance-agent` 确定性事实、Finance Memory、图谱路径和联网取得的最新公告/新闻/政策/公司事件。重点标的、持仓风险、信号突变或事件驱动标的必须执行联网深度研究；联网不可用、来源冲突或证据过期时，结论降级为观察/等待。
+
+Hermes 只对绝对重点标的执行 `asset_deep_analysis` 等深度 Workflow，普通轮询使用轻量触发评估，避免每个 Cron tick 重复运行全部 Workflow。Hermes 自主判断是否需要分析、是否需要通知以及通知级别；无新事实、无状态变化或仍处于冷却窗口时输出 `[SILENT]`。当前主动通知以已登记的微信私聊为主，飞书作为备用目标；若备用渠道没有登记目标，必须在审计中明确记录，不得假装已送达。
+
+如果发现 `finance-agent` 的数据、规则、任务链路或报告存在问题，只能提交“问题证据 -> 影响 -> 改进方案 -> 验证方式”的整改提案，等待用户明确同意后才允许修改代码、配置、数据库或 Skill。不得在分析过程中自行修复或静默改变系统行为。
 
 ## 1. 定位
 
@@ -14,7 +24,7 @@ Hermes 调用本项目时必须遵守以下原则：
 - 所有金融事实必须来自 `finance-agent` 已入库数据，优先通过 CLI 或 MCP 工具读取。
 - 所有建议必须引用 Workflow 报告、因子/风险/信号证据、Finance Memory 或审计事件。
 - 模型只能给出解释、比较、反驳和建议文本，不能修改确定性评分和风控标记。
-- Hermes 可以联网核对公告、新闻、政策和公司事件，也可以使用 Python 对 MCP 返回数据做统计、回测和质量检查；外部结果必须带来源和时间，只能作为交叉验证证据，不能覆盖已入库事实或绕过决策闸门。
+- Hermes 必须联网核对每次推荐涉及的最新公告、新闻、政策和公司事件，也可以使用 Python 对 MCP 返回数据做统计、回测和质量检查；外部结果必须带 URL、来源、发布时间和检索时间，只能作为交叉验证证据，不能覆盖已入库事实或绕过决策闸门。
 
 ## 2. 项目入口
 
@@ -196,7 +206,7 @@ Hermes 不应把 20 个 MCP 工具当作互不相关的查询接口，必须按�
 3. 持仓请求先读取 `portfolio.get_snapshot`，再运行 `portfolio_monitoring`；出现弱持仓和强候选时，补齐源标的与候选标的后再运行 `swap_decision`。
 4. Workflow 运行后必须保存 `workflow_run_id`，继续调用 `get_workflow_run` 检查节点、模型路由、高风险复核和错误，再调用 `get_report(markdown=true)` 读取中文报告。
 5. 使用 `graph_explain_candidate_reason_chain`、`graph_find_similar_decision_paths`、`graph_find_memory_conflicts` 和 `graph_detect_risk_contagion` 复核入池理由、历史相似路径、记忆冲突和风险传导。
-6. 常规轮询分开使用 `evaluate_triggers` 和 `dispatch_triggers`；用户明确要求立即检查时才使用 `run_triggers_once`。触发器只负责生成事件并唤醒 Agent，不是交易指令。
+6. 正常运行由 finance-agent Docker scheduler 程序化执行 `evaluate_triggers`，超过阈值的事件通过带 HMAC 的 Hermes Webhook 自动唤醒；Hermes 不再使用普通 LLM Cron 轮询触发器。`dispatch_triggers` 和 `run_triggers_once` 仅用于人工诊断或用户明确要求立即检查，且必须复用 Webhook 门控。触发器只负责生成事件并唤醒 Agent，不是交易指令。
 7. 数据过期、缺失、冲突、`critical` 风险、Workflow 失败或高风险复核未完成时，只能输出观察、补数或等待确认，不得给强买卖结论。
 
 Workflow 参数约束：

@@ -94,9 +94,10 @@ git clone https://github.com/312308542/finance-agent.git
 cd finance-agent
 ```
 
-### 2. 启动运行环境
+### 2. 使用 Docker Compose 启动完整系统
 
 ```powershell
+Copy-Item .env.example .env
 docker compose up -d --build
 ```
 
@@ -104,8 +105,21 @@ docker compose up -d --build
 
 - PostgreSQL + TimescaleDB：`localhost:5432`
 - Redis：`localhost:6379`
+- 数据库迁移：升级到 Alembic `head` 后正常退出
 - gotdx 通达信行情网关：仅在 Compose 内部网络提供 `8790` 端口
-- 基础数据调度器：等待 PostgreSQL、Redis 和 gotdx 网关健康后启动
+- 基础数据调度器：等待 PostgreSQL、Redis、迁移和 gotdx 网关就绪后启动
+- FastAPI 后端：`http://127.0.0.1:8000`，健康检查为 `http://127.0.0.1:8000/api/health`
+- React Web 控制台：`http://127.0.0.1:5173`，由 Nginx 同源代理 `/api` 到后端
+- MCP Server：`http://127.0.0.1:8765/mcp`
+
+查看服务状态：
+
+```powershell
+docker compose ps
+docker compose logs -f finance-agent-api finance-agent-web
+```
+
+以下步骤只在需要脱离 Docker 进行源码开发时执行。
 
 ### 3. 安装后端依赖
 

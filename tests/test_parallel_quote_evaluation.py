@@ -160,7 +160,7 @@ def test_realtime_collection_task_wires_both_providers_and_latest_storage(monkey
 
     result = module.build_ashare_parallel_realtime_task(object(), type("Args", (), {})(), _Runtime())
 
-    assert result.result.status == "available"
+    assert result.result.status == "stale"
     assert calls[:2] == ["gotdx:600519.SH", "akshare"] or calls[:2] == ["akshare", "gotdx:600519.SH"]
     assert "persist:2" in calls
     assert len(snapshots.inserted) == 1

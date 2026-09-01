@@ -294,6 +294,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--health-max-age-seconds 必须大于 0")
     if args.manage_gotdx_gateway and not (args.run_once or args.loop):
         parser.error("--manage-gotdx-gateway 只能与 --run-once 或 --loop 一起使用")
+    if args.loop and not args.config:
+        parser.error("--loop 常驻模式必须显式提供 --config")
     if args.gotdx_gateway_startup_timeout_seconds is not None and args.gotdx_gateway_startup_timeout_seconds <= 0:
         parser.error("--gotdx-gateway-startup-timeout-seconds 必须大于 0")
     if args.gotdx_gateway_monitor_interval_seconds is not None and args.gotdx_gateway_monitor_interval_seconds <= 0:

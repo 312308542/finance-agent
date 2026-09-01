@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -117,6 +118,7 @@ class AgentWakeupDispatchResult:
 
     dispatched_events: tuple[AssistantTriggerEventORM, ...]
     skipped_events: tuple[AssistantTriggerEventORM, ...]
+    failed_events: tuple[AssistantTriggerEventORM, ...] = ()
 
     def to_dict(self) -> JsonDict:
         """转换为 JSON 友好的字典。"""
@@ -124,10 +126,12 @@ class AgentWakeupDispatchResult:
         return {
             "dispatched_count": len(self.dispatched_events),
             "skipped_count": len(self.skipped_events),
+            "failed_count": len(self.failed_events),
             "dispatched_events": [
                 serialize_trigger_event(event) for event in self.dispatched_events
             ],
             "skipped_events": [serialize_trigger_event(event) for event in self.skipped_events],
+            "failed_events": [serialize_trigger_event(event) for event in self.failed_events],
         }
 
 
@@ -213,6 +217,8 @@ class TriggerService:
         limit: int = 20,
         as_of: datetime | None = None,
         agent_runtime: str | None = None,
+        publisher: Callable[[AssistantTriggerEventORM], None] | None = None,
+        retry_backoff_seconds: int = 30,
     ) -> AgentWakeupDispatchResult:
         """派发待处理触发事件到 Agent 唤醒队列。
 
@@ -223,7 +229,14 @@ class TriggerService:
         dispatch_time = as_of or datetime.now(UTC)
         dispatched: list[AssistantTriggerEventORM] = []
         skipped: list[AssistantTriggerEventORM] = []
-        for event in self.triggers.list_pending_events(owner_id=owner_id, limit=limit):
+        failed: list[AssistantTriggerEventORM] = []
+        for event in self.triggers.list_pending_events(
+            owner_id=owner_id,
+            agent_runtime=agent_runtime,
+            limit=limit,
+        ):
+            if not dispatch_retry_ready(event, dispatch_time):
+                continue
             missing_reason = validate_dispatch_requirements(event)
             if missing_reason:
                 skipped.append(
@@ -236,15 +249,41 @@ class TriggerService:
                 continue
 
             agent_task_id = build_trigger_agent_task_id(event=event)
+            runtime = agent_runtime or event.agent_runtime
+            if runtime == "hermes_agent":
+                if publisher is None:
+                    failed.append(
+                        self.triggers.mark_dispatch_failed(
+                            trigger_event_id=event.trigger_event_id,
+                            failed_at=dispatch_time,
+                            retry_at=dispatch_time
+                            + timedelta(seconds=max(retry_backoff_seconds, 1)),
+                            error_message="未配置 Hermes Webhook 发布器",
+                        )
+                    )
+                    continue
+                try:
+                    publisher(event)
+                except Exception as exc:
+                    failed.append(
+                        self.triggers.mark_dispatch_failed(
+                            trigger_event_id=event.trigger_event_id,
+                            failed_at=dispatch_time,
+                            retry_at=dispatch_time
+                            + timedelta(seconds=max(retry_backoff_seconds, 1)),
+                            error_message=str(exc),
+                        )
+                    )
+                    continue
             dispatched.append(
                 self.triggers.mark_dispatched(
                     trigger_event_id=event.trigger_event_id,
                     agent_task_id=agent_task_id,
                     dispatched_at=dispatch_time,
-                    agent_runtime=agent_runtime,
+                    agent_runtime=runtime,
                     payload={
                         "dispatch_status": "agent_wakeup_queued",
-                        "agent_runtime": agent_runtime or event.agent_runtime,
+                        "agent_runtime": runtime,
                         "agent_task_id": agent_task_id,
                         "requested_workflow_type": event.requested_workflow_type,
                     },
@@ -253,9 +292,15 @@ class TriggerService:
         return AgentWakeupDispatchResult(
             dispatched_events=tuple(dispatched),
             skipped_events=tuple(skipped),
+            failed_events=tuple(failed),
         )
 
-    def run_once(self, request: TriggerEvaluationRequest) -> JsonDict:
+    def run_once(
+        self,
+        request: TriggerEvaluationRequest,
+        *,
+        publisher: Callable[[AssistantTriggerEventORM], None] | None = None,
+    ) -> JsonDict:
         """执行一次评估和派发。"""
 
         evaluation = self.evaluate(request)
@@ -263,6 +308,7 @@ class TriggerService:
             owner_id=request.owner_id,
             limit=max(len(evaluation.created_events), 1),
             as_of=request.as_of,
+            publisher=publisher,
         )
         return {
             "evaluation": evaluation.to_dict(),
@@ -962,6 +1008,22 @@ def validate_dispatch_requirements(event: AssistantTriggerEventORM) -> str | Non
     if event.requested_workflow_type == "asset_deep_analysis" and not event.asset_id:
         return "asset_deep_analysis 缺少 asset_id"
     return None
+
+
+def dispatch_retry_ready(event: AssistantTriggerEventORM, as_of: datetime) -> bool:
+    """判断失败事件是否已经到达下一次发布时间。"""
+
+    retry_at = (event.payload or {}).get("dispatch_retry_at")
+    if not retry_at:
+        return True
+    try:
+        parsed = datetime.fromisoformat(str(retry_at))
+    except ValueError:
+        return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    current = as_of if as_of.tzinfo else as_of.replace(tzinfo=UTC)
+    return parsed <= current
 
 
 def serialize_trigger_event(event: AssistantTriggerEventORM) -> JsonDict:

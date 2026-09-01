@@ -16,6 +16,8 @@
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",
+    "antd": "^5.29.3",
+    "dayjs": "^1.11.21",
     "lucide-react": "^0.562.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
