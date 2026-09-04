@@ -21,6 +21,23 @@ def default_scoring_strategy_seeds() -> list[JsonDict]:
 
     return [
         {
+            "strategy_id": "strategy:ashare:adaptive_v1",
+            "market": "ashare",
+            "name": "A 股自适应 Alpha V1",
+            "description": "按市场状态在趋势、结构、板块、资金、基本面和收益风险六组间切换权重。",
+            "engine": "adaptive_alpha_v1",
+            "group_weights": {
+                "trend": 0.25,
+                "structure": 0.20,
+                "sector_leadership": 0.20,
+                "capital_flow": 0.15,
+                "fundamental_valuation": 0.10,
+                "tradability_return_risk": 0.10,
+            },
+            "missing_penalty": {"per_missing_group": 5.0, "per_partial_group": 2.0},
+            "status": "active",
+        },
+        {
             "strategy_id": "strategy:ashare:balanced_growth",
             "market": "ashare",
             "name": "A 股均衡成长",

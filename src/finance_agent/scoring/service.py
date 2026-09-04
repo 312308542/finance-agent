@@ -194,11 +194,11 @@ def compute_asset_score(factor: FactorFrameORM, *, strategy: Any | None = None) 
     base_score = weighted_sum / used_weight if used_weight > 0 else 0.0
     risk_penalty = compute_risk_penalty(groups.get("risk"))
     partial_groups = factor.payload.get("partial_groups") or []
-    missing_penalty = 0.0
     legacy_missing_penalty = len(factor.missing_groups) * missing_penalty_config[
         "per_missing_group"
     ] + len(partial_groups) * missing_penalty_config["per_partial_group"]
-    total_score = clamp(base_score - risk_penalty, 0, 100)
+    missing_penalty = legacy_missing_penalty
+    total_score = clamp(base_score - risk_penalty - missing_penalty, 0, 100)
     data_confidence = clamp(
         used_weight / sum(weights.values()) - legacy_missing_penalty / 100 * 0.4,
         0.05,
@@ -220,6 +220,7 @@ def compute_asset_score(factor: FactorFrameORM, *, strategy: Any | None = None) 
 
     payload = {
         "status": status,
+        "base_score": base_score,
         "total_score": total_score,
         "confidence": confidence,
         "data_confidence": data_confidence,

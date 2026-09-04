@@ -154,6 +154,24 @@ def test_default_seeds_include_fixed_short_theme_mixed_strategy() -> None:
     }
 
 
+def test_adaptive_strategy_seed_is_available_to_pipeline() -> None:
+    seeds = {item["strategy_id"]: item for item in default_scoring_strategy_seeds()}
+    adaptive = seeds["strategy:ashare:adaptive_v1"]
+
+    assert adaptive["market"] == "ashare"
+    assert adaptive["status"] == "active"
+    assert adaptive["engine"] == "adaptive_alpha_v1"
+    assert adaptive["group_weights"] == {
+        "trend": 0.25,
+        "structure": 0.20,
+        "sector_leadership": 0.20,
+        "capital_flow": 0.15,
+        "fundamental_valuation": 0.10,
+        "tradability_return_risk": 0.10,
+    }
+    validate_scoring_strategy_payload(adaptive)
+
+
 def test_validate_scoring_strategy_rejects_invalid_weight_sum() -> None:
     """策略权重和必须接近 1，避免评分不可解释。"""
 
