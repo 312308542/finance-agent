@@ -94,3 +94,46 @@ def test_snapshot_id_changes_when_payload_changes() -> None:
 
     assert first.data_snapshot_id != second.data_snapshot_id
     assert first.captured_at - first.as_of == timedelta(minutes=1)
+
+
+def test_decision_snapshot_storage_id_can_use_decision_namespace() -> None:
+    from finance_agent.recommendations.decision_snapshot import (
+        DecisionFact,
+        DecisionSnapshotBuilder,
+        DecisionSnapshotInputs,
+    )
+
+    as_of = datetime(2026, 9, 4, 7, 0, tzinfo=UTC)
+
+    def fact(name: str, payload: object) -> DecisionFact:
+        return DecisionFact(
+            data_snapshot_id=f"fact:{name}",
+            as_of=as_of,
+            quality_status="available",
+            payload=payload,
+        )
+
+    result = DecisionSnapshotBuilder().build(
+        DecisionSnapshotInputs(
+            market="ashare",
+            as_of=as_of,
+            market_regime=fact("market", {"regime": "trend_up"}),
+            sector_opportunities=fact("sector", []),
+            structure=fact("structure", {"coverage": 1.0}),
+            risk=fact("risk", {"status": "available"}),
+            assets=(
+                {
+                    "asset_id": "ashare:600519",
+                    "symbol": "600519",
+                    "quality_status": "available",
+                },
+            ),
+            data_versions={},
+            previous_assets={},
+        )
+    )
+
+    assert result.snapshot is not None
+    stored = result.snapshot.to_storage_snapshot()
+    assert stored.data_snapshot_id == result.snapshot.decision_snapshot_id
+    assert stored.snapshot_type == "recommendation_decision_input"
