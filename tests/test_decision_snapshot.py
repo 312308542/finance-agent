@@ -149,6 +149,54 @@ def test_invalid_asset_preserves_previous_valid_state_as_stale() -> None:
     assert asset["reason_codes"] == ["asset_quality_partial"]
 
 
+def test_future_asset_fact_isolated_without_blocking_same_snapshot() -> None:
+    result = DecisionSnapshotBuilder(maximum_skew=timedelta(minutes=5)).build(
+        _inputs(
+            assets=(
+                {
+                    "asset_id": "ashare:600519",
+                    "symbol": "600519",
+                    "quality_status": "available",
+                    "as_of": AS_OF + timedelta(minutes=1),
+                },
+                {
+                    "asset_id": "ashare:000001",
+                    "symbol": "000001",
+                    "quality_status": "available",
+                    "as_of": AS_OF,
+                },
+            )
+        )
+    )
+
+    assert result.status == "partial"
+    assert result.snapshot is not None
+    by_asset = {item["asset_id"]: item for item in result.snapshot.assets}
+    assert by_asset["ashare:600519"]["data_quality"] == "unavailable"
+    assert by_asset["ashare:600519"]["reason_codes"] == ["asset_future"]
+    assert by_asset["ashare:000001"]["data_quality"] == "available"
+
+
+def test_stale_asset_fact_isolated_at_maximum_skew() -> None:
+    result = DecisionSnapshotBuilder(maximum_skew=timedelta(minutes=5)).build(
+        _inputs(
+            assets=(
+                {
+                    "asset_id": "ashare:600519",
+                    "symbol": "600519",
+                    "quality_status": "available",
+                    "as_of": AS_OF - timedelta(minutes=6),
+                },
+            )
+        )
+    )
+
+    assert result.status == "partial"
+    assert result.snapshot is not None
+    assert result.snapshot.assets[0]["data_quality"] == "unavailable"
+    assert result.snapshot.assets[0]["reason_codes"] == ["asset_stale"]
+
+
 def test_builder_persists_once_and_rejects_same_id_with_different_hash() -> None:
     class _Repository:
         def __init__(self) -> None:

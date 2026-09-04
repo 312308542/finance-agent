@@ -7,6 +7,7 @@ import pytest
 
 from finance_agent.data.freshness import (
     ashare_daily_snapshot_at,
+    ashare_market_close_at,
     expected_ashare_report_period,
 )
 
@@ -40,3 +41,15 @@ def test_ashare_daily_snapshot_uses_shanghai_calendar_day() -> None:
     collected_at = datetime(2026, 7, 15, 16, 30, tzinfo=UTC)
 
     assert ashare_daily_snapshot_at(collected_at) == datetime(2026, 7, 16, tzinfo=UTC)
+
+
+def test_ashare_market_close_maps_daily_trade_date_to_fifteen_oclock() -> None:
+    daily_timestamp = datetime(2026, 7, 16, tzinfo=UTC)
+
+    assert ashare_market_close_at(daily_timestamp) == datetime(
+        2026,
+        7,
+        16,
+        7,
+        tzinfo=UTC,
+    )

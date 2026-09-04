@@ -101,7 +101,7 @@ class StructuralDecisionEngine:
                 reasons=("primary_direction_conflict",),
             )
         direction = directions[-1] if directions else "unknown"
-        levels = _risk_levels(primary)
+        levels = _risk_levels(primary, current_price=current_price)
         entry_zone, invalidation_price, target_price = levels
         if (
             current_price is not None
@@ -209,7 +209,9 @@ def _verdict(
 
 def _frame_mapping(frame: Any) -> JsonDict:
     if isinstance(frame, Mapping):
-        return dict(frame)
+        payload = dict(frame)
+        payload.setdefault("horizon", payload.get("schema_version"))
+        return payload
     payload = dict(getattr(frame, "payload", {}) or {})
     for field in ("horizon", "timeframe", "status", "confidence", "evidence_id", "as_of"):
         value = getattr(frame, field, None)
@@ -226,6 +228,20 @@ def _frame_direction(frame: JsonDict) -> str:
     direct = _normalize_direction(frame.get("direction"))
     if direct != "unknown":
         return direct
+    if str(frame.get("horizon") or "") == "structural_swings_v2":
+        swings = _mapping_rows(frame.get("swings"))
+        highs = [row for row in swings if str(row.get("type")) == "H"]
+        lows = [row for row in swings if str(row.get("type")) == "L"]
+        if len(highs) >= 2 and len(lows) >= 2:
+            last_high = _decimal(highs[-1].get("price"))
+            previous_high = _decimal(highs[-2].get("price"))
+            last_low = _decimal(lows[-1].get("price"))
+            previous_low = _decimal(lows[-2].get("price"))
+            if None not in {last_high, previous_high, last_low, previous_low}:
+                if last_high > previous_high and last_low > previous_low:
+                    return "bullish"
+                if last_high < previous_high and last_low < previous_low:
+                    return "bearish"
     candidates = frame.get("items") or frame.get("signals") or frame.get("structure_events")
     if isinstance(candidates, list):
         for item in reversed(candidates):
@@ -255,11 +271,51 @@ def _entry_confirmed(frame: JsonDict) -> bool:
     if timeframe not in {"60m", "1h", "hourly"}:
         return False
     setup = str(frame.get("setup") or frame.get("entry_setup") or "").lower()
-    return setup in {"retest_holds", "breakout_confirmed", "pullback_holds"}
+    if setup in {"retest_holds", "breakout_confirmed", "pullback_holds"}:
+        return True
+    if str(frame.get("horizon") or "") != "smc_lite_v2":
+        return False
+    events = _mapping_rows(frame.get("structure_events"))
+    if not events:
+        return False
+    latest = events[-1]
+    name = str(latest.get("name") or "")
+    direction = _normalize_direction(latest.get("direction"))
+    confidence = float(latest.get("confidence") or 0)
+    break_pct = abs(float(latest.get("break_pct") or 0))
+    confirmed_at = str(latest.get("confirmed_at") or latest.get("timestamp") or "")
+    input_end_at = str(frame.get("input_end_at") or "")
+    latest_bar = frame.get("latest_bar")
+    continuation_holds = False
+    if isinstance(latest_bar, Mapping):
+        latest_close = _decimal(latest_bar.get("close"))
+        latest_low = _decimal(latest_bar.get("low"))
+        break_level = _decimal(latest.get("break_level"))
+        confirmed_at_bar = int(latest.get("confirmed_at_bar") or -1)
+        bar_count = int(frame.get("bar_count") or 0)
+        bars_since_break = bar_count - 1 - confirmed_at_bar
+        continuation_holds = (
+            latest_close is not None
+            and latest_low is not None
+            and break_level is not None
+            and 1 <= bars_since_break <= 3
+            and latest_close >= break_level
+            and latest_low >= break_level * Decimal("0.99")
+        )
+    return (
+        name in {"bos_bullish", "choch_bullish"}
+        and direction == "bullish"
+        and confidence >= 0.55
+        and break_pct <= 0.03
+        and bool(confirmed_at)
+        and (confirmed_at == input_end_at or continuation_holds)
+    )
 
 
 def _risk_levels(
     frames: Sequence[JsonDict],
+    *,
+    current_price: Decimal | None,
 ) -> tuple[tuple[Decimal, Decimal] | None, Decimal | None, Decimal | None]:
     entry_zone = None
     invalidation = None
@@ -272,7 +328,107 @@ def _risk_levels(
                 entry_zone = (min(low, high), max(low, high))
         invalidation = invalidation or _decimal(frame.get("invalidation_price"))
         target = target or _decimal(frame.get("target_price"))
+    if entry_zone is None:
+        entry_zone = _smc_entry_zone(frames)
+    if invalidation is None:
+        invalidation = _swing_invalidation(frames, current_price=current_price)
+    if invalidation is None:
+        invalidation = _ichimoku_invalidation(frames, current_price=current_price)
+    if target is None:
+        target = _measured_move_target(
+            frames,
+            current_price=current_price,
+            invalidation_price=invalidation,
+        )
     return entry_zone, invalidation, target
+
+
+def _smc_entry_zone(frames: Sequence[JsonDict]) -> tuple[Decimal, Decimal] | None:
+    for frame in frames:
+        if str(frame.get("horizon") or "") != "smc_lite_v2":
+            continue
+        if str(frame.get("timeframe") or "").lower() not in {"60m", "1h", "hourly"}:
+            continue
+        events = _mapping_rows(frame.get("structure_events"))
+        if not events:
+            continue
+        latest = events[-1]
+        if not _entry_confirmed(frame):
+            continue
+        break_level = _decimal(latest.get("break_level"))
+        close = _decimal(latest.get("close"))
+        if break_level is None or close is None:
+            continue
+        upper = min(close, break_level * Decimal("1.01"))
+        return min(break_level, upper), max(break_level, upper)
+    return None
+
+
+def _swing_invalidation(
+    frames: Sequence[JsonDict],
+    *,
+    current_price: Decimal | None,
+) -> Decimal | None:
+    if current_price is None:
+        return None
+    lows: list[tuple[str, Decimal]] = []
+    for frame in frames:
+        if str(frame.get("horizon") or "") != "structural_swings_v2":
+            continue
+        if str(frame.get("timeframe") or "").lower() != "1d":
+            continue
+        for swing in _mapping_rows(frame.get("swings")):
+            price = _decimal(swing.get("price"))
+            if str(swing.get("type")) == "L" and price is not None and price < current_price:
+                lows.append((str(swing.get("confirmed_at") or ""), price))
+    return max(lows, key=lambda item: item[0])[1] if lows else None
+
+
+def _ichimoku_invalidation(
+    frames: Sequence[JsonDict],
+    *,
+    current_price: Decimal | None,
+) -> Decimal | None:
+    if current_price is None:
+        return None
+    for frame in frames:
+        if str(frame.get("horizon") or "") != "ichimoku_v1":
+            continue
+        lines = frame.get("lines")
+        kijun = _decimal(lines.get("kijun_sen")) if isinstance(lines, Mapping) else None
+        if kijun is not None and kijun < current_price:
+            return kijun
+    return None
+
+
+def _measured_move_target(
+    frames: Sequence[JsonDict],
+    *,
+    current_price: Decimal | None,
+    invalidation_price: Decimal | None,
+) -> Decimal | None:
+    if current_price is None or invalidation_price is None:
+        return None
+    amplitudes = [
+        amplitude
+        for frame in frames
+        if str(frame.get("horizon") or "") == "structural_swings_v2"
+        and str(frame.get("timeframe") or "").lower() == "1d"
+        for segment in _mapping_rows(frame.get("segments"))
+        if _normalize_direction(segment.get("direction")) == "bullish"
+        and (amplitude := _decimal(segment.get("amplitude"))) is not None
+    ]
+    if not amplitudes:
+        return None
+    target = current_price + max(amplitudes[-3:])
+    minimum_target = current_price + (current_price - invalidation_price) * 2
+    return target if target >= minimum_target else None
+
+
+def _mapping_rows(value: Any) -> list[JsonDict]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes | bytearray):
+        return []
+    return [dict(item) for item in value if isinstance(item, Mapping)]
 
 
 def _reward_risk(

@@ -12,6 +12,7 @@ from finance_agent.pipelines.recommendation import (
 SHORT = "strategy:ashare:short_swing"
 THEME = "strategy:ashare:theme_momentum"
 MIXED = "strategy:ashare:short_theme_mixed_v1"
+ADAPTIVE = "strategy:ashare:adaptive_v1"
 
 
 @dataclass(frozen=True)
@@ -116,14 +117,26 @@ class _Signals:
 
 
 class _Recommendations:
-    def __init__(self, *, recommendation_count: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        recommendation_count: int = 0,
+        buy_ready_count: int = 0,
+        decision_snapshot_id: str | None = None,
+    ) -> None:
         self.calls: list[dict[str, Any]] = []
         self.recommendation_count = recommendation_count
+        self.buy_ready_count = buy_ready_count
+        self.decision_snapshot_id = decision_snapshot_id
 
     def rank_from_screening(self, **kwargs: Any) -> SimpleNamespace:
         self.calls.append(kwargs)
         return SimpleNamespace(
             recommendation_count=self.recommendation_count,
+            buy_ready_count=self.buy_ready_count,
+            active_count=0,
+            exit_pending_count=0,
+            decision_snapshot_id=self.decision_snapshot_id,
             run_id=f"run:{kwargs.get('score_strategy_id')}",
             top_recommendation_id=(
                 f"recommendation:{kwargs.get('score_strategy_id')}"
@@ -131,6 +144,36 @@ class _Recommendations:
                 else None
             ),
         )
+
+
+def test_pipeline_publishes_zero_buy_snapshot_when_no_asset_passes_all_gates() -> None:
+    """研究对象仍可发布，但不能为了凑数生成买入。"""
+
+    pipeline = UniverseRecommendationPipeline.__new__(UniverseRecommendationPipeline)
+    pipeline.universes = _Universes([_Member(asset_id="ashare:000001", symbol="000001")])
+    pipeline.indicators = _Indicators(available_asset_ids={"ashare:000001"})
+    pipeline.factors = _Factors()
+    pipeline.screening_repository = None
+    pipeline.screenings = _Screenings()
+    pipeline.scoring = _Scoring()
+    pipeline.signals = _Signals()
+    pipeline.recommendations = _Recommendations(
+        recommendation_count=2,
+        buy_ready_count=0,
+        decision_snapshot_id="decision:ashare:2026-09-08:test",
+    )
+
+    result = pipeline.run_for_universe(
+        universe_id="universe:test:ashare",
+        strategy_id=SHORT,
+        min_indicator_coverage_ratio=0.5,
+        min_factor_coverage_ratio=0.0,
+    )
+
+    assert result.status == "available"
+    assert result.recommendation_count == 2
+    assert result.buy_ready_count == 0
+    assert result.decision_snapshot_id == "decision:ashare:2026-09-08:test"
 
 
 class _TrialStates:
@@ -450,6 +493,20 @@ def test_trial_gate_requires_validation_evidence_and_marks_validated_non_trial()
     assert validated["trial"] is False
 
 
+def test_adaptive_strategy_is_available_as_audited_research_before_strict_gate() -> None:
+    """第四阶段严格门控接入前，自适应主线必须能生成生命周期研究记录。"""
+
+    gate = recommendation_strategy_gate(
+        market="ashare",
+        strategy_id=ADAPTIVE,
+        trial_states=_TrialStates({}),
+    )
+
+    assert gate["allowed"] is True
+    assert gate["trial"] is False
+    assert gate["blocked_reason"] is None
+
+
 def test_recommendation_pipeline_passes_market_regime_to_recommendation_service() -> None:
     """流水线应把大盘环境上下文传入推荐裁决，但不改变评分结果。"""
 
@@ -474,6 +531,28 @@ def test_recommendation_pipeline_passes_market_regime_to_recommendation_service(
     )
 
     assert recommendations.calls[0]["market_regime"] == market_regime
+
+
+def test_recommendation_pipeline_passes_owner_to_lifecycle_and_portfolio_context() -> None:
+    pipeline = UniverseRecommendationPipeline.__new__(UniverseRecommendationPipeline)
+    pipeline.universes = _Universes([_Member(asset_id="ashare:000001", symbol="000001")])
+    pipeline.indicators = _Indicators(available_asset_ids={"ashare:000001"})
+    pipeline.factors = _Factors()
+    pipeline.screening_repository = None
+    pipeline.screenings = _Screenings()
+    pipeline.scoring = _Scoring()
+    pipeline.signals = _Signals()
+    recommendations = _Recommendations()
+    pipeline.recommendations = recommendations
+
+    pipeline.run_for_universe(
+        universe_id="universe:test:ashare",
+        owner_id="owner-a",
+        min_indicator_coverage_ratio=0.5,
+        min_factor_coverage_ratio=0.0,
+    )
+
+    assert recommendations.calls[0]["owner_id"] == "owner-a"
 
 
 def test_recommendation_pipeline_passes_member_theme_groups_to_factor_service() -> None:

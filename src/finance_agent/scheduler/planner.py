@@ -187,6 +187,7 @@ class SchedulerPlanner:
         if not generations:
             return 0
         generation_ids = tuple(sorted(str(row.task_id) for row in generations))
+        generation_token = _combined_dependency_token(generations)
         scheduled_for = max(
             (_as_utc(getattr(row, "scheduled_for", None) or now) for row in generations),
             default=now,
@@ -203,7 +204,11 @@ class SchedulerPlanner:
             idempotency_key=idempotency_key,
             schedule_type="after_success",
             scheduled_for=scheduled_for,
-            payload=_task_payload(job, scheduled_for=scheduled_for),
+            payload=_task_payload(
+                job,
+                scheduled_for=scheduled_for,
+                generation_token=generation_token,
+            ),
             priority=int(job.priority),
             resource_pool=str(job.resource_pool),
             mutex_key=_job_mutex_key(job),
@@ -232,9 +237,9 @@ def _select_dependency_generations(
         by_dependency: dict[str, dict[str, Any]] = {}
         for dependency in dependencies:
             by_dependency[dependency] = {
-                _as_utc(row.scheduled_for).isoformat(): row
+                _dependency_token(row): row
                 for row in candidates[dependency]
-                if getattr(row, "scheduled_for", None) is not None
+                if _dependency_token(row) is not None
             }
         common_windows = set.intersection(
             *(set(rows) for rows in by_dependency.values())
@@ -252,6 +257,18 @@ def _select_dependency_generations(
         )
         for dependency in dependencies
     )
+
+
+def _dependency_token(row: Any) -> str | None:
+    """返回依赖任务声明的收盘代次 token，旧任务回退到 scheduled_for。"""
+
+    payload = getattr(row, "payload", None)
+    if isinstance(payload, dict):
+        token = str(payload.get("generation_token") or "").strip()
+        if token:
+            return token
+    scheduled_for = getattr(row, "scheduled_for", None)
+    return _as_utc(scheduled_for).isoformat() if scheduled_for is not None else None
 
 
 def _latest_due_tick(job: Any, *, now: datetime) -> datetime | None:
@@ -284,8 +301,13 @@ def _latest_due_tick(job: Any, *, now: datetime) -> datetime | None:
     return None
 
 
-def _task_payload(job: Any, *, scheduled_for: datetime) -> dict[str, Any]:
-    return {
+def _task_payload(
+    job: Any,
+    *,
+    scheduled_for: datetime,
+    generation_token: str | None = None,
+) -> dict[str, Any]:
+    payload = {
         "job_name": job.name,
         "job_type": job.job_type,
         "market": job.market,
@@ -293,6 +315,20 @@ def _task_payload(job: Any, *, scheduled_for: datetime) -> dict[str, Any]:
         "scheduled_for": scheduled_for.isoformat(),
         "params": json.loads(json.dumps(job.params, default=str)),
     }
+    payload["generation_token"] = generation_token or _as_utc(
+        scheduled_for
+    ).isoformat()
+    return payload
+
+
+def _combined_dependency_token(rows: tuple[Any, ...]) -> str:
+    """传播共同根代次；不同根代次使用确定性组合 token。"""
+
+    tokens = tuple(sorted({_dependency_token(row) for row in rows if _dependency_token(row)}))
+    if len(tokens) == 1:
+        return tokens[0]
+    raw = json.dumps(tokens, separators=(",", ":"))
+    return "dependency:" + hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
 def _normalized_schedule_type(value: str) -> str:

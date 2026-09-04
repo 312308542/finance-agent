@@ -24,6 +24,10 @@ class _FakeSession:
         self.statements.append(statement)
         return _FakeScalarResult()
 
+    def scalar(self, statement: Any) -> datetime:
+        self.statements.append(statement)
+        return datetime(2026, 9, 8, tzinfo=UTC)
+
     def execute(self, statement: Any) -> None:
         self.execute_statements.append(statement)
 
@@ -105,6 +109,28 @@ def test_list_window_bars_excludes_non_final_statuses_by_default() -> None:
     assert "market_bars.status IN" in sql
 
 
+def test_list_recent_bars_for_assets_uses_one_closed_batch_window() -> None:
+    """市场截面读取应一次批量查询，并只保留闭合正式 K 线。"""
+
+    session = _FakeSession()
+    repository = MarketDataRepository(session)
+
+    rows = repository.list_recent_bars_for_assets(
+        asset_ids=["ashare:000001", "ashare:600519"],
+        timeframe="1d",
+        limit_per_asset=61,
+    )
+
+    latest_sql = _compiled(session.statements[0])
+    window_sql = _compiled(session.statements[1])
+    assert rows == []
+    assert "max(market_bars.timestamp)" in latest_sql
+    assert "market_bars.is_closed IS true" in latest_sql
+    assert "market_bars.is_closed IS true" in window_sql
+    assert "market_bars.status IN" in window_sql
+    assert "ORDER BY market_bars.asset_id, market_bars.timestamp DESC" in window_sql
+
+
 def test_upsert_bars_writes_rows_in_500_row_chunks() -> None:
     """批量写入 K 线时应按 500 条分块，避免单根 K 线一次数据库往返。"""
 
@@ -165,3 +191,21 @@ def test_list_intraday_bars_filters_window_and_closed_rows() -> None:
     assert "market_bars_intraday.is_closed IS true" in sql
     assert "market_bars_intraday.status IN" in sql
     assert "ORDER BY market_bars_intraday.timestamp" in sql
+
+
+def test_list_recent_intraday_bars_returns_closed_rows_in_time_order() -> None:
+    session = _FakeSession()
+    repository = MarketDataRepository(session)
+
+    rows = repository.list_recent_intraday_bars(
+        asset_id="ashare:600519",
+        timeframe="60m",
+        limit=60,
+    )
+
+    sql = _compiled(session.statements[0])
+    assert rows == []
+    assert "FROM market_bars_intraday" in sql
+    assert "market_bars_intraday.is_closed IS true" in sql
+    assert "market_bars_intraday.status IN" in sql
+    assert "ORDER BY market_bars_intraday.timestamp DESC" in sql

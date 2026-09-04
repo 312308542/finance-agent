@@ -37,6 +37,7 @@ class _PlannerRepository:
         scheduled_for: datetime,
         task_id: str | None = None,
         dependency_generation: tuple[str, ...] = (),
+        payload: dict[str, Any] | None = None,
         coalesced_count: int = 0,
         mutex_key: str | None = None,
     ) -> SimpleNamespace:
@@ -48,7 +49,7 @@ class _PlannerRepository:
             idempotency_key=f"seed:{len(self.rows) + 1}",
             dependency_generation=list(dependency_generation),
             coalesced_count=coalesced_count,
-            payload={},
+            payload=dict(payload or {}),
             created_at=scheduled_for,
             mutex_key=mutex_key,
         )
@@ -297,4 +298,25 @@ def test_barrier_requires_same_scheduled_window() -> None:
     assert SchedulerPlanner(repo).reconcile(now=NOW, config=config).dependency_created == 0
 
     repo.add(job_name="source-b", status="completed", scheduled_for=NOW, task_id="b:2")
+    assert SchedulerPlanner(repo).reconcile(now=NOW, config=config).dependency_created == 1
+
+
+def test_barrier_uses_shared_generation_token_when_scheduled_times_differ() -> None:
+    repo = _PlannerRepository()
+    repo.add(
+        job_name="source-a",
+        status="completed",
+        scheduled_for=NOW,
+        task_id="a:token",
+        payload={"generation_token": "close:2026-09-08"},
+    )
+    repo.add(
+        job_name="source-b",
+        status="completed",
+        scheduled_for=NOW + timedelta(minutes=3),
+        task_id="b:token",
+        payload={"generation_token": "close:2026-09-08"},
+    )
+    config = _config(_dependency_job("barrier"))
+
     assert SchedulerPlanner(repo).reconcile(now=NOW, config=config).dependency_created == 1

@@ -8,22 +8,45 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from collections.abc import Sequence
 from copy import copy
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from finance_agent.application.market_context_service import adjust_buy_percentile_threshold
+from finance_agent.data.freshness import ashare_market_close_at
+from finance_agent.recommendations.adaptive_decision import (
+    AdaptiveAssetDecision,
+    AdaptiveRecommendationDecisionEngine,
+)
+from finance_agent.recommendations.decision_snapshot import (
+    DecisionFact,
+    DecisionSnapshot,
+    DecisionSnapshotBuilder,
+    DecisionSnapshotInputs,
+)
+from finance_agent.recommendations.lifecycle import RecommendationState, StockSetup
+from finance_agent.recommendations.portfolio_construction import (
+    PortfolioPosition,
+    PortfolioRiskBudget,
+)
+from finance_agent.recommendations.state_repository import RecommendationStateRepository
 from finance_agent.recommendations.structural_decision import StructuralDecisionEngine
 from finance_agent.storage.orm import AssetScoreORM, RiskFindingORM, SignalSnapshotORM
 from finance_agent.storage.repositories import (
     AssetRepository,
     AssetScoreRepository,
     BacktestRepository,
+    DataSnapshotRepository,
+    FactorFrameRepository,
     IndicatorFrameRepository,
+    MarketDataRepository,
+    PortfolioRepository,
     RecommendationRepository,
     RiskRepository,
     ScreeningRepository,
@@ -41,6 +64,7 @@ STRUCTURAL_LITE_HORIZONS: tuple[str, ...] = (
     "elliott_lite_v2",
     "ichimoku_v1",
 )
+ADAPTIVE_STRATEGY_ID = "strategy:ashare:adaptive_v1"
 
 
 @dataclass(frozen=True)
@@ -56,6 +80,28 @@ class RecommendationRunResult:
     horizon: str
     recommendation_count: int
     top_recommendation_id: str | None
+    decision_snapshot_id: str | None = None
+    buy_ready_count: int = 0
+    active_count: int = 0
+    exit_pending_count: int = 0
+
+
+@dataclass
+class LifecycleScoreView:
+    """让筛选池外的开放生命周期资产继续参与状态维护。"""
+
+    score_id: str
+    asset_id: str
+    symbol: str
+    market: str
+    horizon: str
+    total_score: Decimal
+    confidence: Decimal
+    factor_frame_id: str | None
+    as_of: datetime
+    payload: JsonDict
+    rank: int
+    missing_penalty: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -133,6 +179,12 @@ class RecommendationService:
         self.indicators = IndicatorFrameRepository(session)
         self.recommendations = RecommendationRepository(session)
         self.backtests = BacktestRepository(session)
+        self.factors = FactorFrameRepository(session)
+        self.snapshots = DataSnapshotRepository(session)
+        self.market_data = MarketDataRepository(session)
+        self.portfolios = PortfolioRepository(session)
+        self.lifecycle_states = RecommendationStateRepository(session)
+        self.adaptive_decisions = AdaptiveRecommendationDecisionEngine()
 
     def rank_from_screening(
         self,
@@ -149,6 +201,9 @@ class RecommendationService:
         memory_ranking_adjustments: dict[str, MemoryRankingAdjustment] | None = None,
         trial_state: str | None = None,
         validation_evidence_id: str | None = None,
+        owner_id: str = "default-owner",
+        decision_snapshot: DecisionSnapshot | None = None,
+        portfolio_budget: PortfolioRiskBudget | None = None,
     ) -> RecommendationRunResult:
         """读取一次初筛的评分结果并生成推荐榜单。"""
 
@@ -169,15 +224,28 @@ class RecommendationService:
             trial_state=trial_state,
             validation_evidence_id=validation_evidence_id,
         )
-        raw_scores = (
+        listed_scores = (
             self.scores.list_scores_for_screening(
                 screening_id,
                 strategy_id=score_strategy_id,
             )
             if score_strategy_id is not None
             else self.scores.list_scores_for_screening(screening_id)
-        )[:limit]
+        )
+        raw_scores = (
+            listed_scores
+            if score_strategy_id == ADAPTIVE_STRATEGY_ID
+            else listed_scores[:limit]
+        )
         scores = apply_memory_ranking_adjustments(raw_scores, memory_ranking_adjustments or {})
+        if score_strategy_id == ADAPTIVE_STRATEGY_ID:
+            scores = self.expand_adaptive_scores_with_open_assets(
+                scores,
+                owner_id=owner_id,
+                strategy_id=score_strategy_id,
+                market=screening.market,
+                horizon=horizon,
+            )
         ensure_scores_match_market(scores=scores, market=screening.market)
         backtest_strategy_id = resolve_backtest_strategy_id(
             scores=scores,
@@ -199,6 +267,95 @@ class RecommendationService:
             )
         )
         recommendation_ids: list[str] = []
+        adaptive_result = None
+        adaptive_by_asset: dict[str, AdaptiveAssetDecision] = {}
+        if score_strategy_id == ADAPTIVE_STRATEGY_ID:
+            state_repository = getattr(self, "lifecycle_states", None)
+            state_rows = (
+                state_repository.list_states(
+                    owner_id=owner_id,
+                    strategy_id=score_strategy_id,
+                    asset_ids=tuple(score.asset_id for score in scores),
+                )
+                if state_repository is not None
+                and hasattr(state_repository, "list_states")
+                else []
+            )
+            state_rows_by_asset = {str(row.asset_id): row for row in state_rows}
+            previous_states = {
+                state.asset_id: state
+                for row in state_rows
+                if (state := _recommendation_state_from_row(row)) is not None
+            }
+            previous_assets = {
+                str(row.asset_id): dict(decision_asset)
+                for row in state_rows
+                if isinstance((payload := getattr(row, "payload", None)), dict)
+                and isinstance((decision_asset := payload.get("decision_asset")), dict)
+            }
+            if decision_snapshot is None:
+                decision_snapshot = self.build_adaptive_decision_snapshot(
+                    scores=scores,
+                    market=screening.market,
+                    horizon=horizon,
+                    market_regime=market_regime,
+                    previous_assets=previous_assets,
+                )
+            if decision_snapshot.market != screening.market:
+                raise ValueError("决策快照市场与初筛市场不一致")
+            adaptive_engine = getattr(
+                self,
+                "adaptive_decisions",
+                AdaptiveRecommendationDecisionEngine(),
+            )
+            (
+                portfolio_positions,
+                resolved_portfolio_budget,
+                closed_position_asset_ids,
+            ) = self.load_portfolio_context(
+                owner_id=owner_id,
+                market=screening.market,
+                market_regime=decision_snapshot.market_regime,
+                explicit_budget=portfolio_budget,
+                previous_states=previous_states,
+            )
+            adaptive_result = adaptive_engine.decide(
+                decision_snapshot,
+                previous_states=previous_states,
+                positions=portfolio_positions,
+                budget=resolved_portfolio_budget,
+                closed_position_events=closed_position_asset_ids,
+                owner_id=owner_id,
+                strategy_id=score_strategy_id,
+            )
+            adaptive_by_asset = {
+                item.asset_id: item for item in adaptive_result.decisions
+            }
+            scores.sort(
+                key=lambda score: adaptive_by_asset.get(score.asset_id).alpha.alpha_score
+                if score.asset_id in adaptive_by_asset
+                else -1,
+                reverse=True,
+            )
+            for rank, score in enumerate(scores, start=1):
+                score.rank = rank
+                decision = adaptive_by_asset.get(score.asset_id)
+                if decision is not None:
+                    score.total_score = Decimal(str(decision.alpha.alpha_score))
+                    score.confidence = Decimal(str(decision.alpha.confidence))
+            if state_repository is not None:
+                for item in adaptive_result.decisions:
+                    setup = stock_setup_from_adaptive_decision(
+                        item,
+                        owner_id=owner_id,
+                        strategy_id=score_strategy_id,
+                    )
+                    if setup is not None and hasattr(state_repository, "save_setup"):
+                        state_repository.save_setup(setup)
+                    state_repository.save_transition(
+                        item.transition,
+                        current_state=state_rows_by_asset.get(item.asset_id),
+                    )
 
         self.recommendations.upsert_run_universe(
             record_id=f"{run_id}:{screening.universe_id}",
@@ -219,33 +376,52 @@ class RecommendationService:
             },
         )
 
+        asset_names = self.asset_names(tuple(score.asset_id for score in scores))
         for rank, score in enumerate(scores, start=1):
-            signal = self.signals.get_latest_signal(asset_id=score.asset_id, horizon=horizon)
-            risks = self.risks.list_recent_risks(asset_id=score.asset_id, limit=10)
-            decision_context = RecommendationDecisionContext(
-                rank=rank,
-                total=len(scores),
-                style_tendency=profile_style_tendency,
-                market_regime=market_regime,
-            )
-            recommendation = build_recommendation_payload(
-                score=score,
-                signal=signal,
-                risks=risks,
-                asset_name=self.asset_name(score.asset_id, fallback_symbol=score.symbol),
-                rank=rank,
-                run_id=run_id,
-                rule_version=rule_version,
-                backtest_evidence=backtest_evidence,
-                decision_context=decision_context,
-                structure_evidence=build_asset_structure_payload(
-                    indicators=getattr(self, "indicators", None),
+            adaptive_decision = adaptive_by_asset.get(score.asset_id)
+            if score_strategy_id == ADAPTIVE_STRATEGY_ID:
+                recommendation = build_adaptive_recommendation_payload(
+                    score=score,
+                    decision=adaptive_decision,
+                    decision_snapshot=decision_snapshot,
+                    asset_name=asset_names.get(score.asset_id, score.symbol),
+                    rank=rank,
+                    run_id=run_id,
+                    rule_version=rule_version,
+                    backtest_evidence=backtest_evidence,
+                    trial_state=trial_state,
+                    validation_evidence_id=validation_evidence_id,
+                )
+            else:
+                signal = self.signals.get_latest_signal(
                     asset_id=score.asset_id,
-                    timeframe=str(score.payload.get("timeframe") or "1d"),
-                ),
-                trial_state=trial_state,
-                validation_evidence_id=validation_evidence_id,
-            )
+                    horizon=horizon,
+                )
+                risks = self.risks.list_recent_risks(asset_id=score.asset_id, limit=10)
+                decision_context = RecommendationDecisionContext(
+                    rank=rank,
+                    total=len(scores),
+                    style_tendency=profile_style_tendency,
+                    market_regime=market_regime,
+                )
+                recommendation = build_recommendation_payload(
+                    score=score,
+                    signal=signal,
+                    risks=risks,
+                    asset_name=asset_names.get(score.asset_id, score.symbol),
+                    rank=rank,
+                    run_id=run_id,
+                    rule_version=rule_version,
+                    backtest_evidence=backtest_evidence,
+                    decision_context=decision_context,
+                    structure_evidence=build_asset_structure_payload(
+                        indicators=getattr(self, "indicators", None),
+                        asset_id=score.asset_id,
+                        timeframe=str(score.payload.get("timeframe") or "1d"),
+                    ),
+                    trial_state=trial_state,
+                    validation_evidence_id=validation_evidence_id,
+                )
             saved = self.recommendations.upsert_asset_recommendation(
                 recommendation_id=recommendation["recommendation_id"],
                 run_id=run_id,
@@ -273,10 +449,14 @@ class RecommendationService:
 
         finished_at = datetime.now(tz=UTC)
         status = "available" if recommendation_ids else "unavailable"
-        summary = build_run_summary(
-            recommendation_count=len(recommendation_ids),
-            market=screening.market,
-            strategy=strategy,
+        summary = (
+            "本次没有满足新增买入门槛的标的。"
+            if adaptive_result is not None and adaptive_result.buy_ready_count == 0
+            else build_run_summary(
+                recommendation_count=len(recommendation_ids),
+                market=screening.market,
+                strategy=strategy,
+            )
         )
         run_payload = {
             "schema_version": "1.0",
@@ -298,6 +478,16 @@ class RecommendationService:
             "trial": is_trial,
             "validation_state": trial_state,
             "validation_evidence_id": validation_evidence_id,
+            "decision_snapshot_id": (
+                adaptive_result.decision_snapshot_id if adaptive_result is not None else None
+            ),
+            "buy_ready_count": (
+                adaptive_result.buy_ready_count if adaptive_result is not None else 0
+            ),
+            "active_count": adaptive_result.active_count if adaptive_result is not None else 0,
+            "exit_pending_count": (
+                adaptive_result.exit_pending_count if adaptive_result is not None else 0
+            ),
         }
         if profile_style_tendency:
             run_payload["profile_style_tendency"] = profile_style_tendency
@@ -330,13 +520,514 @@ class RecommendationService:
             horizon=horizon,
             recommendation_count=len(recommendation_ids),
             top_recommendation_id=recommendation_ids[0] if recommendation_ids else None,
+            decision_snapshot_id=(
+                adaptive_result.decision_snapshot_id if adaptive_result is not None else None
+            ),
+            buy_ready_count=(
+                adaptive_result.buy_ready_count if adaptive_result is not None else 0
+            ),
+            active_count=adaptive_result.active_count if adaptive_result is not None else 0,
+            exit_pending_count=(
+                adaptive_result.exit_pending_count if adaptive_result is not None else 0
+            ),
         )
+
+    def build_adaptive_decision_snapshot(
+        self,
+        *,
+        scores: list[AssetScoreORM],
+        market: str,
+        horizon: str,
+        market_regime: JsonDict | None,
+        previous_assets: dict[str, JsonDict] | None = None,
+    ) -> DecisionSnapshot:
+        """从已落库因子和结构事实冻结统一的自适应决策输入。"""
+
+        if not scores:
+            raise ValueError("自适应决策快照至少需要一个评分资产")
+        as_of_values = [
+            value for score in scores if isinstance((value := getattr(score, "as_of", None)), datetime)
+        ]
+        if not as_of_values:
+            raise ValueError("自适应评分缺少显式 as_of，不能构造点时快照")
+        decision_as_of = max(
+            _normalize_fact_time(value, market=market) for value in as_of_values
+        )
+        assets: list[JsonDict] = []
+        data_versions: JsonDict = {}
+        sector_rows: dict[str, JsonDict] = {}
+        risk_rows: list[JsonDict] = []
+        structure_evidence_ids: list[str] = []
+        factors = getattr(self, "factors", None)
+        asset_ids = tuple(score.asset_id for score in scores)
+        factor_rows = (
+            factors.list_latest_factor_frames(
+                asset_ids=asset_ids,
+                horizon=horizon,
+                as_of=decision_as_of,
+            )
+            if factors is not None and hasattr(factors, "list_latest_factor_frames")
+            else load_factor_rows_individually(
+                factors=factors,
+                scores=scores,
+                horizon=horizon,
+                as_of=decision_as_of,
+            )
+        )
+        factor_by_asset = {str(row.asset_id): row for row in factor_rows}
+        indicators = getattr(self, "indicators", None)
+        structure_rows = (
+            indicators.list_latest_indicator_frames(
+                asset_ids=asset_ids,
+                timeframes=("1d", "60m"),
+                horizons=STRUCTURAL_LITE_HORIZONS,
+                library=STRUCTURAL_LITE_LIBRARY,
+                as_of=decision_as_of,
+            )
+            if indicators is not None
+            and hasattr(indicators, "list_latest_indicator_frames")
+            else []
+        )
+        structure_by_asset: dict[str, list[Any]] = {}
+        for row in structure_rows:
+            structure_by_asset.setdefault(str(row.asset_id), []).append(row)
+        status_rows = (
+            self.assets.list_latest_statuses(
+                asset_ids=asset_ids,
+                as_of=decision_as_of,
+            )
+            if hasattr(self.assets, "list_latest_statuses")
+            else []
+        )
+        status_by_asset = {str(row.asset_id): row for row in status_rows}
+        price_rows = (
+            self.market_data.list_latest_closed_bars(
+                asset_ids=asset_ids,
+                timeframe="1d",
+                as_of=decision_as_of,
+            )
+            if hasattr(self, "market_data")
+            and hasattr(self.market_data, "list_latest_closed_bars")
+            else []
+        )
+        price_by_asset = {str(row.asset_id): row for row in price_rows}
+        for score in scores:
+            factor = factor_by_asset.get(score.asset_id)
+            frames = (
+                compact_decision_structure_frames(structure_by_asset[score.asset_id])
+                if score.asset_id in structure_by_asset
+                else build_asset_decision_structure_frames(
+                    indicators=indicators,
+                    asset_id=score.asset_id,
+                    timeframes=("60m", "1d"),
+                    as_of=decision_as_of,
+                )
+            )
+            asset = build_adaptive_snapshot_asset(
+                score=score,
+                factor=factor,
+                frames=frames,
+                decision_as_of=decision_as_of,
+                trading_status=status_by_asset.get(score.asset_id),
+                price_bar=price_by_asset.get(score.asset_id),
+            )
+            assets.append(asset)
+            factor_id = str(getattr(factor, "factor_frame_id", "") or "")
+            if factor_id:
+                data_versions[f"{score.asset_id}:factor_frame_id"] = factor_id
+            price_bar = price_by_asset.get(score.asset_id)
+            if price_bar is not None:
+                data_versions[f"{score.asset_id}:price_as_of"] = (
+                    price_bar.timestamp.isoformat()
+                )
+            sector_id = str(asset.get("sector_id") or "")
+            if sector_id and sector_id != "sector:unknown":
+                sector_rows[sector_id] = {
+                    "sector_id": sector_id,
+                    "sector_regime": asset.get("sector_regime"),
+                }
+            risk_rows.append(
+                {
+                    "asset_id": score.asset_id,
+                    "downside_risk": asset.get("downside_risk"),
+                }
+            )
+            structure_evidence_ids.extend(
+                str(frame.get("evidence_id") or "")
+                for frame in frames
+                if str(frame.get("evidence_id") or "")
+            )
+
+        snapshot_repository = getattr(self, "snapshots", None)
+        persisted_market = (
+            snapshot_repository.get_latest(snapshot_type="market_regime", market=market)
+            if market_regime is None
+            and snapshot_repository is not None
+            and hasattr(snapshot_repository, "get_latest")
+            else None
+        )
+        persisted_sector = (
+            snapshot_repository.get_latest(
+                snapshot_type="sector_opportunities",
+                market=market,
+            )
+            if snapshot_repository is not None
+            and hasattr(snapshot_repository, "get_latest")
+            else None
+        )
+        market_problem = persisted_context_problem(
+            persisted_market,
+            decision_as_of=decision_as_of,
+            context_name="market",
+        )
+        sector_problem = persisted_context_problem(
+            persisted_sector,
+            decision_as_of=decision_as_of,
+            context_name="sector",
+        )
+        normalized_regime = normalize_adaptive_market_regime(
+            dict(persisted_market.payload or {})
+            if persisted_market is not None and market_problem is None
+            else market_regime
+        )
+        if market_problem is not None:
+            normalized_regime = normalize_adaptive_market_regime(None)
+            normalized_regime["reason_codes"] = list(
+                dict.fromkeys(
+                    [
+                        *normalized_regime.get("reason_codes", []),
+                        market_problem,
+                    ]
+                )
+            )
+        market_fact = DecisionFact(
+            data_snapshot_id=(
+                str(persisted_market.data_snapshot_id)
+                if persisted_market is not None and market_problem is None
+                else decision_fact_id(
+                    "market",
+                    payload=normalized_regime,
+                    as_of=decision_as_of,
+                )
+            ),
+            as_of=(
+                persisted_market.as_of
+                if persisted_market is not None and market_problem is None
+                else decision_as_of
+            ),
+            quality_status="available",
+            payload=normalized_regime,
+        )
+        if persisted_market is not None:
+            data_versions["market_snapshot_id"] = str(
+                persisted_market.data_snapshot_id
+            )
+
+        derived_sector_payload = tuple(sector_rows[key] for key in sorted(sector_rows))
+        persisted_sector_payload = (
+            (persisted_sector.payload or {}).get("sector_opportunities")
+            if persisted_sector is not None
+            else None
+        )
+        sector_payload = (
+            tuple(
+                dict(item)
+                for item in persisted_sector_payload
+                if isinstance(item, dict)
+            )
+            if sector_problem is None
+            and isinstance(persisted_sector_payload, list | tuple)
+            else derived_sector_payload
+        )
+        if market_problem is not None or sector_problem is not None:
+            context_reasons = [
+                reason
+                for reason in (market_problem, sector_problem)
+                if reason is not None
+            ]
+            for asset in assets:
+                asset["quality_status"] = "partial"
+                asset["context_reason_codes"] = context_reasons
+        sector_fact = DecisionFact(
+            data_snapshot_id=(
+                str(persisted_sector.data_snapshot_id)
+                if persisted_sector is not None and sector_problem is None
+                else decision_fact_id(
+                    "sector",
+                    payload=sector_payload,
+                    as_of=decision_as_of,
+                )
+            ),
+            as_of=(
+                persisted_sector.as_of
+                if persisted_sector is not None and sector_problem is None
+                else decision_as_of
+            ),
+            quality_status="available",
+            payload=sector_payload,
+        )
+        if persisted_sector is not None:
+            data_versions["sector_snapshot_id"] = str(
+                persisted_sector.data_snapshot_id
+            )
+        structure_fact = DecisionFact(
+            data_snapshot_id=decision_fact_id(
+                "structure",
+                payload=tuple(sorted(set(structure_evidence_ids))),
+                as_of=decision_as_of,
+            ),
+            as_of=decision_as_of,
+            quality_status="available",
+            payload=tuple(sorted(set(structure_evidence_ids))),
+        )
+        risk_fact = DecisionFact(
+            data_snapshot_id=decision_fact_id(
+                "risk",
+                payload=risk_rows,
+                as_of=decision_as_of,
+            ),
+            as_of=decision_as_of,
+            quality_status="available",
+            payload=risk_rows,
+        )
+        builder = DecisionSnapshotBuilder(
+            repository=getattr(self, "snapshots", None),
+        )
+        built = builder.build(
+            DecisionSnapshotInputs(
+                market=market,
+                as_of=decision_as_of,
+                market_regime=market_fact,
+                sector_opportunities=sector_fact,
+                structure=structure_fact,
+                risk=risk_fact,
+                assets=tuple(assets),
+                data_versions=data_versions,
+                previous_assets=previous_assets or {},
+            )
+        )
+        if built.snapshot is None:
+            reasons = ", ".join(built.reason_codes)
+            raise ValueError(f"统一决策快照被点时门控阻止: {reasons}")
+        return built.snapshot
+
+    def load_portfolio_context(
+        self,
+        *,
+        owner_id: str,
+        market: str,
+        market_regime: JsonDict,
+        explicit_budget: PortfolioRiskBudget | None,
+        previous_states: dict[str, RecommendationState],
+    ) -> tuple[
+        tuple[PortfolioPosition, ...],
+        PortfolioRiskBudget,
+        dict[str, datetime],
+    ]:
+        """批量读取用户真实持仓，并解析组合权益和交易约束。"""
+
+        repository = getattr(self, "portfolios", None)
+        if repository is None:
+            return (
+                (),
+                explicit_budget or _portfolio_budget_from_market_regime(market_regime),
+                {},
+            )
+        portfolios = repository.list_portfolios(owner_id=owner_id, status="active")
+        rows = repository.list_active_positions_by_owner(
+            owner_id=owner_id,
+            market=market,
+        )
+        positions = tuple(portfolio_position_from_row(row) for row in rows)
+        all_rows = (
+            repository.list_positions_by_owner(
+                owner_id=owner_id,
+                market=market,
+                status=None,
+            )
+            if hasattr(repository, "list_positions_by_owner")
+            else rows
+        )
+        active_assets = {position.asset_id for position in positions}
+        latest_closed: dict[str, datetime] = {}
+        for row in all_rows:
+            asset_id = str(getattr(row, "asset_id", "") or "")
+            closed_at = getattr(row, "as_of", None)
+            if (
+                not asset_id
+                or asset_id in active_assets
+                or str(getattr(row, "status", "active")) != "closed"
+                or not isinstance(closed_at, datetime)
+            ):
+                continue
+            current = latest_closed.get(asset_id)
+            if current is None or closed_at > current:
+                latest_closed[asset_id] = closed_at
+        closed_assets: dict[str, datetime] = {}
+        for asset_id, closed_at in latest_closed.items():
+            previous = previous_states.get(asset_id)
+            consumed_at = parse_iso_datetime(
+                (previous.payload if previous is not None else {}).get(
+                    "closed_position_as_of"
+                )
+            )
+            if consumed_at is None or closed_at > consumed_at:
+                closed_assets[asset_id] = closed_at
+        if explicit_budget is not None:
+            return positions, explicit_budget, closed_assets
+        equity = sum(
+            (
+                Decimal(str(portfolio.total_equity))
+                for portfolio in portfolios
+                if getattr(portfolio, "total_equity", None) is not None
+            ),
+            Decimal("0"),
+        )
+        base = _portfolio_budget_from_market_regime(market_regime)
+        weekly_turnover = max(
+            (
+                float((getattr(portfolio, "payload", {}) or {}).get("weekly_turnover_ratio", 0))
+                for portfolio in portfolios
+            ),
+            default=0.0,
+        )
+        if equity <= 0:
+            return positions, PortfolioRiskBudget(
+                equity=Decimal("1"),
+                total_exposure=0.0,
+                per_position_risk=0.0,
+                allow_new_buys=False,
+                max_sector_exposure=base.max_sector_exposure,
+                minimum_positions=base.minimum_positions,
+                maximum_positions=base.maximum_positions,
+                weekly_turnover_ratio=weekly_turnover,
+                maximum_weekly_turnover=base.maximum_weekly_turnover,
+                weak_market_sector_override=False,
+            ), closed_assets
+        return positions, PortfolioRiskBudget(
+            equity=equity,
+            total_exposure=base.total_exposure,
+            per_position_risk=base.per_position_risk,
+            allow_new_buys=base.allow_new_buys,
+            max_sector_exposure=base.max_sector_exposure,
+            minimum_positions=base.minimum_positions,
+            maximum_positions=base.maximum_positions,
+            weekly_turnover_ratio=weekly_turnover,
+            maximum_weekly_turnover=base.maximum_weekly_turnover,
+            weak_market_sector_override=base.weak_market_sector_override,
+        ), closed_assets
 
     def asset_name(self, asset_id: str, *, fallback_symbol: str) -> str:
         """查询资产名称，缺失时用 symbol 兜底。"""
 
         asset = self.assets.get_asset_or_none(asset_id)
         return asset.name if asset else fallback_symbol
+
+    def expand_adaptive_scores_with_open_assets(
+        self,
+        scores: list[Any],
+        *,
+        owner_id: str,
+        strategy_id: str,
+        market: str,
+        horizon: str,
+    ) -> list[Any]:
+        """把筛选池外的开放生命周期和持仓资产并入状态维护截面。"""
+
+        existing_ids = {str(score.asset_id) for score in scores}
+        fallback_as_of = max(
+            (
+                score.as_of
+                for score in scores
+                if isinstance(getattr(score, "as_of", None), datetime)
+            ),
+            default=datetime.now(tz=UTC),
+        )
+        state_repository = getattr(self, "lifecycle_states", None)
+        open_states = (
+            state_repository.list_open_states(
+                owner_id=owner_id,
+                strategy_id=strategy_id,
+            )
+            if state_repository is not None
+            and hasattr(state_repository, "list_open_states")
+            else ()
+        )
+        portfolio_repository = getattr(self, "portfolios", None)
+        position_rows = (
+            portfolio_repository.list_positions_by_owner(
+                owner_id=owner_id,
+                market=market,
+                status=None,
+            )
+            if portfolio_repository is not None
+            and hasattr(portfolio_repository, "list_positions_by_owner")
+            else ()
+        )
+        candidates: dict[str, tuple[JsonDict, Any | None]] = {}
+        for state in open_states:
+            payload = dict(getattr(state, "payload", {}) or {})
+            decision_asset = payload.get("decision_asset")
+            candidates[str(state.asset_id)] = (
+                dict(decision_asset) if isinstance(decision_asset, dict) else {},
+                state,
+            )
+        for row in position_rows:
+            asset_id = str(getattr(row, "asset_id", "") or "")
+            if not asset_id:
+                continue
+            candidates.setdefault(
+                asset_id,
+                (
+                    {
+                        "asset_id": asset_id,
+                        "symbol": str(getattr(row, "symbol", "") or asset_id.split(":")[-1]),
+                    },
+                    None,
+                ),
+            )
+        result = list(scores)
+        for asset_id in sorted(candidates):
+            if asset_id in existing_ids:
+                continue
+            decision_asset, _state = candidates[asset_id]
+            symbol = str(decision_asset.get("symbol") or asset_id.split(":")[-1])
+            result.append(
+                LifecycleScoreView(
+                    score_id=f"lifecycle-score:{strategy_id}:{asset_id}",
+                    asset_id=asset_id,
+                    symbol=symbol,
+                    market=market,
+                    horizon=horizon,
+                    total_score=Decimal(str(decision_asset.get("alpha_score") or 0)),
+                    confidence=Decimal(str(decision_asset.get("confidence") or 0)),
+                    factor_frame_id=(
+                        str(decision_asset["factor_frame_id"])
+                        if decision_asset.get("factor_frame_id")
+                        else None
+                    ),
+                    as_of=fallback_as_of,
+                    payload={
+                        "strategy_id": strategy_id,
+                        "lifecycle_maintenance": True,
+                    },
+                    rank=len(result) + 1,
+                )
+            )
+        return result
+
+    def asset_names(self, asset_ids: tuple[str, ...]) -> dict[str, str]:
+        """批量读取资产名称；旧测试适配器回退到单条查询。"""
+
+        if hasattr(self.assets, "find_by_ids"):
+            return {
+                str(asset.asset_id): str(asset.name or asset.symbol)
+                for asset in self.assets.find_by_ids(asset_ids)
+            }
+        return {
+            asset_id: self.asset_name(asset_id, fallback_symbol=asset_id.split(":")[-1])
+            for asset_id in asset_ids
+        }
 
 
 def build_recommendation_payload(
@@ -450,6 +1141,254 @@ def build_recommendation_payload(
     return payload
 
 
+def build_adaptive_recommendation_payload(
+    *,
+    score: AssetScoreORM,
+    decision: AdaptiveAssetDecision | None,
+    decision_snapshot: DecisionSnapshot | None,
+    asset_name: str,
+    rank: int,
+    run_id: str,
+    rule_version: str,
+    backtest_evidence: JsonDict,
+    trial_state: str | None,
+    validation_evidence_id: str | None,
+) -> JsonDict:
+    """直接从统一决策构造推荐，避免旧分位动作污染自适应审计。"""
+
+    snapshot_id = decision_snapshot.decision_snapshot_id if decision_snapshot else None
+    if decision is None:
+        action = "watch"
+        recommendation_state = "watch"
+        previous_state = None
+        state_changed_at = decision_snapshot.as_of if decision_snapshot else score.as_of
+        reason_codes = ("decision_snapshot_asset_missing",)
+        structure_payload: JsonDict = {"status": "no_structure_evidence"}
+        structure_verdict = None
+        expected_return = None
+        downside_risk = None
+        alpha_score = float(score.total_score)
+        confidence = float(score.confidence)
+        setup_id = None
+        raw_payload: JsonDict = {}
+    else:
+        action = decision.action
+        recommendation_state = decision.transition.to_state
+        previous_state = decision.transition.from_state
+        state_changed_at = decision.transition.occurred_at
+        reason_codes = decision.reason_codes
+        structure_payload = {
+            "library": STRUCTURAL_LITE_LIBRARY,
+            "structure_frames": list(decision.payload.get("structure_frames") or []),
+        }
+        structure_verdict = decision.structure.to_dict()
+        expected_return = decision.alpha.expected_net_return
+        downside_risk = decision.alpha.downside_risk
+        alpha_score = decision.alpha.alpha_score
+        confidence = decision.alpha.confidence
+        setup_id = decision.transition.setup_id
+        raw_payload = decision.payload
+    summary = build_asset_summary(
+        symbol=score.symbol,
+        action=action,
+        total_score=alpha_score,
+        confidence=confidence,
+    )
+    evidence_ids = sorted(
+        set(
+            (structure_verdict or {}).get("primary_evidence_ids", [])
+            + (structure_verdict or {}).get("auxiliary_evidence_ids", [])
+        )
+    )
+    return {
+        "schema_version": "2.0",
+        "rule_version": rule_version,
+        "recommendation_id": build_recommendation_id(
+            run_id=run_id,
+            asset_id=score.asset_id,
+            horizon=score.horizon,
+        ),
+        "asset_id": score.asset_id,
+        "symbol": score.symbol,
+        "name": asset_name,
+        "market": score.market,
+        "horizon": score.horizon,
+        "action": action,
+        "intended_action": decision.intended_action if decision is not None else None,
+        "execution_status": (
+            decision.execution_status if decision is not None else "not_applicable"
+        ),
+        "proposed_action": action,
+        "action_source": "adaptive_lifecycle_portfolio",
+        "rank": rank,
+        "total_score": alpha_score,
+        "conviction": decide_conviction(score=score),
+        "confidence": confidence,
+        "summary": summary,
+        "score_id": score.score_id,
+        "factor_frame_id": score.factor_frame_id,
+        "signal_ids": [],
+        "risk_ids": [],
+        "evidence_ids": evidence_ids,
+        "reasons": [f"生命周期原因：{code}" for code in reason_codes],
+        "risk_rebuttals": [],
+        "watch_conditions": {
+            "conditions": [f"等待条件变化：{code}" for code in reason_codes],
+            "score_id": score.score_id,
+        },
+        "invalid_if": {
+            "conditions": [
+                f"结构失效价：{(structure_verdict or {}).get('invalidation_price')}"
+            ]
+            if (structure_verdict or {}).get("invalidation_price") is not None
+            else []
+        },
+        "missing_data": list(raw_payload.get("missing_groups") or []),
+        "score_strategy_id": ADAPTIVE_STRATEGY_ID,
+        "score_weight_snapshot": score.payload.get("weight_snapshot"),
+        "backtest_evidence": backtest_evidence,
+        "tradability": {
+            "tradable": bool(raw_payload.get("tradable", False)),
+            "reasons": list(raw_payload.get("tradability_reasons") or []),
+        },
+        "memory_ranking_adjustment": score.payload.get("memory_ranking_adjustment"),
+        "decision_context": None,
+        "trial": trial_state == "trial",
+        "validation_state": trial_state,
+        "validation_evidence_id": validation_evidence_id,
+        "recommendation_state": recommendation_state,
+        "previous_state": previous_state,
+        "state_changed_at": state_changed_at.isoformat(),
+        "decision_snapshot_id": snapshot_id,
+        "setup_id": setup_id,
+        "planned_horizon_days": int(raw_payload.get("planned_horizon_days") or 10),
+        "sector_regime": str(raw_payload.get("sector_regime") or "unknown"),
+        "structure": structure_payload,
+        "structure_verdict": structure_verdict,
+        "entry_zone": (structure_verdict or {}).get("entry_zone"),
+        "invalidation_price": (structure_verdict or {}).get("invalidation_price"),
+        "target_price": (structure_verdict or {}).get("target_price"),
+        "expected_net_return": expected_return,
+        "downside_risk": downside_risk,
+        "alpha_score": alpha_score,
+        "data_quality": decision.data_quality if decision is not None else "unavailable",
+        "lifecycle_reason_codes": list(reason_codes),
+    }
+
+
+def _recommendation_state_from_row(row: Any | None) -> RecommendationState | None:
+    """把 ORM 或测试适配器返回值转换为纯生命周期状态。"""
+
+    if row is None:
+        return None
+    if isinstance(row, RecommendationState):
+        return row
+    return RecommendationState(
+        state_id=str(row.state_id),
+        owner_id=str(row.owner_id),
+        strategy_id=str(row.strategy_id),
+        asset_id=str(row.asset_id),
+        setup_id=str(row.setup_id) if row.setup_id is not None else None,
+        current_state=str(row.current_state),  # type: ignore[arg-type]
+        previous_state=(
+            str(row.previous_state) if row.previous_state is not None else None
+        ),  # type: ignore[arg-type]
+        decision_snapshot_id=str(row.decision_snapshot_id),
+        state_changed_at=row.state_changed_at,
+        consecutive_valid_closes=int(row.consecutive_valid_closes),
+        active_days=int(row.active_days),
+        cooldown_until=row.cooldown_until,
+        payload=dict(row.payload or {}),
+    )
+
+
+def stock_setup_from_adaptive_decision(
+    decision: AdaptiveAssetDecision,
+    *,
+    owner_id: str,
+    strategy_id: str,
+) -> StockSetup | None:
+    """把具备完整风险位的自适应决策转换为可审计股票设置。"""
+
+    entry_zone = decision.structure.entry_zone
+    setup_id = decision.transition.setup_id
+    if setup_id is None or entry_zone is None or decision.structure.invalidation_price is None:
+        return None
+    target = decision.structure.target_price
+    return StockSetup(
+        setup_id=setup_id,
+        owner_id=owner_id,
+        decision_snapshot_id=decision.decision_snapshot_id,
+        asset_id=decision.asset_id,
+        strategy_id=strategy_id,
+        setup_type=str(decision.payload.get("setup_type") or "structure_confirmed"),
+        planned_horizon_days=int(decision.payload.get("planned_horizon_days") or 10),
+        entry_zone={"low": str(entry_zone[0]), "high": str(entry_zone[1])},
+        invalidation_price=decision.structure.invalidation_price,
+        target_zone=(
+            {"low": str(target), "high": str(target)} if target is not None else {}
+        ),
+        expected_net_return=Decimal(str(decision.alpha.expected_net_return)),
+        downside_risk=Decimal(str(decision.alpha.downside_risk)),
+        confidence=Decimal(str(decision.alpha.confidence)),
+        as_of=decision.transition.occurred_at,
+        payload={
+            "structure_verdict": decision.structure.to_dict(),
+            "lifecycle_reason_codes": list(decision.reason_codes),
+        },
+    )
+
+
+def _portfolio_budget_from_market_regime(
+    market_regime: JsonDict,
+) -> PortfolioRiskBudget:
+    """把市场风险预算转换为仅用于推荐容量裁决的标准名义组合。"""
+
+    raw = market_regime.get("risk_budget")
+    risk_budget = raw if isinstance(raw, dict) else {}
+    return PortfolioRiskBudget(
+        equity=Decimal("1000000"),
+        total_exposure=max(
+            0.0,
+            min(1.0, float(risk_budget.get("total_exposure", 1.0))),
+        ),
+        per_position_risk=max(
+            0.0,
+            min(1.0, float(risk_budget.get("per_position_risk", 0.01))),
+        ),
+        allow_new_buys=bool(risk_budget.get("allow_new_buys", True)),
+        weak_market_sector_override=bool(
+            risk_budget.get("allow_sector_override", False)
+            and str(market_regime.get("regime") or "") == "trend_down"
+        ),
+    )
+
+
+def portfolio_position_from_row(row: Any) -> PortfolioPosition:
+    """把持仓 ORM 转换为组合裁决所需的保守事实。"""
+
+    payload = dict(getattr(row, "payload", {}) or {})
+    quantity = Decimal(str(getattr(row, "quantity", 0) or 0))
+    sellable = Decimal(str(payload.get("sellable_quantity", 0) or 0))
+    price_raw = getattr(row, "last_price", None) or getattr(row, "avg_cost", None)
+    price = Decimal(str(price_raw or 0))
+    tradability_reasons = tuple(
+        str(item) for item in payload.get("tradability_reasons", ()) if str(item)
+    )
+    return PortfolioPosition(
+        position_id=str(row.position_id),
+        asset_id=str(row.asset_id),
+        sector_id=str(payload.get("sector_id") or "sector:unknown"),
+        quantity=quantity,
+        sellable_quantity=sellable,
+        price=price,
+        expected_net_return=float(payload.get("expected_net_return", 0.0) or 0.0),
+        required_action="hold",
+        tradable=bool(payload.get("tradable", price > 0)),
+        tradability_reasons=tradability_reasons,
+    )
+
+
 def validate_trial_audit(
     *,
     trial_state: str | None,
@@ -494,6 +1433,418 @@ def build_asset_structure_payload(
         "library": STRUCTURAL_LITE_LIBRARY,
         "structure_frames": frames,
     }
+
+
+def build_asset_decision_structure_frames(
+    *,
+    indicators: Any,
+    asset_id: str,
+    timeframes: tuple[str, ...],
+    as_of: datetime,
+) -> tuple[JsonDict, ...]:
+    """读取结构决策所需字段，不把完整结构算法中间量带入快照。"""
+
+    if indicators is None or not hasattr(indicators, "get_latest_indicator_frame"):
+        return ()
+    rows = []
+    for timeframe in timeframes:
+        for horizon in STRUCTURAL_LITE_HORIZONS:
+            frame = indicators.get_latest_indicator_frame(
+                asset_id=asset_id,
+                timeframe=timeframe,
+                horizon=horizon,
+                library=STRUCTURAL_LITE_LIBRARY,
+                as_of=as_of,
+            )
+            if frame is not None:
+                rows.append(frame)
+    return compact_decision_structure_frames(rows)
+
+
+def compact_decision_structure_frames(rows: Sequence[Any]) -> tuple[JsonDict, ...]:
+    """压缩一批已经按点时读取的结构帧。"""
+
+    frames: list[JsonDict] = []
+    for frame in rows:
+        payload = dict(getattr(frame, "payload", {}) or {})
+        timeframe = str(
+            getattr(frame, "timeframe", None) or payload.get("timeframe") or "1d"
+        )
+        horizon = str(
+            getattr(frame, "horizon", None) or payload.get("schema_version") or ""
+        )
+        if not horizon:
+            continue
+        raw_as_of = parse_iso_datetime(getattr(frame, "as_of", None)) or parse_iso_datetime(
+            payload.get("input_end_at")
+        )
+        effective_as_of = (
+            _normalize_fact_time(raw_as_of, market="ashare")
+            if timeframe == "1d"
+            else raw_as_of
+        )
+        compact: JsonDict = {
+            "horizon": horizon,
+            "timeframe": timeframe,
+            "status": str(payload.get("status") or getattr(frame, "status", "unknown")),
+            "confidence": normalize_structure_confidence(
+                payload.get("confidence", getattr(frame, "confidence", 0))
+            ),
+            "evidence_id": str(
+                payload.get("evidence_id") or getattr(frame, "evidence_id", "") or ""
+            ),
+            "as_of": effective_as_of.isoformat() if effective_as_of is not None else "",
+        }
+        for key in (
+            "direction",
+            "setup",
+            "entry_setup",
+            "entry_zone",
+            "invalidation_price",
+            "target_price",
+            "input_end_at",
+            "swings",
+            "signals",
+            "lines",
+            "structure_events",
+            "fair_value_gaps",
+            "latest_bar",
+            "segments",
+        ):
+            if key in payload:
+                compact[key] = _json_safe(payload[key])
+        frames.append(compact)
+    return tuple(frames)
+
+
+def load_factor_rows_individually(
+    *,
+    factors: Any,
+    scores: Sequence[AssetScoreORM],
+    horizon: str,
+    as_of: datetime,
+) -> list[Any]:
+    """兼容测试适配器；生产仓储始终走批量点时查询。"""
+
+    if factors is None:
+        return []
+    rows: list[Any] = []
+    for score in scores:
+        try:
+            row = factors.get_latest_factor_frame(
+                asset_id=score.asset_id,
+                horizon=horizon,
+                as_of=as_of,
+            )
+        except TypeError:
+            row = factors.get_latest_factor_frame(
+                asset_id=score.asset_id,
+                horizon=horizon,
+            )
+        if row is not None:
+            rows.append(row)
+    return rows
+
+
+def build_adaptive_snapshot_asset(
+    *,
+    score: AssetScoreORM,
+    factor: Any | None,
+    frames: tuple[JsonDict, ...],
+    decision_as_of: datetime,
+    trading_status: Any | None,
+    price_bar: Any | None,
+) -> JsonDict:
+    """把旧因子帧适配为六组自适应 Alpha 和结构门控输入。"""
+
+    factor_payload = dict(getattr(factor, "payload", {}) or {})
+    raw_groups = factor_payload.get("factor_groups")
+    groups = {
+        str(item.get("group")): dict(item)
+        for item in raw_groups
+        if isinstance(item, dict) and str(item.get("group") or "")
+    } if isinstance(raw_groups, list) else {}
+    price_bar_as_of = _normalize_fact_time(
+        getattr(price_bar, "timestamp", None),
+        market="ashare",
+    )
+    price_is_current = (
+        isinstance(price_bar_as_of, datetime)
+        and price_bar_as_of <= decision_as_of
+        and decision_as_of - price_bar_as_of <= timedelta(minutes=5)
+    )
+    current_price = (
+        _optional_decimal(getattr(price_bar, "close", None))
+        if price_is_current
+        else None
+    )
+    structure = StructuralDecisionEngine().evaluate(
+        frames=frames,
+        current_price=current_price,
+    )
+    group_sources = {
+        "trend": ("technical",),
+        "sector_leadership": ("sector_strength", "leadership"),
+        "capital_flow": ("capital_flow",),
+        "fundamental_valuation": ("fundamental", "valuation"),
+        "tradability_return_risk": ("liquidity", "risk"),
+    }
+    group_scores: JsonDict = {
+        name: average_group_score(groups, source_names)
+        for name, source_names in group_sources.items()
+    }
+    group_scores["structure"] = structure_score(structure)
+    missing_groups = [name for name, value in group_scores.items() if value is None]
+    partial_groups = [
+        name
+        for name, source_names in group_sources.items()
+        if name not in missing_groups
+        and any(str(groups.get(source, {}).get("status")) == "partial" for source in source_names)
+    ]
+    if frames and structure.status == "waiting":
+        partial_groups.append("structure")
+    daily_structure_times = [
+        parsed
+        for frame in frames
+        if str(frame.get("timeframe") or "").lower() == "1d"
+        and str(frame.get("horizon") or "") in {
+            "structural_swings_v2",
+            "smc_lite_v2",
+            "ichimoku_v1",
+        }
+        and (parsed := parse_iso_datetime(frame.get("as_of"))) is not None
+    ]
+    intraday_structure_times = [
+        parsed
+        for frame in frames
+        if str(frame.get("timeframe") or "").lower() in {"60m", "1h", "hourly"}
+        and str(frame.get("horizon") or "") == "smc_lite_v2"
+        and (parsed := parse_iso_datetime(frame.get("as_of"))) is not None
+    ]
+    sector_group = groups.get("sector_strength", {})
+    sector_factors = (
+        dict(sector_group.get("factors") or {})
+        if isinstance(sector_group.get("factors"), dict)
+        else {}
+    )
+    risk_score = average_group_score(groups, ("risk",))
+    downside_risk = (
+        max(0.0, (100.0 - risk_score) / 1000.0)
+        if risk_score is not None
+        else 0.10
+    )
+    status_as_of = getattr(trading_status, "as_of", None)
+    status_is_current = (
+        isinstance(status_as_of, datetime)
+        and status_as_of.date() == decision_as_of.date()
+    )
+    trading_status_name = str(
+        getattr(trading_status, "trading_status", "missing") or "missing"
+    ).lower()
+    tradable = bool(getattr(trading_status, "tradable", False)) and status_is_current
+    tradability_reasons: list[str] = []
+    if trading_status is None:
+        tradability_reasons.append("trading_status_missing")
+    elif not status_is_current:
+        tradability_reasons.append("trading_status_stale")
+    if trading_status_name in {"suspended", "st", "delisted", "unavailable"}:
+        tradability_reasons.append(trading_status_name)
+        tradable = False
+    explicit_reason = str(getattr(trading_status, "reason", "") or "").strip()
+    if explicit_reason and not tradable:
+        tradability_reasons.append(explicit_reason)
+    factor_as_of = _normalize_fact_time(getattr(factor, "as_of", None), market="ashare")
+    quality_status = str(getattr(factor, "status", None) or "unavailable")
+    normalized_decision_as_of = (
+        decision_as_of
+        if decision_as_of.tzinfo is not None
+        else decision_as_of.replace(tzinfo=UTC)
+    )
+    required_structure_times = (
+        max(daily_structure_times) if daily_structure_times else None,
+        max(intraday_structure_times) if intraday_structure_times else None,
+    )
+    if any(
+        structure_time is None
+        or structure_time > normalized_decision_as_of
+        or normalized_decision_as_of - structure_time > timedelta(minutes=5)
+        for structure_time in required_structure_times
+    ):
+        quality_status = "partial"
+        partial_groups.append("structure")
+    if not tradable:
+        quality_status = "partial"
+        partial_groups.append("tradability_return_risk")
+    if current_price is None:
+        quality_status = "partial"
+        partial_groups.append("tradability_return_risk")
+    return {
+        "asset_id": score.asset_id,
+        "symbol": score.symbol,
+        "quality_status": quality_status,
+        "as_of": factor_as_of or decision_as_of,
+        "group_scores": group_scores,
+        "factor_as_of": {
+            name: factor_as_of or decision_as_of for name in group_scores
+        },
+        "missing_groups": missing_groups,
+        "partial_groups": tuple(dict.fromkeys(partial_groups)),
+        "expected_return_hint": score.payload.get("expected_return_hint"),
+        "downside_risk": downside_risk,
+        "structure_frames": frames,
+        "structure_invalidated": structure.status == "invalidated",
+        "current_price": str(current_price) if current_price is not None else None,
+        "entry_threshold": 70.0,
+        "retention_threshold": 58.0,
+        "sector_id": str(sector_factors.get("sector_id") or "sector:unknown"),
+        "sector_regime": str(sector_factors.get("sector_regime") or "unknown"),
+        "tradable": tradable,
+        "tradability_reasons": tuple(dict.fromkeys(tradability_reasons)),
+        "planned_horizon_days": int(score.payload.get("planned_horizon_days") or 10),
+        "trade_date": decision_as_of.date().isoformat(),
+    }
+
+
+def parse_iso_datetime(value: Any) -> datetime | None:
+    """解析结构证据时点并统一为带时区时间。"""
+
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _normalize_fact_time(value: datetime | None, *, market: str) -> datetime | None:
+    """把存储层自然日时间转换为真实交易知识时点。"""
+
+    if value is None:
+        return None
+    normalized = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if market == "ashare" and normalized.hour == 0 and normalized.minute == 0:
+        return ashare_market_close_at(normalized)
+    return normalized
+
+
+def average_group_score(
+    groups: dict[str, JsonDict],
+    names: tuple[str, ...],
+) -> float | None:
+    """返回一组旧因子的简单均值，缺失组不参与但不会被重新伪造。"""
+
+    values = [
+        float(value)
+        for name in names
+        if (value := groups.get(name, {}).get("score")) is not None
+    ]
+    return sum(values) / len(values) if values else None
+
+
+def structure_score(verdict: Any) -> float | None:
+    """把结构裁决映射为 Alpha 组分，最终买入仍由硬门槛决定。"""
+
+    return {
+        "confirmed": 100.0,
+        "waiting": 50.0,
+        "blocked": 20.0,
+        "invalidated": 0.0,
+    }.get(str(verdict.status))
+
+
+def planned_entry_price(frames: tuple[JsonDict, ...]) -> Decimal | None:
+    """缺少实时价时使用明确入场区间中点评估计划收益风险。"""
+
+    for frame in frames:
+        zone = frame.get("entry_zone")
+        if not isinstance(zone, dict):
+            continue
+        low = _optional_decimal(zone.get("low"))
+        high = _optional_decimal(zone.get("high"))
+        if low is not None and high is not None:
+            return (low + high) / 2
+    return None
+
+
+def normalize_adaptive_market_regime(value: JsonDict | None) -> JsonDict:
+    """规范市场状态；缺失时以可审计的 risk_off 保护事实关闭买入。"""
+
+    if not value:
+        return {
+            "regime": "risk_off",
+            "quality_status": "unavailable",
+            "reason_codes": ["market_regime_missing"],
+            "risk_budget": {
+                "total_exposure": 0.0,
+                "per_position_risk": 0.0,
+                "allow_new_buys": False,
+                "allow_sector_override": False,
+            },
+        }
+    result = dict(value)
+    result["regime"] = {
+        "bull": "trend_up",
+        "bear": "trend_down",
+    }.get(str(result.get("regime") or "range"), str(result.get("regime") or "range"))
+    if not isinstance(result.get("risk_budget"), dict):
+        regime = str(result["regime"])
+        defaults = {
+            "trend_up": (1.0, 0.01, True, True),
+            "range": (0.7, 0.008, True, True),
+            "trend_down": (0.35, 0.005, True, True),
+            "risk_off": (0.0, 0.0, False, False),
+        }
+        exposure, per_position, allow_buys, allow_override = defaults.get(
+            regime,
+            defaults["risk_off"],
+        )
+        result["risk_budget"] = {
+            "total_exposure": exposure,
+            "per_position_risk": per_position,
+            "allow_new_buys": allow_buys,
+            "allow_sector_override": allow_override,
+        }
+    return result
+
+
+def persisted_context_problem(
+    record: Any | None,
+    *,
+    decision_as_of: datetime,
+    context_name: str,
+) -> str | None:
+    """返回持久化上下文的质量或点时问题。"""
+
+    if record is None:
+        return None
+    quality = str(getattr(record, "quality_status", "unavailable") or "unavailable")
+    if quality != "available":
+        return f"{context_name}_quality_{quality}"
+    as_of = getattr(record, "as_of", None)
+    if not isinstance(as_of, datetime):
+        return f"{context_name}_as_of_missing"
+    if as_of > decision_as_of:
+        return f"{context_name}_future"
+    if decision_as_of - as_of > timedelta(minutes=5):
+        return f"{context_name}_stale"
+    return None
+
+
+def decision_fact_id(label: str, *, payload: Any, as_of: datetime) -> str:
+    """为聚合事实生成可重放 ID。"""
+
+    canonical = json.dumps(
+        {"label": label, "as_of": as_of.isoformat(), "payload": _json_safe(payload)},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+    return f"decision-fact:{label}:{digest}"
 
 
 def compact_structure_frame(frame: Any) -> JsonDict | None:

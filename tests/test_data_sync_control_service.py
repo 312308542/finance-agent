@@ -1095,7 +1095,9 @@ def test_read_scheduler_jobs_merges_missing_regenerable_jobs(tmp_path: Path) -> 
     assert "analytics.universe.merge.ashare.recommendation" in returned_jobs
     assert jobs["analytics.universe.merge.ashare.recommendation"]["params"]["name"] == "A 股推荐合并候选池"
     assert jobs["analytics.recommendations.ashare.all_a"]["depends_on"] == [
-        "analytics.universe.merge.ashare.recommendation"
+        "analytics.snapshot.ashare.close",
+        "analytics.sector.ashare.daily",
+        "analytics.structural.ashare.daily",
     ]
 
 

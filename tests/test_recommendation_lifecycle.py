@@ -107,6 +107,37 @@ def test_candidate_needs_two_valid_closes_before_buy_ready() -> None:
     assert second.to_state == "buy_ready"
 
 
+def test_same_trade_date_replay_does_not_count_as_second_valid_close() -> None:
+    engine = RecommendationLifecycleEngine()
+    evidence = _evidence(day=1, eligible=True, setup_id="setup-1")
+
+    first = engine.transition(None, evidence)
+    replayed = engine.transition(first.state, evidence)
+
+    assert first.to_state == "setup_confirming"
+    assert replayed.to_state == "setup_confirming"
+    assert replayed.consecutive_valid_closes == 1
+    assert replayed.reason_codes == ("same_trade_date_confirmation_retained",)
+
+
+def test_stale_evidence_retains_previous_buy_ready_state_without_new_action() -> None:
+    transition = RecommendationLifecycleEngine().transition(
+        _state("buy_ready"),
+        _evidence(
+            day=2,
+            eligible=False,
+            data_stale=True,
+            reason_codes=("data_quality_stale",),
+        ),
+    )
+
+    assert transition.to_state == "buy_ready"
+    assert transition.reason_codes == (
+        "stale_evidence_state_retained",
+        "data_quality_stale",
+    )
+
+
 def test_active_position_uses_lower_retention_threshold() -> None:
     transition = RecommendationLifecycleEngine().transition(
         _state("active", active_days=6),
@@ -122,6 +153,22 @@ def test_active_position_uses_lower_retention_threshold() -> None:
     assert transition.to_state == "active"
     assert transition.reason_codes == ("retention_threshold_met",)
     assert transition.active_days == 7
+
+
+def test_same_trade_date_replay_does_not_increment_active_days() -> None:
+    engine = RecommendationLifecycleEngine()
+    evidence = _evidence(
+        day=7,
+        eligible=False,
+        alpha_score=61,
+        retention_threshold=58,
+    )
+
+    first = engine.transition(_state("active", active_days=6), evidence)
+    replayed = engine.transition(first.state, evidence)
+
+    assert first.active_days == 7
+    assert replayed.active_days == 7
 
 
 def test_high_quality_intraday_breakout_can_confirm_once() -> None:
@@ -256,6 +303,8 @@ def _evidence(
         "structure_invalidated": False,
         "high_quality_intraday_breakout": False,
         "ordinary_volatility": False,
+        "held": False,
+        "data_stale": False,
         "sold": False,
         "cooldown_until": None,
         "new_independent_catalyst": False,

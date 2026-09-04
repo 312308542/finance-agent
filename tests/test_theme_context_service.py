@@ -1,11 +1,42 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any
+
+from sqlalchemy.dialects import postgresql
 
 from finance_agent.application.theme_context_service import (
     ThemeContextInput,
     ThemeContextService,
 )
+
+
+class _PointInTimeSession:
+    def __init__(self) -> None:
+        self.statements: list[Any] = []
+
+    def scalars(self, statement: Any) -> list[Any]:
+        self.statements.append(statement)
+        return []
+
+
+def test_theme_fact_queries_are_bounded_by_snapshot_as_of() -> None:
+    session = _PointInTimeSession()
+    service = ThemeContextService(session)  # type: ignore[arg-type]
+    as_of = datetime(2026, 9, 8, 7, 0, tzinfo=UTC)
+
+    service._latest_daily_bars(["ashare:600519"], as_of=as_of)
+    service._latest_capital_flows(["ashare:600519"], as_of=as_of)
+    service._latest_asset_status(["ashare:600519"], as_of=as_of)
+
+    sql = [
+        str(statement.compile(dialect=postgresql.dialect()))
+        for statement in session.statements
+    ]
+    assert "market_bars.timestamp <=" in sql[0]
+    assert "capital_flow_snapshots.as_of <=" in sql[1]
+    assert "asset_status_snapshots.as_of <=" in sql[2]
 
 
 def test_theme_context_service_builds_factor_groups_per_asset() -> None:

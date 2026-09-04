@@ -225,6 +225,7 @@ class StructuralMethodologyAdapter:
                 "swing_count": 0,
                 "structure_events": [],
                 "fair_value_gaps": [],
+                "latest_bar": serialize_latest_bar(normalized),
                 "confidence": 0.0,
                 "caveats": [
                     f"SMC 结构至少需要 {self.minimum_bar_count} 根 K 线，当前仅 {len(normalized)} 根。",
@@ -264,6 +265,7 @@ class StructuralMethodologyAdapter:
             "swing_count": len(swings),
             "structure_events": structure_events,
             "fair_value_gaps": fair_value_gaps,
+            "latest_bar": serialize_latest_bar(normalized),
             "confidence": round(confidence, 6),
             "confidence_method": "max_event_or_gap_confidence",
             "caveats": [
@@ -1069,6 +1071,22 @@ def serialize_swing(point: SwingPoint) -> JsonDict:
         "price": round(point.price, 6),
         "confirmed_bar_index": point.confirmed_bar_index,
         "confirmed_at": point.confirmed_at.isoformat(),
+    }
+
+
+def serialize_latest_bar(bars: list[StructuralPriceBar]) -> JsonDict | None:
+    """输出延续确认所需的最后一根闭合 K，不泄露未来数据。"""
+
+    if not bars:
+        return None
+    bar = bars[-1]
+    return {
+        "timestamp": bar.timestamp.isoformat(),
+        "open": round(bar.open, 6),
+        "high": round(bar.high, 6),
+        "low": round(bar.low, 6),
+        "close": round(bar.close, 6),
+        "volume": round(bar.volume, 6),
     }
 
 

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -295,6 +296,8 @@ class ThemeContextService:
         members: list[AssetUniverseMemberORM],
         *,
         strong_sector_limit: int = 20,
+        market_regime: str = "range",
+        as_of: datetime | None = None,
     ) -> dict[str, ThemeContext]:
         """从数据库中的板块成员、行情和资金流为候选池成员生成题材上下文。"""
 
@@ -304,9 +307,10 @@ class ThemeContextService:
         if not asset_ids:
             return {}
 
-        latest_bars = self._latest_daily_bars(asset_ids)
-        latest_flows = self._latest_capital_flows(asset_ids)
-        latest_status = self._latest_asset_status(asset_ids)
+        effective_as_of = as_of or datetime.now(tz=UTC)
+        latest_bars = self._latest_daily_bars(asset_ids, as_of=effective_as_of)
+        latest_flows = self._latest_capital_flows(asset_ids, as_of=effective_as_of)
+        latest_status = self._latest_asset_status(asset_ids, as_of=effective_as_of)
         asset_names = self._asset_names(asset_ids)
         inputs = [
             self._theme_input_from_membership(
@@ -319,7 +323,11 @@ class ThemeContextService:
             )
             for membership, universe in self._theme_memberships(asset_ids)
         ]
-        return self.build_contexts(inputs, strong_sector_limit=strong_sector_limit)
+        return self.build_contexts(
+            inputs,
+            strong_sector_limit=strong_sector_limit,
+            market_regime=market_regime,
+        )
 
     def _theme_memberships(
         self,
@@ -346,7 +354,12 @@ class ThemeContextService:
             if is_theme_universe(universe)
         ]
 
-    def _latest_daily_bars(self, asset_ids: list[str]) -> dict[str, MarketBarORM]:
+    def _latest_daily_bars(
+        self,
+        asset_ids: list[str],
+        *,
+        as_of: datetime,
+    ) -> dict[str, MarketBarORM]:
         """批量查询每个资产最新日 K。"""
 
         if self.session is None:
@@ -359,6 +372,7 @@ class ThemeContextService:
             .where(
                 MarketBarORM.asset_id.in_(asset_ids),
                 MarketBarORM.timeframe == "1d",
+                MarketBarORM.timestamp <= as_of,
                 MarketBarORM.is_closed.is_(True),
                 MarketBarORM.status.in_(("available", "partial")),
             )
@@ -374,7 +388,12 @@ class ThemeContextService:
         )
         return {row.asset_id: row for row in self.session.scalars(statement)}
 
-    def _latest_capital_flows(self, asset_ids: list[str]) -> dict[str, CapitalFlowSnapshotORM]:
+    def _latest_capital_flows(
+        self,
+        asset_ids: list[str],
+        *,
+        as_of: datetime,
+    ) -> dict[str, CapitalFlowSnapshotORM]:
         """批量查询每个资产最新资金流。"""
 
         if self.session is None:
@@ -384,7 +403,10 @@ class ThemeContextService:
                 CapitalFlowSnapshotORM.asset_id.label("asset_id"),
                 func.max(CapitalFlowSnapshotORM.as_of).label("as_of"),
             )
-            .where(CapitalFlowSnapshotORM.asset_id.in_(asset_ids))
+            .where(
+                CapitalFlowSnapshotORM.asset_id.in_(asset_ids),
+                CapitalFlowSnapshotORM.as_of <= as_of,
+            )
             .group_by(CapitalFlowSnapshotORM.asset_id)
             .subquery()
         )
@@ -397,7 +419,12 @@ class ThemeContextService:
         )
         return {row.asset_id: row for row in self.session.scalars(statement)}
 
-    def _latest_asset_status(self, asset_ids: list[str]) -> dict[str, AssetStatusSnapshotORM]:
+    def _latest_asset_status(
+        self,
+        asset_ids: list[str],
+        *,
+        as_of: datetime,
+    ) -> dict[str, AssetStatusSnapshotORM]:
         """批量查询每个资产最新交易状态。"""
 
         if self.session is None:
@@ -407,7 +434,10 @@ class ThemeContextService:
                 AssetStatusSnapshotORM.asset_id.label("asset_id"),
                 func.max(AssetStatusSnapshotORM.as_of).label("as_of"),
             )
-            .where(AssetStatusSnapshotORM.asset_id.in_(asset_ids))
+            .where(
+                AssetStatusSnapshotORM.asset_id.in_(asset_ids),
+                AssetStatusSnapshotORM.as_of <= as_of,
+            )
             .group_by(AssetStatusSnapshotORM.asset_id)
             .subquery()
         )

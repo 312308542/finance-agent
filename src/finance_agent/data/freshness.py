@@ -30,3 +30,10 @@ def ashare_daily_snapshot_at(collected_at: datetime) -> datetime:
 
     local_date = collected_at.astimezone(ASHARE_TIMEZONE).date()
     return datetime.combine(local_date, time.min, tzinfo=UTC)
+
+
+def ashare_market_close_at(trade_timestamp: datetime) -> datetime:
+    """把 A 股日级交易日期归一化为当日上海 15:00 的 UTC 时点。"""
+
+    local_date = trade_timestamp.astimezone(ASHARE_TIMEZONE).date()
+    return datetime.combine(local_date, time(15, 0), tzinfo=ASHARE_TIMEZONE).astimezone(UTC)

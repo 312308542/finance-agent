@@ -43,6 +43,7 @@ TECHNICAL_SCREENING_POOL_SOURCE = "technical_screening_pool"
 TECHNICAL_SCREENING_STRATEGY = "technical_screening_v1"
 THEME_FACTOR_GROUP_NAMES = {"sector_strength", "leadership"}
 DEFAULT_OBSERVATION_ROUND_TRIP_COST = 0.003
+ADAPTIVE_RESEARCH_STRATEGY_ID = "strategy:ashare:adaptive_v1"
 ASHARE_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
@@ -67,6 +68,10 @@ class UniverseRecommendationRunResult:
     top_recommendation_id: str | None
     errors: tuple[JsonDict, ...]
     strategy_results: tuple[JsonDict, ...] = ()
+    decision_snapshot_id: str | None = None
+    buy_ready_count: int = 0
+    active_count: int = 0
+    exit_pending_count: int = 0
 
 
 class UniverseRecommendationPipeline:
@@ -108,6 +113,7 @@ class UniverseRecommendationPipeline:
         observation_trade_date: date | None = None,
         round_trip_cost: float = DEFAULT_OBSERVATION_ROUND_TRIP_COST,
         market_regime: JsonDict | None = None,
+        owner_id: str = "default-owner",
     ) -> UniverseRecommendationRunResult:
         """执行一次候选池推荐流水线。"""
 
@@ -273,6 +279,10 @@ class UniverseRecommendationPipeline:
                 "recommendation_count": 0,
                 "recommendation_run_id": None,
                 "top_recommendation_id": None,
+                "decision_snapshot_id": None,
+                "buy_ready_count": 0,
+                "active_count": 0,
+                "exit_pending_count": 0,
                 "trial_state": None,
                 "trial": False,
                 "validation_evidence_id": None,
@@ -367,6 +377,7 @@ class UniverseRecommendationPipeline:
                     market_regime=market_regime,
                     trial_state=gate["trial_state"],
                     validation_evidence_id=gate["validation_evidence_id"],
+                    owner_id=owner_id,
                 )
             except Exception as exc:
                 strategy_result["recommendation_status"] = "error"
@@ -387,9 +398,26 @@ class UniverseRecommendationPipeline:
             strategy_result["recommendation_count"] = recommendation_count
             strategy_result["recommendation_run_id"] = recommendation.run_id
             strategy_result["top_recommendation_id"] = recommendation.top_recommendation_id
+            strategy_result["decision_snapshot_id"] = getattr(
+                recommendation,
+                "decision_snapshot_id",
+                None,
+            )
+            strategy_result["buy_ready_count"] = int(
+                getattr(recommendation, "buy_ready_count", 0)
+            )
+            strategy_result["active_count"] = int(
+                getattr(recommendation, "active_count", 0)
+            )
+            strategy_result["exit_pending_count"] = int(
+                getattr(recommendation, "exit_pending_count", 0)
+            )
 
         scored_count = sum(int(item["scored_count"]) for item in strategy_runs)
         recommendation_count = sum(int(item["recommendation_count"]) for item in strategy_runs)
+        buy_ready_count = sum(int(item["buy_ready_count"]) for item in strategy_runs)
+        active_count = sum(int(item["active_count"]) for item in strategy_runs)
+        exit_pending_count = sum(int(item["exit_pending_count"]) for item in strategy_runs)
         primary_recommendation = recommendation_results[0] if recommendation_results else None
         status = multi_strategy_run_status(
             universe=universe,
@@ -428,6 +456,14 @@ class UniverseRecommendationPipeline:
             ),
             errors=tuple(errors),
             strategy_results=tuple(strategy_runs),
+            decision_snapshot_id=(
+                getattr(primary_recommendation, "decision_snapshot_id", None)
+                if primary_recommendation is not None
+                else None
+            ),
+            buy_ready_count=buy_ready_count,
+            active_count=active_count,
+            exit_pending_count=exit_pending_count,
         )
 
     def _compute_indicator(
@@ -531,6 +567,7 @@ def recommendation_strategy_gate(
     if (
         not market.startswith("ashare")
         or strategy_id == BASELINE_STRATEGY_ID
+        or strategy_id == ADAPTIVE_RESEARCH_STRATEGY_ID
         or strategy_id.endswith(":legacy_default")
     ):
         return {

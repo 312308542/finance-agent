@@ -795,6 +795,84 @@ def test_scheduler_executes_recommendation_pipeline_job_without_collection() -> 
     ]
 
 
+def test_scheduler_executes_decision_context_refresh_without_collection() -> None:
+    """收盘市场和板块上下文任务应走独立分析执行器。"""
+
+    calls: list[dict[str, Any]] = []
+
+    def refresh(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {"status": "available", "data_snapshot_id": "snapshot:test"}
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="analytics.snapshot.ashare.close",
+                job_type="decision_context_refresh",
+                group="analytics",
+                interval_seconds=3600,
+                market="ashare",
+                params={
+                    "context_type": "market",
+                    "universe_id": "universe:base:ashare:p0:all_a",
+                    "lookback_bars": 61,
+                },
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=lambda _args: {},
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        run_decision_context_refresh_func=refresh,
+    )
+
+    result = scheduler.run_once()
+
+    assert result["jobs"][0]["status"] == "executed"
+    assert calls == [
+        {
+            "context_type": "market",
+            "market": "ashare",
+            "universe_id": "universe:base:ashare:p0:all_a",
+            "lookback_bars": 61,
+        }
+    ]
+
+
+def test_partial_decision_context_is_not_marked_as_success_for_dependents() -> None:
+    """partial 市场上下文只能落观测结果，不能满足推荐依赖。"""
+
+    def refresh(**_kwargs: Any) -> dict[str, Any]:
+        return {"status": "partial", "quality_status": "partial"}
+
+    config = BaseDataSchedulerConfig(
+        job_timeout_seconds=0,
+        jobs=(
+            BaseDataSchedulerJob(
+                name="analytics.snapshot.ashare.close",
+                job_type="decision_context_refresh",
+                group="analytics",
+                interval_seconds=3600,
+                market="ashare",
+                params={"context_type": "market", "universe_id": "u"},
+            ),
+        ),
+    )
+    scheduler = BaseDataScheduler(
+        config,
+        collect_base_data_func=lambda _args: {},
+        default_collection_args_func=lambda **kwargs: Namespace(**kwargs),
+        run_decision_context_refresh_func=refresh,
+    )
+
+    result = scheduler.run_once()
+
+    assert result["jobs"][0]["status"] == "blocked"
+    assert result["jobs"][0]["summary"]["status"] == "partial"
+
+
 def test_scheduler_runs_data_quality_refresh_without_collection() -> None:
     """数据质量任务应调用质量刷新执行器，而不是误走基础采集入口。"""
 

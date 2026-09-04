@@ -19,6 +19,7 @@ from finance_agent.storage.orm import (
 )
 
 JsonDict = dict[str, Any]
+_CURRENT_STATE_UNSET = object()
 
 
 class RecommendationStateRepository:
@@ -42,6 +43,49 @@ class RecommendationStateRepository:
             RecommendationLifecycleStateORM.asset_id == asset_id,
         )
         return self.session.scalars(statement).one_or_none()
+
+    def list_states(
+        self,
+        *,
+        owner_id: str,
+        strategy_id: str,
+        asset_ids: Sequence[str],
+    ) -> tuple[RecommendationLifecycleStateORM, ...]:
+        """一次读取一组资产的当前生命周期状态。"""
+
+        normalized_ids = tuple(sorted({str(item) for item in asset_ids if str(item)}))
+        if not normalized_ids:
+            return ()
+        statement = select(RecommendationLifecycleStateORM).where(
+            RecommendationLifecycleStateORM.owner_id == owner_id,
+            RecommendationLifecycleStateORM.strategy_id == strategy_id,
+            RecommendationLifecycleStateORM.asset_id.in_(normalized_ids),
+        )
+        return tuple(self.session.scalars(statement))
+
+    def list_open_states(
+        self,
+        *,
+        owner_id: str,
+        strategy_id: str,
+    ) -> tuple[RecommendationLifecycleStateORM, ...]:
+        """读取仍需持续维护的全部推荐生命周期状态。"""
+
+        statement = select(RecommendationLifecycleStateORM).where(
+            RecommendationLifecycleStateORM.owner_id == owner_id,
+            RecommendationLifecycleStateORM.strategy_id == strategy_id,
+            RecommendationLifecycleStateORM.current_state.in_(
+                (
+                    "setup_confirming",
+                    "buy_ready",
+                    "active",
+                    "weakening",
+                    "exit_pending",
+                    "cooldown",
+                )
+            ),
+        )
+        return tuple(self.session.scalars(statement))
 
     def save_setup(self, setup: StockSetup) -> StockSetupORM:
         """幂等保存绑定决策快照的股票设置。"""
@@ -73,13 +117,19 @@ class RecommendationStateRepository:
     def save_transition(
         self,
         transition: RecommendationTransition,
+        *,
+        current_state: Any = _CURRENT_STATE_UNSET,
     ) -> RecommendationLifecycleStateORM:
         """刷新当前状态，仅在状态或原因变化时追加审计事件。"""
 
-        current = self.get_state(
-            owner_id=transition.owner_id,
-            strategy_id=transition.strategy_id,
-            asset_id=transition.asset_id,
+        current = (
+            self.get_state(
+                owner_id=transition.owner_id,
+                strategy_id=transition.strategy_id,
+                asset_id=transition.asset_id,
+            )
+            if current_state is _CURRENT_STATE_UNSET
+            else current_state
         )
         current_payload = dict(current.payload or {}) if current is not None else {}
         last_reason_codes = tuple(current_payload.get("last_reason_codes", ()))

@@ -29,11 +29,16 @@ def test_scheduler_payload_registers_structural_methodology_job() -> None:
     assert job["resource_pool"] == "analytics"
     assert job["priority"] == 540
     assert job["schedule_type"] == "after_success"
-    assert job["depends_on"] == ["ashare.bars.1d.close_final"]
+    assert job["depends_on"] == [
+        "analytics.universe.merge.ashare.recommendation",
+        "analytics.snapshot.ashare.close",
+    ]
+    assert job["dependency_mode"] == "barrier"
     assert job["params"] == {
         "sync_task_type": "analytics.structural_methodology",
         "market": "ashare",
         "timeframe": "1d",
+        "timeframes": ["1d", "60m"],
         "engines": ["swings", "smc", "harmonic", "elliott", "ichimoku"],
         "universe_ids": ["universe:merged:ashare:recommendation"],
         "lookback_bars": 250,
@@ -302,6 +307,7 @@ def test_structural_service_writes_insufficient_outputs_with_stable_upsert_keys(
         assert call["status"] == "insufficient_data"
         assert call["payload"]["status"] == "insufficient_data"
         assert call["payload"]["schema_version"] == call["horizon"]
+        assert call["as_of"] == call["input_end_at"]
         assert call["payload"]["red_lines"]
 
 
@@ -372,6 +378,26 @@ def _market_bar(index: int, *, asset: Any) -> Any:
         is_closed=True,
         status="available",
     )
+
+
+def test_structural_intraday_bar_uses_closed_bucket_end_timestamp() -> None:
+    from finance_agent.application.structural_methodology_service import (
+        to_structural_price_bar,
+    )
+
+    start = datetime(2026, 9, 8, 6, 0, tzinfo=UTC)
+    end = datetime(2026, 9, 8, 7, 0, tzinfo=UTC)
+    bar = SimpleNamespace(
+        timestamp=start,
+        end_timestamp=end,
+        open=Decimal("10"),
+        high=Decimal("11"),
+        low=Decimal("9"),
+        close=Decimal("10.5"),
+        volume=Decimal("1000"),
+    )
+
+    assert to_structural_price_bar(bar).timestamp == end
 
 
 def test_structural_candidates_are_prioritized_before_limit() -> None:

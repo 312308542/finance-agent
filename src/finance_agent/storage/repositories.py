@@ -1265,6 +1265,41 @@ class AssetRepository:
 
         return self.session.get(AssetORM, asset_id)
 
+    def find_by_ids(self, asset_ids: Sequence[str]) -> list[AssetORM]:
+        """一次读取一组资产主数据。"""
+
+        normalized_ids = tuple(sorted({str(item) for item in asset_ids if str(item)}))
+        if not normalized_ids:
+            return []
+        statement = select(AssetORM).where(AssetORM.asset_id.in_(normalized_ids))
+        return list(self.session.scalars(statement.order_by(AssetORM.asset_id)))
+
+    def list_latest_statuses(
+        self,
+        *,
+        asset_ids: Sequence[str],
+        as_of: datetime,
+    ) -> list[AssetStatusSnapshotORM]:
+        """批量读取决策时点之前每个资产最新交易状态。"""
+
+        normalized_ids = tuple(sorted({str(item) for item in asset_ids if str(item)}))
+        if not normalized_ids:
+            return []
+        statement = (
+            select(AssetStatusSnapshotORM)
+            .where(
+                AssetStatusSnapshotORM.asset_id.in_(normalized_ids),
+                AssetStatusSnapshotORM.as_of <= as_of,
+            )
+            .distinct(AssetStatusSnapshotORM.asset_id)
+            .order_by(
+                AssetStatusSnapshotORM.asset_id,
+                AssetStatusSnapshotORM.as_of.desc(),
+                AssetStatusSnapshotORM.source,
+            )
+        )
+        return list(self.session.scalars(statement))
+
     def find_by_market(self, market: str, *, only_tradable: bool = True) -> list[AssetORM]:
         """按市场查询资产列表。"""
 
@@ -2253,6 +2288,31 @@ class MarketDataRepository:
             )
         return list(self.session.scalars(statement.order_by(MarketBarIntradayORM.timestamp)))
 
+    def list_recent_intraday_bars(
+        self,
+        *,
+        asset_id: str,
+        timeframe: str,
+        limit: int,
+        source: str | None = None,
+    ) -> list[MarketBarIntradayORM]:
+        """读取单个资产最近 N 根闭合分钟 K，返回时间升序结果。"""
+
+        statement = select(MarketBarIntradayORM).where(
+            MarketBarIntradayORM.asset_id == asset_id,
+            MarketBarIntradayORM.timeframe == timeframe,
+            MarketBarIntradayORM.is_closed.is_(True),
+            MarketBarIntradayORM.status.in_(FINAL_MARKET_BAR_STATUSES),
+        )
+        if source:
+            statement = statement.where(MarketBarIntradayORM.source == source)
+        rows = list(
+            self.session.scalars(
+                statement.order_by(MarketBarIntradayORM.timestamp.desc()).limit(limit)
+            )
+        )
+        return list(reversed(rows))
+
     def get_bar(
         self,
         *,
@@ -2326,6 +2386,89 @@ class MarketDataRepository:
         return list(
             self.session.scalars(statement.order_by(MarketBarORM.asset_id, MarketBarORM.timestamp))
         )
+
+
+    def list_recent_bars_for_assets(
+        self,
+        *,
+        asset_ids: Sequence[str],
+        timeframe: str,
+        limit_per_asset: int,
+    ) -> list[MarketBarORM]:
+        """批量读取多资产最近 N 根闭合 K，按来源和时间确定性去重。"""
+
+        normalized_ids = tuple(sorted({str(item) for item in asset_ids if str(item)}))
+        if not normalized_ids:
+            return []
+        latest = self.session.scalar(
+            select(func.max(MarketBarORM.timestamp)).where(
+                MarketBarORM.asset_id.in_(normalized_ids),
+                MarketBarORM.timeframe == timeframe,
+                MarketBarORM.is_closed.is_(True),
+                MarketBarORM.status.in_(FINAL_MARKET_BAR_STATUSES),
+            )
+        )
+        if latest is None:
+            return []
+        window_days = max(int(limit_per_asset) * 3, 30)
+        statement = select(MarketBarORM).where(
+            MarketBarORM.asset_id.in_(normalized_ids),
+            MarketBarORM.timeframe == timeframe,
+            MarketBarORM.timestamp >= latest - timedelta(days=window_days),
+            MarketBarORM.timestamp <= latest,
+            MarketBarORM.is_closed.is_(True),
+            MarketBarORM.status.in_(FINAL_MARKET_BAR_STATUSES),
+        )
+        rows = list(
+            self.session.scalars(
+                statement.order_by(
+                    MarketBarORM.asset_id,
+                    MarketBarORM.timestamp.desc(),
+                    MarketBarORM.source,
+                    MarketBarORM.adjustment,
+                )
+            )
+        )
+        by_asset: dict[str, dict[datetime, MarketBarORM]] = {}
+        for row in rows:
+            by_asset.setdefault(row.asset_id, {}).setdefault(row.timestamp, row)
+        result: list[MarketBarORM] = []
+        for asset_id in normalized_ids:
+            by_time = by_asset.get(asset_id, {})
+            timestamps = sorted(by_time)[-max(1, int(limit_per_asset)) :]
+            result.extend(by_time[timestamp] for timestamp in timestamps)
+        return result
+
+    def list_latest_closed_bars(
+        self,
+        *,
+        asset_ids: Sequence[str],
+        timeframe: str,
+        as_of: datetime,
+    ) -> list[MarketBarORM]:
+        """批量读取决策时点之前每个资产的最新闭合 K。"""
+
+        normalized_ids = tuple(sorted({str(item) for item in asset_ids if str(item)}))
+        if not normalized_ids:
+            return []
+        statement = (
+            select(MarketBarORM)
+            .where(
+                MarketBarORM.asset_id.in_(normalized_ids),
+                MarketBarORM.timeframe == timeframe,
+                MarketBarORM.timestamp <= as_of,
+                MarketBarORM.is_closed.is_(True),
+                MarketBarORM.status.in_(FINAL_MARKET_BAR_STATUSES),
+            )
+            .distinct(MarketBarORM.asset_id)
+            .order_by(
+                MarketBarORM.asset_id,
+                MarketBarORM.timestamp.desc(),
+                MarketBarORM.source,
+                MarketBarORM.adjustment,
+            )
+        )
+        return list(self.session.scalars(statement))
 
 
 class IndicatorFrameRepository:
@@ -2421,6 +2564,7 @@ class IndicatorFrameRepository:
         timeframe: str,
         horizon: str,
         library: str | None = None,
+        as_of: datetime | None = None,
     ) -> IndicatorFrameORM | None:
         """查询单标的最新技术指标结果。"""
 
@@ -2431,9 +2575,58 @@ class IndicatorFrameRepository:
         )
         if library:
             statement = statement.where(IndicatorFrameORM.library == library)
+        if as_of is not None:
+            statement = statement.where(
+                IndicatorFrameORM.input_end_at <= as_of,
+                IndicatorFrameORM.as_of <= as_of,
+            )
         return self.session.scalars(
             statement.order_by(IndicatorFrameORM.input_end_at.desc()).limit(1)
         ).one_or_none()
+
+    def list_latest_indicator_frames(
+        self,
+        *,
+        asset_ids: Sequence[str],
+        timeframes: Sequence[str],
+        horizons: Sequence[str],
+        library: str,
+        as_of: datetime,
+    ) -> list[IndicatorFrameORM]:
+        """批量读取决策时点之前每个资产、周期和结构引擎的最新帧。"""
+
+        normalized_assets = tuple(sorted({str(item) for item in asset_ids if str(item)}))
+        normalized_timeframes = tuple(
+            sorted({str(item) for item in timeframes if str(item)})
+        )
+        normalized_horizons = tuple(sorted({str(item) for item in horizons if str(item)}))
+        if not normalized_assets or not normalized_timeframes or not normalized_horizons:
+            return []
+        statement = (
+            select(IndicatorFrameORM)
+            .where(
+                IndicatorFrameORM.asset_id.in_(normalized_assets),
+                IndicatorFrameORM.timeframe.in_(normalized_timeframes),
+                IndicatorFrameORM.horizon.in_(normalized_horizons),
+                IndicatorFrameORM.library == library,
+                IndicatorFrameORM.input_end_at <= as_of,
+                IndicatorFrameORM.as_of <= as_of,
+            )
+            .distinct(
+                IndicatorFrameORM.asset_id,
+                IndicatorFrameORM.timeframe,
+                IndicatorFrameORM.horizon,
+                IndicatorFrameORM.library,
+            )
+            .order_by(
+                IndicatorFrameORM.asset_id,
+                IndicatorFrameORM.timeframe,
+                IndicatorFrameORM.horizon,
+                IndicatorFrameORM.library,
+                IndicatorFrameORM.input_end_at.desc(),
+            )
+        )
+        return list(self.session.scalars(statement))
 
 
 class FactorFrameRepository:
@@ -2490,6 +2683,7 @@ class FactorFrameRepository:
         *,
         asset_id: str,
         horizon: str,
+        as_of: datetime | None = None,
     ) -> FactorFrameORM | None:
         """查询单标的最新因子结果。"""
 
@@ -2497,9 +2691,35 @@ class FactorFrameRepository:
             FactorFrameORM.asset_id == asset_id,
             FactorFrameORM.horizon == horizon,
         )
+        if as_of is not None:
+            statement = statement.where(FactorFrameORM.as_of <= as_of)
         return self.session.scalars(
             statement.order_by(FactorFrameORM.as_of.desc()).limit(1)
         ).one_or_none()
+
+    def list_latest_factor_frames(
+        self,
+        *,
+        asset_ids: Sequence[str],
+        horizon: str,
+        as_of: datetime,
+    ) -> list[FactorFrameORM]:
+        """批量读取决策时点之前每个资产的最新因子帧。"""
+
+        normalized_assets = tuple(sorted({str(item) for item in asset_ids if str(item)}))
+        if not normalized_assets:
+            return []
+        statement = (
+            select(FactorFrameORM)
+            .where(
+                FactorFrameORM.asset_id.in_(normalized_assets),
+                FactorFrameORM.horizon == horizon,
+                FactorFrameORM.as_of <= as_of,
+            )
+            .distinct(FactorFrameORM.asset_id)
+            .order_by(FactorFrameORM.asset_id, FactorFrameORM.as_of.desc())
+        )
+        return list(self.session.scalars(statement))
 
 
 class ScreeningRepository:
@@ -3970,6 +4190,53 @@ class PortfolioRepository:
             statement = statement.where(PositionORM.status == status)
         return list(
             self.session.scalars(statement.order_by(PositionORM.market, PositionORM.symbol))
+        )
+
+    def list_active_positions_by_owner(
+        self,
+        *,
+        owner_id: str,
+        market: str,
+    ) -> list[PositionORM]:
+        """一次查询用户指定市场的全部活跃持仓。"""
+
+        statement = (
+            select(PositionORM)
+            .join(PortfolioORM, PortfolioORM.portfolio_id == PositionORM.portfolio_id)
+            .where(
+                PortfolioORM.owner_id == owner_id,
+                PortfolioORM.status == "active",
+                PositionORM.status == "active",
+                PositionORM.market == market,
+            )
+            .order_by(PositionORM.portfolio_id, PositionORM.symbol)
+        )
+        return list(self.session.scalars(statement))
+
+    def list_positions_by_owner(
+        self,
+        *,
+        owner_id: str,
+        market: str,
+        status: str | None = "active",
+    ) -> list[PositionORM]:
+        """一次查询用户指定市场的持仓，可包含已关闭记录。"""
+
+        statement = (
+            select(PositionORM)
+            .join(PortfolioORM, PortfolioORM.portfolio_id == PositionORM.portfolio_id)
+            .where(
+                PortfolioORM.owner_id == owner_id,
+                PortfolioORM.status == "active",
+                PositionORM.market == market,
+            )
+        )
+        if status is not None:
+            statement = statement.where(PositionORM.status == status)
+        return list(
+            self.session.scalars(
+                statement.order_by(PositionORM.portfolio_id, PositionORM.symbol)
+            )
         )
 
     def list_portfolio_snapshots(

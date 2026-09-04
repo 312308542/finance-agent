@@ -57,6 +57,7 @@ JOB_TYPES = {
     "data_quality_refresh",
     "technical_screening_refresh",
     "structural_methodology_refresh",
+    "decision_context_refresh",
     "trigger_evaluation",
     "agent_loop_consume",
     "high_risk_reviews",
@@ -143,6 +144,7 @@ class ScheduledJobState:
     queued: bool = False
     last_success_generation: int | None = None
     last_triggered_dependency_generation: int | None = None
+    pending_generation: int | None = None
 
 
 def is_market_universe_job(job: BaseDataSchedulerJob) -> bool:
@@ -444,6 +446,7 @@ def trigger_after_success_dependents(
             continue
         state.next_run_at = triggered_at
         state.last_triggered_dependency_generation = completion_generation
+        state.pending_generation = completion_generation
 
 
 def dependency_is_satisfied(
@@ -469,23 +472,44 @@ def dependency_is_satisfied(
     if job.dependency_mode == "any_of":
         return any(item is not None for item in generations)
     if job.dependency_mode == "barrier":
-        if generation is None:
-            return False
-        return all(item == generation for item in generations)
+        if generation is not None:
+            return all(item == generation for item in generations)
+        # due-filter 在每轮扫描时没有单独的完成代次参数；当所有依赖已经
+        # 记录同一代次时可以安全推断 barrier 已满足，避免任务永久阻塞。
+        return bool(generations) and generations[0] is not None and all(
+            item == generations[0] for item in generations
+        )
     return all(item is not None for item in generations)
+
+
+def scheduler_job_outcome_status(job: BaseDataSchedulerJob, summary: Any) -> str:
+    """把需要硬质量门控的分析结果转换为调度终态。"""
+
+    if job.job_type != "decision_context_refresh" or not isinstance(summary, Mapping):
+        return "executed"
+    quality = str(summary.get("quality_status") or summary.get("status") or "")
+    return "executed" if quality == "available" else "blocked"
 
 
 def filter_due_states_by_dependencies(
     due_states: list[ScheduledJobState],
     *,
     all_states: Sequence[ScheduledJobState],
+    generation: int | None = None,
 ) -> tuple[list[ScheduledJobState], list[ScheduledJobState]]:
     """将依赖未满足的到期任务暂缓到下一轮。"""
 
     runnable: list[ScheduledJobState] = []
     blocked: list[ScheduledJobState] = []
     for state in due_states:
-        if dependency_is_satisfied(state.job, all_states):
+        effective_generation = (
+            generation if generation is not None else state.pending_generation
+        )
+        if dependency_is_satisfied(
+            state.job,
+            all_states,
+            generation=effective_generation,
+        ):
             runnable.append(state)
         else:
             blocked.append(state)
@@ -996,6 +1020,7 @@ class BaseDataScheduler(RecoverySchedulerMixin):
         run_data_quality_refresh_func: Callable[..., JsonDict] | None = None,
         run_technical_screening_refresh_func: Callable[..., JsonDict] | None = None,
         run_structural_methodology_refresh_func: Callable[..., JsonDict] | None = None,
+        run_decision_context_refresh_func: Callable[..., JsonDict] | None = None,
         run_trigger_evaluation_func: Callable[..., JsonDict] | None = None,
         run_agent_loop_consume_func: Callable[..., JsonDict] | None = None,
         run_high_risk_reviews_func: Callable[..., JsonDict] | None = None,
@@ -1019,6 +1044,7 @@ class BaseDataScheduler(RecoverySchedulerMixin):
         self._run_data_quality_refresh = run_data_quality_refresh_func
         self._run_technical_screening_refresh = run_technical_screening_refresh_func
         self._run_structural_methodology_refresh = run_structural_methodology_refresh_func
+        self._run_decision_context_refresh = run_decision_context_refresh_func
         self._run_trigger_evaluation = run_trigger_evaluation_func
         self._run_agent_loop_consume = run_agent_loop_consume_func
         self._run_high_risk_reviews = run_high_risk_reviews_func
@@ -1835,12 +1861,14 @@ class BaseDataScheduler(RecoverySchedulerMixin):
                             completed_at=state.last_run_at,
                         )
                         if summary.get("status") == "executed":
-                            state.last_success_generation = cycles
+                            success_generation = state.pending_generation or cycles
+                            state.last_success_generation = success_generation
+                            state.pending_generation = None
                             trigger_after_success_dependents(
                                 states,
                                 completed_job_name=state.job.name,
                                 triggered_at=state.last_run_at,
-                                completion_generation=cycles,
+                                completion_generation=success_generation,
                             )
                         executed.append(
                             summary
@@ -2078,6 +2106,8 @@ class BaseDataScheduler(RecoverySchedulerMixin):
             planned["technical_screening_args"] = self.build_technical_screening_refresh_kwargs(job)
         elif job.job_type == "structural_methodology_refresh":
             planned["structural_methodology_args"] = self.build_structural_methodology_refresh_kwargs(job)
+        elif job.job_type == "decision_context_refresh":
+            planned["decision_context_args"] = self.build_decision_context_refresh_kwargs(job)
         elif job.job_type == "trigger_evaluation":
             planned["trigger_evaluation_args"] = self.build_trigger_evaluation_kwargs(job)
         elif job.job_type == "agent_loop_consume":
@@ -2218,15 +2248,16 @@ class BaseDataScheduler(RecoverySchedulerMixin):
                     )
                 return failed
 
+            outcome_status = scheduler_job_outcome_status(job, summary)
             executed = planned | {
                 "dry_run": False,
-                "status": "executed",
+                "status": outcome_status,
                 "attempt_count": attempt,
                 "summary": summary,
                 "finished_at": datetime.now(tz=UTC).isoformat(),
             }
             self.emit_event(
-                "job_success",
+                "job_success" if outcome_status == "executed" else "job_blocked",
                 job=job.name,
                 attempt=attempt,
                 summary=compact_collection_summary(summary),
@@ -2234,16 +2265,17 @@ class BaseDataScheduler(RecoverySchedulerMixin):
             self.write_status(
                 state="running",
                 last_job=job.name,
-                last_job_status="executed",
+                last_job_status=outcome_status,
                 last_job_at=datetime.now(tz=UTC),
                 last_error=None,
             )
             logger.info(
-                "调度任务完成 job=%s job_type=%s market=%s attempt=%s status=executed summary=%s",
+                "调度任务完成 job=%s job_type=%s market=%s attempt=%s status=%s summary=%s",
                 job.name,
                 job.job_type,
                 job.market,
                 attempt,
+                outcome_status,
                 compact_collection_summary(summary),
             )
             if progress is not None:
@@ -2281,6 +2313,9 @@ class BaseDataScheduler(RecoverySchedulerMixin):
         if job.job_type == "structural_methodology_refresh":
             kwargs = self.build_structural_methodology_refresh_kwargs(job)
             return self.run_structural_methodology_refresh(**kwargs)
+        if job.job_type == "decision_context_refresh":
+            kwargs = self.build_decision_context_refresh_kwargs(job)
+            return self.run_decision_context_refresh(**kwargs)
         if job.job_type == "trigger_evaluation":
             kwargs = self.build_trigger_evaluation_kwargs(job)
             return self.run_trigger_evaluation(**kwargs)
@@ -2441,6 +2476,25 @@ class BaseDataScheduler(RecoverySchedulerMixin):
             params["recommendation_intake_limit"] = int(value)
         return params
 
+    def build_decision_context_refresh_kwargs(self, job: BaseDataSchedulerJob) -> JsonDict:
+        """把收盘决策上下文任务配置转换为刷新参数。"""
+
+        if job.job_type != "decision_context_refresh":
+            raise ValueError(f"{job.name} 不是决策上下文任务")
+        context_type = str(job.params.get("context_type") or "").strip()
+        if context_type not in {"market", "sector"}:
+            raise ValueError(f"{job.name}.params.context_type 必须是 market 或 sector")
+        market = str(job.params.get("market") or job.market or "").strip()
+        universe_id = str(job.params.get("universe_id") or "").strip()
+        if not market or not universe_id:
+            raise ValueError(f"{job.name} 缺少 market 或 universe_id")
+        return {
+            "context_type": context_type,
+            "market": market,
+            "universe_id": universe_id,
+            "lookback_bars": int(job.params.get("lookback_bars") or 61),
+        }
+
     def build_data_quality_refresh_kwargs(self, job: BaseDataSchedulerJob) -> JsonDict:
         """把数据质量任务配置转换为刷新服务参数。"""
 
@@ -2522,6 +2576,9 @@ class BaseDataScheduler(RecoverySchedulerMixin):
             ),
             "lookback_bars": int(job.params.get("lookback_bars") or 250),
         }
+        timeframes = parse_string_list(job.params.get("timeframes"))
+        if timeframes:
+            params["timeframes"] = timeframes
         if job.limit is not None:
             params["limit"] = int(job.limit)
         for key in (
@@ -2712,7 +2769,7 @@ class BaseDataScheduler(RecoverySchedulerMixin):
             return self._run_recommendation_pipeline(**kwargs)
 
         auto_sync_watchlist = bool(kwargs.pop("auto_sync_watchlist", False))
-        owner_id = str(kwargs.pop("owner_id", "") or "").strip()
+        owner_id = str(kwargs.get("owner_id", "") or "").strip()
         watchlist_id = str(kwargs.pop("watchlist_id", "") or "").strip()
         recommendation_intake_limit = int(kwargs.pop("recommendation_intake_limit", 0) or 0)
 
@@ -2735,6 +2792,21 @@ class BaseDataScheduler(RecoverySchedulerMixin):
                     limit=recommendation_intake_limit or int(kwargs.get("limit") or 20),
                 )
         return payload
+
+    def run_decision_context_refresh(self, **kwargs: Any) -> JsonDict:
+        """刷新收盘市场状态或热门板块快照。"""
+
+        if self._run_decision_context_refresh is not None:
+            return self._run_decision_context_refresh(**kwargs)
+
+        from finance_agent.application.closing_decision_context_service import (
+            ClosingDecisionContextService,
+        )
+        from finance_agent.storage.db import create_session_factory, session_scope
+
+        session_factory = create_session_factory()
+        with session_scope(session_factory) as session:
+            return ClosingDecisionContextService(session).refresh(**kwargs)
 
     def run_universe_merge(self, **kwargs: Any) -> JsonDict:
         """执行候选池合并任务。"""
@@ -3635,6 +3707,7 @@ def as_job_group_choice(
         "data_quality_refresh",
         "technical_screening_refresh",
         "structural_methodology_refresh",
+        "decision_context_refresh",
         "trigger_evaluation",
         "high_risk_reviews",
         "reviews_due",

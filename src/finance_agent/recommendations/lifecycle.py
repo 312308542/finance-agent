@@ -106,6 +106,8 @@ class LifecycleEvidence:
     structure_invalidated: bool
     high_quality_intraday_breakout: bool
     ordinary_volatility: bool
+    held: bool
+    data_stale: bool
     sold: bool
     cooldown_until: date | None
     new_independent_catalyst: bool
@@ -171,7 +173,11 @@ class RecommendationLifecycleEngine:
             previous,
             evidence,
         )
-        self.ensure_legal_transition(from_state, to_state)
+        self.ensure_legal_transition(
+            from_state,
+            to_state,
+            execution_registered=evidence.held,
+        )
 
         reason_codes = _unique_codes((*reasons, *evidence.reason_codes))
         state_id = previous.state_id if previous is not None else _stable_id(
@@ -189,6 +195,11 @@ class RecommendationLifecycleEngine:
             evidence.decision_snapshot_id,
             evidence.as_of.isoformat(),
         )
+        transition_payload = dict(evidence.payload)
+        if to_state in {"setup_confirming", "buy_ready"} and evidence.eligible:
+            transition_payload["last_valid_trade_date"] = evidence.trade_date.isoformat()
+        if to_state in {"active", "weakening"}:
+            transition_payload["last_active_trade_date"] = evidence.trade_date.isoformat()
         return RecommendationTransition(
             event_id=event_id,
             state_id=state_id,
@@ -204,13 +215,15 @@ class RecommendationLifecycleEngine:
             consecutive_valid_closes=valid_closes,
             active_days=active_days,
             cooldown_until=cooldown_until,
-            payload=dict(evidence.payload),
+            payload=transition_payload,
         )
 
     @staticmethod
     def ensure_legal_transition(
         from_state: RecommendationStateName | None,
         to_state: RecommendationStateName,
+        *,
+        execution_registered: bool = False,
     ) -> None:
         """拒绝绕过生命周期约束的状态跳转。"""
 
@@ -218,6 +231,12 @@ class RecommendationLifecycleEngine:
             allowed = frozenset({"discovered", "watch", "setup_confirming", "buy_ready"})
         else:
             allowed = LEGAL_STATE_TRANSITIONS[from_state]
+        if (
+            execution_registered
+            and to_state == "active"
+            and from_state in {None, "discovered", "watch", "setup_confirming", "buy_ready"}
+        ):
+            return
         if to_state not in allowed:
             raise ValueError(f"非法的推荐生命周期迁移: {from_state!r} -> {to_state!r}")
 
@@ -256,6 +275,15 @@ class RecommendationLifecycleEngine:
         previous_valid_closes = previous.consecutive_valid_closes if previous else 0
         previous_active_days = previous.active_days if previous else 0
         previous_cooldown = previous.cooldown_until if previous else None
+        previous_active_date = str(
+            (previous.payload if previous is not None else {}).get(
+                "last_active_trade_date",
+                "",
+            )
+        )
+        next_active_days = previous_active_days + (
+            0 if previous_active_date == evidence.trade_date.isoformat() else 1
+        )
         entry_eligible = evidence.eligible and evidence.alpha_score >= evidence.entry_threshold
         retained = evidence.alpha_score >= evidence.retention_threshold
 
@@ -308,6 +336,24 @@ class RecommendationLifecycleEngine:
                 )
             return "watch", ("structure_invalidated",), 0, 0, None
 
+        if evidence.held and current not in {"active", "weakening", "exit_pending"}:
+            return (
+                "active",
+                ("position_execution_registered",),
+                previous_valid_closes,
+                max(previous_active_days, 1),
+                None,
+            )
+
+        if evidence.data_stale and current is not None:
+            return (
+                current,
+                ("stale_evidence_state_retained",),
+                previous_valid_closes,
+                previous_active_days,
+                previous_cooldown,
+            )
+
         if current == "active":
             if retained:
                 reasons = ["retention_threshold_met"]
@@ -317,14 +363,14 @@ class RecommendationLifecycleEngine:
                     "active",
                     tuple(reasons),
                     previous_valid_closes,
-                    previous_active_days + 1,
+                    next_active_days,
                     None,
                 )
             return (
                 "weakening",
                 ("retention_threshold_missed",),
                 previous_valid_closes,
-                previous_active_days + 1,
+                next_active_days,
                 None,
             )
 
@@ -334,14 +380,14 @@ class RecommendationLifecycleEngine:
                     "active",
                     ("retention_threshold_recovered",),
                     previous_valid_closes,
-                    previous_active_days + 1,
+                    next_active_days,
                     None,
                 )
             return (
                 "weakening",
                 ("retention_threshold_missed",),
                 previous_valid_closes,
-                previous_active_days + 1,
+                next_active_days,
                 None,
             )
 
@@ -367,6 +413,24 @@ class RecommendationLifecycleEngine:
 
         same_setup = previous is not None and evidence.setup_id == previous.setup_id
         if entry_eligible:
+            previous_valid_date = str(
+                (previous.payload if previous is not None else {}).get(
+                    "last_valid_trade_date",
+                    "",
+                )
+            )
+            if (
+                current == "setup_confirming"
+                and same_setup
+                and previous_valid_date == evidence.trade_date.isoformat()
+            ):
+                return (
+                    "setup_confirming",
+                    ("same_trade_date_confirmation_retained",),
+                    previous_valid_closes,
+                    0,
+                    None,
+                )
             valid_closes = previous_valid_closes + 1 if same_setup else 1
             if current == "buy_ready" or valid_closes >= 2:
                 return "buy_ready", ("two_valid_closes_confirmed",), valid_closes, 0, None

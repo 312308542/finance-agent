@@ -69,6 +69,7 @@ class StructuralMethodologyRefreshService:
         *,
         market: str = "ashare",
         timeframe: str = "1d",
+        timeframes: Sequence[str] | None = None,
         engines: Sequence[str] | None = None,
         universe_ids: Sequence[str] | None = None,
         lookback_bars: int = 250,
@@ -88,6 +89,15 @@ class StructuralMethodologyRefreshService:
             raise ValueError("结构方法论刷新需要可用的 K 线仓储和指标仓储。")
         normalized_market = str(market).strip()
         normalized_timeframe = str(timeframe).strip() or "1d"
+        selected_timeframes = tuple(
+            dict.fromkeys(
+                str(item).strip()
+                for item in (timeframes or (normalized_timeframe,))
+                if str(item).strip()
+            )
+        )
+        if not selected_timeframes:
+            raise ValueError("结构方法论 timeframes 不能为空。")
         selected_engines = normalize_engines(engines)
         normalized_lookback = max(int(lookback_bars), 1)
         adapter = StructuralMethodologyAdapter(
@@ -114,35 +124,36 @@ class StructuralMethodologyRefreshService:
             symbol = str(asset.symbol)
             asset_market = str(getattr(asset, "market", normalized_market) or normalized_market)
             try:
-                bars = self.market_data.list_recent_bars(
-                    asset_id=asset_id,
-                    timeframe=normalized_timeframe,
-                    limit=normalized_lookback,
-                    source=source,
-                )
-                price_bars = [to_structural_price_bar(bar) for bar in bars]
-                for engine, payload in compute_engine_payloads(
-                    adapter=adapter,
-                    engines=selected_engines,
-                    asset_id=asset_id,
-                    symbol=symbol,
-                    market=asset_market,
-                    timeframe=normalized_timeframe,
-                    bars=price_bars,
-                    as_of=as_of,
-                ):
-                    self.persist_payload(
+                for selected_timeframe in selected_timeframes:
+                    bars = self.load_bars(
+                        asset_id=asset_id,
+                        timeframe=selected_timeframe,
+                        limit=normalized_lookback,
+                        source=source,
+                    )
+                    price_bars = [to_structural_price_bar(bar) for bar in bars]
+                    for engine, payload in compute_engine_payloads(
+                        adapter=adapter,
+                        engines=selected_engines,
                         asset_id=asset_id,
                         symbol=symbol,
                         market=asset_market,
-                        timeframe=normalized_timeframe,
-                        payload=payload,
+                        timeframe=selected_timeframe,
+                        bars=price_bars,
                         as_of=as_of,
-                    )
-                    written_count += 1
-                    engine_counts[engine] += 1
-                    status = str(payload.get("status") or "unknown")
-                    status_counts[status] = status_counts.get(status, 0) + 1
+                    ):
+                        self.persist_payload(
+                            asset_id=asset_id,
+                            symbol=symbol,
+                            market=asset_market,
+                            timeframe=selected_timeframe,
+                            payload=payload,
+                            as_of=as_of,
+                        )
+                        written_count += 1
+                        engine_counts[engine] += 1
+                        status = str(payload.get("status") or "unknown")
+                        status_counts[status] = status_counts.get(status, 0) + 1
             except Exception as exc:  # noqa: BLE001 - 批量任务需要单标的隔离失败。
                 errors.append(
                     {
@@ -155,6 +166,7 @@ class StructuralMethodologyRefreshService:
             "status": "available" if assets else "unavailable",
             "market": normalized_market,
             "timeframe": normalized_timeframe,
+            "timeframes": list(selected_timeframes),
             "asset_count": len(assets),
             "written_count": written_count,
             "engine_counts": engine_counts,
@@ -163,6 +175,39 @@ class StructuralMethodologyRefreshService:
             "errors": errors[:20],
             "engine_version": ENGINE_VERSION,
         }
+
+    def load_bars(
+        self,
+        *,
+        asset_id: str,
+        timeframe: str,
+        limit: int,
+        source: str | None,
+    ) -> list[Any]:
+        """日线读取长期表，分钟/小时线读取独立盘中表。"""
+
+        if self.market_data is None:
+            return []
+        if timeframe in {"1m", "5m", "15m", "60m", "1h"} and hasattr(
+            self.market_data,
+            "list_recent_intraday_bars",
+        ):
+            return list(
+                self.market_data.list_recent_intraday_bars(
+                    asset_id=asset_id,
+                    timeframe=timeframe,
+                    limit=limit,
+                    source=source,
+                )
+            )
+        return list(
+            self.market_data.list_recent_bars(
+                asset_id=asset_id,
+                timeframe=timeframe,
+                limit=limit,
+                source=source,
+            )
+        )
 
     def list_candidate_assets(
         self,
@@ -221,7 +266,7 @@ class StructuralMethodologyRefreshService:
             input_end_at=input_end_at,
             bar_count=int(payload.get("bar_count") or 0),
             status=str(payload.get("status") or "unknown"),
-            as_of=as_of,
+            as_of=input_end_at,
             payload=payload,
         )
 
@@ -410,7 +455,10 @@ def to_structural_price_bar(bar: Any) -> StructuralPriceBar:
     """把标准 K 线 ORM 或测试替身转换为结构引擎输入。"""
 
     return StructuralPriceBar(
-        timestamp=parse_payload_datetime(bar.timestamp, fallback=datetime.now(tz=UTC)),
+        timestamp=parse_payload_datetime(
+            getattr(bar, "end_timestamp", None) or bar.timestamp,
+            fallback=datetime.now(tz=UTC),
+        ),
         open=to_float(bar.open),
         high=to_float(bar.high),
         low=to_float(bar.low),

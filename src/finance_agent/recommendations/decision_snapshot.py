@@ -142,6 +142,8 @@ class DecisionSnapshotBuilder:
         normalized_assets, asset_reasons = _normalize_assets(
             inputs.assets,
             previous_assets=inputs.previous_assets,
+            decision_as_of=as_of,
+            maximum_skew=self.maximum_skew,
         )
         quality_status: Literal["available", "partial"] = (
             "partial" if asset_reasons else "available"
@@ -227,6 +229,8 @@ def _normalize_assets(
     assets: Sequence[Mapping[str, Any]],
     *,
     previous_assets: Mapping[str, Mapping[str, Any]],
+    decision_as_of: datetime,
+    maximum_skew: timedelta,
 ) -> tuple[tuple[JsonDict, ...], tuple[str, ...]]:
     normalized: list[JsonDict] = []
     all_reasons: list[str] = []
@@ -240,6 +244,21 @@ def _normalize_assets(
             reasons.append("symbol_missing")
         if quality != "available":
             reasons.append(f"asset_quality_{quality or 'missing'}")
+        asset_as_of_raw = row.get("as_of")
+        if asset_as_of_raw is not None:
+            parsed_asset_as_of = (
+                datetime.fromisoformat(asset_as_of_raw.replace("Z", "+00:00"))
+                if isinstance(asset_as_of_raw, str)
+                else asset_as_of_raw
+            )
+            asset_as_of = normalize_datetime(
+                parsed_asset_as_of,
+                field_name=f"assets[{asset_id}].as_of",
+            )
+            if asset_as_of > decision_as_of:
+                reasons.append("asset_future")
+            elif decision_as_of - asset_as_of > maximum_skew:
+                reasons.append("asset_stale")
         if reasons:
             previous = previous_assets.get(asset_id)
             if previous is not None:

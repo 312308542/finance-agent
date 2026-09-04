@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
+from finance_agent.indicators.structural_methodology_adapters import (
+    StructuralMethodologyAdapter,
+    StructuralPriceBar,
+)
+from finance_agent.recommendations.service import compact_decision_structure_frames
 from finance_agent.recommendations.structural_decision import StructuralDecisionEngine
 
 
@@ -126,3 +133,102 @@ def test_price_below_invalidation_returns_invalidated() -> None:
     assert verdict.status == "invalidated"
     assert verdict.buy_allowed is False
     assert verdict.reason_codes == ("invalidation_price_breached",)
+
+
+def test_real_swing_and_smc_payloads_produce_auditable_entry_and_risk_levels() -> None:
+    prices = [10.0, 15.0, 12.0, 18.0, 15.0, 21.0, 18.0, 24.0, 22.0, 24.5]
+    bars = [
+        StructuralPriceBar(
+            timestamp=datetime(2026, 8, 1, tzinfo=UTC) + timedelta(hours=index),
+            open=price - 0.1,
+            high=price + 0.2,
+            low=price - 0.2,
+            close=price,
+            volume=1000 + index * 10,
+        )
+        for index, price in enumerate(prices)
+    ]
+    adapter = StructuralMethodologyAdapter(swing_window=1)
+    daily_swings = adapter.compute_swings(
+        asset_id="ashare:600519",
+        symbol="600519",
+        market="ashare",
+        timeframe="1d",
+        bars=bars,
+    )
+    hourly_smc = adapter.compute_smc(
+        asset_id="ashare:600519",
+        symbol="600519",
+        market="ashare",
+        timeframe="60m",
+        bars=bars,
+    )
+
+    verdict = StructuralDecisionEngine().evaluate(
+        frames=(daily_swings, hourly_smc),
+        current_price=Decimal("24.5"),
+    )
+
+    assert verdict.status == "confirmed"
+    assert verdict.direction == "bullish"
+    assert verdict.entry_zone is not None
+    assert verdict.invalidation_price == Decimal("21.8")
+    assert verdict.target_price is not None
+    assert verdict.reward_risk_ratio is not None
+    assert verdict.reward_risk_ratio >= 2
+
+    compacted = compact_decision_structure_frames(
+        (
+            SimpleNamespace(
+                horizon=daily_swings["schema_version"],
+                timeframe="1d",
+                status=daily_swings["status"],
+                as_of=datetime.fromisoformat(daily_swings["input_end_at"]),
+                payload=daily_swings,
+            ),
+            SimpleNamespace(
+                horizon=hourly_smc["schema_version"],
+                timeframe="60m",
+                status=hourly_smc["status"],
+                as_of=datetime.fromisoformat(hourly_smc["input_end_at"]),
+                payload=hourly_smc,
+            ),
+        )
+    )
+    compacted_verdict = StructuralDecisionEngine().evaluate(
+        frames=compacted,
+        current_price=Decimal("24.5"),
+    )
+    assert compacted_verdict.status == "confirmed"
+
+    extended_bars = [
+        *bars,
+        StructuralPriceBar(
+            timestamp=bars[-1].timestamp + timedelta(hours=1),
+            open=24.4,
+            high=24.8,
+            low=24.3,
+            close=24.6,
+            volume=1200,
+        ),
+    ]
+    next_daily = adapter.compute_swings(
+        asset_id="ashare:600519",
+        symbol="600519",
+        market="ashare",
+        timeframe="1d",
+        bars=extended_bars,
+    )
+    next_hourly = adapter.compute_smc(
+        asset_id="ashare:600519",
+        symbol="600519",
+        market="ashare",
+        timeframe="60m",
+        bars=extended_bars,
+    )
+    next_verdict = StructuralDecisionEngine().evaluate(
+        frames=(next_daily, next_hourly),
+        current_price=Decimal("24.6"),
+    )
+    assert next_verdict.status == "confirmed"
+    assert next_verdict.invalidation_price == verdict.invalidation_price

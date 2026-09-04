@@ -69,22 +69,21 @@ def test_default_scheduler_plan_excludes_crypto_jobs() -> None:
     assert all("crypto" not in name for name in job_names)
 
 
-def test_personal_ashare_recommendation_job_exports_three_strategy_observation() -> None:
-    """默认 A 股推荐任务应复用原任务并启用三策略前向观察。"""
+def test_personal_ashare_recommendation_job_exports_adaptive_strategy_observation() -> None:
+    """默认 A 股推荐任务应切换到自适应策略并保留前向观察。"""
 
     payload = export_scheduler_payload(build_preset_config())
     jobs = {str(job["name"]): job for job in payload["jobs"]}
     recommendation = jobs["analytics.recommendations.ashare.all_a"]
 
     # 默认触发链路已改为 Webhook 唤醒 Hermes，不再导出 3 个内部 Agent 消费任务。
-    assert len(payload["jobs"]) == 33
+    assert len(payload["jobs"]) == 35
     assert all("crypto" not in name for name in jobs)
     assert recommendation["job_type"] == "recommendation_pipeline"
     assert recommendation["params"]["strategy_ids"] == [
-        "strategy:ashare:short_swing",
-        "strategy:ashare:theme_momentum",
-        "strategy:ashare:short_theme_mixed_v1",
+        "strategy:ashare:adaptive_v1",
     ]
+    assert recommendation["params"]["strategy_id"] == "strategy:ashare:adaptive_v1"
     assert recommendation["params"]["observation_enabled"] is True
     assert recommendation["params"]["round_trip_cost"] == 0.003
 
@@ -216,7 +215,7 @@ def test_scheduler_payload_registers_real_universe_recommendation_jobs() -> None
         "universe:avoid:ashare:system"
     )
     assert jobs["analytics.recommendations.ashare.all_a"]["params"]["strategy_id"] == (
-        "strategy:ashare:short_swing"
+        "strategy:ashare:adaptive_v1"
     )
     assert jobs["analytics.recommendations.crypto_spot.binance"]["params"]["universe_id"] == (
         "universe:base:crypto:spot:binance"
@@ -665,8 +664,11 @@ def test_ashare_analytics_jobs_run_after_close_final_not_midday_partial() -> Non
     ashare_recommendation = jobs["analytics.recommendations.ashare.all_a"]
     assert ashare_recommendation["schedule_type"] == "after_success"
     assert ashare_recommendation["depends_on"] == [
-        "analytics.universe.merge.ashare.recommendation"
+        "analytics.snapshot.ashare.close",
+        "analytics.sector.ashare.daily",
+        "analytics.structural.ashare.daily",
     ]
+    assert ashare_recommendation["dependency_mode"] == "barrier"
     assert not [
         job
         for job in jobs.values()
@@ -695,7 +697,9 @@ def test_scheduler_payload_registers_technical_screening_jobs() -> None:
 
     recommendation_job = jobs["analytics.recommendations.ashare.all_a"]
     assert recommendation_job["depends_on"] == [
-        "analytics.universe.merge.ashare.recommendation"
+        "analytics.snapshot.ashare.close",
+        "analytics.sector.ashare.daily",
+        "analytics.structural.ashare.daily",
     ]
 
 

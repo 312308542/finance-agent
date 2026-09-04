@@ -736,6 +736,7 @@ def export_scheduler_payload(config: DataSyncConfig) -> JsonDict:
         *build_technical_screening_scheduler_jobs(config),
         *build_structural_methodology_scheduler_jobs(config),
         *build_universe_preparation_scheduler_jobs(config),
+        *build_decision_context_scheduler_jobs(config),
         *build_recommendation_scheduler_jobs(config),
         *build_backtest_scheduler_jobs(config),
         *build_trigger_scheduler_jobs(config),
@@ -943,12 +944,8 @@ def build_recommendation_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict
                     min_indicator_coverage_ratio=0.7,
                     min_factor_coverage_ratio=0.5,
                     min_available_factor_groups=3,
-                    strategy_id="strategy:ashare:short_swing",
-                    strategy_ids=[
-                        "strategy:ashare:short_swing",
-                        "strategy:ashare:theme_momentum",
-                        "strategy:ashare:short_theme_mixed_v1",
-                    ],
+                    strategy_id="strategy:ashare:adaptive_v1",
+                    strategy_ids=["strategy:ashare:adaptive_v1"],
                     observation_enabled=True,
                     round_trip_cost=0.003,
                     avoid_universe_id="universe:avoid:ashare:system",
@@ -957,7 +954,12 @@ def build_recommendation_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict
                     watchlist_id="watchlist:default-owner:ashare:research",
                     recommendation_intake_limit=20,
                     schedule_type="after_success",
-                    depends_on=["analytics.universe.merge.ashare.recommendation"],
+                    depends_on=[
+                        "analytics.snapshot.ashare.close",
+                        "analytics.sector.ashare.daily",
+                        "analytics.structural.ashare.daily",
+                    ],
+                    dependency_mode="barrier",
                 )
             )
         elif market == "crypto_spot":
@@ -1003,6 +1005,56 @@ def build_recommendation_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict
                 )
             )
     return jobs
+
+
+def build_decision_context_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
+    """生成收盘市场状态和热门板块事实任务。"""
+
+    if not config.enabled:
+        return []
+    market_config = config.markets.get("ashare")
+    if market_config is None or not market_config.enabled:
+        return []
+    return [
+        {
+            "name": "analytics.snapshot.ashare.close",
+            "job_type": "decision_context_refresh",
+            "group": "analytics",
+            "enabled": True,
+            "interval_seconds": 0,
+            "market": "ashare",
+            "schedule_type": "after_success",
+            "depends_on": ["ashare.bars.1d.close_final"],
+            "params": {
+                "sync_task_type": "analytics.decision_context.market",
+                "context_type": "market",
+                "market": "ashare",
+                "universe_id": "universe:base:ashare:p0:all_a",
+                "lookback_bars": 61,
+            },
+        },
+        {
+            "name": "analytics.sector.ashare.daily",
+            "job_type": "decision_context_refresh",
+            "group": "analytics",
+            "enabled": True,
+            "interval_seconds": 0,
+            "market": "ashare",
+            "schedule_type": "after_success",
+            "depends_on": [
+                "analytics.universe.merge.ashare.recommendation",
+                "analytics.snapshot.ashare.close",
+            ],
+            "dependency_mode": "barrier",
+            "params": {
+                "sync_task_type": "analytics.decision_context.sector",
+                "context_type": "sector",
+                "market": "ashare",
+                "universe_id": "universe:merged:ashare:recommendation",
+                "lookback_bars": 5,
+            },
+        },
+    ]
 
 
 def build_backtest_scheduler_jobs(config: DataSyncConfig) -> list[JsonDict]:
@@ -1180,11 +1232,16 @@ def build_structural_methodology_scheduler_jobs(config: DataSyncConfig) -> list[
             "limit": min(market_config.batch_size, 200),
             "market": "ashare",
             "schedule_type": "after_success",
-            "depends_on": ["ashare.bars.1d.close_final"],
+            "depends_on": [
+                "analytics.universe.merge.ashare.recommendation",
+                "analytics.snapshot.ashare.close",
+            ],
+            "dependency_mode": "barrier",
             "params": {
                 "sync_task_type": "analytics.structural_methodology",
                 "market": "ashare",
                 "timeframe": timeframe,
+                "timeframes": [timeframe, "60m"],
                 "engines": ["swings", "smc", "harmonic", "elliott", "ichimoku"],
                 "universe_ids": ["universe:merged:ashare:recommendation"],
                 "lookback_bars": 250,
@@ -1367,6 +1424,7 @@ def build_recommendation_scheduler_job(
     recommendation_intake_limit: int | None = None,
     schedule_type: str = "interval",
     depends_on: list[str] | None = None,
+    dependency_mode: str | None = None,
 ) -> JsonDict:
     """生成单个推荐流水线调度任务。"""
 
@@ -1407,6 +1465,8 @@ def build_recommendation_scheduler_job(
         job["schedule_type"] = schedule_type
     if depends_on:
         job["depends_on"] = depends_on
+    if dependency_mode:
+        job["dependency_mode"] = dependency_mode
     return job
 
 
