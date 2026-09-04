@@ -67,10 +67,33 @@ class SqlAlchemySchedulerRuntimeTaskSource:
         return list(self.session.scalars(statement))
 
     def recent_terminal_tasks(self) -> list[SchedulerTaskRunORM]:
+        ranked_task_ids = (
+            select(
+                SchedulerTaskRunORM.task_id.label("task_id"),
+                func.row_number()
+                .over(
+                    partition_by=SchedulerTaskRunORM.job_name,
+                    order_by=(
+                        SchedulerTaskRunORM.updated_at.desc(),
+                        SchedulerTaskRunORM.task_id.desc(),
+                    ),
+                )
+                .label("definition_rank"),
+            )
+            .where(SchedulerTaskRunORM.status.in_(TERMINAL_TASK_STATUSES))
+            .subquery()
+        )
         statement = (
             select(SchedulerTaskRunORM)
-            .where(SchedulerTaskRunORM.status.in_(TERMINAL_TASK_STATUSES))
-            .order_by(SchedulerTaskRunORM.updated_at.desc())
+            .join(
+                ranked_task_ids,
+                SchedulerTaskRunORM.task_id == ranked_task_ids.c.task_id,
+            )
+            .where(ranked_task_ids.c.definition_rank == 1)
+            .order_by(
+                SchedulerTaskRunORM.updated_at.desc(),
+                SchedulerTaskRunORM.task_id.desc(),
+            )
             .limit(self.terminal_limit)
         )
         return list(self.session.scalars(statement))
@@ -232,15 +255,32 @@ class SchedulerRuntimeReporter:
 
 
 def _deduplicate_tasks(tasks: list[SchedulerTaskRunORM]) -> list[SchedulerTaskRunORM]:
-    seen: set[str] = set()
-    result: list[SchedulerTaskRunORM] = []
+    definitions: dict[str, SchedulerTaskRunORM] = {}
     for task in tasks:
-        task_id = str(task.task_id)
-        if task_id in seen:
-            continue
-        seen.add(task_id)
-        result.append(task)
-    return result
+        definition_key = str(task.job_name or task.task_id)
+        current = definitions.get(definition_key)
+        if current is None or _definition_task_rank(task) > _definition_task_rank(current):
+            definitions[definition_key] = task
+    return list(definitions.values())
+
+
+def _definition_task_rank(task: SchedulerTaskRunORM) -> tuple[int, datetime, str]:
+    """活动实例优先；同状态下选择最近更新的实例。"""
+
+    status_rank = {
+        "running": 4,
+        "pending": 3,
+        "blocked": 2,
+        "scheduled": 1,
+    }
+    updated_at = getattr(task, "updated_at", None) or getattr(task, "created_at", None)
+    if not isinstance(updated_at, datetime):
+        updated_at = datetime.min.replace(tzinfo=UTC)
+    return (
+        status_rank.get(str(task.status), 0),
+        _as_utc(updated_at),
+        str(task.task_id),
+    )
 
 
 def _serialize_task(

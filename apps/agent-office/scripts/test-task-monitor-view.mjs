@@ -266,17 +266,26 @@ const persistentInstances = buildTaskMonitorModel({
     ],
     waiting: [],
   },
+}, {
+  fallbackWaiting: [
+    {
+      job_name: "ashare.events",
+      title: "A 股新闻公告同步",
+      status: "waiting",
+    },
+  ],
 });
 assert.deepEqual(
   persistentInstances.items.map((item) => [item.id, item.runId, item.progressRatio]),
   [
-    ["task:instance-1", "ashare.events:run-1", 0.33],
-    ["task:instance-2", "ashare.events:run-2", 0.4],
+    ["ashare.events", "ashare.events:run-1", 0.33],
   ],
 );
 assert.equal(persistentInstances.items[0].summary.completedItems, 66);
 assert.equal(persistentInstances.items[0].progressAvailable, true);
 assert.equal(taskProgressLabel(persistentInstances.items[0]), "33%");
+assert.match(appSource, /aria-label="任务定义"/);
+assert.match(appSource, /<h2>任务定义<\/h2>/);
 
 const atomicRunningTask = buildTaskMonitorModel({
   status: "ok",

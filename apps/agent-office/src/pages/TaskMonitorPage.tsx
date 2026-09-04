@@ -96,11 +96,11 @@ export function TaskMonitorPage({
 
   return (
     <section className="task-monitor-shell">
-      <aside className="task-monitor-list-panel" aria-label="任务队列">
+      <aside className="task-monitor-list-panel" aria-label="任务定义">
         <header className="task-monitor-list-head">
           <div className="task-monitor-list-title">
             <ListChecks size={18} />
-            <h2>任务队列</h2>
+            <h2>任务定义</h2>
           </div>
           <span className={`task-cache-dot tone-${connectionTone}`}>{model.cacheBackend || "cache"}</span>
         </header>

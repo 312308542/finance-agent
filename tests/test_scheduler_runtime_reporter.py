@@ -220,6 +220,66 @@ def test_snapshot_distinguishes_cumulative_counts_from_listed_rows() -> None:
     }
 
 
+def test_snapshot_projects_one_row_per_job_definition() -> None:
+    """同一任务定义只展示一条，活动实例优先于最近终态实例。"""
+
+    running = _task("same.active", "running", task_id="task:active")
+    completed_while_active = _task("same.active", "completed", task_id="task:active-old")
+    latest_failed = _task("same.terminal", "failed", task_id="task:terminal-latest")
+    older_completed = _task("same.terminal", "completed", task_id="task:terminal-old")
+    latest_completed = _task("same.latest", "completed", task_id="task:latest-completed")
+    older_failed = _task("same.latest", "failed", task_id="task:older-failed")
+    latest_failed.updated_at = NOW
+    older_completed.updated_at = NOW - timedelta(minutes=1)
+    latest_completed.updated_at = NOW
+    older_failed.updated_at = NOW - timedelta(minutes=1)
+
+    snapshot = SchedulerRuntimeReporter(
+        _TaskSource(
+            [
+                running,
+                completed_while_active,
+                latest_failed,
+                older_completed,
+                latest_completed,
+                older_failed,
+            ]
+        )
+    ).snapshot(now=NOW)
+
+    assert [(task["job_name"], task["task_id"], task["status"]) for task in snapshot.tasks] == [
+        ("same.active", "task:active", "running"),
+        ("same.terminal", "task:terminal-latest", "failed"),
+        ("same.latest", "task:latest-completed", "completed"),
+    ]
+    assert snapshot.task_list["listed_count"] == 3
+    assert snapshot.task_list["active_count"] == 1
+    assert snapshot.task_list["terminal_count"] == 2
+
+
+def test_recent_terminal_tasks_selects_latest_instance_per_job_definition() -> None:
+    """终态查询必须先按任务定义分组，再选择每组最近一次执行。"""
+
+    class _ScalarsSession:
+        statement: Any | None = None
+
+        def scalars(self, statement: Any) -> list[Any]:
+            self.statement = statement
+            return []
+
+    session = _ScalarsSession()
+
+    assert SqlAlchemySchedulerRuntimeTaskSource(session).recent_terminal_tasks() == []  # type: ignore[arg-type]
+    assert session.statement is not None
+    sql = str(session.statement.compile(dialect=postgresql.dialect()))
+    assert "row_number() OVER" in sql
+    assert "PARTITION BY scheduler_task_runs.job_name" in sql
+    assert (
+        "ORDER BY scheduler_task_runs.updated_at DESC, scheduler_task_runs.task_id DESC"
+        in sql
+    )
+
+
 def test_latest_config_digest_uses_latest_created_task_even_when_digest_is_null() -> None:
     """最新任务摘要为空时必须返回 unknown，不能回退到旧任务摘要。"""
 

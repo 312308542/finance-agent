@@ -1027,24 +1027,17 @@ function formatTime(value: string): string {
 }
 
 function dedupeTaskItems(items: TaskMonitorItem[]): TaskMonitorItem[] {
-  const concreteJobNames = new Set(
-    items
-      .filter((item) => item.id && item.id !== item.jobName)
-      .map((item) => item.jobName)
-      .filter(Boolean),
-  );
   const seen = new Set<string>();
-  return items.filter((item) => {
-    if (item.id === item.jobName && concreteJobNames.has(item.jobName)) {
-      return false;
-    }
-    const key = item.id || item.jobName;
+  const definitions: TaskMonitorItem[] = [];
+  items.forEach((item) => {
+    const key = item.jobName || item.id;
     if (!key || seen.has(key)) {
-      return false;
+      return;
     }
     seen.add(key);
-    return true;
+    definitions.push({ ...item, id: key });
   });
+  return definitions;
 }
 
 function countByStatus(items: TaskMonitorItem[], status: TaskMonitorStatus): number {
