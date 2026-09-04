@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from types import SimpleNamespace
 
+from finance_agent.recommendations.portfolio_construction import (
+    PortfolioCandidate,
+    PortfolioConstructionEngine,
+    PortfolioRiskBudget,
+)
 from finance_agent.recommendations.service import (
     RecommendationDecisionContext,
     build_recommendation_payload,
@@ -46,6 +52,34 @@ def test_recommendation_payload_includes_tradability_context_and_watch_reason() 
     assert payload["action"] == "watch"
     assert payload["tradability"]["blocking_level"] == "blocked"
     assert "当前可买入性受限：one_word_limit_up。" in payload["watch_conditions"]["conditions"]
+
+
+def test_portfolio_plan_does_not_buy_one_word_limit_up_candidate() -> None:
+    candidate = PortfolioCandidate(
+        asset_id="ashare:600519",
+        setup_id="setup:1",
+        sector_id="liquor",
+        price=Decimal("10"),
+        invalidation_price=Decimal("9.5"),
+        expected_net_return=0.08,
+        downside_risk=0.03,
+        confidence=0.85,
+        tradable=False,
+        tradability_reasons=("one_word_limit_up",),
+    )
+
+    plan = PortfolioConstructionEngine().allocate(
+        candidates=(candidate,),
+        positions=(),
+        budget=PortfolioRiskBudget(
+            equity=Decimal("100000"),
+            total_exposure=1.0,
+            per_position_risk=0.01,
+        ),
+    )
+
+    assert plan.orders == ()
+    assert plan.blocked_candidates[0].reason_codes == ("one_word_limit_up",)
 
 
 def score_row(*, total_score: int) -> SimpleNamespace:
