@@ -4,14 +4,25 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy.dialects import postgresql
 
+from finance_agent.storage.orm import RealtimeQuoteSnapshotORM
 from finance_agent.storage.repositories import AssetRepository
 
 NOW = datetime(2026, 7, 20, 9, 40, tzinfo=UTC)
+MIGRATION_PATH = (
+    Path(__file__).parents[1]
+    / "src"
+    / "finance_agent"
+    / "storage"
+    / "migrations"
+    / "versions"
+    / "20260904_0028_harden_realtime_quote_history.py"
+)
 
 
 class _Result:
@@ -40,6 +51,52 @@ class _Session:
 
 def _compiled(statement: Any) -> str:
     return str(statement.compile(dialect=postgresql.dialect()))
+
+
+def test_realtime_history_schema_tracks_capture_time_and_quality() -> None:
+    columns = RealtimeQuoteSnapshotORM.__table__.c
+    indexes = {index.name for index in RealtimeQuoteSnapshotORM.__table__.indexes}
+
+    assert {"captured_at", "freshness_ms", "quality_status"}.issubset(columns.keys())
+    assert columns.captured_at.nullable is False
+    assert columns.quality_status.nullable is False
+    assert "idx_realtime_quotes_quality_asof" in indexes
+
+
+def test_realtime_history_migration_adds_retention_policies() -> None:
+    content = MIGRATION_PATH.read_text(encoding="utf-8")
+
+    assert 'revision = "20260904_0028"' in content
+    assert 'down_revision = "20260831_0027"' in content
+    assert "create_hypertable('realtime_quote_snapshots'" in content
+    assert "add_retention_policy('realtime_quote_snapshots', INTERVAL '7 days'" in content
+    assert "add_retention_policy('market_bars_intraday', INTERVAL '180 days'" in content
+
+
+def test_realtime_history_upsert_writes_capture_and_quality_columns() -> None:
+    session = _Session()
+
+    count = AssetRepository(session).upsert_realtime_quote_snapshots(
+        [
+            {
+                "asset_id": "ashare:600519",
+                "source": "gotdx:tdx_main",
+                "symbol": "600519",
+                "market": "ashare",
+                "as_of": NOW,
+                "captured_at": NOW,
+                "freshness_ms": 250,
+                "quality_status": "available",
+                "last_price": Decimal("1500.25"),
+            }
+        ]
+    )
+
+    sql = _compiled(session.executed[0])
+    assert count == 1
+    assert "captured_at" in sql
+    assert "freshness_ms" in sql
+    assert "quality_status" in sql
 
 
 def test_intraday_latest_upsert_overwrites_by_asset_and_source() -> None:

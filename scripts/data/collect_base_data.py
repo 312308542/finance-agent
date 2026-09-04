@@ -14,7 +14,7 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -1276,7 +1276,8 @@ def build_ashare_parallel_realtime_task(
         persisted_rows = tuple(
             dict(row, data_snapshot_id=snapshot.data_snapshot_id) for row in result.rows
         )
-        rows_written = repository.upsert_intraday_quote_latest(persisted_rows)
+        write_counts = persist_realtime_quote_rows(repository, persisted_rows)
+        rows_written = write_counts["latest"]
         assets = [
             AssetData(
                 asset_id=str(row["asset_id"]),
@@ -1474,6 +1475,19 @@ def _fetch_gotdx_quote_rows(
             }
         )
     return rows
+
+
+def persist_realtime_quote_rows(
+    repository: AssetRepository,
+    rows: Sequence[JsonDict],
+) -> dict[str, int]:
+    """同一事务追加实时历史并更新最新值。"""
+
+    normalized = tuple(dict(row) for row in rows)
+    return {
+        "history": repository.upsert_realtime_quote_snapshots(normalized),
+        "latest": repository.upsert_intraday_quote_latest(normalized),
+    }
 
 
 def _fetch_akshare_quote_rows(

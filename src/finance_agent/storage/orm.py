@@ -179,6 +179,7 @@ class RealtimeQuoteSnapshotORM(Base):
         Index("idx_realtime_quotes_market_symbol_asof", "market", "symbol", "as_of"),
         Index("idx_realtime_quotes_source", "source"),
         Index("idx_realtime_quotes_snapshot", "data_snapshot_id"),
+        Index("idx_realtime_quotes_quality_asof", "quality_status", "as_of"),
     )
 
     asset_id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -187,6 +188,10 @@ class RealtimeQuoteSnapshotORM(Base):
     data_snapshot_id: Mapped[str | None] = mapped_column(String(255))
     symbol: Mapped[str] = mapped_column(String(64), nullable=False)
     market: Mapped[str] = mapped_column(String(32), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    freshness_ms: Mapped[int | None] = mapped_column(Integer)
     last_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
     prev_close: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
     open: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
@@ -200,6 +205,9 @@ class RealtimeQuoteSnapshotORM(Base):
     bid_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
     ask_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
     status: Mapped[str] = mapped_column(
+        String(32), server_default=text("'available'"), nullable=False
+    )
+    quality_status: Mapped[str] = mapped_column(
         String(32), server_default=text("'available'"), nullable=False
     )
     payload: Mapped[JsonDict] = mapped_column(

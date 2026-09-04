@@ -72,6 +72,38 @@ def test_clear_intraday_quote_cache_removes_only_temporary_rows() -> None:
     assert cache == {}
 
 
+def test_realtime_collection_persists_history_and_latest_rows() -> None:
+    module = import_collection_module()
+
+    class _RecordingAssetRepository:
+        def __init__(self) -> None:
+            self.history_rows: list[Any] = []
+            self.latest_rows: list[Any] = []
+
+        def upsert_realtime_quote_snapshots(self, rows: Any) -> int:
+            self.history_rows = list(rows)
+            return len(self.history_rows)
+
+        def upsert_intraday_quote_latest(self, rows: Any) -> int:
+            self.latest_rows = list(rows)
+            return len(self.latest_rows)
+
+    repository = _RecordingAssetRepository()
+    rows = [
+        {
+            "asset_id": "ashare:600519",
+            "source": "gotdx:tdx_main",
+            "as_of": datetime(2026, 7, 20, 9, 40, tzinfo=UTC),
+        }
+    ]
+
+    written = module.persist_realtime_quote_rows(repository, rows)
+
+    assert written == {"history": 1, "latest": 1}
+    assert repository.history_rows == rows
+    assert repository.latest_rows == rows
+
+
 def test_realtime_collection_task_wires_both_providers_and_latest_storage(monkeypatch) -> None:
     module = import_collection_module()
     calls: list[str] = []
@@ -132,11 +164,18 @@ def test_realtime_collection_task_wires_both_providers_and_latest_storage(monkey
             )
 
     class _Repo:
-        rows: list[Any] = []
+        def __init__(self) -> None:
+            self.history_rows: list[Any] = []
+            self.latest_rows: list[Any] = []
+
+        def upsert_realtime_quote_snapshots(self, rows: Any) -> int:
+            self.history_rows = list(rows)
+            calls.append(f"persist-history:{len(rows)}")
+            return len(rows)
 
         def upsert_intraday_quote_latest(self, rows: Any) -> int:
-            self.rows = list(rows)
-            calls.append(f"persist:{len(rows)}")
+            self.latest_rows = list(rows)
+            calls.append(f"persist-latest:{len(rows)}")
             return len(rows)
 
     class _Snapshots:
@@ -162,9 +201,13 @@ def test_realtime_collection_task_wires_both_providers_and_latest_storage(monkey
 
     assert result.result.status == "stale"
     assert calls[:2] == ["gotdx:600519.SH", "akshare"] or calls[:2] == ["akshare", "gotdx:600519.SH"]
-    assert "persist:2" in calls
+    assert "persist-history:2" in calls
+    assert "persist-latest:2" in calls
     assert len(snapshots.inserted) == 1
-    assert {row["data_snapshot_id"] for row in repository.rows} == {
+    assert {row["data_snapshot_id"] for row in repository.history_rows} == {
+        snapshots.inserted[0].data_snapshot_id
+    }
+    assert {row["data_snapshot_id"] for row in repository.latest_rows} == {
         snapshots.inserted[0].data_snapshot_id
     }
 

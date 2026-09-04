@@ -853,6 +853,8 @@ class AssetRepository:
                     "data_snapshot_id": item.get("data_snapshot_id"),
                     "symbol": item["symbol"],
                     "market": item["market"],
+                    "captured_at": item.get("captured_at", item["as_of"]),
+                    "freshness_ms": item.get("freshness_ms"),
                     "last_price": item.get("last_price"),
                     "prev_close": item.get("prev_close"),
                     "open": item.get("open", item.get("open_price")),
@@ -866,6 +868,9 @@ class AssetRepository:
                     "bid_price": item.get("bid_price"),
                     "ask_price": item.get("ask_price"),
                     "status": item.get("status", "available"),
+                    "quality_status": item.get(
+                        "quality_status", item.get("status", "available")
+                    ),
                     "payload": _json_safe(item.get("payload") or {}),
                 }
                 for item in snapshots
