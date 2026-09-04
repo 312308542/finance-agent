@@ -347,9 +347,12 @@ def build_regime_samples(
         except ValueError:
             continue
         result = service.evaluate(regime_input)
-        if len(samples[result.regime]) >= limit:
+        legacy_regime = result.legacy_regime
+        if len(samples[legacy_regime]) >= limit:
             continue
-        samples[result.regime].append(sample_to_dict(trade_date, result, regime_input, metrics))
+        samples[legacy_regime].append(
+            sample_to_dict(trade_date, result, regime_input, metrics)
+        )
     return samples
 
 
@@ -428,7 +431,8 @@ def sample_to_dict(
 
     return {
         "as_of": trade_date.isoformat(),
-        "regime": result.regime,
+        "regime": result.legacy_regime,
+        "adaptive_regime": result.regime,
         "strength": result.strength,
         "risk_multiplier": result.risk_multiplier,
         "index_trend_20d": regime_input.index_trend_20d,
