@@ -69,6 +69,9 @@ const payload = {
       evidence_ids: ["ev:1"],
       summary: "评分领先，但仍需确认风险。",
       payload: {
+        recommendation_state: "setup_confirming",
+        previous_state: "watch",
+        decision_snapshot_id: "decision:1",
         score_breakdown: {
           technical: 31.2,
           liquidity: 18.4,
@@ -194,6 +197,15 @@ assert.deepEqual(buildDecisionFeedbackPayload("modified", "改为观察", "watch
 assert.equal(model.items[0].structureEvidence.length, 2);
 assert.equal(model.items[0].structureEvidence[0].isDemo, false);
 assert.equal(model.items[0].structureStatus, "available");
+assert.deepEqual(Object.keys(model.lifecycleGroups), [
+  "new_opportunities",
+  "continuing",
+  "waiting_entry",
+  "positions",
+  "weakening_or_exit",
+]);
+assert.equal(model.lifecycleGroups.waiting_entry.length, 1);
+assert.equal(model.lifecycleGroups.waiting_entry[0].recommendationState, "setup_confirming");
 assert.deepEqual(
   model.items[0].structureEvidence.map((item) => [item.horizon, item.title, item.confidenceDisplay]),
   [
@@ -266,6 +278,7 @@ const merged = mergeRecommendationPayloads([
     runs: [{ run_id: "run:a", market: "ashare", payload: { avoid_pool_excluded: { count: 1 } } }],
     recommendations: [{ ...payload.recommendations[0], recommendation_id: "rec:a", market: "ashare" }],
     metrics: { recommendation_count: 1 },
+    message: "今日没有满足新增买入门槛的机会。",
   },
   {
     status: "ok",
@@ -275,12 +288,19 @@ const merged = mergeRecommendationPayloads([
     metrics: { recommendation_count: 1 },
   },
 ]);
+assert.equal(merged.message, "今日没有满足新增买入门槛的机会。");
 
 const cryptoModel = buildRecommendationPageModel(merged, decisions, "crypto_spot");
 assert.equal(cryptoModel.marketTabs.length, 2);
 assert.equal(cryptoModel.items.length, 1);
 assert.equal(cryptoModel.activeRun?.runId, "run:c");
 assert.equal(cryptoModel.avoidPoolSummary.count, 3);
+
+assert.match(pageSource, /今日新机会/);
+assert.match(pageSource, /持续有效/);
+assert.match(pageSource, /等待入场/);
+assert.match(pageSource, /当前持仓建议/);
+assert.match(pageSource, /转弱与退出/);
 
 assert.match(pageSource, /function StructureEvidenceCard/);
 assert.match(pageSource, /function StructureEvidenceEmptyState/);

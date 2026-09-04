@@ -17,6 +17,8 @@ import {
   type RecommendationPageModel,
   type RecommendationTone,
   type StructureEvidenceItem,
+  lifecycleGroupLabels,
+  type LifecycleGroupKey,
 } from "../recommendationView";
 
 type RecommendationPageProps = {
@@ -218,10 +220,13 @@ function RecommendationHeader({
       ) : null}
       <div className="recommendation-metrics">
         <RecommendationMetric label="候选建议" value={model.metrics.recommendationCount} />
-        <RecommendationMetric label="候选买入" value={model.metrics.buyCount} />
+        <RecommendationMetric label="新增买入" value={model.metrics.buyReadyCount} />
+        <RecommendationMetric label="当前持仓" value={model.metrics.activeCount} />
+        <RecommendationMetric label="转弱/退出" value={model.metrics.exitPendingCount} />
         <RecommendationMetric label="建议观察" value={model.metrics.watchCount} />
         <RecommendationMetric label="待确认" value={model.metrics.pendingDecisionCount} />
       </div>
+      {model.message ? <div className="notice recommendation-zero-buy">{model.message}</div> : null}
       {notice ? <div className="notice recommendation-notice">{notice}</div> : null}
     </>
   );
@@ -298,11 +303,42 @@ function RecommendationTable({
   savingDraftDecisionId: string | null;
   confirmedDecisionByRecommendationId: Record<string, string>;
 }) {
-  if (!model.items.length) {
-    return <div className="empty-state">{model.emptyText}</div>;
-  }
+  // 生命周期分组：今日新机会、持续有效、等待入场、当前持仓建议、转弱与退出。
+  const [selectedGroup, setSelectedGroup] = React.useState<LifecycleGroupKey>("new_opportunities");
+  React.useEffect(() => {
+    if (!model.lifecycleGroups[selectedGroup].length) {
+      const firstAvailable = (Object.keys(lifecycleGroupLabels) as LifecycleGroupKey[]).find(
+        (key) => model.lifecycleGroups[key].length,
+      );
+      if (firstAvailable) {
+        setSelectedGroup(firstAvailable);
+      }
+    }
+  }, [model.lifecycleGroups, selectedGroup]);
+  const visibleItems = model.lifecycleGroups[selectedGroup];
   return (
     <div className="recommendation-table">
+      <div className="recommendation-lifecycle-tabs" role="tablist" aria-label="推荐生命周期">
+        {(Object.keys(lifecycleGroupLabels) as LifecycleGroupKey[]).map((key) => (
+          <button
+            key={key}
+            className={key === selectedGroup ? "is-active" : ""}
+            type="button"
+            role="tab"
+            aria-selected={key === selectedGroup}
+            onClick={() => setSelectedGroup(key)}
+          >
+            <span>{lifecycleGroupLabels[key]}</span>
+            <em>{model.lifecycleGroups[key].length}</em>
+          </button>
+        ))}
+      </div>
+      {!model.items.length ? <div className="empty-state">{model.emptyText}</div> : null}
+      {model.items.length > 0 && !visibleItems.length ? (
+        <div className="empty-state">该生命周期暂无推荐，切换其他分组查看。</div>
+      ) : null}
+      {visibleItems.length ? (
+        <>
       <div className="recommendation-table-head">
         <span>排名</span>
         <span>标的</span>
@@ -312,7 +348,7 @@ function RecommendationTable({
         <span>风险</span>
         <span>操作</span>
       </div>
-      {model.items.map((item) => (
+      {visibleItems.map((item) => (
         <article key={item.recommendationId || item.assetId} className="recommendation-row">
           <button className="recommendation-row-main" type="button" onClick={() => onToggle(item.recommendationId)}>
             <span className="rank-cell">{item.rank || "—"}</span>
@@ -351,6 +387,8 @@ function RecommendationTable({
           ) : null}
         </article>
       ))}
+        </>
+      ) : null}
     </div>
   );
 }

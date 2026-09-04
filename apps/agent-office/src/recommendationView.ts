@@ -58,6 +58,20 @@ export type RecommendationItemModel = {
   riskRebuttal: string;
   reportWorkflowRunId: string;
   pendingDecision: PendingDecisionModel | null;
+  ownerId: string;
+  recommendationState: string;
+  previousState: string;
+  stateChangedAt: string;
+  decisionSnapshotId: string;
+  plannedHorizonDays: number;
+  sectorRegime: string;
+  structureVerdict: Record<string, unknown>;
+  entryZone: { low: number; high: number } | null;
+  invalidationPrice: number | null;
+  expectedNetReturn: number | null;
+  downsideRisk: number | null;
+  replacementReason: string;
+  dataQuality: string;
   payload: Record<string, any>;
 };
 
@@ -73,6 +87,7 @@ export type RecommendationRunModel = {
 
 export type RecommendationPageModel = {
   status: string;
+  message: string;
   dataSource: string;
   isOfflineDemo: boolean;
   selectedMarket: string;
@@ -81,6 +96,7 @@ export type RecommendationPageModel = {
   activeRun: RecommendationRunModel | null;
   items: RecommendationItemModel[];
   allItems: RecommendationItemModel[];
+  lifecycleGroups: Record<LifecycleGroupKey, RecommendationItemModel[]>;
   pendingDecisions: PendingDecisionModel[];
   avoidPoolSummary: {
     count: number;
@@ -91,9 +107,27 @@ export type RecommendationPageModel = {
     recommendationCount: number;
     buyCount: number;
     watchCount: number;
+    buyReadyCount: number;
+    activeCount: number;
+    exitPendingCount: number;
     pendingDecisionCount: number;
   };
   emptyText: string;
+};
+
+export type LifecycleGroupKey =
+  | "new_opportunities"
+  | "continuing"
+  | "waiting_entry"
+  | "positions"
+  | "weakening_or_exit";
+
+export const lifecycleGroupLabels: Record<LifecycleGroupKey, string> = {
+  new_opportunities: "今日新机会",
+  continuing: "持续有效",
+  waiting_entry: "等待入场",
+  positions: "当前持仓建议",
+  weakening_or_exit: "转弱与退出",
 };
 
 const marketLabels: Record<string, string> = {
@@ -140,6 +174,7 @@ export function buildRecommendationPageModel(
     ? selectedMarket
     : fallbackMarket;
   const items = allItems.filter((item) => item.market === currentMarket);
+  const lifecycleGroups = buildLifecycleGroups(items, recommendationPayload?.groups);
   const activeRuns = Array.isArray(recommendationPayload?.active_runs)
     ? recommendationPayload.active_runs
         .map((item: unknown) => normalizeRecommendationRun(item))
@@ -155,6 +190,7 @@ export function buildRecommendationPageModel(
   const metrics = isRecord(recommendationPayload?.metrics) ? recommendationPayload.metrics : {};
   return {
     status: normalizeText(recommendationPayload?.status) || "empty",
+    message: normalizeText(recommendationPayload?.message),
     dataSource,
     isOfflineDemo,
     selectedMarket: currentMarket,
@@ -163,12 +199,22 @@ export function buildRecommendationPageModel(
     activeRun,
     items,
     allItems,
+    lifecycleGroups,
     pendingDecisions,
     avoidPoolSummary,
     metrics: {
       recommendationCount: normalizeNumber(metrics.recommendation_count ?? allItems.length),
       buyCount: normalizeNumber(metrics.buy_count ?? allItems.filter((item) => item.action.includes("buy")).length),
       watchCount: normalizeNumber(metrics.watch_count ?? allItems.filter((item) => item.action === "watch").length),
+      buyReadyCount: normalizeNumber(
+        metrics.buy_ready_count ?? allItems.filter((item) => item.recommendationState === "buy_ready").length,
+      ),
+      activeCount: normalizeNumber(
+        metrics.active_count ?? allItems.filter((item) => item.recommendationState === "active").length,
+      ),
+      exitPendingCount: normalizeNumber(
+        metrics.exit_pending_count ?? allItems.filter((item) => item.recommendationState === "exit_pending").length,
+      ),
       pendingDecisionCount: pendingDecisions.length,
     },
     emptyText: "暂无推荐运行，等待推荐流水线生成候选建议。",
@@ -235,8 +281,84 @@ export function normalizeRecommendationItem(
     riskRebuttal: normalizeText(payload.risk_rebuttal || payload.riskRebuttal || payload.risk_summary),
     reportWorkflowRunId: normalizeText(payload.workflow_run_id || payload.report_workflow_run_id),
     pendingDecision,
+    ownerId: normalizeText(item.owner_id || item.ownerId || payload.owner_id || payload.ownerId),
+    recommendationState: normalizeText(
+      item.recommendation_state || item.recommendationState || payload.recommendation_state || payload.recommendationState,
+    ) || "watch",
+    previousState: normalizeText(item.previous_state || item.previousState || payload.previous_state || payload.previousState),
+    stateChangedAt: normalizeText(item.state_changed_at || item.stateChangedAt || payload.state_changed_at || payload.stateChangedAt),
+    decisionSnapshotId: normalizeText(
+      item.decision_snapshot_id || item.decisionSnapshotId || payload.decision_snapshot_id || payload.decisionSnapshotId,
+    ),
+    plannedHorizonDays: normalizeNumber(item.planned_horizon_days || item.plannedHorizonDays || payload.planned_horizon_days || payload.plannedHorizonDays),
+    sectorRegime: normalizeText(item.sector_regime || item.sectorRegime || payload.sector_regime || payload.sectorRegime),
+    structureVerdict: isRecord(item.structure_verdict || item.structureVerdict || payload.structure_verdict || payload.structureVerdict)
+      ? (item.structure_verdict || item.structureVerdict || payload.structure_verdict || payload.structureVerdict)
+      : {},
+    entryZone: normalizeEntryZone(item.entry_zone || item.entryZone || payload.entry_zone || payload.entryZone),
+    invalidationPrice: normalizeNullableNumber(item.invalidation_price ?? item.invalidationPrice ?? payload.invalidation_price ?? payload.invalidationPrice),
+    expectedNetReturn: normalizeNullableNumber(item.expected_net_return ?? item.expectedNetReturn ?? payload.expected_net_return ?? payload.expectedNetReturn),
+    downsideRisk: normalizeNullableNumber(item.downside_risk ?? item.downsideRisk ?? payload.downside_risk ?? payload.downsideRisk),
+    replacementReason: normalizeText(item.replacement_reason || item.replacementReason || payload.replacement_reason || payload.replacementReason),
+    dataQuality: normalizeText(item.data_quality || item.dataQuality || payload.data_quality || payload.dataQuality),
     payload,
   };
+}
+
+function buildLifecycleGroups(
+  items: RecommendationItemModel[],
+  rawGroups: unknown,
+): Record<LifecycleGroupKey, RecommendationItemModel[]> {
+  const groups: Record<LifecycleGroupKey, RecommendationItemModel[]> = {
+    new_opportunities: [],
+    continuing: [],
+    waiting_entry: [],
+    positions: [],
+    weakening_or_exit: [],
+  };
+  const source = isRecord(rawGroups) ? rawGroups : null;
+  if (source) {
+    for (const key of Object.keys(groups) as LifecycleGroupKey[]) {
+      const rows = Array.isArray(source[key]) ? source[key] : [];
+      const ids = new Set(rows.filter(isRecord).map((row) => normalizeText(row.recommendation_id || row.recommendationId)));
+      groups[key] = items.filter((item) => ids.has(item.recommendationId));
+    }
+    if (Object.values(groups).some((group) => group.length)) {
+      return groups;
+    }
+  }
+  for (const item of items) {
+    const state = item.recommendationState;
+    const key: LifecycleGroupKey =
+      state === "active"
+        ? "positions"
+        : state === "discovered" || state === "buy_ready"
+          ? "new_opportunities"
+          : state === "setup_confirming" || state === "watch"
+            ? "waiting_entry"
+            : state === "weakening" || state === "exit_pending" || state === "exited" || state === "cooldown"
+              ? "weakening_or_exit"
+              : "continuing";
+    groups[key].push(item);
+  }
+  return groups;
+}
+
+function normalizeEntryZone(value: unknown): { low: number; high: number } | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const low = Number(value.low ?? value.min ?? value["0"]);
+  const high = Number(value.high ?? value.max ?? value["1"]);
+  return Number.isFinite(low) && Number.isFinite(high) ? { low, high } : null;
+}
+
+function normalizeNullableNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 export function buildDecisionFeedbackPayload(
@@ -277,6 +399,9 @@ export function mergeRecommendationPayloads(payloads: Array<Record<string, any> 
     },
     { recommendation_count: 0, buy_count: 0, watch_count: 0 },
   );
+  const message = validPayloads
+    .map((payload) => normalizeText(payload.message))
+    .find((value) => Boolean(value)) ?? "";
   return {
     status: recommendations.length ? "ok" : validPayloads.some((payload) => payload.status === "unavailable") ? "unavailable" : "empty",
     data_source: validPayloads.some((payload) => payload.data_source === "offline_demo") ? "offline_demo" : undefined,
@@ -284,6 +409,7 @@ export function mergeRecommendationPayloads(payloads: Array<Record<string, any> 
     active_runs: activeRuns,
     active_run: activeRuns[0] ?? null,
     recommendations,
+    message,
     metrics,
   };
 }

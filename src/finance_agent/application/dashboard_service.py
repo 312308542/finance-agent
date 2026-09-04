@@ -28,6 +28,7 @@ from finance_agent.storage.orm import (
     DataQualitySnapshotORM,
     DecisionLogORM,
     MonitoringAlertORM,
+    RecommendationLifecycleStateORM,
     RiskFindingORM,
 )
 from finance_agent.storage.repositories import (
@@ -193,11 +194,11 @@ class DashboardService:
     ) -> JsonDict:
         """读取最近可用推荐运行和推荐列表。
 
-        `owner_id` 当前用于接口统一和后续个人化推荐过滤。推荐运行表现阶段未强制
-        绑定 owner，先按最近可用运行返回。
+        推荐运行本身是策略级事实，用户级展示通过生命周期状态和持仓归属隔离。
+        对没有生命周期记录的旧版运行保留兼容展示，但不会把其他用户的生命周期状态
+        混入当前用户。
         """
 
-        _ = owner_id
         since = datetime.now(UTC) - timedelta(days=30)
         runs = self.recommendations.list_available_runs_since(
             since=since,
@@ -211,18 +212,169 @@ class DashboardService:
             run_id=active_run.run_id,
             limit=limit,
         )
+        lifecycle_states = self._list_lifecycle_states(owner_id=owner_id, market=market)
+        state_by_asset = {str(state.asset_id): state for state in lifecycle_states}
+        serialized_items: list[JsonDict] = []
+        for item in items:
+            state = state_by_asset.get(str(item.asset_id))
+            # 自适应推荐必须有用户生命周期状态才能展示；旧策略没有该状态时保留
+            # 兼容读取，避免历史页面突然变为空。
+            if lifecycle_states and active_run.strategy == "strategy:ashare:adaptive_v1" and state is None:
+                continue
+            serialized = serialize_asset_recommendation(item)
+            serialized_items.append(self._merge_lifecycle_view(serialized, state, owner_id=owner_id))
+        # 当前运行可能没有再次入榜，但用户仍有开放生命周期；把状态中的决策资产
+        # 合并进页面，保证持续推荐不会因榜单截断而消失。
+        current_ids = {str(item.get("asset_id")) for item in serialized_items}
+        for state in lifecycle_states:
+            if str(state.asset_id) in current_ids or str(state.current_state) in {"exited"}:
+                continue
+            decision_asset = (state.payload or {}).get("decision_asset")
+            if not isinstance(decision_asset, dict):
+                continue
+            synthetic = {
+                "recommendation_id": f"lifecycle:{state.state_id}",
+                "run_id": active_run.run_id,
+                "asset_id": state.asset_id,
+                "symbol": decision_asset.get("symbol", str(state.asset_id).split(":")[-1]),
+                "name": decision_asset.get("name", ""),
+                "market": market or str(state.asset_id).split(":", 1)[0],
+                "horizon": active_run.horizon,
+                "action": decision_asset.get("action", "watch"),
+                "rank": 0,
+                "total_score": decision_asset.get("alpha_score", 0),
+                "confidence": decision_asset.get("confidence", 0),
+                "conviction": decision_asset.get("conviction", "medium"),
+                "score_id": decision_asset.get("score_id"),
+                "factor_frame_id": decision_asset.get("factor_frame_id"),
+                "signal_ids": [],
+                "risk_ids": [],
+                "evidence_ids": [],
+                "summary": decision_asset.get("summary", "持续生命周期状态"),
+                "payload": decision_asset,
+            }
+            serialized_items.append(self._merge_lifecycle_view(synthetic, state, owner_id=owner_id))
+        groups = self._group_recommendations_by_lifecycle(serialized_items)
+        metrics = {
+            "recommendation_count": len(serialized_items),
+            "buy_count": sum(1 for item in serialized_items if "buy" in str(item.get("action", ""))),
+            "watch_count": sum(1 for item in serialized_items if item.get("action") == "watch"),
+            "buy_ready_count": sum(
+                1 for item in serialized_items if item.get("recommendation_state") == "buy_ready"
+            ),
+            "active_count": sum(
+                1 for item in serialized_items if item.get("recommendation_state") == "active"
+            ),
+            "exit_pending_count": sum(
+                1 for item in serialized_items if item.get("recommendation_state") == "exit_pending"
+            ),
+            "markets": sorted({str(item.get("market")) for item in serialized_items if item.get("market")}),
+        }
         return {
-            "status": "ok" if items else "empty",
+            "status": "ok" if serialized_items else "empty",
             "runs": [serialize_recommendation_run(run) for run in runs],
             "active_run": serialize_recommendation_run(active_run),
-            "recommendations": [serialize_asset_recommendation(item) for item in items],
-            "metrics": {
-                "recommendation_count": len(items),
-                "buy_count": sum(1 for item in items if "buy" in item.action),
-                "watch_count": sum(1 for item in items if item.action == "watch"),
-                "markets": sorted({item.market for item in items}),
-            },
+            "recommendations": serialized_items,
+            "groups": groups,
+            "message": (
+                "今日没有满足新增买入门槛的机会。"
+                if metrics["buy_ready_count"] == 0
+                else ""
+            ),
+            "metrics": metrics,
         }
+
+    def _list_lifecycle_states(
+        self,
+        *,
+        owner_id: str,
+        market: str | None,
+    ) -> list[RecommendationLifecycleStateORM]:
+        """按用户和市场批量读取推荐生命周期状态。"""
+
+        session = getattr(self, "session", None)
+        if session is None:
+            return []
+        statement = select(RecommendationLifecycleStateORM).where(
+            RecommendationLifecycleStateORM.owner_id == owner_id
+        )
+        if market:
+            statement = statement.where(
+                RecommendationLifecycleStateORM.asset_id.like(f"{market}:%")
+            )
+        return list(
+            session.scalars(
+                statement.order_by(RecommendationLifecycleStateORM.updated_at.desc())
+            )
+        )
+
+    @staticmethod
+    def _merge_lifecycle_view(
+        item: JsonDict,
+        state: Any | None,
+        *,
+        owner_id: str,
+    ) -> JsonDict:
+        """把用户生命周期状态合并到推荐读模型。"""
+
+        payload = dict(item.get("payload") or {})
+        if state is not None:
+            state_payload = dict(getattr(state, "payload", None) or {})
+            payload = {**state_payload, **payload}
+            item.update(
+                {
+                    "owner_id": owner_id,
+                    "recommendation_state": state.current_state,
+                    "previous_state": state.previous_state,
+                    "state_changed_at": json_value(state.state_changed_at),
+                    "decision_snapshot_id": state.decision_snapshot_id,
+                    "setup_id": getattr(state, "setup_id", None),
+                }
+            )
+        else:
+            item["owner_id"] = owner_id
+        fields = (
+            "planned_horizon_days",
+            "sector_regime",
+            "structure_verdict",
+            "entry_zone",
+            "invalidation_price",
+            "expected_net_return",
+            "downside_risk",
+            "replacement_reason",
+            "data_quality",
+        )
+        for field in fields:
+            if field in payload:
+                item[field] = json_value(payload[field])
+        item["payload"] = payload
+        return item
+
+    @staticmethod
+    def _group_recommendations_by_lifecycle(items: list[JsonDict]) -> JsonDict:
+        """按生命周期返回固定分组，分组顺序对前端稳定。"""
+
+        groups: JsonDict = {
+            "new_opportunities": [],
+            "continuing": [],
+            "waiting_entry": [],
+            "positions": [],
+            "weakening_or_exit": [],
+        }
+        for item in items:
+            state = str(item.get("recommendation_state") or "watch")
+            if state in {"discovered", "buy_ready"}:
+                group = "new_opportunities"
+            elif state == "active":
+                group = "positions"
+            elif state in {"setup_confirming", "watch"}:
+                group = "waiting_entry"
+            elif state in {"weakening", "exit_pending", "exited", "cooldown"}:
+                group = "weakening_or_exit"
+            else:
+                group = "continuing"
+            groups[group].append(item)
+        return groups
 
     def get_risk_overview(self, *, owner_id: str, limit: int = 20) -> JsonDict:
         """读取风险事件、提醒和触发摘要。"""

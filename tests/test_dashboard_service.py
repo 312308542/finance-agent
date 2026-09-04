@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
@@ -69,6 +70,122 @@ def test_dashboard_watchlists_split_research_and_manual_pools() -> None:
             "description": "暂未归类到研究池或用户观察池的有效条目。",
         },
     ]
+
+
+def test_latest_recommendations_returns_lifecycle_groups_and_zero_buy_message() -> None:
+    """推荐接口应按生命周期分组，并在零买入时返回明确说明。"""
+
+    service = DashboardService.__new__(DashboardService)
+    service.recommendations = SimpleNamespace(
+        list_available_runs_since=lambda **_: [
+            SimpleNamespace(
+                run_id="run:latest",
+                universe_id="universe:merged:ashare:recommendation",
+                screening_id="screening:1",
+                strategy="strategy:ashare:adaptive_v1",
+                market="ashare",
+                horizon="swing",
+                limit=80,
+                status="available",
+                started_at=datetime(2026, 9, 4, 15, 0, tzinfo=UTC),
+                finished_at=datetime(2026, 9, 4, 15, 1, tzinfo=UTC),
+                summary="本次没有满足新增买入门槛的标的。",
+                payload={"buy_ready_count": 0},
+            )
+        ],
+        list_top_recommendations=lambda **_: [
+            SimpleNamespace(
+                recommendation_id="rec:1",
+                run_id="run:latest",
+                asset_id="ashare:600519",
+                symbol="600519",
+                name="贵州茅台",
+                market="ashare",
+                horizon="swing",
+                action="watch",
+                rank=1,
+                total_score=Decimal("62"),
+                confidence=Decimal("0.62"),
+                conviction="medium",
+                score_id=None,
+                factor_frame_id=None,
+                signal_ids=[],
+                risk_ids=[],
+                evidence_ids=[],
+                summary="等待结构确认。",
+                payload={
+                    "recommendation_state": "setup_confirming",
+                    "previous_state": "watch",
+                    "state_changed_at": "2026-09-04T15:00:00+08:00",
+                    "decision_snapshot_id": "decision:ashare:2026-09-04:abc",
+                    "planned_horizon_days": 10,
+                    "sector_regime": "diffusion",
+                    "structure_verdict": {"status": "waiting"},
+                    "entry_zone": {"low": 100, "high": 102},
+                    "invalidation_price": 96,
+                    "expected_net_return": 0.04,
+                    "downside_risk": 0.02,
+                    "replacement_reason": "暂无新增买入门槛",
+                    "data_quality": "available",
+                },
+            )
+        ],
+    )
+    service._list_lifecycle_states = lambda **_: [
+        SimpleNamespace(
+            owner_id="owner-a",
+            strategy_id="strategy:ashare:adaptive_v1",
+            asset_id="ashare:600519",
+            current_state="setup_confirming",
+            previous_state="watch",
+            state_changed_at=datetime(2026, 9, 4, 15, 0, tzinfo=UTC),
+            decision_snapshot_id="decision:ashare:2026-09-04:abc",
+            payload={"sector_regime": "diffusion"},
+        )
+    ]
+
+    payload = service.get_latest_recommendations(owner_id="owner-a", market="ashare", limit=80)
+
+    assert set(payload["groups"]) == {
+        "new_opportunities",
+        "continuing",
+        "waiting_entry",
+        "positions",
+        "weakening_or_exit",
+    }
+    assert payload["metrics"]["buy_ready_count"] == 0
+    assert payload["message"] == "今日没有满足新增买入门槛的机会。"
+    assert payload["groups"]["waiting_entry"][0]["recommendation_state"] == "setup_confirming"
+
+
+def test_latest_recommendations_isolates_lifecycle_by_owner() -> None:
+    """生命周期推荐不能把其他用户的资产泄露到当前用户。"""
+
+    service = DashboardService.__new__(DashboardService)
+    service.recommendations = SimpleNamespace(
+        list_available_runs_since=lambda **_: [
+            SimpleNamespace(
+                run_id="run:latest",
+                universe_id=None,
+                screening_id=None,
+                strategy="strategy:ashare:adaptive_v1",
+                market="ashare",
+                horizon="swing",
+                limit=80,
+                status="available",
+                started_at=datetime(2026, 9, 4, 15, 0, tzinfo=UTC),
+                finished_at=None,
+                summary=None,
+                payload={"buy_ready_count": 0},
+            )
+        ],
+        list_top_recommendations=lambda **_: [],
+    )
+    service._list_lifecycle_states = lambda **_: []
+
+    payload = service.get_latest_recommendations(owner_id="owner-a", market="ashare", limit=80)
+
+    assert payload["recommendations"] == []
 
 
 def watchlist_item(
