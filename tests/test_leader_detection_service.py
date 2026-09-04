@@ -77,3 +77,18 @@ def test_leader_detection_filters_non_strong_sectors() -> None:
     )
 
     assert result == []
+
+
+def test_leader_ranks_restart_inside_each_sector() -> None:
+    result = LeaderDetectionService().rank_leaders(
+        [
+            LeaderCandidateInput("concept:robot", "ashare:300001", pct_change=10),
+            LeaderCandidateInput("industry:bank", "ashare:600001", pct_change=5),
+        ],
+        strong_sector_ids=["concept:robot", "industry:bank"],
+    )
+
+    assert [(item.sector_id, item.leader_rank, item.role) for item in result] == [
+        ("concept:robot", 1, "leader"),
+        ("industry:bank", 1, "leader"),
+    ]

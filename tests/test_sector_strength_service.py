@@ -21,6 +21,9 @@ def test_sector_strength_ranks_hot_sectors_with_traceable_evidence() -> None:
                 limit_up=True,
                 popularity_rank=3,
                 board_hits=2,
+                returns_by_horizon={1: 0.12, 3: 0.18, 5: 0.24, 10: 0.30, 20: 0.35},
+                above_ma20=True,
+                flow_positive_streak=4,
                 evidence_ids=["ev:flow:300001", "ev:limit:300001"],
             ),
             SectorStrengthInput(
@@ -33,6 +36,9 @@ def test_sector_strength_ranks_hot_sectors_with_traceable_evidence() -> None:
                 limit_up=False,
                 popularity_rank=12,
                 board_hits=1,
+                returns_by_horizon={1: 0.06, 3: 0.12, 5: 0.16, 10: 0.20, 20: 0.22},
+                above_ma20=True,
+                flow_positive_streak=3,
                 evidence_ids=["ev:flow:300002"],
             ),
             SectorStrengthInput(
@@ -60,6 +66,11 @@ def test_sector_strength_ranks_hot_sectors_with_traceable_evidence() -> None:
     assert robot.strength_score > result[1].strength_score
     assert robot.evidence_ids == ["ev:flow:300001", "ev:limit:300001", "ev:flow:300002"]
     assert robot.payload["top_assets"][0]["asset_id"] == "ashare:300001"
+    assert robot.excess_returns[5] == 0.20
+    assert robot.breadth == 1.0
+    assert robot.ma20_ratio == 1.0
+    assert robot.flow_streak == 4
+    assert robot.payload["strength_percentile"] == 100.0
 
 
 def test_sector_strength_ignores_members_without_sector_id() -> None:

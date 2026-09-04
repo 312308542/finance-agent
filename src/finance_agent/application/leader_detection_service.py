@@ -76,35 +76,35 @@ class LeaderDetectionService:
 
         strong = {sector_id for sector_id in strong_sector_ids if sector_id}
         filtered = [item for item in candidates if item.sector_id in strong]
-        scored = [
-            (
-                compute_leadership_score(item),
-                item,
-            )
-            for item in filtered
-        ]
-        scored.sort(key=lambda item: item[0], reverse=True)
         result: list[LeaderRank] = []
-        for index, (score, item) in enumerate(scored, start=1):
-            result.append(
-                LeaderRank(
-                    asset_id=item.asset_id,
-                    sector_id=item.sector_id,
-                    leader_rank=index,
-                    role=leader_role(index),
-                    leadership_score=score,
-                    consecutive_limit_up=max(int(item.consecutive_limit_up or 0), 0),
-                    relative_strength=round(float(item.pct_change or 0), 6),
-                    buyability_warning=buyability_warning(item),
-                    evidence_ids=dedupe(item.evidence_ids),
-                    payload={
-                        "asset_name": item.asset_name,
-                        "limit_up_time": item.limit_up_time,
-                        "unbuyable_reasons": unbuyable_reasons(item),
-                        "net_inflow": float(item.net_inflow or 0),
-                    },
+        for sector_id in sorted(strong):
+            scored = [
+                (compute_leadership_score(item), item)
+                for item in filtered
+                if item.sector_id == sector_id
+            ]
+            scored.sort(key=lambda item: (-item[0], item[1].asset_id))
+            for index, (score, item) in enumerate(scored, start=1):
+                result.append(
+                    LeaderRank(
+                        asset_id=item.asset_id,
+                        sector_id=item.sector_id,
+                        leader_rank=index,
+                        role=leader_role(index),
+                        leadership_score=score,
+                        consecutive_limit_up=max(int(item.consecutive_limit_up or 0), 0),
+                        relative_strength=round(float(item.pct_change or 0), 6),
+                        buyability_warning=buyability_warning(item),
+                        evidence_ids=dedupe(item.evidence_ids),
+                        payload={
+                            "asset_name": item.asset_name,
+                            "limit_up_time": item.limit_up_time,
+                            "unbuyable_reasons": unbuyable_reasons(item),
+                            "net_inflow": float(item.net_inflow or 0),
+                        },
+                    )
                 )
-            )
+        result.sort(key=lambda item: (-item.leadership_score, item.sector_id, item.asset_id))
         return result
 
 

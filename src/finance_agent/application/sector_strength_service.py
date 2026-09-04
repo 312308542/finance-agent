@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import log10
 from typing import Any
 
@@ -26,6 +26,11 @@ class SectorStrengthInput:
     limit_up: bool = False
     popularity_rank: int | None = None
     board_hits: int = 0
+    returns_by_horizon: dict[int, float] = field(default_factory=dict)
+    above_ma20: bool | None = None
+    flow_positive_streak: int = 0
+    breadth_change: float = 0.0
+    valid_cross_sections: int = 1
     evidence_ids: list[str] = field(default_factory=list)
 
 
@@ -41,6 +46,10 @@ class SectorStrength:
     average_pct_change: float
     limit_up_count: int
     continuity: int
+    excess_returns: dict[int, float]
+    breadth: float
+    ma20_ratio: float
+    flow_streak: int
     evidence_ids: list[str]
     payload: JsonDict
 
@@ -59,6 +68,10 @@ class SectorStrength:
                 "average_pct_change": self.average_pct_change,
                 "limit_up_count": self.limit_up_count,
                 "continuity": self.continuity,
+                "excess_returns": self.excess_returns,
+                "breadth": self.breadth,
+                "ma20_ratio": self.ma20_ratio,
+                "flow_streak": self.flow_streak,
             },
             "evidence_ids": self.evidence_ids,
         }
@@ -79,7 +92,14 @@ class SectorStrengthService:
 
         strengths = [self._build_strength(sector_id, members) for sector_id, members in buckets.items()]
         strengths.sort(key=lambda item: item.strength_score, reverse=True)
-        return strengths
+        percentiles = strength_percentiles(strengths)
+        return [
+            replace(
+                item,
+                payload={**item.payload, "strength_percentile": percentiles[item.sector_id]},
+            )
+            for item in strengths
+        ]
 
     def _build_strength(
         self,
@@ -99,6 +119,30 @@ class SectorStrengthService:
             default=None,
         )
         evidence_ids = unique_evidence_ids(members)
+        excess_returns = {
+            horizon: round(sum(values) / len(values), 6)
+            for horizon in (1, 3, 5, 10, 20)
+            if (
+                values := [
+                    float(item.returns_by_horizon[horizon])
+                    for item in members
+                    if horizon in item.returns_by_horizon
+                ]
+            )
+        }
+        advancing = sum(
+            1
+            for item in members
+            if float(item.returns_by_horizon.get(1, float(item.pct_change or 0) / 100)) > 0
+        )
+        breadth = advancing / len(members) if members else 0.0
+        ma20_values = [item.above_ma20 for item in members if item.above_ma20 is not None]
+        ma20_ratio = (
+            sum(bool(value) for value in ma20_values) / len(ma20_values)
+            if ma20_values
+            else breadth
+        )
+        flow_streak = max((max(0, item.flow_positive_streak) for item in members), default=0)
         strength_score = compute_sector_strength_score(
             total_net_inflow=total_net_inflow,
             average_pct_change=average_pct_change,
@@ -124,6 +168,10 @@ class SectorStrengthService:
             average_pct_change=round(average_pct_change, 6),
             limit_up_count=limit_up_count,
             continuity=continuity,
+            excess_returns=excess_returns,
+            breadth=round(breadth, 6),
+            ma20_ratio=round(ma20_ratio, 6),
+            flow_streak=flow_streak,
             evidence_ids=evidence_ids,
             payload={
                 "top_assets": [
@@ -136,6 +184,14 @@ class SectorStrengthService:
                     for item in top_assets
                 ],
                 "best_popularity_rank": best_popularity,
+                "breadth_change": round(
+                    sum(item.breadth_change for item in members) / len(members),
+                    6,
+                ),
+                "valid_cross_sections": max(
+                    (item.valid_cross_sections for item in members),
+                    default=1,
+                ),
             },
         )
 
@@ -169,6 +225,22 @@ def unique_evidence_ids(members: list[SectorStrengthInput]) -> list[str]:
             if evidence_id not in result:
                 result.append(evidence_id)
     return result
+
+
+def strength_percentiles(strengths: list[SectorStrength]) -> dict[str, float]:
+    """按当前截面计算板块强度分位，常数截面统一返回 50。"""
+
+    if not strengths:
+        return {}
+    values = {item.strength_score for item in strengths}
+    if len(values) == 1:
+        return {item.sector_id: 50.0 for item in strengths}
+    ascending = sorted(strengths, key=lambda item: (item.strength_score, item.sector_id))
+    size = len(ascending)
+    return {
+        item.sector_id: round((index + 1) / size * 100, 6)
+        for index, item in enumerate(ascending)
+    }
 
 
 def clamp(value: float, low: float, high: float) -> float:

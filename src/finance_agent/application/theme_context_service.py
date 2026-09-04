@@ -18,6 +18,11 @@ from finance_agent.application.leader_detection_service import (
     LeaderDetectionService,
     LeaderRank,
 )
+from finance_agent.application.sector_opportunity_service import (
+    SectorOpportunity,
+    SectorOpportunityHistory,
+    SectorOpportunityService,
+)
 from finance_agent.application.sector_strength_service import (
     SectorStrength,
     SectorStrengthInput,
@@ -52,6 +57,12 @@ class ThemeContextInput:
     limit_up_time: str | None = None
     one_word_limit: bool = False
     suspended: bool = False
+    returns_by_horizon: dict[int, float] = field(default_factory=dict)
+    above_ma20: bool | None = None
+    flow_positive_streak: int = 0
+    breadth_change: float = 0.0
+    valid_cross_sections: int = 1
+    previous_sector_regime: str | None = None
     evidence_ids: list[str] = field(default_factory=list)
 
     def to_sector_input(self) -> SectorStrengthInput:
@@ -67,6 +78,11 @@ class ThemeContextInput:
             limit_up=self.limit_up,
             popularity_rank=self.popularity_rank,
             board_hits=self.board_hits,
+            returns_by_horizon=self.returns_by_horizon,
+            above_ma20=self.above_ma20,
+            flow_positive_streak=self.flow_positive_streak,
+            breadth_change=self.breadth_change,
+            valid_cross_sections=self.valid_cross_sections,
             evidence_ids=self.evidence_ids,
         )
 
@@ -120,16 +136,19 @@ class ThemeContextService:
         *,
         sector_strength_service: SectorStrengthService | None = None,
         leader_detection_service: LeaderDetectionService | None = None,
+        sector_opportunity_service: SectorOpportunityService | None = None,
     ) -> None:
         self.session = session
         self.sector_strength_service = sector_strength_service or SectorStrengthService()
         self.leader_detection_service = leader_detection_service or LeaderDetectionService()
+        self.sector_opportunity_service = sector_opportunity_service or SectorOpportunityService()
 
     def build_contexts(
         self,
         inputs: list[ThemeContextInput],
         *,
         strong_sector_limit: int = 20,
+        market_regime: str = "range",
     ) -> dict[str, ThemeContext]:
         """根据已整理题材事实生成每个资产的上下文。"""
 
@@ -145,6 +164,12 @@ class ThemeContextService:
         leaders = self.leader_detection_service.rank_leaders(
             [item.to_leader_input() for item in inputs],
             strong_sector_ids=strong_sector_ids,
+        )
+        opportunities = self._sector_opportunities(
+            inputs,
+            strengths=sector_strengths,
+            leaders=leaders,
+            market_regime=market_regime,
         )
 
         best_sector_by_asset: dict[str, SectorStrength] = {}
@@ -164,7 +189,16 @@ class ThemeContextService:
 
         contexts: dict[str, ThemeContext] = {}
         for asset_id, sector in best_sector_by_asset.items():
-            factor_groups = [sector.to_factor_group()]
+            sector_group = sector.to_factor_group()
+            opportunity = opportunities[sector.sector_id]
+            sector_group["factors"] = {
+                **dict(sector_group["factors"]),
+                "sector_regime": opportunity.regime,
+                "override_eligible": opportunity.override_eligible,
+                "chase_risk": opportunity.chase_risk,
+                "excess_returns": opportunity.excess_returns,
+            }
+            factor_groups = [sector_group]
             leader = best_leader_by_asset.get(asset_id)
             leadership_payload: JsonDict | None = None
             if leader is not None:
@@ -190,12 +224,71 @@ class ThemeContextService:
                         "sector_id": sector.sector_id,
                         "sector_name": sector.sector_name,
                         "strength_score": sector.strength_score,
+                        "sector_regime": opportunity.regime,
+                        "override_eligible": opportunity.override_eligible,
                     },
                 ),
                 leadership=leadership_payload,
                 evidence_ids=tuple(evidence_ids),
             )
         return contexts
+
+    def _sector_opportunities(
+        self,
+        inputs: list[ThemeContextInput],
+        *,
+        strengths: list[SectorStrength],
+        leaders: list[LeaderRank],
+        market_regime: str,
+    ) -> dict[str, SectorOpportunity]:
+        """把强度、角色和多日输入压缩为板块生命周期。"""
+
+        inputs_by_sector: dict[str, list[ThemeContextInput]] = {}
+        for item in inputs:
+            inputs_by_sector.setdefault(item.sector_id, []).append(item)
+        leaders_by_sector: dict[str, list[LeaderRank]] = {}
+        for item in leaders:
+            leaders_by_sector.setdefault(item.sector_id, []).append(item)
+        result: dict[str, SectorOpportunity] = {}
+        for strength in strengths:
+            members = inputs_by_sector.get(strength.sector_id, [])
+            sector_leaders = leaders_by_sector.get(strength.sector_id, [])
+            history = SectorOpportunityHistory(
+                sector_id=strength.sector_id,
+                excess_returns=strength.excess_returns,
+                breadth=strength.breadth,
+                ma20_ratio=strength.ma20_ratio,
+                flow_streak=strength.flow_streak,
+                leader_asset_ids=tuple(
+                    item.asset_id for item in sector_leaders if item.role == "leader"
+                ),
+                challenger_asset_ids=tuple(
+                    item.asset_id for item in sector_leaders if item.role == "challenger"
+                ),
+                breadth_change=(
+                    sum(item.breadth_change for item in members) / len(members)
+                    if members
+                    else 0.0
+                ),
+                valid_cross_sections=max(
+                    (item.valid_cross_sections for item in members),
+                    default=1,
+                ),
+                previous_regime=next(
+                    (
+                        item.previous_sector_regime
+                        for item in members
+                        if item.previous_sector_regime
+                    ),
+                    None,
+                ),
+                evidence_ids=tuple(strength.evidence_ids),
+            )
+            result[strength.sector_id] = self.sector_opportunity_service.evaluate(
+                history,
+                market_regime=market_regime,
+            )
+        return result
 
     def build_for_members(
         self,
@@ -373,6 +466,18 @@ class ThemeContextService:
             limit_up_time=first_str(payload, "limit_up_time", "涨停时间"),
             one_word_limit=bool(payload.get("one_word_limit") or payload.get("一字涨停")),
             suspended=bool(status and status.trading_status in {"suspended", "停牌"}),
+            returns_by_horizon=return_horizon_map(payload.get("returns_by_horizon")),
+            above_ma20=optional_bool(payload.get("above_ma20")),
+            flow_positive_streak=(
+                first_int(dict(getattr(flow, "payload", {}) or {}), "positive_streak", "flow_streak")
+                if flow is not None
+                else None
+            )
+            or first_int(payload, "flow_positive_streak", "flow_streak")
+            or 0,
+            breadth_change=first_float(payload, "breadth_change") or 0.0,
+            valid_cross_sections=first_int(payload, "valid_cross_sections") or 1,
+            previous_sector_regime=first_str(payload, "previous_sector_regime"),
             evidence_ids=evidence_ids,
         )
 
@@ -436,6 +541,51 @@ def first_str(payload: JsonDict, *keys: str) -> str | None:
         if value:
             return str(value)
     return None
+
+
+def first_float(payload: JsonDict, *keys: str) -> float | None:
+    """从 payload 里按多个候选 key 提取浮点数。"""
+
+    for key in keys:
+        value = payload.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def optional_bool(value: Any) -> bool | None:
+    """解析可选布尔值，无法识别时保持缺失。"""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def return_horizon_map(value: Any) -> dict[int, float]:
+    """规范化 1/3/5/10/20 日收益映射。"""
+
+    if not isinstance(value, dict):
+        return {}
+    result: dict[int, float] = {}
+    for raw_horizon, raw_return in value.items():
+        try:
+            horizon = int(raw_horizon)
+            parsed = float(raw_return)
+        except (TypeError, ValueError):
+            continue
+        if horizon in {1, 3, 5, 10, 20}:
+            result[horizon] = parsed
+    return result
 
 
 def dedupe_evidence_ids(values: Any) -> list[str]:
