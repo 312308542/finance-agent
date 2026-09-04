@@ -57,6 +57,16 @@ def _market_bar_row(index: int) -> dict[str, Any]:
     }
 
 
+def _intraday_bar_row(index: int) -> dict[str, Any]:
+    row = _market_bar_row(index)
+    row["timeframe"] = "1m"
+    row["timestamp"] = datetime(2026, 9, 7, 1, 30, tzinfo=UTC) + timedelta(minutes=index)
+    row["end_timestamp"] = row["timestamp"] + timedelta(minutes=1)
+    row["source"] = "gotdx:tdx_main"
+    row["adjustment"] = ""
+    return row
+
+
 def test_list_recent_bars_excludes_non_final_statuses_by_default() -> None:
     """最近 K 线读取默认只使用正式可用数据，避免 partial/error 污染指标。"""
 
@@ -121,3 +131,37 @@ def test_upsert_bars_deduplicates_conflict_keys_before_batch_write() -> None:
     assert row_count == 1
     assert len(session.execute_statements) == 1
     assert session.flush_count == 1
+
+
+def test_upsert_intraday_bars_uses_independent_table_and_conflict_key() -> None:
+    session = _FakeSession()
+    repository = MarketDataRepository(session)
+
+    row_count = repository.upsert_intraday_bars(
+        [_intraday_bar_row(0), _intraday_bar_row(0) | {"close": Decimal("10.80")}]
+    )
+
+    sql = _compiled(session.execute_statements[0])
+    assert row_count == 1
+    assert "INSERT INTO market_bars_intraday" in sql
+    assert "ON CONFLICT (asset_id, timeframe, timestamp, source, adjustment)" in sql
+    assert session.flush_count == 1
+
+
+def test_list_intraday_bars_filters_window_and_closed_rows() -> None:
+    session = _FakeSession()
+    repository = MarketDataRepository(session)
+
+    rows = repository.list_intraday_bars(
+        asset_id="ashare:000001",
+        timeframe="5m",
+        start_at=datetime(2026, 9, 7, 1, 30, tzinfo=UTC),
+        end_at=datetime(2026, 9, 7, 3, 0, tzinfo=UTC),
+    )
+
+    sql = _compiled(session.statements[0])
+    assert rows == []
+    assert "FROM market_bars_intraday" in sql
+    assert "market_bars_intraday.is_closed IS true" in sql
+    assert "market_bars_intraday.status IN" in sql
+    assert "ORDER BY market_bars_intraday.timestamp" in sql

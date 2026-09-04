@@ -58,6 +58,7 @@ from finance_agent.storage.orm import (
     FundNavSnapshotORM,
     IndicatorFrameORM,
     IntradayQuoteLatestORM,
+    MarketBarIntradayORM,
     MarketBarORM,
     MarketCalendarORM,
     MemoryEmbeddingORM,
@@ -2126,6 +2127,93 @@ class MarketDataRepository:
             row_count += len(chunk)
         self.session.flush()
         return row_count
+
+    def upsert_intraday_bars(
+        self,
+        bars: Sequence[JsonDict],
+        *,
+        chunk_size: int = 500,
+    ) -> int:
+        """按盘中 K 唯一键分块幂等写入独立分钟表。"""
+
+        conflict_keys = ("asset_id", "timeframe", "timestamp", "source", "adjustment")
+        rows = _dedupe_rows(
+            [
+                {
+                    "asset_id": item["asset_id"],
+                    "symbol": item["symbol"],
+                    "market": item["market"],
+                    "timeframe": item["timeframe"],
+                    "timestamp": item["timestamp"],
+                    "end_timestamp": item.get("end_timestamp"),
+                    "open": item["open"],
+                    "high": item["high"],
+                    "low": item["low"],
+                    "close": item["close"],
+                    "volume": item["volume"],
+                    "amount": item.get("amount"),
+                    "source": item["source"],
+                    "adjustment": item.get("adjustment", ""),
+                    "is_closed": item.get("is_closed", True),
+                    "raw_record_id": item.get("raw_record_id"),
+                    "status": item.get("status", "available"),
+                }
+                for item in bars
+            ],
+            conflict_keys,
+        )
+
+        def build_statement(chunk: Sequence[JsonDict]) -> Any:
+            statement = insert(MarketBarIntradayORM).values(list(chunk))
+            update_values = {
+                key: statement.excluded[key]
+                for key in rows[0]
+                if key not in conflict_keys
+            }
+            return statement.on_conflict_do_update(
+                index_elements=[
+                    MarketBarIntradayORM.asset_id,
+                    MarketBarIntradayORM.timeframe,
+                    MarketBarIntradayORM.timestamp,
+                    MarketBarIntradayORM.source,
+                    MarketBarIntradayORM.adjustment,
+                ],
+                set_=update_values,
+            )
+
+        return _execute_chunked_upserts(
+            self.session,
+            rows,
+            chunk_size=chunk_size,
+            build_statement=build_statement,
+        )
+
+    def list_intraday_bars(
+        self,
+        *,
+        asset_id: str,
+        timeframe: str,
+        start_at: datetime,
+        end_at: datetime,
+        closed_only: bool = True,
+        source: str | None = None,
+    ) -> list[MarketBarIntradayORM]:
+        """按半开时间窗口读取单标的盘中 K，默认只返回闭合可用行。"""
+
+        statement = select(MarketBarIntradayORM).where(
+            MarketBarIntradayORM.asset_id == asset_id,
+            MarketBarIntradayORM.timeframe == timeframe,
+            MarketBarIntradayORM.timestamp >= start_at,
+            MarketBarIntradayORM.timestamp < end_at,
+        )
+        if source:
+            statement = statement.where(MarketBarIntradayORM.source == source)
+        if closed_only:
+            statement = statement.where(
+                MarketBarIntradayORM.is_closed.is_(True),
+                MarketBarIntradayORM.status.in_(FINAL_MARKET_BAR_STATUSES),
+            )
+        return list(self.session.scalars(statement.order_by(MarketBarIntradayORM.timestamp)))
 
     def get_bar(
         self,
