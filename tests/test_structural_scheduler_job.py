@@ -35,10 +35,7 @@ def test_scheduler_payload_registers_structural_methodology_job() -> None:
         "market": "ashare",
         "timeframe": "1d",
         "engines": ["swings", "smc", "harmonic", "elliott", "ichimoku"],
-        "universe_ids": [
-            "universe:technical:ashare:main_board",
-            "universe:tradeable:ashare:main_board",
-        ],
+        "universe_ids": ["universe:merged:ashare:recommendation"],
         "lookback_bars": 250,
         "swing_window": 10,
         "harmonic_max_bars_since_d": 10,
@@ -375,3 +372,56 @@ def _market_bar(index: int, *, asset: Any) -> Any:
         is_closed=True,
         status="available",
     )
+
+
+def test_structural_candidates_are_prioritized_before_limit() -> None:
+    from finance_agent.application.structural_methodology_service import (
+        StructuralMethodologyRefreshService,
+    )
+
+    members = [
+        SimpleNamespace(asset_id="ashare:000005", market="ashare", payload={}),
+        SimpleNamespace(
+            asset_id="ashare:000004",
+            market="ashare",
+            payload={"previous_recommendation_rank": 10},
+        ),
+        SimpleNamespace(
+            asset_id="ashare:000003",
+            market="ashare",
+            payload={"sector_role": "leader"},
+        ),
+        SimpleNamespace(
+            asset_id="ashare:000002",
+            market="ashare",
+            payload={"recommendation_state": "active"},
+        ),
+        SimpleNamespace(
+            asset_id="ashare:000001",
+            market="ashare",
+            payload={"held": True},
+        ),
+    ]
+
+    class _Universes:
+        def list_members(self, _universe_id: str, *, included_only: bool) -> list[Any]:
+            assert included_only is True
+            return members
+
+    service = StructuralMethodologyRefreshService(
+        None,
+        universe_repository=_Universes(),
+    )
+
+    selected = service.list_candidate_assets(
+        market="ashare",
+        universe_ids=["universe:merged:ashare:recommendation"],
+        limit=4,
+    )
+
+    assert [item.asset_id for item in selected] == [
+        "ashare:000001",
+        "ashare:000002",
+        "ashare:000003",
+        "ashare:000004",
+    ]

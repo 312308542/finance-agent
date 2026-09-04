@@ -180,6 +180,7 @@ class StructuralMethodologyRefreshService:
         if not candidates and self.assets is not None:
             candidates = list(self.assets.find_by_market(market, only_tradable=True))
         deduped = dedupe_assets(candidates, market=market)
+        deduped.sort(key=structural_candidate_priority)
         if limit is not None and int(limit) > 0:
             return deduped[: int(limit)]
         return deduped
@@ -437,6 +438,29 @@ def dedupe_assets(candidates: Iterable[Any], *, market: str) -> list[Any]:
             continue
         deduped[asset_id] = candidate
     return list(deduped.values())
+
+
+def structural_candidate_priority(candidate: Any) -> tuple[int, int, str]:
+    """按持仓、活跃状态、板块龙头和上一轮排名排列结构候选。"""
+
+    payload = dict(getattr(candidate, "payload", {}) or {})
+    asset_id = str(getattr(candidate, "asset_id", "") or "")
+    if bool(payload.get("held")):
+        return 0, 0, asset_id
+    if str(payload.get("recommendation_state") or "") in {
+        "active",
+        "buy_ready",
+        "setup_confirming",
+    }:
+        return 1, 0, asset_id
+    if str(payload.get("sector_role") or "") in {"leader", "challenger"}:
+        return 2, 0, asset_id
+    previous_rank = payload.get("previous_recommendation_rank")
+    try:
+        rank = max(1, int(previous_rank))
+    except (TypeError, ValueError):
+        rank = 1_000_000
+    return (3 if rank < 1_000_000 else 4), rank, asset_id
 
 
 def parse_payload_datetime(value: Any, *, fallback: datetime) -> datetime:

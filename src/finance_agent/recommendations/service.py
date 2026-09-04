@@ -17,6 +17,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from finance_agent.application.market_context_service import adjust_buy_percentile_threshold
+from finance_agent.recommendations.structural_decision import StructuralDecisionEngine
 from finance_agent.storage.orm import AssetScoreORM, RiskFindingORM, SignalSnapshotORM
 from finance_agent.storage.repositories import (
     AssetRepository,
@@ -38,6 +39,7 @@ STRUCTURAL_LITE_HORIZONS: tuple[str, ...] = (
     "smc_lite_v2",
     "harmonic_lite_v2",
     "elliott_lite_v2",
+    "ichimoku_v1",
 )
 
 
@@ -354,12 +356,24 @@ def build_recommendation_payload(
 ) -> JsonDict:
     """构建单标的推荐 payload。"""
 
-    action = decide_action(
+    proposed_action = decide_action(
         score=score,
         signal=signal,
         risks=risks,
         decision_context=decision_context,
     )
+    structure_verdict = None
+    action = proposed_action
+    if structure_evidence is not None:
+        structure_frames = structure_evidence.get("structure_frames")
+        structure_verdict = StructuralDecisionEngine().evaluate(
+            frames=structure_frames if isinstance(structure_frames, list) else (),
+            current_price=_optional_decimal(
+                score.payload.get("last_price") or score.payload.get("current_price")
+            ),
+        )
+        if proposed_action == "buy_candidate" and not structure_verdict.buy_allowed:
+            action = "watch"
     conviction = decide_conviction(score=score)
     signal_ids = [signal.signal_id] if signal else []
     risk_ids = [risk.risk_id for risk in risks]
@@ -403,6 +417,7 @@ def build_recommendation_payload(
         "market": score.market,
         "horizon": score.horizon,
         "action": action,
+        "proposed_action": proposed_action,
         "rank": rank,
         "total_score": float(score.total_score),
         "conviction": conviction,
@@ -431,6 +446,7 @@ def build_recommendation_payload(
     }
     if structure_evidence is not None:
         payload["structure"] = structure_evidence
+        payload["structure_verdict"] = structure_verdict.to_dict() if structure_verdict else None
     return payload
 
 
@@ -490,6 +506,7 @@ def compact_structure_frame(frame: Any) -> JsonDict | None:
     status = str(payload.get("status") or getattr(frame, "status", None) or "unknown")
     result: JsonDict = {
         "horizon": horizon,
+        "timeframe": str(getattr(frame, "timeframe", None) or payload.get("timeframe") or "1d"),
         "status": status,
         "confidence": normalize_structure_confidence(payload.get("confidence", getattr(frame, "confidence", 0))),
         "evidence_id": str(payload.get("evidence_id") or getattr(frame, "evidence_id", "") or ""),
@@ -531,7 +548,26 @@ def summarize_structure_items(*, horizon: str, payload: JsonDict) -> list[JsonDi
     if horizon == "structural_swings_v2":
         segments = list_records(payload.get("segments"))
         return [{"direction": str(item.get("direction") or "")} for item in segments[-3:]]
+    if horizon == "ichimoku_v1":
+        return [
+            {
+                "name": str(item.get("name") or ""),
+                "direction": str(item.get("direction") or ""),
+            }
+            for item in list_records(payload.get("signals"))[:3]
+        ]
     return []
+
+
+def _optional_decimal(value: Any) -> Decimal | None:
+    """把推荐上下文中的可选价格转换为 Decimal。"""
+
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except (ArithmeticError, ValueError):
+        return None
 
 
 def list_records(value: Any) -> list[JsonDict]:

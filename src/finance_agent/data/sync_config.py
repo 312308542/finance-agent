@@ -1186,10 +1186,7 @@ def build_structural_methodology_scheduler_jobs(config: DataSyncConfig) -> list[
                 "market": "ashare",
                 "timeframe": timeframe,
                 "engines": ["swings", "smc", "harmonic", "elliott", "ichimoku"],
-                "universe_ids": [
-                    "universe:technical:ashare:main_board",
-                    "universe:tradeable:ashare:main_board",
-                ],
+                "universe_ids": ["universe:merged:ashare:recommendation"],
                 "lookback_bars": 250,
                 "swing_window": 10,
                 "harmonic_max_bars_since_d": 10,

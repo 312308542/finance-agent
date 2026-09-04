@@ -90,7 +90,8 @@ def test_rank_from_screening_passes_percentile_context_to_recommendations() -> N
 
     first_payload = recommendations.asset_payloads[0]["payload"]
     fourth_payload = recommendations.asset_payloads[3]["payload"]
-    assert first_payload["action"] == "buy_candidate"
+    assert first_payload["proposed_action"] == "buy_candidate"
+    assert first_payload["action"] == "watch"
     assert first_payload["decision_context"]["percentile"] == 0.1
     assert first_payload["decision_context"]["buy_percentile_threshold"] == 0.2
     assert fourth_payload["action"] == "watch"
@@ -135,7 +136,7 @@ def test_rank_from_screening_applies_memory_ranking_adjustments_without_mutating
     assert last_payload["total_score"] == 58.9
 
 
-def test_rank_from_screening_attaches_compact_structure_evidence_without_changing_action() -> None:
+def test_rank_from_screening_attaches_structure_verdict_and_blocks_unconfirmed_buy() -> None:
     recommendations = _RecommendationStore()
     service = RecommendationService.__new__(RecommendationService)
     service.assets = _AssetStore()
@@ -150,7 +151,7 @@ def test_rank_from_screening_attaches_compact_structure_evidence_without_changin
         screening_id="screen:percentile",
         strategy="balanced_swing_v1",
         horizon="swing",
-        limit=1,
+        limit=10,
         profile_style_tendency={"theme": 0.8, "value": 0.2},
     )
 
@@ -166,18 +167,29 @@ def test_rank_from_screening_attaches_compact_structure_evidence_without_changin
         rule_version=payload["rule_version"],
         decision_context=RecommendationDecisionContext(
             rank=1,
-            total=1,
+            total=10,
             style_tendency={"theme": 0.8, "value": 0.2},
         ),
     )
 
-    assert payload["action"] == baseline["action"]
+    assert baseline["action"] == "buy_candidate"
+    assert payload["action"] == "watch"
+    assert payload["structure_verdict"]["status"] == "waiting"
+    assert payload["structure_verdict"]["buy_allowed"] is False
     structure = payload["structure"]
     assert structure["library"] == "structural-lite"
-    assert len(structure["structure_frames"]) == 4
+    assert len(structure["structure_frames"]) == 5
     assert len(json.dumps(structure, ensure_ascii=False).encode("utf-8")) <= 4096
     smc = next(frame for frame in structure["structure_frames"] if frame["horizon"] == "smc_lite_v2")
-    assert set(smc) == {"horizon", "status", "confidence", "evidence_id", "as_of", "items"}
+    assert set(smc) == {
+        "horizon",
+        "timeframe",
+        "status",
+        "confidence",
+        "evidence_id",
+        "as_of",
+        "items",
+    }
     assert smc["items"] == [
         {"name": "bos_bullish", "direction": "bullish", "break_level": 12.3},
         {"name": "choch_bearish", "direction": "bearish", "break_level": 11.8},
@@ -205,6 +217,8 @@ def test_rank_from_screening_marks_missing_structure_evidence() -> None:
 
     payload = recommendations.asset_payloads[0]["payload"]
     assert payload["structure"] == {"status": "no_structure_evidence"}
+    assert payload["structure_verdict"]["status"] == "blocked"
+    assert payload["action"] == "watch"
 
 
 def score(*, total_score: float, confidence: float) -> SimpleNamespace:
@@ -364,6 +378,20 @@ class _IndicatorStore:
                         "evidence_id": "structural_swings:ashare:000001:1d:20260705",
                     },
                 ),
+                "ichimoku_v1": SimpleNamespace(
+                    horizon="ichimoku_v1",
+                    timeframe="1d",
+                    status="available",
+                    confidence=Decimal("0.65"),
+                    as_of=as_of,
+                    payload={
+                        "schema_version": "ichimoku_v1",
+                        "status": "available",
+                        "direction": "bullish",
+                        "signals": [{"name": "cloud_breakout", "direction": "bullish"}],
+                        "evidence_id": "ichimoku:ashare:000001:1d:20260705",
+                    },
+                ),
             }
         )
 
@@ -375,7 +403,6 @@ class _IndicatorStore:
         horizon: str,
         library: str | None = None,
     ) -> SimpleNamespace | None:
-        assert asset_id == "ashare:000001"
         assert timeframe == "1d"
         assert library == "structural-lite"
-        return self.frames.get(horizon)
+        return self.frames.get(horizon) if asset_id == "ashare:000001" else None
