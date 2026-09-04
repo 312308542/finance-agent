@@ -75,3 +75,4 @@ coverage/
 !src/finance_agent/agents/reports/
 !src/finance_agent/agents/reports/*.py
 .gitnexus
+.worktrees/
