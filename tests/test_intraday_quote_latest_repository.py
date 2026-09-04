@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -145,3 +145,25 @@ def test_list_intraday_latest_reads_latest_rows_for_risk_and_position_consumers(
     assert rows == []
     assert "SELECT" in _compiled(session.executed[0])
     assert "intraday_quote_latest" in _compiled(session.executed[0])
+
+
+def test_list_realtime_history_filters_assets_sources_and_time_window() -> None:
+    session = _Session()
+
+    rows = AssetRepository(session).list_realtime_quote_snapshots(
+        asset_ids=("ashare:600519",),
+        sources=("gotdx:tdx_main",),
+        start_at=NOW - timedelta(minutes=5),
+        end_at=NOW,
+        quality_statuses=("available",),
+    )
+
+    sql = _compiled(session.executed[0])
+    assert rows == []
+    assert "FROM realtime_quote_snapshots" in sql
+    assert "realtime_quote_snapshots.asset_id IN" in sql
+    assert "realtime_quote_snapshots.source IN" in sql
+    assert "realtime_quote_snapshots.as_of >=" in sql
+    assert "realtime_quote_snapshots.as_of <=" in sql
+    assert "realtime_quote_snapshots.quality_status IN" in sql
+    assert "ORDER BY realtime_quote_snapshots.asset_id" in sql

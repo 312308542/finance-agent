@@ -962,6 +962,44 @@ class AssetRepository:
             build_statement=build_statement,
         )
 
+    def list_realtime_quote_snapshots(
+        self,
+        *,
+        asset_ids: Sequence[str] = (),
+        sources: Sequence[str] = (),
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        quality_statuses: Sequence[str] = (),
+    ) -> list[RealtimeQuoteSnapshotORM]:
+        """按资产、来源与闭区间读取追加式实时行情历史。"""
+
+        statement = select(RealtimeQuoteSnapshotORM)
+        normalized_asset_ids = tuple(str(item).strip() for item in asset_ids if str(item).strip())
+        normalized_sources = tuple(str(item).strip() for item in sources if str(item).strip())
+        normalized_quality = tuple(
+            str(item).strip() for item in quality_statuses if str(item).strip()
+        )
+        if normalized_asset_ids:
+            statement = statement.where(
+                RealtimeQuoteSnapshotORM.asset_id.in_(normalized_asset_ids)
+            )
+        if normalized_sources:
+            statement = statement.where(RealtimeQuoteSnapshotORM.source.in_(normalized_sources))
+        if start_at is not None:
+            statement = statement.where(RealtimeQuoteSnapshotORM.as_of >= start_at)
+        if end_at is not None:
+            statement = statement.where(RealtimeQuoteSnapshotORM.as_of <= end_at)
+        if normalized_quality:
+            statement = statement.where(
+                RealtimeQuoteSnapshotORM.quality_status.in_(normalized_quality)
+            )
+        statement = statement.order_by(
+            RealtimeQuoteSnapshotORM.asset_id,
+            RealtimeQuoteSnapshotORM.source,
+            RealtimeQuoteSnapshotORM.as_of,
+        )
+        return list(self.session.scalars(statement))
+
     def clear_intraday_quote_latest(self, *, market: str | None = None) -> int:
         """收盘最终日 K 完成后清理盘中临时行情。"""
 
