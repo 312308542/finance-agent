@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from finance_agent.application.memory_service import MemoryService
 from finance_agent.application.portfolio_service import PortfolioService, PortfolioSnapshot
+from finance_agent.monitoring.repository import PositionMonitoringRepository
 from finance_agent.storage.orm import (
     DecisionLogORM,
     ExecutionRecordORM,
@@ -152,6 +153,7 @@ class ActionLoopService:
         action_repository: ActionRepository | None = None,
         portfolio_service: PortfolioPositionService | None = None,
         latest_price_loader: Callable[..., JsonDict | None] | None = None,
+        monitoring_repository: Any | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.session = session
@@ -159,6 +161,11 @@ class ActionLoopService:
         self.action_repository = action_repository or ActionLoopRepository(session)
         self.portfolio_service = portfolio_service or PortfolioService(session)
         self.latest_price_loader = latest_price_loader or load_latest_market_bar_price
+        self.monitoring_repository = monitoring_repository or (
+            PositionMonitoringRepository(session)
+            if hasattr(session, "execute") and hasattr(session, "get")
+            else None
+        )
         self.now = now or (lambda: datetime.now().astimezone())
 
     def confirm_decision(
@@ -293,8 +300,54 @@ class ActionLoopService:
             created_at=self.now(),
         )
         position = self.apply_position_update(record=record, update=position_update)
+        self._sync_monitoring_after_execution(
+            record=record,
+            position=position,
+            current=current,
+            action=normalized_action,
+        )
         self.record_execution_audit(record=record, position=position)
         return record
+
+    def _sync_monitoring_after_execution(
+        self,
+        *,
+        record: ExecutionRecordORM,
+        position: PositionORM,
+        current: PositionORM | None,
+        action: str,
+    ) -> None:
+        """把执行登记同步到监控状态，并按 A 股 T+1 锁定新增买入数量。"""
+
+        repository = self.monitoring_repository
+        if repository is None or not hasattr(repository, "apply_execution"):
+            return
+        previous_payload = dict(getattr(current, "payload", {}) or {}) if current else {}
+        previous_sellable = Decimal(
+            str(previous_payload.get("sellable_quantity", getattr(current, "quantity", "0") or "0"))
+        )
+        if action in {"buy", "add"}:
+            sellable_quantity = previous_sellable
+        else:
+            sellable_quantity = max(
+                Decimal("0"), previous_sellable - Decimal(str(record.executed_quantity))
+            )
+        repository.apply_execution(
+            action=action,
+            execution=record,
+            position=position,
+            owner_id=record.owner_id,
+            portfolio_id=record.portfolio_id,
+            asset_id=record.asset_id,
+            total_quantity=Decimal(str(position.quantity or "0")),
+            sellable_quantity=sellable_quantity,
+            opened_on=(
+                previous_payload.get("opened_on")
+                or record.executed_at.date()
+                if action in {"buy", "add"}
+                else previous_payload.get("opened_on")
+            ),
+        )
 
     def update_position_from_execution(self, execution: ExecutionRecordORM) -> PositionORM:
         """根据执行登记更新当前持仓。"""

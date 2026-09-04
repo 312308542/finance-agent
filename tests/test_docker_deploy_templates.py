@@ -55,13 +55,13 @@ def test_docker_runtime_paths_are_explicit_and_shared() -> None:
     for dockerfile_content in (backend_dockerfile_content, scheduler_dockerfile_content):
         assert "FINANCE_AGENT_PROJECT_ROOT=/app" in dockerfile_content
         assert "FINANCE_AGENT_RUNTIME_DIR=/app/runtime" in dockerfile_content
-    assert compose_content.count("FINANCE_AGENT_PROJECT_ROOT: /app") == 3
+    assert compose_content.count("FINANCE_AGENT_PROJECT_ROOT: /app") == 4
     assert "FINANCE_AGENT_DOCKER_PROJECT_ROOT" not in compose_content
     runtime_path_expression = "${FINANCE_AGENT_DOCKER_RUNTIME_DIR:-/app/runtime}"
     assert compose_content.count(
         f"FINANCE_AGENT_RUNTIME_DIR: {runtime_path_expression}"
-    ) == 3
-    assert compose_content.count(f"target: {runtime_path_expression}") == 3
+    ) == 4
+    assert compose_content.count(f"target: {runtime_path_expression}") == 4
     assert f"- {runtime_path_expression}/base_data_scheduler/status.json" in compose_content
     assert f"- {runtime_path_expression}/base_data_scheduler/events.jsonl" in compose_content
 
@@ -150,7 +150,7 @@ def test_root_compose_includes_all_runtime_services() -> None:
 
     content = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 
-    assert content.count("restart: unless-stopped") == 8
+    assert content.count("restart: unless-stopped") == 9
     assert "finance-agent-gotdx-gateway" in content
     assert "finance-agent-scheduler" in content
     assert "finance-agent-realtime-monitor" in content
@@ -197,7 +197,7 @@ def test_root_compose_runs_schema_migration_before_database_consumers_start() ->
 
     assert "finance-agent-migrate:" in compose_content
     assert "python -m alembic -c /app/alembic.ini upgrade head" in compose_content
-    assert compose_content.count("condition: service_completed_successfully") == 4
+    assert compose_content.count("condition: service_completed_successfully") == 5
     assert "COPY pyproject.toml README.md alembic.ini ./" in dockerfile_content
 
 
@@ -215,3 +215,18 @@ def test_compose_defines_independent_realtime_monitor_service() -> None:
         assert "finance-agent-gotdx-gateway:\n        condition: service_healthy" in content
     assert "finance-agent-migrate:\n        condition: service_completed_successfully" in root_content
     assert "postgres:\n        condition: service_healthy" in root_content
+
+
+def test_compose_defines_independent_position_monitor_service() -> None:
+    """根 Compose 和调度模板必须单独运行盘中持仓监控进程。"""
+
+    root_content = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    scheduler_content = read_template("compose.scheduler.yml")
+    for content in (root_content, scheduler_content):
+        assert "finance-agent-position-monitor:" in content
+        assert "scripts/runtime/run_position_monitor.py" in content
+        assert "--loop" in content
+        assert "finance-agent-realtime-monitor" in content
+    assert "finance-agent-migrate" in root_content
+    assert "postgres" in root_content
+    assert "redis" in root_content

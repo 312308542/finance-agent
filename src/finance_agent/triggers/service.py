@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -19,10 +19,12 @@ from sqlalchemy.orm import Session
 
 from finance_agent.agents.tools.runtime import json_value
 from finance_agent.application import PortfolioService, WatchlistService
+from finance_agent.monitoring.models import PositionAction
 from finance_agent.storage.orm import (
     AssistantTriggerEventORM,
     DataQualitySnapshotORM,
     IntradayQuoteLatestORM,
+    PositionMonitoringStateORM,
     PositionORM,
     RealtimeQuoteSnapshotORM,
     RecommendationRunORM,
@@ -209,6 +211,74 @@ class TriggerService:
             drafts=drafts,
             skipped_no_data_count=skipped_no_data_count,
         )
+
+    def persist_position_actions(
+        self,
+        actions: Sequence[PositionAction],
+        as_of: datetime,
+        cooldown_minutes: int = 15,
+    ) -> TriggerEvaluationResult:
+        """将盘中监控动作转换为持仓工作流触发事件并幂等写入。
+
+        去重键包含动作和原因码，因此相同动作不会在冷却期内重复唤醒，
+        动作发生变化时仍可及时触发；不可执行动作会保留原计划动作。
+        """
+
+        action_items = tuple(actions)
+        drafts: list[TriggerEventDraft] = []
+        for action in action_items:
+            payload = dict(action.to_dict())
+            context = action.payload or {}
+            state_row = None
+            if self.session is not None and hasattr(self.session, "get"):
+                state_row = self.session.get(
+                    PositionMonitoringStateORM,
+                    f"monitoring:{action.position_id}",
+                )
+            payload.update(
+                {
+                    "owner_id": context.get("owner_id")
+                    or getattr(state_row, "owner_id", None)
+                    or "default-owner",
+                    "portfolio_id": context.get("portfolio_id")
+                    or getattr(state_row, "portfolio_id", None),
+                    "asset_id": context.get("asset_id")
+                    or getattr(state_row, "asset_id", None),
+                    "symbol": context.get("symbol")
+                    or getattr(state_row, "symbol", None),
+                }
+            )
+            drafts.append(
+                TriggerEventDraft(
+                    trigger_type="position_monitoring_action",
+                    requested_workflow_type="portfolio_monitoring",
+                    severity=action.severity,
+                    trigger_ref=action.position_id,
+                    dedup_key=build_dedup_key(
+                        owner_id=str(payload["owner_id"]),
+                        trigger_type="position_monitoring_action",
+                        requested_workflow_type="portfolio_monitoring",
+                        scope_id=(
+                            f"{action.position_id}:{action.action}:"
+                            f"{','.join(action.reason_codes)}"
+                        ),
+                        asset_id=str(payload.get("asset_id") or action.position_id),
+                    ),
+                    portfolio_id=payload.get("portfolio_id"),
+                    asset_id=payload.get("asset_id"),
+                    payload=payload,
+                )
+            )
+        request = TriggerEvaluationRequest(
+            owner_id=str(
+                (actions[0].payload or {}).get("owner_id", "default-owner")
+                if action_items
+                else "default-owner"
+            ),
+            as_of=as_of,
+            cooldown_minutes=max(0, int(cooldown_minutes)),
+        )
+        return self._persist_drafts(request=request, drafts=drafts)
 
     def dispatch_pending(
         self,
@@ -801,7 +871,7 @@ class TriggerService:
             created.append(
                 self.triggers.upsert_trigger_event(
                     trigger_event_id=event_id,
-                    owner_id=request.owner_id,
+                    owner_id=str((draft.payload or {}).get("owner_id") or request.owner_id),
                     trigger_type=draft.trigger_type,
                     trigger_ref=draft.trigger_ref,
                     dedup_key=draft.dedup_key,

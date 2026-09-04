@@ -11,6 +11,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+from finance_agent.monitoring.models import PositionAction
 from finance_agent.storage.orm import (
     AssistantMemoryORM,
     PortfolioORM,
@@ -35,6 +36,7 @@ class PortfolioMonitoringInput:
     decision_gate_id: str | None = None
     decision_gate_status: str | None = None
     intraday_quotes_by_asset: dict[str, tuple[dict[str, Any], ...]] | None = None
+    position_actions_by_position: dict[str, PositionAction] | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ class PortfolioMonitoringDecision:
     decision_gate_id: str | None = None
     decision_gate_status: str | None = None
     intraday_quotes: tuple[dict[str, Any], ...] = ()
+    intended_action: str | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +92,9 @@ class PortfolioMonitoringWorkflow:
                 intraday_quotes=(workflow_input.intraday_quotes_by_asset or {}).get(
                     position.asset_id, ()
                 ),
+                position_action=(workflow_input.position_actions_by_position or {}).get(
+                    position.position_id
+                ),
             )
             for position in workflow_input.positions
         )
@@ -115,10 +121,20 @@ class PortfolioMonitoringWorkflow:
         risks: tuple[RiskFindingORM, ...],
         memories: tuple[AssistantMemoryORM, ...],
         intraday_quotes: tuple[dict[str, Any], ...],
+        position_action: PositionAction | None = None,
     ) -> PortfolioMonitoringDecision:
         """根据单个持仓的信号、风险和记忆生成建议。"""
 
         direction = signal.direction if signal else "neutral"
+        if position_action is not None:
+            return decision_from_position_action(
+                position=position,
+                signal=signal,
+                risks=risks,
+                memories=memories,
+                intraday_quotes=intraday_quotes,
+                position_action=position_action,
+            )
         high_risks = [risk for risk in risks if risk.severity in {"high", "critical"}]
         pnl_pct = position.unrealized_pnl_pct
         if high_risks or direction == "bearish":
@@ -169,6 +185,64 @@ class PortfolioMonitoringWorkflow:
             evidence_ids=evidence_ids,
             intraday_quotes=intraday_quotes,
         )
+
+
+def decision_from_position_action(
+    *,
+    position: PositionORM,
+    signal: SignalSnapshotORM | None,
+    risks: tuple[RiskFindingORM, ...],
+    memories: tuple[AssistantMemoryORM, ...],
+    intraday_quotes: tuple[dict[str, Any], ...],
+    position_action: PositionAction,
+) -> PortfolioMonitoringDecision:
+    """将盘中动作作为工作流唯一动作来源，避免被简化规则覆盖。"""
+
+    action = position_action.action
+    intended_action = position_action.intended_action
+    suggested_action = (
+        "wait"
+        if action == "unexecutable"
+        else "sell"
+        if action == "exit"
+        else action
+    )
+    decision_type = (
+        "position_monitoring_unexecutable"
+        if action == "unexecutable"
+        else "position_monitoring"
+    )
+    reason = "、".join(position_action.reason_codes) or "盘中监控动作已更新"
+    summary = (
+        f"{position.symbol} 盘中监控建议 {intended_action or '未知动作'}，"
+        f"当前状态不可执行（{reason}）。"
+        if action == "unexecutable"
+        else f"{position.symbol} 盘中监控建议 {action}（{reason}）。"
+    )
+    risk_ids = tuple(risk.risk_id for risk in risks)
+    evidence_ids = tuple(
+        sorted({evidence_id for risk in risks for evidence_id in risk.evidence_ids})
+    )
+    return PortfolioMonitoringDecision(
+        asset_id=position.asset_id,
+        symbol=position.symbol,
+        market=position.market,
+        suggested_action=suggested_action,
+        decision_type=decision_type,
+        severity=position_action.severity,
+        summary=summary,
+        risk_rebuttal=build_risk_rebuttal(signal=signal, risks=risks, memories=memories),
+        trigger_condition=f"盘中监控动作：{reason}。",
+        thesis=build_thesis(position=position, signal=signal, action=suggested_action),
+        review_questions=build_review_questions(
+            action=suggested_action, signal=signal, risks=risks
+        ),
+        signal_ids=(signal.signal_id,) if signal else (),
+        risk_ids=risk_ids,
+        evidence_ids=evidence_ids,
+        intraday_quotes=intraday_quotes,
+        intended_action=intended_action,
+    )
 
 
 def apply_decision_gate(

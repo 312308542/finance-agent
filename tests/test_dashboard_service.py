@@ -5,6 +5,8 @@ from typing import Any
 
 from finance_agent.application.dashboard_service import DashboardService
 
+NOW = datetime(2026, 9, 7, 10, 0, tzinfo=UTC)
+
 
 def test_dashboard_watchlists_split_research_and_manual_pools() -> None:
     """Dashboard 应区分系统研究跟踪池和用户观察池。"""
@@ -186,6 +188,88 @@ def test_latest_recommendations_isolates_lifecycle_by_owner() -> None:
     payload = service.get_latest_recommendations(owner_id="owner-a", market="ashare", limit=80)
 
     assert payload["recommendations"] == []
+
+
+def test_portfolio_overview_exposes_monitoring_state_and_execution_boundary() -> None:
+    """持仓页面应区分监控建议和真实执行状态，T+1 不可卖不能伪装为已卖出。"""
+
+    position = SimpleNamespace(
+        position_id="position:1",
+        portfolio_id="portfolio:1",
+        asset_id="ashare:600519",
+        symbol="600519",
+        market="ashare",
+        side="long",
+        quantity=Decimal("1000"),
+        avg_cost=Decimal("10"),
+        last_price=Decimal("9.2"),
+        market_value=Decimal("9200"),
+        unrealized_pnl=Decimal("-800"),
+        unrealized_pnl_pct=Decimal("-0.08"),
+        portfolio_weight=Decimal("0.10"),
+        status="active",
+        as_of=NOW,
+        payload={},
+    )
+    portfolio = SimpleNamespace(
+        portfolio_id="portfolio:1",
+        owner_id="owner-a",
+        name="测试组合",
+        portfolio_type="manual",
+        base_currency="CNY",
+        risk_profile="balanced",
+        total_equity=Decimal("100000"),
+        cash=Decimal("90000"),
+        market_value=Decimal("10000"),
+        max_position_weight=Decimal("0.25"),
+        max_drawdown_alert=Decimal("0.12"),
+        status="active",
+        as_of=NOW,
+        payload={},
+    )
+    monitoring_state = SimpleNamespace(
+        monitoring_state_id="monitoring:position:1",
+        position_id="position:1",
+        owner_id="owner-a",
+        current_action="unexecutable",
+        previous_valid_action="hold",
+        total_quantity=Decimal("1000"),
+        sellable_quantity=Decimal("0"),
+        planned_horizon_days=10,
+        invalidation_price=Decimal("9.4"),
+        protective_price=Decimal("9.5"),
+        sector_regime="cooling",
+        last_evaluated_at=NOW,
+        payload={"structure_direction": "bearish", "reason_codes": ["t1_not_sellable"]},
+    )
+    service = DashboardService.__new__(DashboardService)
+    service.portfolios = SimpleNamespace(
+        list_portfolios=lambda **_: [portfolio],
+        list_positions=lambda *_: [position],
+    )
+    service.assets = SimpleNamespace(list_intraday_quote_latest=lambda **_: [])
+    service.monitoring = SimpleNamespace(
+        list_states_by_position_ids=lambda *_args, **_kwargs: [monitoring_state],
+        list_events=lambda **_: [
+            SimpleNamespace(
+                event_id="event:1",
+                action="unexecutable",
+                severity="critical",
+                reason_codes=["t1_not_sellable"],
+                occurred_at=NOW,
+                payload={},
+            )
+        ],
+    )
+
+    payload = service.get_portfolio_overview(owner_id="owner-a")
+
+    item = payload["positions"][0]["monitoring"]
+    assert item["action"] == "unexecutable"
+    assert item["intended_action"] == "exit"
+    assert item["sellable_quantity"] == "0"
+    assert item["reason_codes"] == ["t1_not_sellable"]
+    assert item["execution_status"] == "blocked"
 
 
 def watchlist_item(

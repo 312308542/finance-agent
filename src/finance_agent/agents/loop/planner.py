@@ -90,6 +90,7 @@ class InternalFinanceAgentPlanner:
                 "trigger_ref": event.trigger_ref,
                 "severity": event.severity,
                 "reason": payload.get("reason"),
+                "payload": payload,
             },
         }
         return AgentLoopPlan(

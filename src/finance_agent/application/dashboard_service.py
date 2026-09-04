@@ -20,6 +20,7 @@ from finance_agent.agents.tools.runtime import (
     serialize_recommendation_run,
     serialize_watchlist_item,
 )
+from finance_agent.monitoring.repository import PositionMonitoringRepository
 from finance_agent.scheduler import read_scheduler_health
 from finance_agent.storage.orm import (
     AgentWorkflowRunORM,
@@ -61,6 +62,7 @@ class DashboardService:
         self.data_quality = DataQualityRepository(session)
         self.models = ModelRuntimeConfigRepository(session)
         self.assets = AssetRepository(session)
+        self.monitoring = PositionMonitoringRepository(session)
 
     def build_summary(self, *, owner_id: str) -> JsonDict:
         """构建控制台总览快照。"""
@@ -130,6 +132,13 @@ class DashboardService:
             portfolio=active,
             positions=positions,
         )
+        monitoring_by_position: dict[str, Any] = {}
+        monitoring_repo = getattr(self, "monitoring", None)
+        if monitoring_repo is not None and hasattr(monitoring_repo, "list_states_by_position_ids"):
+            states = monitoring_repo.list_states_by_position_ids(
+                [str(position.position_id) for position in positions]
+            )
+            monitoring_by_position = {str(state.position_id): state for state in states}
         return {
             "status": "ok",
             "active_portfolio_id": active.portfolio_id,
@@ -138,6 +147,10 @@ class DashboardService:
                 {
                     **serialize_position(item),
                     "intraday_quotes": quotes_by_asset.get(item.asset_id, []),
+                    "monitoring": self._serialize_position_monitoring(
+                        item,
+                        monitoring_by_position.get(str(item.position_id)),
+                    ),
                 }
                 for item in positions
             ],
@@ -282,6 +295,43 @@ class DashboardService:
                 else ""
             ),
             "metrics": metrics,
+        }
+
+    @staticmethod
+    def _serialize_position_monitoring(position: Any, state: Any | None) -> JsonDict:
+        """序列化持仓监控状态，明确建议动作和执行边界。"""
+
+        payload = dict(getattr(state, "payload", None) or {}) if state is not None else {}
+        action = str(getattr(state, "current_action", None) or payload.get("action") or "watch")
+        intended = "exit" if action == "unexecutable" and getattr(position, "quantity", 0) else action
+        reason_codes = list(
+            getattr(state, "reason_codes", None)
+            or payload.get("reason_codes")
+            or (["monitoring_state_missing"] if state is None else [])
+        )
+        return {
+            "monitoring_state_id": getattr(state, "monitoring_state_id", None),
+            "position_id": position.position_id,
+            "action": action,
+            "intended_action": intended,
+            "execution_status": "blocked" if action == "unexecutable" else "not_executed",
+            "severity": str(getattr(state, "severity", None) or payload.get("severity") or "low"),
+            "sellable_quantity": json_value(
+                getattr(state, "sellable_quantity", None)
+                if state is not None
+                else payload.get("sellable_quantity", getattr(position, "quantity", 0))
+            ),
+            "planned_horizon_days": int(
+                getattr(state, "planned_horizon_days", None) or payload.get("planned_horizon_days", 10)
+            ),
+            "structure_direction": str(payload.get("structure_direction", "unknown")),
+            "protective_price": json_value(getattr(state, "protective_price", None)),
+            "sector_regime": str(
+                getattr(state, "sector_regime", None) or payload.get("sector_regime", "unknown")
+            ),
+            "reason_codes": reason_codes,
+            "last_evaluated_at": json_value(getattr(state, "last_evaluated_at", None)),
+            "next_review_at": json_value(payload.get("next_review_at")),
         }
 
     def _list_lifecycle_states(

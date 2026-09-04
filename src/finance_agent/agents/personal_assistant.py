@@ -236,6 +236,7 @@ class PersonalFinanceAgentService:
                     "risk_rebuttal": decision.risk_rebuttal,
                     "thesis": decision.thesis,
                     "signal_ids": decision.signal_ids,
+                    "intended_action": decision.intended_action,
                 },
             )
             finance_memory = self.memory.upsert_memory(

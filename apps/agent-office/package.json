@@ -11,6 +11,7 @@
     "test:data-sync": "node scripts/test-data-sync-view.mjs",
     "test:task-monitor": "node scripts/test-task-monitor-view.mjs",
     "test:chat-stream": "node scripts/test-chat-stream.mjs",
+    "test:position-monitor": "node scripts/test-position-monitor-view.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0"
   },

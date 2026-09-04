@@ -7,7 +7,7 @@ CLI、MCP、Scheduler 或后续 API 都应通过这里调用 `FinanceAssistantSe
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -28,6 +28,7 @@ from finance_agent.application import PortfolioService, WatchlistService
 from finance_agent.application.decision_gate import DecisionGateInput, DecisionGateService
 from finance_agent.graph import GraphSyncService
 from finance_agent.graph.stores import DryRunGraphStore
+from finance_agent.monitoring.models import PositionAction
 from finance_agent.storage.orm import AgentWorkflowEventORM, AgentWorkflowRunORM
 from finance_agent.storage.repositories import (
     AssetRepository,
@@ -41,6 +42,17 @@ from finance_agent.storage.repositories import (
 from finance_agent.storage.snapshot_contracts import snapshot_from_orm
 
 JsonDict = dict[str, Any]
+
+
+def _decimal_value(value: Any) -> Decimal | None:
+    """将触发事件中的数值安全转换为 Decimal。"""
+
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except (TypeError, ValueError, ArithmeticError):
+        return None
 
 
 def build_workflow_gate_context(
@@ -373,6 +385,29 @@ class FinanceAgentInterface:
                 horizon=horizon,
                 gate_context=gate_context,
             )
+            trigger_payload = ((state.get("trigger_event") or {}).get("payload") or {})
+            if (
+                trigger_payload.get("action")
+                and trigger_payload.get("position_id")
+            ):
+                action = PositionAction(
+                    position_id=str(trigger_payload["position_id"]),
+                    action=str(trigger_payload["action"]),
+                    intended_action=trigger_payload.get("intended_action"),
+                    severity=str(trigger_payload.get("severity") or "medium"),
+                    reason_codes=tuple(trigger_payload.get("reason_codes") or ()),
+                    protective_price=_decimal_value(trigger_payload.get("protective_price")),
+                    suggested_quantity=_decimal_value(trigger_payload.get("suggested_quantity"))
+                    or Decimal("0"),
+                    evaluated_at=as_of,
+                    quote_snapshot_id=str(trigger_payload.get("quote_snapshot_id") or ""),
+                    decision_snapshot_id=trigger_payload.get("decision_snapshot_id"),
+                    payload=dict(trigger_payload.get("payload") or {}),
+                )
+                state["workflow_input"] = replace(
+                    state["workflow_input"],
+                    position_actions_by_position={action.position_id: action},
+                )
         elif workflow_type == "watchlist_management":
             if not watchlist_id:
                 raise ValueError("watchlist_management 需要 watchlist_id。")

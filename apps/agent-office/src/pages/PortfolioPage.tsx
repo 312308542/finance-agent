@@ -15,6 +15,7 @@ import {
   type OrderDraftModel,
 } from "../actionLoopView";
 import { buildPortfolioPageModel } from "../consolePagesView";
+import { buildPositionMonitorModel, monitoringActionLabel } from "../positionMonitorView";
 
 type PortfolioPageProps = {
   ownerId: string;
@@ -43,6 +44,7 @@ export function PortfolioPage({ ownerId, initialPayload = null }: PortfolioPageP
     note: "",
   });
   const model = React.useMemo(() => buildPortfolioPageModel(payload), [payload]);
+  const monitorModel = React.useMemo(() => buildPositionMonitorModel(payload), [payload]);
   const draftModel = React.useMemo(() => buildOrderDraftsModel(draftPayload), [draftPayload]);
   const executionModel = React.useMemo(() => buildExecutionsModel(executionPayload), [executionPayload]);
 
@@ -183,6 +185,41 @@ export function PortfolioPage({ ownerId, initialPayload = null }: PortfolioPageP
           <WeightList title="市场权重" items={model.marketWeights} />
           <WeightList title="行业权重" items={model.industryWeights} />
         </article>
+      </section>
+      <section className="panel position-monitor-panel">
+        <div className="panel-head">
+          <div>
+            <p className="eyebrow">Intraday Monitoring</p>
+            <h2>盘中持仓动作</h2>
+            <p>建议动作与实际执行分离展示；T+1、停牌或行情过期时只标记暂不可执行。</p>
+          </div>
+          <AlertTriangle size={16} />
+        </div>
+        {monitorModel.items.length ? (
+          <div className="position-monitor-list">
+            {monitorModel.items.map((item) => (
+              <article className={`position-monitor-card severity-${item.severity}`} key={item.positionId}>
+                <header>
+                  <strong>{item.assetLabel || item.assetId}</strong>
+                  <span>{monitoringActionLabel(item.action)}</span>
+                </header>
+                <dl>
+                  <div><dt>当前动作</dt><dd>{monitoringActionLabel(item.action)}</dd></div>
+                  <div><dt>意图动作</dt><dd>{monitoringActionLabel(item.intendedAction)}</dd></div>
+                  <div><dt>执行状态</dt><dd>{item.executionStatus === "blocked" ? "风险已触发，当前暂不可执行" : "未执行"}</dd></div>
+                  <div><dt>持有周期</dt><dd>{item.plannedHorizonDays} 个交易日</dd></div>
+                  <div><dt>结构方向</dt><dd>{item.structureDirection}</dd></div>
+                  <div><dt>保护位</dt><dd>{item.protectivePrice ?? "—"}</dd></div>
+                  <div><dt>板块阶段</dt><dd>{item.sectorRegime}</dd></div>
+                  <div><dt>T+1 可卖</dt><dd>{item.sellableQuantity}</dd></div>
+                </dl>
+                {item.reasonCodes.length ? <p className="position-monitor-reasons">原因：{item.reasonCodes.join("、")}</p> : null}
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p className="empty-copy">{monitorModel.emptyText}</p>
+        )}
       </section>
       <section className="real-page-columns action-loop-columns" id="execution-registration">
         <ExecutionRegistrationPanel

@@ -1547,6 +1547,87 @@ p {
   color: var(--muted);
 }
 
+.position-monitor-panel {
+  min-width: 0;
+}
+
+.position-monitor-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+}
+
+.position-monitor-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.position-monitor-card.severity-critical,
+.position-monitor-card.severity-high {
+  border-color: rgba(232, 102, 102, 0.55);
+}
+
+.position-monitor-card header,
+.position-monitor-card dl > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.position-monitor-card header {
+  margin-bottom: 10px;
+}
+
+.position-monitor-card header strong {
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.position-monitor-card header span {
+  flex: 0 0 auto;
+  color: var(--amber);
+  font-size: 11px;
+}
+
+.position-monitor-card dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px 12px;
+  margin: 0;
+}
+
+.position-monitor-card dt,
+.position-monitor-card dd {
+  margin: 0;
+  font-size: 11px;
+}
+
+.position-monitor-card dt {
+  color: var(--muted);
+}
+
+.position-monitor-card dd {
+  overflow: hidden;
+  color: var(--soft);
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.position-monitor-reasons {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .avoid-pool-summary {
   display: flex;
   align-items: center;

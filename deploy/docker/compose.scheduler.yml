@@ -34,6 +34,34 @@ services:
       - scripts/data/run_realtime_quote_monitor.py
       - --loop
 
+  finance-agent-position-monitor:
+    container_name: finance-agent-position-monitor
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.scheduler
+    restart: unless-stopped
+    environment:
+      FINANCE_AGENT_PROJECT_ROOT: /app
+      FINANCE_AGENT_RUNTIME_DIR: ${FINANCE_AGENT_RUNTIME_DIR:-/app/runtime}
+      FINANCE_AGENT_DATABASE_URL: ${FINANCE_AGENT_DATABASE_URL:-postgresql+psycopg://finance_agent:finance_agent@postgres:5432/finance_agent}
+      PYTHONPATH: /app/src
+    depends_on:
+      finance-agent-realtime-monitor:
+        condition: service_started
+    volumes:
+      - ../../runtime:/app/runtime
+      - ../../src:/app/src:ro
+    command:
+      - python
+      - scripts/runtime/run_position_monitor.py
+      - --loop
+      - --owner-id
+      - ${FINANCE_AGENT_POSITION_MONITOR_OWNER_ID:-default-owner}
+      - --poll-seconds
+      - ${FINANCE_AGENT_POSITION_MONITOR_POLL_SECONDS:-5}
+      - --status-file
+      - runtime/position_monitor/status.json
+
   finance-agent-scheduler:
     container_name: finance-agent-scheduler
     build:

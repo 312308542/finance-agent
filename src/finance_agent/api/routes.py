@@ -131,6 +131,24 @@ def portfolio_overview(
         return {"status": "unavailable", "message": str(exc)[:240], "portfolios": []}
 
 
+@router.get("/portfolios/monitoring")
+def portfolios_monitoring(
+    owner_id: str = "default-owner",
+    session: Session = SESSION_DEPENDENCY,
+) -> JsonDict:
+    """返回用户组合和持仓盘中监控读模型。"""
+
+    try:
+        return DashboardService(session).get_portfolio_overview(owner_id=owner_id)
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "message": str(exc)[:240],
+            "portfolios": [],
+            "positions": [],
+        }
+
+
 @router.get("/watchlists")
 def watchlists(
     owner_id: str,
