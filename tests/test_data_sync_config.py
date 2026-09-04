@@ -77,7 +77,7 @@ def test_personal_ashare_recommendation_job_exports_adaptive_strategy_observatio
     recommendation = jobs["analytics.recommendations.ashare.all_a"]
 
     # 默认触发链路已改为 Webhook 唤醒 Hermes，不再导出 3 个内部 Agent 消费任务。
-    assert len(payload["jobs"]) == 35
+    assert len(payload["jobs"]) == 38
     assert all("crypto" not in name for name in jobs)
     assert recommendation["job_type"] == "recommendation_pipeline"
     assert recommendation["params"]["strategy_ids"] == [
@@ -267,6 +267,23 @@ def test_scheduler_payload_registers_weekly_backtest_job() -> None:
         "rebalance": "once",
         "timeframe": "1d",
     }
+
+
+def test_scheduler_payload_registers_walk_forward_validation_jobs() -> None:
+    """策略验证任务应有固定频率、明确依赖，并位于推荐任务之前。"""
+
+    jobs = {
+        job["name"]: job
+        for job in export_scheduler_payload(build_preset_config("personal-comprehensive"))["jobs"]
+    }
+
+    assert jobs["analytics.strategy.walk_forward.weekly"]["run_at"] == ["07:30"]
+    assert jobs["analytics.strategy.forward_settlement.daily"]["depends_on"] == [
+        "ashare.bars.1d.close_final"
+    ]
+    assert jobs["analytics.recommendations.ashare.all_a"]["depends_on"][-1] == (
+        "analytics.strategy.validation_gate"
+    )
 
 
 def test_scheduler_payload_uses_long_enough_bar_lookback_for_analytics() -> None:
@@ -667,6 +684,7 @@ def test_ashare_analytics_jobs_run_after_close_final_not_midday_partial() -> Non
         "analytics.snapshot.ashare.close",
         "analytics.sector.ashare.daily",
         "analytics.structural.ashare.daily",
+        "analytics.strategy.validation_gate",
     ]
     assert ashare_recommendation["dependency_mode"] == "barrier"
     assert not [
@@ -700,6 +718,7 @@ def test_scheduler_payload_registers_technical_screening_jobs() -> None:
         "analytics.snapshot.ashare.close",
         "analytics.sector.ashare.daily",
         "analytics.structural.ashare.daily",
+        "analytics.strategy.validation_gate",
     ]
 
 

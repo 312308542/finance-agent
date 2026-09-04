@@ -345,8 +345,8 @@ def _failing_metrics() -> dict[str, Any]:
     }
 
 
-def test_two_consecutive_forward_failures_disable_trial() -> None:
-    """两个不同周的失败才自动关闭，重复执行同一周不重复计数。"""
+def test_three_consecutive_forward_failures_disable_trial() -> None:
+    """三个不同周的失败才自动关闭，重复执行同一周不重复计数。"""
 
     service, repository, _source = _service()
     repository.states[MIXED] = _trial_state()
@@ -359,8 +359,13 @@ def test_two_consecutive_forward_failures_disable_trial() -> None:
     assert repository.states[MIXED].consecutive_failure_count == 1
 
     service.evaluate_weekly(strategy_id=MIXED, as_of=week_2, metrics=_failing_metrics())
-    assert repository.states[MIXED].state == "disabled"
+    assert repository.states[MIXED].state == "trial"
     assert repository.states[MIXED].consecutive_failure_count == 2
+
+    week_3 = datetime(2026, 8, 17, tzinfo=UTC)
+    service.evaluate_weekly(strategy_id=MIXED, as_of=week_3, metrics=_failing_metrics())
+    assert repository.states[MIXED].state == "disabled"
+    assert repository.states[MIXED].consecutive_failure_count == 3
 
 
 def test_integrity_violation_or_large_drawdown_disables_immediately() -> None:
@@ -418,8 +423,8 @@ def test_sixty_t20_samples_and_revalidated_gate_promote_trial() -> None:
     assert state.disabled_reason is None
 
 
-def test_short_baseline_failure_only_records_alert() -> None:
-    """没有替代基线时，短线策略失败只能告警，不能自动中断。"""
+def test_short_baseline_failure_disables_after_three_failures() -> None:
+    """基准策略同样遵守连续前向失败停用规则。"""
 
     service, repository, _source = _service()
     repository.states[SHORT] = _trial_state(SHORT)
@@ -432,8 +437,8 @@ def test_short_baseline_failure_only_records_alert() -> None:
         metrics=metrics,
     )
 
-    assert state.state == "trial"
-    assert state.payload["high_risk_alerts"][-1]["reason"] == "drawdown_gap_above_10pct"
+    assert state.state == "disabled"
+    assert state.disabled_reason == "drawdown_gap_above_10pct"
 
 
 def test_disabled_strategy_cannot_be_reenabled_by_routine_evaluation() -> None:
@@ -442,7 +447,7 @@ def test_disabled_strategy_cannot_be_reenabled_by_routine_evaluation() -> None:
     service, repository, _source = _service()
     disabled = _trial_state()
     disabled.state = "disabled"
-    disabled.disabled_reason = "two_consecutive_forward_failures"
+    disabled.disabled_reason = "three_consecutive_forward_failures"
     repository.states[MIXED] = disabled
 
     historical = service.apply_historical_result(
@@ -467,7 +472,7 @@ def test_disabled_strategy_cannot_be_reenabled_by_routine_evaluation() -> None:
 
     assert historical.state == "disabled"
     assert weekly.state == "disabled"
-    assert weekly.disabled_reason == "two_consecutive_forward_failures"
+    assert weekly.disabled_reason == "three_consecutive_forward_failures"
 
 
 def test_research_strategy_cannot_skip_historical_gate_during_weekly_evaluation() -> None:

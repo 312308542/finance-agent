@@ -1098,6 +1098,7 @@ def test_read_scheduler_jobs_merges_missing_regenerable_jobs(tmp_path: Path) -> 
         "analytics.snapshot.ashare.close",
         "analytics.sector.ashare.daily",
         "analytics.structural.ashare.daily",
+        "analytics.strategy.validation_gate",
     ]
 
 

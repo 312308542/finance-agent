@@ -221,6 +221,9 @@ def run_factor_score_topn_backtest(
             "horizon": horizon,
             "years": normalized_years,
             "price_source": price_source,
+            "schema_version": "factor_score_topn_v1",
+            "gating_eligible": False,
+            "research_only": True,
         },
     )
     return {

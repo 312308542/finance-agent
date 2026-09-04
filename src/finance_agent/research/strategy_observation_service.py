@@ -27,6 +27,7 @@ from finance_agent.research.strategy_walk_forward_runner import (
     DEFAULT_MARKET_BAR_SOURCE,
     FIXED_ROUND_TRIP_COST,
 )
+from finance_agent.research.validation_gate import StrategyValidationGate
 from finance_agent.storage.orm import (
     AssetScoreORM,
     MarketBarORM,
@@ -697,19 +698,6 @@ class StrategyObservationService:
             immediate_reason = "drawdown_gap_above_10pct"
 
         payload = dict(getattr(current, "payload", None) or {})
-        if immediate_reason and strategy_id == BASELINE_STRATEGY_ID:
-            alerts = list(payload.get("high_risk_alerts") or [])
-            alerts.append({"as_of": normalized_as_of.isoformat(), "reason": immediate_reason})
-            payload["high_risk_alerts"] = alerts
-            return self._save_state(
-                current=current,
-                state=str(current.state),
-                metrics=forward_metrics,
-                failure_count=int(current.consecutive_failure_count),
-                disabled_reason=getattr(current, "disabled_reason", None),
-                as_of=normalized_as_of,
-                payload=payload,
-            )
         if immediate_reason:
             return self._save_state(
                 current=current,
@@ -756,8 +744,15 @@ class StrategyObservationService:
             if failed
             else (0 if enough_samples else int(current.consecutive_failure_count))
         )
-        state = "disabled" if failure_count >= 2 else str(current.state)
-        disabled_reason = "two_consecutive_forward_failures" if state == "disabled" else None
+        state = "disabled" if failure_count >= 3 else str(current.state)
+        disabled_reason = "three_consecutive_forward_failures" if state == "disabled" else None
+        gate_decision = StrategyValidationGate().evaluate_forward(
+            state=current,
+            outcomes=forward_metrics,
+        )
+        if gate_decision.next_state == "disabled":
+            state = "disabled"
+            disabled_reason = ",".join(gate_decision.reason_codes) or "forward_validation_failed"
         return self._save_state(
             current=current,
             state=state,

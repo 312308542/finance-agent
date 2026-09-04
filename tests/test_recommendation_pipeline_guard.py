@@ -8,6 +8,7 @@ from finance_agent.pipelines.recommendation import (
     UniverseRecommendationPipeline,
     recommendation_strategy_gate,
 )
+from finance_agent.research.strategy_observation_service import BASELINE_STRATEGY_ID
 
 SHORT = "strategy:ashare:short_swing"
 THEME = "strategy:ashare:theme_momentum"
@@ -170,10 +171,10 @@ def test_pipeline_publishes_zero_buy_snapshot_when_no_asset_passes_all_gates() -
         min_factor_coverage_ratio=0.0,
     )
 
-    assert result.status == "available"
-    assert result.recommendation_count == 2
+    assert result.status == "partial"
+    assert result.recommendation_count == 0
     assert result.buy_ready_count == 0
-    assert result.decision_snapshot_id == "decision:ashare:2026-09-08:test"
+    assert result.decision_snapshot_id is None
 
 
 class _TrialStates:
@@ -356,9 +357,7 @@ def test_recommendation_pipeline_passes_strategy_id_to_scoring_service() -> None
             "strategy_id": "strategy:ashare:short_swing",
         }
     ]
-    assert pipeline.recommendations.calls[0]["score_strategy_id"] == (
-        "strategy:ashare:short_swing"
-    )
+    assert pipeline.recommendations.calls == []
 
 
 def test_pipeline_scores_three_strategies_from_one_screening() -> None:
@@ -410,9 +409,9 @@ def test_pipeline_scores_three_strategies_from_one_screening() -> None:
     assert factors.calls == [item.asset_id for item in members]
     assert [call["strategy_id"] for call in scoring.calls] == [SHORT, THEME, MIXED]
     assert observations.calls[0]["strategy_ids"] == (SHORT, THEME, MIXED)
-    assert [call["score_strategy_id"] for call in recommendations.calls] == [SHORT, MIXED]
-    assert recommendations.calls[1]["trial_state"] == "trial"
-    assert recommendations.calls[1]["validation_evidence_id"] == "bt:wf:mixed-passed"
+    assert [call["score_strategy_id"] for call in recommendations.calls] == [MIXED]
+    assert recommendations.calls[0]["trial_state"] == "trial"
+    assert recommendations.calls[0]["validation_evidence_id"] == "bt:wf:mixed-passed"
     strategy_results = {item["strategy_id"]: item for item in result.strategy_results}
     assert strategy_results[THEME]["recommendation_status"] == "blocked"
     assert strategy_results[THEME]["blocked_reason"] == "historical_gate_not_passed"
@@ -493,8 +492,8 @@ def test_trial_gate_requires_validation_evidence_and_marks_validated_non_trial()
     assert validated["trial"] is False
 
 
-def test_adaptive_strategy_is_available_as_audited_research_before_strict_gate() -> None:
-    """第四阶段严格门控接入前，自适应主线必须能生成生命周期研究记录。"""
+def test_adaptive_strategy_also_requires_validation_gate() -> None:
+    """自适应主线没有历史验证证据时只能停留在研究状态。"""
 
     gate = recommendation_strategy_gate(
         market="ashare",
@@ -502,9 +501,22 @@ def test_adaptive_strategy_is_available_as_audited_research_before_strict_gate()
         trial_states=_TrialStates({}),
     )
 
-    assert gate["allowed"] is True
+    assert gate["allowed"] is False
     assert gate["trial"] is False
-    assert gate["blocked_reason"] is None
+    assert gate["blocked_reason"] == "historical_gate_not_passed"
+
+
+def test_baseline_strategy_also_requires_validation_gate() -> None:
+    """基准策略不能绕过历史与前向验证门控。"""
+
+    gate = recommendation_strategy_gate(
+        market="ashare",
+        strategy_id=BASELINE_STRATEGY_ID,
+        trial_states=_TrialStates({}),
+    )
+
+    assert gate["allowed"] is False
+    assert gate["blocked_reason"] == "historical_gate_not_passed"
 
 
 def test_recommendation_pipeline_passes_market_regime_to_recommendation_service() -> None:

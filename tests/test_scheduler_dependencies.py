@@ -278,6 +278,7 @@ def test_recommendation_job_depends_on_close_sector_and_structure() -> None:
         "analytics.snapshot.ashare.close",
         "analytics.sector.ashare.daily",
         "analytics.structural.ashare.daily",
+        "analytics.strategy.validation_gate",
     ]
     assert recommendation["dependency_mode"] == "barrier"
     assert all(name in jobs for name in recommendation["depends_on"])

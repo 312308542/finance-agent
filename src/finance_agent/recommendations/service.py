@@ -2030,6 +2030,11 @@ def build_backtest_evidence(
             universe_id=universe_id,
         )
     metrics = _json_safe(row.metrics or {})
+    payload = row.payload if isinstance(row.payload, dict) else {}
+    schema_version = str(payload.get("schema_version") or "")
+    gating_eligible = schema_version == "strategy_walk_forward_v2" and bool(
+        metrics.get("gate_passed")
+    )
     evidence = {
         "status": row.status,
         "backtest_id": row.backtest_id,
@@ -2043,8 +2048,11 @@ def build_backtest_evidence(
         "data_versions": _json_safe(row.data_versions or {}),
         "created_at": _isoformat(row.created_at),
         "summary": build_backtest_summary(metrics=metrics, start_at=row.start_at, end_at=row.end_at),
+        "schema_version": schema_version or None,
+        "gating_eligible": gating_eligible,
+        "research_only": not gating_eligible,
     }
-    warnings = (row.payload or {}).get("warnings") if isinstance(row.payload, dict) else None
+    warnings = payload.get("warnings")
     if warnings:
         evidence["warnings"] = _json_safe(warnings)
     return evidence

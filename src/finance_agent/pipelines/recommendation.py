@@ -24,7 +24,6 @@ from finance_agent.factors import FactorComputationResult, FactorService
 from finance_agent.indicators import IndicatorComputationResult, IndicatorService
 from finance_agent.recommendations import RecommendationRunResult, RecommendationService
 from finance_agent.research.strategy_observation_service import (
-    BASELINE_STRATEGY_ID,
     create_strategy_observation_service,
 )
 from finance_agent.scoring import ScoringRunResult, ScoringService
@@ -566,8 +565,6 @@ def recommendation_strategy_gate(
 
     if (
         not market.startswith("ashare")
-        or strategy_id == BASELINE_STRATEGY_ID
-        or strategy_id == ADAPTIVE_RESEARCH_STRATEGY_ID
         or strategy_id.endswith(":legacy_default")
     ):
         return {

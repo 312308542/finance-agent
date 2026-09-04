@@ -7,6 +7,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
+from finance_agent.monitoring.models import PositionAction
 from finance_agent.triggers.service import TriggerEvaluationRequest, TriggerService
 
 
@@ -212,3 +213,34 @@ def test_intraday_volatility_skips_when_quote_data_is_insufficient() -> None:
 
     assert result.created_events == ()
     assert result.skipped_no_data_count == 1
+
+
+def test_persist_position_actions_keeps_unexecutable_intended_action() -> None:
+    """监控动作写入触发事件时，不可执行状态仍须保留原计划动作。"""
+
+    as_of = datetime(2026, 6, 12, 10, 30, tzinfo=UTC)
+    service = _service(snapshots=[])
+    action = PositionAction(
+        position_id="position:600519",
+        action="unexecutable",
+        intended_action="exit",
+        severity="high",
+        reason_codes=("quote_missing",),
+        evaluated_at=as_of,
+        payload={
+            "owner_id": "default-owner",
+            "portfolio_id": "portfolio:default-owner",
+            "asset_id": "ashare:600519",
+            "symbol": "600519",
+        },
+    )
+
+    result = service.persist_position_actions((action,), as_of=as_of)
+
+    assert len(result.created_events) == 1
+    event = result.created_events[0]
+    assert event.trigger_type == "position_monitoring_action"
+    assert event.requested_workflow_type == "portfolio_monitoring"
+    assert event.payload["action"] == "unexecutable"
+    assert event.payload["intended_action"] == "exit"
+    assert event.payload["reason_codes"] == ["quote_missing"]

@@ -89,6 +89,9 @@ def test_run_factor_score_topn_backtest_persists_result(monkeypatch: Any) -> Non
     assert calls[3]["status"] == "available"
     assert calls[3]["metrics"] == {"cagr": 0.12, "selected_asset_count": 20}
     assert calls[3]["payload"]["strategy_name"] == "factor_score_topn"
+    assert calls[3]["payload"]["schema_version"] == "factor_score_topn_v1"
+    assert calls[3]["payload"]["gating_eligible"] is False
+    assert calls[3]["payload"]["research_only"] is True
 
 
 def test_run_factor_score_topn_backtest_rejects_unknown_strategy() -> None:

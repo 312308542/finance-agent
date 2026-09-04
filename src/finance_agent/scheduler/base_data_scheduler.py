@@ -2852,8 +2852,56 @@ class BaseDataScheduler(RecoverySchedulerMixin):
         if self._run_backtest is not None:
             return self._run_backtest(**kwargs)
 
-        from finance_agent.backtesting.runner import run_factor_score_topn_backtest
         from finance_agent.storage.db import create_session_factory, session_scope
+
+        strategy = str(kwargs.get("strategy") or "factor_score_topn")
+        if strategy == "strategy_validation_gate":
+            from finance_agent.research.validation_gate import StrategyValidationGate
+            from finance_agent.storage.repositories import StrategyObservationRepository
+
+            session_factory = create_session_factory()
+            with session_scope(session_factory) as session:
+                state = StrategyObservationRepository(session).get_trial_state(
+                    str(kwargs["strategy_id"])
+                )
+                decision = StrategyValidationGate().evaluate_forward(
+                    state=state or {"state": "research"},
+                    outcomes=(getattr(state, "forward_metrics", {}) if state else {}),
+                )
+            return {
+                "status": "available",
+                "strategy_id": kwargs["strategy_id"],
+                "state": decision.next_state,
+                "allowed": decision.allowed,
+                "reason_codes": list(decision.reason_codes),
+            }
+        if strategy in {"strategy_forward_settlement", "strategy_walk_forward_v2"}:
+            from datetime import UTC
+
+            from finance_agent.research.strategy_walk_forward_runner import (
+                run_strategy_walk_forward,
+            )
+
+            session_factory = create_session_factory()
+            end_at = kwargs.get("end_at") or datetime.now(tz=UTC)
+            start_at = kwargs.get("start_at") or (
+                end_at - timedelta(days=365 * int(kwargs.get("years") or 5))
+            )
+            with session_scope(session_factory) as session:
+                result = run_strategy_walk_forward(
+                    session,
+                    strategy_id=str(kwargs["strategy_id"]),
+                    universe_id=str(
+                        kwargs.get("universe_id") or "universe:merged:ashare:recommendation"
+                    ),
+                    start_at=start_at,
+                    end_at=end_at,
+                    topn=int(kwargs.get("topn") or 20),
+                    dry_run=bool(kwargs.get("dry_run", False)),
+                    asset_limit=kwargs.get("asset_limit"),
+                )
+            return result
+        from finance_agent.backtesting.runner import run_factor_score_topn_backtest
 
         session_factory = create_session_factory()
         with session_scope(session_factory) as session:

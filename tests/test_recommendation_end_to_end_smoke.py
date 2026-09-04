@@ -311,21 +311,13 @@ def test_merged_avoid_strategy_recommendation_pipeline_smoke() -> None:
         limit=5,
     )
 
-    assert result.status == "available"
+    assert result.status == "partial"
     assert result.member_count == 1
-    assert result.recommendation_count == 1
-    assert recommendations.run_payload is not None
-    assert recommendations.run_payload["avoid_pool_excluded"]["count"] == 1
-    assert recommendations.run_payload["avoid_pool_excluded"]["assets"][0]["asset_id"] == "ashare:600519"
-    assert recommendations.run_payload["source"]["universe_id"] == "universe:merged:ashare:recommendation"
-    assert recommendations.run_payload["scoring_strategy_id"] == "strategy:ashare:short_swing"
-    assert recommendations.recommendation_payloads[0]["asset_id"] == "ashare:000001"
-    assert recommendations.recommendation_payloads[0]["payload"]["score_strategy_id"] == (
-        "strategy:ashare:short_swing"
-    )
-    assert recommendations.recommendation_payloads[0]["payload"]["score_weight_snapshot"][
-        "group_weights"
-    ] == {"technical": 0.8, "fundamental": 0.2}
+    assert result.recommendation_count == 0
+    assert result.buy_ready_count == 0
+    assert result.decision_snapshot_id is None
+    assert recommendations.run_payload is None
+    assert recommendations.recommendation_payloads == []
 
     trial_result = recommendation_service.rank_from_screening(
         screening_id="screen:merged:ashare:short_swing",

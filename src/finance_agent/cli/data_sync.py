@@ -34,7 +34,7 @@ from finance_agent.scoring.strategies import (
     validate_scoring_strategy_payload,
 )
 from finance_agent.storage.db import create_session_factory, session_scope
-from finance_agent.storage.repositories import ScoringStrategyRepository
+from finance_agent.storage.repositories import ScoringStrategyRepository, StrategyObservationRepository
 
 JsonDict = dict[str, Any]
 
@@ -218,6 +218,16 @@ def add_data_arguments(subparsers: argparse._SubParsersAction[argparse.ArgumentP
         action="store_true",
         help="写入后直接标记为 active；未指定时保存为 draft。",
     )
+    strategy_validate = strategy_commands.add_parser(
+        "validate", help="查看策略历史与前向准入状态。"
+    )
+    strategy_validate.add_argument("--strategy-id", required=True, help="策略 ID。")
+    strategy_validate.add_argument(
+        "--market",
+        default="ashare",
+        choices=["ashare", "crypto_spot", "crypto_future"],
+        help="策略市场，默认 A 股。",
+    )
 
 
 def dispatch_data(args: argparse.Namespace) -> JsonDict:
@@ -359,6 +369,41 @@ def dispatch_data_strategy(args: argparse.Namespace) -> JsonDict:
 
     session_factory = create_session_factory(args.database_url)
     with session_scope(session_factory) as session:
+        if args.subcommand == "validate":
+            state = StrategyObservationRepository(session).get_trial_state(args.strategy_id)
+            if state is None:
+                return {
+                    "status": "ok",
+                    "data": {
+                        "strategy_id": args.strategy_id,
+                        "market": args.market,
+                        "strategy_state": "research",
+                        "historical_evidence_id": None,
+                        "matured_t20_count": 0,
+                        "reason_codes": ["strategy_state_missing"],
+                        "allow_new_buys": False,
+                    },
+                }
+            forward_metrics = dict(getattr(state, "forward_metrics", {}) or {})
+            sample_counts = dict(forward_metrics.get("sample_counts") or {})
+            state_name = str(getattr(state, "state", "research"))
+            allow_new_buys = state_name == "validated" and bool(
+                getattr(state, "historical_evidence_id", None)
+            )
+            return {
+                "status": "ok",
+                "data": {
+                    "strategy_id": args.strategy_id,
+                    "market": args.market,
+                    "strategy_state": state_name,
+                    "historical_evidence_id": getattr(state, "historical_evidence_id", None),
+                    "matured_t20_count": int(sample_counts.get("20", 0) or 0),
+                    "reason_codes": [
+                        str(getattr(state, "disabled_reason", ""))
+                    ] if getattr(state, "disabled_reason", None) else [],
+                    "allow_new_buys": allow_new_buys,
+                },
+            }
         repository = ScoringStrategyRepository(session)
         if args.subcommand == "init":
             seeded = repository.seed_defaults(default_scoring_strategy_seeds())

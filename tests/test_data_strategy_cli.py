@@ -46,6 +46,16 @@ class _StrategyRepository:
         return record
 
 
+class _ObservationRepository:
+    state = None
+
+    def __init__(self, session: object) -> None:
+        self.session = session
+
+    def get_trial_state(self, strategy_id: str) -> Any:
+        return self.__class__.state
+
+
 @contextmanager
 def _session_scope(factory: object):
     yield object()
@@ -76,6 +86,7 @@ def _patch_strategy_repository(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(data_sync, "ScoringStrategyRepository", _StrategyRepository)
     monkeypatch.setattr(data_sync, "create_session_factory", lambda database_url: object())
     monkeypatch.setattr(data_sync, "session_scope", _session_scope)
+    monkeypatch.setattr(data_sync, "StrategyObservationRepository", _ObservationRepository)
 
 
 def test_data_strategy_init_seeds_defaults() -> None:
@@ -165,3 +176,28 @@ def test_data_strategy_set_refuses_to_overwrite_active_strategy() -> None:
                 missing_penalty='{"per_missing_group":3,"per_partial_group":1}',
             )
         )
+
+
+def test_data_strategy_validate_returns_state_and_buy_permission() -> None:
+    """validate 应输出策略状态、证据、成熟样本和新增买入权限。"""
+
+    _ObservationRepository.state = SimpleNamespace(
+        strategy_id="strategy:ashare:adaptive_v1",
+        state="trial",
+        historical_evidence_id="bt:wf:1",
+        forward_metrics={"sample_counts": {"20": 42}},
+        disabled_reason=None,
+    )
+    result = data_sync.dispatch_data(
+        _args(
+            subcommand="validate",
+            strategy_id="strategy:ashare:adaptive_v1",
+            market="ashare",
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert result["data"]["strategy_state"] == "trial"
+    assert result["data"]["historical_evidence_id"] == "bt:wf:1"
+    assert result["data"]["matured_t20_count"] == 42
+    assert result["data"]["allow_new_buys"] is False
