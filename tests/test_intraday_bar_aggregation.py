@@ -127,3 +127,26 @@ def test_unclosed_bucket_is_not_returned() -> None:
 
 def test_supported_intraday_timeframes_are_fixed() -> None:
     assert SUPPORTED_INTRADAY_TIMEFRAMES == {"1m": 1, "5m": 5, "15m": 15, "60m": 60}
+
+
+def test_aggregator_reads_provider_source_from_quote_payload() -> None:
+    quote = SimpleNamespace(
+        asset_id="ashare:600519",
+        symbol="600519",
+        market="ashare",
+        as_of=_datetime("2026-09-07T09:30:10+08:00"),
+        server_timestamp=_datetime("2026-09-07T09:30:10+08:00"),
+        last_price=Decimal("10.00"),
+        volume=Decimal("100"),
+        amount=Decimal("1000"),
+        quality_status="available",
+        payload={"source": "gotdx:tdx_main"},
+    )
+
+    bars = aggregate_closed_bars(
+        [quote],
+        timeframe="1m",
+        close_before=_datetime("2026-09-07T09:31:00+08:00"),
+    )
+
+    assert bars[0].source == "gotdx:tdx_main"

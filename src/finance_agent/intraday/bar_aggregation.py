@@ -140,7 +140,9 @@ def _dedupe_and_sort_ticks(ticks: Sequence[Any]) -> tuple[_Tick, ...]:
 
 def _normalize_tick(raw: Any) -> _Tick:
     asset_id = str(_value(raw, "asset_id") or "").strip()
-    source = str(_value(raw, "source") or "").strip()
+    payload = _value(raw, "payload")
+    payload_source = payload.get("source") if isinstance(payload, Mapping) else None
+    source = str(_value(raw, "source") or payload_source or "").strip()
     symbol = str(_value(raw, "symbol") or "").strip()
     market = str(_value(raw, "market") or "").strip()
     timestamp = _as_shanghai_time(
