@@ -849,7 +849,6 @@ def scheduler_job_resource_pool(job: JsonDict) -> str:
     if name == "ashare.news_articles":
         return "article_enrichment"
     if name in {
-        "ashare.realtime_quotes",
         "ashare.realtime_quotes.market_sweep",
         "ashare.risk_sentiment",
         "analytics.triggers.evaluate.intraday",
@@ -882,7 +881,7 @@ def scheduler_job_priority(job: JsonDict) -> int:
     schedule_type = str(job.get("schedule_type") or "interval")
     if schedule_type == "manual":
         return 900
-    if name in {"ashare.realtime_quotes", "analytics.triggers.evaluate.intraday"}:
+    if name == "analytics.triggers.evaluate.intraday":
         return 800
     if name == "ashare.realtime_quotes.market_sweep":
         return 750
@@ -1673,31 +1672,12 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
         session_windows = ["09:25-11:35", "12:55-15:10"]
         tasks.append(
             DataSyncTaskPreview(
-                task_key="ashare.realtime_quotes",
-                market="ashare",
-                task_type="realtime_quote_refresh",
-                title="刷新 A 股实时行情快照",
-                interval_seconds=config.interval_seconds.get("realtime_quotes", 5 * 60),
-                mode="incremental_snapshot",
-                batch_size=200,
-                schedule_type="trading_session",
-                session_windows=session_windows,
-                timezone="Asia/Shanghai",
-                trading_day_policy="trading_day_only",
-                sources=["stock_zh_a_spot"],
-                data_packages=["realtime_quotes"],
-                extra_params={"scope": "priority"},
-                notes=["复用 A 股实时行情资产接口刷新价格和交易状态快照。"],
-            )
-        )
-        tasks.append(
-            DataSyncTaskPreview(
                 task_key="ashare.realtime_quotes.market_sweep",
                 market="ashare",
                 task_type="realtime_quote_refresh",
                 title="轮询 A 股全市场实时行情",
-                interval_seconds=config.interval_seconds.get("realtime_quotes", 5 * 60),
-                mode="partitioned_market_sweep",
+                interval_seconds=5 * 60,
+                mode="full_market_snapshot",
                 batch_size=None,
                 schedule_type="trading_session",
                 session_windows=session_windows,
@@ -1707,10 +1687,10 @@ def preview_ashare_tasks(config: MarketSyncConfig) -> list[DataSyncTaskPreview]:
                 data_packages=["realtime_quotes"],
                 extra_params={
                     "scope": "market_sweep",
-                    "batch_size": config.batch_size,
-                    "partition_cursor": 0,
+                    "source_mode": "akshare_full_market",
+                    "write_chunk_size": 500,
                 },
-                notes=["按稳定排序的可交易资产池分区续跑，完成全市场盘中覆盖。"],
+                notes=["AKShare 整表只抓取一次，再按 500 行分块写入实时历史和最新表。"],
             )
         )
     if "fundamentals" in config.data_packages or "valuation" in config.data_packages:

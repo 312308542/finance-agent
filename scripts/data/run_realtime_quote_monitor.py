@@ -195,8 +195,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     while True:
         summary = monitor.run_due_channels(owner_id=args.owner_id)
-        _write_status(Path(args.status_file), summary.to_dict())
-        logger.info("实时行情通道完成 summary=%s", json.dumps(summary.to_dict(), ensure_ascii=False))
+        if summary.executed_channels:
+            _write_status(Path(args.status_file), summary.to_dict())
+            logger.info(
+                "实时行情通道完成 summary=%s",
+                json.dumps(summary.to_dict(), ensure_ascii=False),
+            )
         if args.once or not args.loop or stop_event.is_set():
             return 0
         stop_event.wait(0.2)

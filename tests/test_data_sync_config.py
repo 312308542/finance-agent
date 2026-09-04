@@ -17,24 +17,23 @@ def test_personal_ashare_is_the_default_preset_without_crypto() -> None:
     assert preset_label(config.preset) == "私人助手 A 股与基金模式"
 
 
-def test_scheduler_exports_fixed_session_realtime_priority_and_market_sweep() -> None:
-    """高频 A 股任务使用固定交易时段，实时行情拆成重点池与全市场 sweep。"""
+def test_scheduler_uses_one_full_market_snapshot_and_removes_priority_duplicate() -> None:
+    """重点池交给独立进程后，调度器只保留单次全市场截面。"""
 
     payload = export_scheduler_payload(build_preset_config())
     jobs = {str(job["name"]): job for job in payload["jobs"]}
     windows = ["09:25-11:35", "12:55-15:10"]
 
-    priority = jobs["ashare.realtime_quotes"]
+    assert "ashare.realtime_quotes" not in jobs
     sweep = jobs["ashare.realtime_quotes.market_sweep"]
-    assert priority["limit"] == 200
-    assert priority["params"]["scope"] == "priority"
     assert sweep["limit"] is None
+    assert sweep["interval_seconds"] == 300
+    assert sweep["params"]["mode"] == "full_market_snapshot"
     assert sweep["params"]["scope"] == "market_sweep"
-    assert sweep["params"]["partition_cursor"] == 0
-    assert priority["priority"] > sweep["priority"]
+    assert sweep["params"]["source_mode"] == "akshare_full_market"
+    assert sweep["params"]["write_chunk_size"] == 500
 
     for name in (
-        "ashare.realtime_quotes",
         "ashare.realtime_quotes.market_sweep",
         "ashare.capital_flow",
         "ashare.risk_sentiment",
@@ -78,7 +77,7 @@ def test_personal_ashare_recommendation_job_exports_three_strategy_observation()
     recommendation = jobs["analytics.recommendations.ashare.all_a"]
 
     # 默认触发链路已改为 Webhook 唤醒 Hermes，不再导出 3 个内部 Agent 消费任务。
-    assert len(payload["jobs"]) == 34
+    assert len(payload["jobs"]) == 33
     assert all("crypto" not in name for name in jobs)
     assert recommendation["job_type"] == "recommendation_pipeline"
     assert recommendation["params"]["strategy_ids"] == [
@@ -130,9 +129,9 @@ def test_scheduler_exports_intraday_ashare_jobs_with_explicit_policies() -> None
     scheduler_payload = export_scheduler_payload(config)
     jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
 
-    assert jobs["ashare.realtime_quotes"]["schedule_type"] == "trading_session"
-    assert jobs["ashare.realtime_quotes"]["trading_day_policy"] == "trading_day_only"
-    assert jobs["ashare.realtime_quotes"]["interval_seconds"] == 5 * 60
+    assert jobs["ashare.realtime_quotes.market_sweep"]["schedule_type"] == "trading_session"
+    assert jobs["ashare.realtime_quotes.market_sweep"]["trading_day_policy"] == "trading_day_only"
+    assert jobs["ashare.realtime_quotes.market_sweep"]["interval_seconds"] == 5 * 60
 
     assert jobs["ashare.capital_flow"]["schedule_type"] == "trading_session"
     assert jobs["ashare.capital_flow"]["trading_day_policy"] == "trading_day_only"
@@ -484,8 +483,6 @@ def test_ashare_scheduler_jobs_export_priority_and_resource_pool() -> None:
     scheduler_payload = export_scheduler_payload(config)
     jobs = {job["name"]: job for job in scheduler_payload["jobs"]}
 
-    assert jobs["ashare.realtime_quotes"]["resource_pool"] == "realtime"
-    assert jobs["ashare.realtime_quotes"]["priority"] == 800
     assert jobs["ashare.realtime_quotes.market_sweep"]["resource_pool"] == "realtime"
     assert jobs["ashare.realtime_quotes.market_sweep"]["priority"] == 750
     assert jobs["ashare.risk_sentiment"]["resource_pool"] == "realtime"
@@ -530,7 +527,10 @@ def test_scheduler_payload_does_not_cap_universe_refresh_by_batch_size() -> None
     assert ashare_params["industry_catalog_limit"] == 0
     assert ashare_params["concept_catalog_limit"] == 0
     assert ashare_params["catalog_member_limit"] == 0
-    assert "limit" not in jobs["ashare.realtime_quotes"]["params"]
+    sweep = jobs["ashare.realtime_quotes.market_sweep"]
+    assert sweep["limit"] is None
+    assert "limit" not in sweep["params"]
+    assert sweep["params"]["write_chunk_size"] == 500
 
 
 def test_scheduler_payload_does_not_cap_list_sources_by_batch_size() -> None:

@@ -179,8 +179,10 @@ def test_monitor_runs_only_channels_whose_interval_is_due() -> None:
     assert collector.calls == []
 
     clock.advance(1)
-    monitor.run_due_channels()
+    summary = monitor.run_due_channels()
     assert collector.calls == [("held", ("600519",))]
+    assert summary.executed_channels == ("held",)
+    assert summary.channel_status["radar"] == "available"
 
 
 def test_monitor_cold_start_timeout_degrades_held_channel_to_five_seconds() -> None:

@@ -88,6 +88,7 @@ class RealtimeMonitorSummary:
 
     started_at: datetime
     completed_at: datetime
+    executed_channels: tuple[str, ...]
     requested_by_channel: dict[str, tuple[str, ...]]
     channel_status: dict[str, str]
     collections: dict[str, QuoteChannelCollection]
@@ -103,6 +104,7 @@ class RealtimeMonitorSummary:
         return {
             "started_at": self.started_at.isoformat(),
             "completed_at": self.completed_at.isoformat(),
+            "executed_channels": list(self.executed_channels),
             "requested_by_channel": {
                 channel: list(symbols)
                 for channel, symbols in self.requested_by_channel.items()
@@ -144,6 +146,7 @@ class RealtimeQuoteMonitor:
             channel: quote_channel_policy(channel).interval_seconds
             for channel in ACTIVE_CHANNELS
         }
+        self._last_channel_status: dict[str, str] = {}
 
     def run_due_channels(self, owner_id: str = "default-owner") -> RealtimeMonitorSummary:
         """执行当前到期通道；单通道失败不会阻断其他通道。"""
@@ -155,10 +158,12 @@ class RealtimeQuoteMonitor:
         collections: dict[str, QuoteChannelCollection] = {}
         errors: dict[str, str] = {}
         claimed_symbols: set[str] = set()
+        executed_channels: list[str] = []
 
         for channel in ACTIVE_CHANNELS:
             if monotonic_now < self._next_due[channel]:
                 continue
+            executed_channels.append(channel)
             try:
                 source_symbols = self.symbol_source.symbols_for(channel, owner_id=owner_id)
                 symbols = tuple(
@@ -198,11 +203,13 @@ class RealtimeQuoteMonitor:
                 self._mark_failure(channel)
             self._schedule(channel, monotonic_now)
 
+        self._last_channel_status.update(channel_status)
         return RealtimeMonitorSummary(
             started_at=started_at,
             completed_at=self.clock.now(),
+            executed_channels=tuple(executed_channels),
             requested_by_channel=requested_by_channel,
-            channel_status=channel_status,
+            channel_status=dict(self._last_channel_status),
             collections=collections,
             errors=errors,
         )

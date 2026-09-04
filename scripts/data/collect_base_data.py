@@ -148,6 +148,8 @@ COLLECTION_ARG_DEFAULTS: JsonDict = {
     "source_limit": None,
     "priority_symbol_limit": None,
     "scope": "priority",
+    "source_mode": None,
+    "write_chunk_size": 500,
     "partition_cursor": 0,
     "partition_count": None,
     "news_scope": "priority",
@@ -381,6 +383,24 @@ def parse_args() -> argparse.Namespace:
         help="按标的补采任务的单批标的数量",
     )
     parser.add_argument(
+        "--scope",
+        choices=["priority", "market_sweep"],
+        default=COLLECTION_ARG_DEFAULTS["scope"],
+        help="实时行情范围；重点池由独立进程负责，全市场用于调度器整表快照。",
+    )
+    parser.add_argument(
+        "--source-mode",
+        choices=["akshare_full_market"],
+        default=COLLECTION_ARG_DEFAULTS["source_mode"],
+        help="全市场实时行情固定使用 AKShare 单次整表模式。",
+    )
+    parser.add_argument(
+        "--write-chunk-size",
+        type=int,
+        default=COLLECTION_ARG_DEFAULTS["write_chunk_size"],
+        help="实时行情整表结果的数据库分块写入行数。",
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=COLLECTION_ARG_DEFAULTS["max_workers"],
@@ -612,6 +632,8 @@ def parse_args() -> argparse.Namespace:
         help="基金 K 线周期",
     )
     args = parser.parse_args()
+    if args.write_chunk_size <= 0:
+        parser.error("--write-chunk-size 必须大于 0")
     if args.group is None:
         args.group = list(COLLECTION_ARG_DEFAULTS["group"])
     return args
@@ -1137,6 +1159,9 @@ def build_ashare_parallel_realtime_task(
     """执行重点标的 gotdx/AKShare 并行快照，只覆盖盘中临时行情。"""
 
     scope = str(getattr(args, "scope", "priority") or "priority").strip()
+    source_mode = str(getattr(args, "source_mode", "") or "").strip()
+    if scope == "market_sweep" and source_mode == "akshare_full_market":
+        return build_ashare_full_market_realtime_task(session, args, runtime)
     limit = getattr(args, "limit", None)
     batch_size = max(1, int(getattr(args, "batch_size", 200) or 200))
     partition_cursor = max(0, int(getattr(args, "partition_cursor", 0) or 0))
@@ -1328,6 +1353,92 @@ def build_ashare_parallel_realtime_task(
             **task_result.payload,
             "next_partition_payload": partition.next_partition_payload,
         },
+    )
+
+
+def build_ashare_full_market_realtime_task(
+    session: Any,
+    args: argparse.Namespace,
+    runtime: CollectionRuntime,
+) -> CollectionTaskResult:
+    """一次抓取 AKShare 全市场截面，再按固定批量双写实时行情。"""
+
+    write_chunk_size = max(1, int(getattr(args, "write_chunk_size", 500) or 500))
+
+    def collect() -> ArchivedProviderResult:
+        provider_result, rows = _fetch_akshare_full_market_quote_rows(AkshareProvider())
+        if not rows:
+            raise RuntimeError("AKShare 全市场行情没有可写入的 A 股行")
+        captured_at = provider_result.collected_at
+        snapshot = build_data_snapshot(
+            snapshot_type="ashare_realtime_quotes",
+            market="ashare",
+            as_of=captured_at,
+            captured_at=captured_at,
+            provider="akshare:stock_zh_a_spot",
+            provider_version="full-market-v1",
+            quality_status=provider_result.status,
+            payload={"rows": rows},
+            metadata={
+                "source_mode": "akshare_full_market",
+                "quote_count": len(rows),
+                "temporary_storage": "intraday_quote_latest",
+            },
+        )
+        persisted_rows = tuple(
+            dict(row, data_snapshot_id=snapshot.data_snapshot_id) for row in rows
+        )
+        DataSnapshotRepository(session).insert_snapshot(snapshot)
+        repository = AssetRepository(session)
+        history_count = repository.upsert_realtime_quote_snapshots(
+            persisted_rows,
+            chunk_size=write_chunk_size,
+        )
+        latest_count = repository.upsert_intraday_quote_latest(
+            persisted_rows,
+            chunk_size=write_chunk_size,
+        )
+        assets = [
+            AssetData(
+                asset_id=str(row["asset_id"]),
+                symbol=str(row["symbol"]),
+                name=str(row["symbol"]),
+                market="ashare",
+                asset_type="stock",
+                payload=dict(row),
+            )
+            for row in rows
+        ]
+        return ArchivedProviderResult(
+            result=AssetListResult(
+                provider_name="akshare:stock_zh_a_spot",
+                status=provider_result.status,
+                collected_at=captured_at,
+                assets=assets,
+                error_message=provider_result.error_message,
+                payload={
+                    "actual_source": ["akshare:stock_zh_a_spot"],
+                    "source_mode": "akshare_full_market",
+                    "data_snapshot_id": snapshot.data_snapshot_id,
+                    "rows_written": latest_count,
+                    "history_rows_written": history_count,
+                    "write_chunk_size": write_chunk_size,
+                    "temporary_storage": "intraday_quote_latest",
+                },
+            ),
+            raw_record_id=None,
+        )
+
+    return runtime.run_task(
+        task="ashare_realtime_quotes_market_sweep",
+        provider_key="akshare:stock_zh_a_spot",
+        parameters={
+            "scope": "market_sweep",
+            "source_mode": "akshare_full_market",
+            "write_chunk_size": write_chunk_size,
+        },
+        force=bool(getattr(args, "force_provider", False)),
+        collect=collect,
     )
 
 
@@ -1536,6 +1647,51 @@ def _fetch_akshare_quote_rows(
             }
         )
     return rows
+
+
+def _fetch_akshare_full_market_quote_rows(
+    provider: AkshareProvider,
+) -> tuple[AssetListResult, list[JsonDict]]:
+    """只调用一次 AKShare 全市场接口并规范化全部 A 股行情。"""
+
+    result = provider.fetch_assets(limit=None)
+    if result.status not in {"available", "partial"}:
+        raise RuntimeError(
+            f"AKShare 行情 Provider 不可用 status={result.status} error={result.error_message}"
+        )
+    rows: list[JsonDict] = []
+    for asset in result.assets:
+        symbol = normalize_ashare_symbol(str(asset.symbol or ""))
+        if not is_tradeable_ashare_symbol(symbol):
+            continue
+        payload = dict(asset.payload or {})
+        rows.append(
+            {
+                "asset_id": asset.asset_id,
+                "symbol": symbol,
+                "market": "ashare",
+                "source": "akshare:stock_zh_a_spot",
+                "as_of": result.collected_at,
+                "captured_at": result.collected_at,
+                "freshness_ms": 0,
+                "last_price": _quote_decimal(payload, ("最新价", "最新")),
+                "prev_close": _quote_decimal(payload, ("昨收", "昨收价")),
+                "open": _quote_decimal(payload, ("今开", "开盘")),
+                "high": _quote_decimal(payload, ("最高",)),
+                "low": _quote_decimal(payload, ("最低",)),
+                "volume": _quote_decimal(payload, ("成交量",)),
+                "amount": _quote_decimal(payload, ("成交额",)),
+                "turnover_rate": _quote_decimal(payload, ("换手率",)),
+                "change_amount": _quote_decimal(payload, ("涨跌额",)),
+                "change_percent": _quote_decimal(payload, ("涨跌幅", "日增长率")),
+                "status": asset.status,
+                "quality_status": (
+                    "available" if asset.status == "available" else asset.status
+                ),
+                "payload": payload,
+            }
+        )
+    return result, rows
 
 
 def _quote_decimal(payload: Mapping[str, Any], keys: tuple[str, ...]) -> Decimal | None:
