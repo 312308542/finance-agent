@@ -175,6 +175,32 @@ def test_lifecycle_repository_keeps_one_current_state_and_append_only_events() -
     assert session.flush_count == 2
 
 
+def test_lifecycle_repository_does_not_append_unchanged_action_reason() -> None:
+    session = _LifecycleSession()
+    repository = RecommendationStateRepository(session)  # type: ignore[arg-type]
+    first = _transition(None, "watch", occurred_at=datetime(2026, 9, 7, tzinfo=UTC))
+    repeated = RecommendationTransition(
+        **{
+            **first.__dict__,
+            "event_id": "event:watch:repeat",
+            "from_state": "watch",
+            "decision_snapshot_id": "decision:2",
+            "occurred_at": datetime(2026, 9, 8, tzinfo=UTC),
+            "payload": {"quote": "refreshed"},
+        }
+    )
+
+    repository.save_transition(first)
+    repository.save_transition(repeated)
+
+    assert [event.to_state for event in session.events] == ["watch"]
+    assert session.current.decision_snapshot_id == "decision:2"
+    assert session.current.payload == {
+        "quote": "refreshed",
+        "last_reason_codes": ["to_watch"],
+    }
+
+
 def _transition(
     from_state: str | None,
     to_state: str,

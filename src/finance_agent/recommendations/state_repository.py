@@ -74,22 +74,44 @@ class RecommendationStateRepository:
         self,
         transition: RecommendationTransition,
     ) -> RecommendationLifecycleStateORM:
-        """在同一事务内更新当前状态并追加一次迁移事件。"""
+        """刷新当前状态，仅在状态或原因变化时追加审计事件。"""
+
+        current = self.get_state(
+            owner_id=transition.owner_id,
+            strategy_id=transition.strategy_id,
+            asset_id=transition.asset_id,
+        )
+        current_payload = dict(current.payload or {}) if current is not None else {}
+        last_reason_codes = tuple(current_payload.get("last_reason_codes", ()))
+        should_append_event = (
+            current is None
+            or current.current_state != transition.to_state
+            or last_reason_codes != transition.reason_codes
+        )
+        state_id = current.state_id if current is not None else transition.state_id
+        state_payload = dict(transition.payload)
+        state_payload["last_reason_codes"] = list(transition.reason_codes)
+        if current is not None and not should_append_event:
+            previous_state = current.previous_state
+            state_changed_at = current.state_changed_at
+        else:
+            previous_state = transition.from_state
+            state_changed_at = transition.occurred_at
 
         state_values = {
-            "state_id": transition.state_id,
+            "state_id": state_id,
             "owner_id": transition.owner_id,
             "strategy_id": transition.strategy_id,
             "asset_id": transition.asset_id,
             "setup_id": transition.setup_id,
             "current_state": transition.to_state,
-            "previous_state": transition.from_state,
+            "previous_state": previous_state,
             "decision_snapshot_id": transition.decision_snapshot_id,
-            "state_changed_at": transition.occurred_at,
+            "state_changed_at": state_changed_at,
             "consecutive_valid_closes": transition.consecutive_valid_closes,
             "active_days": transition.active_days,
             "cooldown_until": transition.cooldown_until,
-            "payload": _json_safe(transition.payload),
+            "payload": _json_safe(state_payload),
             "updated_at": transition.occurred_at,
         }
         state_statement = insert(RecommendationLifecycleStateORM).values(**state_values)
@@ -103,29 +125,32 @@ class RecommendationStateRepository:
                 },
             )
         )
-        event_values = {
-            "event_id": transition.event_id,
-            "state_id": transition.state_id,
-            "owner_id": transition.owner_id,
-            "strategy_id": transition.strategy_id,
-            "asset_id": transition.asset_id,
-            "setup_id": transition.setup_id,
-            "from_state": transition.from_state,
-            "to_state": transition.to_state,
-            "reason_codes": list(transition.reason_codes),
-            "decision_snapshot_id": transition.decision_snapshot_id,
-            "occurred_at": transition.occurred_at,
-            "payload": _json_safe(transition.payload),
-        }
-        self.session.execute(
-            insert(RecommendationLifecycleEventORM)
-            .values(**event_values)
-            .on_conflict_do_nothing(
-                index_elements=[RecommendationLifecycleEventORM.event_id]
+        if should_append_event:
+            event_values = {
+                "event_id": transition.event_id,
+                "state_id": state_id,
+                "owner_id": transition.owner_id,
+                "strategy_id": transition.strategy_id,
+                "asset_id": transition.asset_id,
+                "setup_id": transition.setup_id,
+                "from_state": transition.from_state,
+                "to_state": transition.to_state,
+                "reason_codes": list(transition.reason_codes),
+                "decision_snapshot_id": transition.decision_snapshot_id,
+                "occurred_at": transition.occurred_at,
+                "payload": _json_safe(transition.payload),
+            }
+            self.session.execute(
+                insert(RecommendationLifecycleEventORM)
+                .values(**event_values)
+                .on_conflict_do_nothing(
+                    index_elements=[RecommendationLifecycleEventORM.event_id]
+                )
             )
-        )
         self.session.flush()
-        return self.session.get_one(RecommendationLifecycleStateORM, transition.state_id)
+        if current is not None and hasattr(self.session, "expire"):
+            self.session.expire(current)
+        return self.session.get_one(RecommendationLifecycleStateORM, state_id)
 
     def list_events(
         self,
