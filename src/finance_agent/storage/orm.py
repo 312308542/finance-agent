@@ -1327,6 +1327,126 @@ class AssetRecommendationORM(Base):
     )
 
 
+class StockSetupORM(Base):
+    """绑定决策快照的股票交易设置。"""
+
+    __tablename__ = "stock_setups"
+    __table_args__ = (
+        Index("idx_stock_setups_owner_asset", "owner_id", "asset_id"),
+        Index(
+            "idx_stock_setups_snapshot_strategy",
+            "decision_snapshot_id",
+            "strategy_id",
+        ),
+    )
+
+    setup_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    decision_snapshot_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    setup_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    planned_horizon_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    entry_zone: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
+    invalidation_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    target_zone: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
+    expected_net_return: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    downside_risk: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    confidence: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class RecommendationLifecycleStateORM(Base):
+    """用户、策略和资产唯一的推荐生命周期当前状态。"""
+
+    __tablename__ = "recommendation_lifecycle_states"
+    __table_args__ = (
+        CheckConstraint(
+            "current_state IN ('discovered','watch','setup_confirming','buy_ready',"
+            "'active','weakening','exit_pending','exited','cooldown')",
+            name="ck_recommendation_lifecycle_current_state",
+        ),
+        UniqueConstraint(
+            "owner_id",
+            "strategy_id",
+            "asset_id",
+            name="uq_recommendation_lifecycle_owner_strategy_asset",
+        ),
+        Index("idx_recommendation_lifecycle_state", "current_state", "updated_at"),
+    )
+
+    state_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    setup_id: Mapped[str | None] = mapped_column(String(192))
+    current_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    previous_state: Mapped[str | None] = mapped_column(String(32))
+    decision_snapshot_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    state_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consecutive_valid_closes: Mapped[int] = mapped_column(
+        Integer, server_default=text("0"), nullable=False
+    )
+    active_days: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
+    cooldown_until: Mapped[date | None] = mapped_column(Date)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+
+class RecommendationLifecycleEventORM(Base):
+    """推荐生命周期只追加迁移事件。"""
+
+    __tablename__ = "recommendation_lifecycle_events"
+    __table_args__ = (
+        CheckConstraint(
+            "to_state IN ('discovered','watch','setup_confirming','buy_ready','active',"
+            "'weakening','exit_pending','exited','cooldown')",
+            name="ck_recommendation_lifecycle_event_to_state",
+        ),
+        Index(
+            "idx_recommendation_lifecycle_events_state_time",
+            "state_id",
+            "occurred_at",
+        ),
+        Index(
+            "idx_recommendation_lifecycle_events_owner_asset",
+            "owner_id",
+            "asset_id",
+            "occurred_at",
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    state_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    setup_id: Mapped[str | None] = mapped_column(String(192))
+    from_state: Mapped[str | None] = mapped_column(String(32))
+    to_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_codes: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    decision_snapshot_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
 class AgentAnalysisRunORM(Base):
     """Agent 分析运行审计表。"""
 
