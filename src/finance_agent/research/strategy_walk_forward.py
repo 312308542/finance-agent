@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time
 from typing import Any
 
@@ -39,6 +39,18 @@ class PointInTimeFactorSnapshot:
     groups: JsonDict
     available_weight: float
     source_ids: tuple[str, ...]
+    integrity_violations: tuple[str, ...] = ()
+    structure_verdict: StructureVerdict = field(
+        default_factory=lambda: StructureVerdict(status="unavailable", reason="not_loaded")
+    )
+
+
+@dataclass(frozen=True)
+class StructureVerdict:
+    """点时结构计算结论。"""
+
+    status: str
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +77,33 @@ class HistoricalGateResult:
     passed: bool
     metrics: JsonDict
     reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RankedCrossSection:
+    """单日候选排序及其已成熟的前向收益。"""
+
+    signal_date: date
+    scores: Mapping[str, float]
+    forward_returns: Mapping[str, float]
+
+
+@dataclass(frozen=True)
+class RegimeLabel:
+    """市场与板块环境标签。"""
+
+    market: str
+    sector_override: bool = False
+
+
+def _rank_ic(scores: Mapping[str, float], returns: Mapping[str, float]) -> float | None:
+    keys = [key for key in scores if key in returns]
+    if len(keys) < 2:
+        return None
+    score_rank = pd.Series([scores[key] for key in keys]).rank(method="average")
+    return_rank = pd.Series([returns[key] for key in keys]).rank(method="average")
+    value = score_rank.corr(return_rank, method="pearson")
+    return float(value) if value is not None and math.isfinite(float(value)) else None
 
 
 def build_price_feature_snapshot(
@@ -227,6 +266,9 @@ def evaluate_historical_gate(
     outcomes: Sequence[WalkForwardOutcome],
     *,
     coverage_by_date: Mapping[date, Sequence[float]],
+    rankings: Sequence[RankedCrossSection] = (),
+    selections: Mapping[date, Sequence[str]] | None = None,
+    regimes: Mapping[date, RegimeLabel] | None = None,
 ) -> HistoricalGateResult:
     """按固定样本、收益、分阶段和回撤门槛评估历史结果。"""
 
@@ -269,6 +311,37 @@ def evaluate_historical_gate(
         },
         "phases": phase_metrics,
     }
+    selections = selections or {}
+    regimes = regimes or {}
+    rank_ics = [
+        value
+        for item in rankings
+        if (value := _rank_ic(item.scores, item.forward_returns)) is not None
+    ]
+    turnover_values: list[float] = []
+    prior: set[str] | None = None
+    for day in sorted(selections):
+        current = set(selections[day])
+        if prior is not None and prior:
+            turnover_values.append(1.0 - len(current & prior) / len(prior))
+        prior = current
+    regime_slices: JsonDict = {}
+    for _day, regime in regimes.items():
+        key = f"{regime.market}_{'sector_override' if regime.sector_override else 'normal'}"
+        bucket = regime_slices.setdefault(key, {"count": 0, "mean_excess_return": None})
+        bucket["count"] += 1
+    metrics.update(
+        {
+            "rank_ic": {"mean": float(np.mean(rank_ics)) if rank_ics else None, "count": len(rank_ics)},
+            "turnover": {
+                "weekly_mean": float(np.mean(turnover_values)) if turnover_values else 0.0,
+                "observations": len(turnover_values),
+            },
+            "execution": {"unexecutable_rate": None},
+            "concentration": {"max_sector_weight": None},
+            "regime_slices": regime_slices,
+        }
+    )
 
     insufficient_reasons: list[str] = []
     if len(valid_dates) < MINIMUM_CROSS_SECTIONS:

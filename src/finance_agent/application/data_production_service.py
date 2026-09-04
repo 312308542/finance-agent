@@ -17,7 +17,12 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
-from finance_agent.storage.repositories import AssetRepository, RiskRepository, UniverseRepository
+from finance_agent.storage.repositories import (
+    AssetRepository,
+    RiskRepository,
+    UniverseMembershipHistoryRepository,
+    UniverseRepository,
+)
 
 JsonDict = dict[str, Any]
 
@@ -687,6 +692,7 @@ class ProductionUniverseService:
         self.assets = AssetRepository(session)
         self.universes = UniverseRepository(session)
         self.risks = RiskRepository(session)
+        self.membership_history = UniverseMembershipHistoryRepository(session)
         self.merge_service = UniverseMergeService()
         self.avoid_policy = AvoidPoolPolicy()
 
@@ -764,6 +770,12 @@ class ProductionUniverseService:
             as_of=as_of,
             removed_reason="not_in_latest_merge",
         )
+        self._record_membership_snapshot(
+            universe_id=target_universe_id,
+            members=plans,
+            as_of=as_of,
+            source_snapshot_id=f"{target_universe_id}:{as_of.date().isoformat()}",
+        )
         return plans
 
     def rebuild_avoid_pool(
@@ -822,4 +834,33 @@ class ProductionUniverseService:
             universe_id=universe_id,
             members=[plan.to_repository_payload() for plan in plans],
         )
+        self._record_membership_snapshot(
+            universe_id=universe_id,
+            members=plans,
+            as_of=as_of,
+            source_snapshot_id=f"{universe_id}:{as_of.date().isoformat()}",
+        )
         return plans
+
+    def _record_membership_snapshot(
+        self,
+        *,
+        universe_id: str,
+        members: list[UniverseMemberPlan],
+        as_of: datetime,
+        source_snapshot_id: str,
+    ) -> None:
+        """在完整刷新成功后追加候选池点时成员历史。
+
+        兼容只注入 UniverseRepository 的旧测试替身；生产实例始终具备历史仓储。
+        """
+
+        repository = getattr(self, "membership_history", None)
+        if repository is None or not hasattr(repository, "record_snapshot"):
+            return
+        repository.record_snapshot(
+            universe_id=universe_id,
+            members=[plan.to_repository_payload() for plan in members],
+            as_of=as_of,
+            source_snapshot_id=source_snapshot_id,
+        )

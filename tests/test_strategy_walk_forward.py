@@ -7,6 +7,8 @@ import pandas as pd
 import pytest
 
 from finance_agent.research.strategy_walk_forward import (
+    RankedCrossSection,
+    RegimeLabel,
     WalkForwardOutcome,
     build_price_feature_snapshot,
     evaluate_historical_gate,
@@ -208,3 +210,29 @@ def test_historical_gate_fails_when_drawdown_exceeds_benchmark_by_five_points() 
     assert result.status == "failed"
     assert result.metrics["drawdown_gap"] > 0.05
     assert "drawdown_gap_above_limit" in result.reasons
+
+
+def test_historical_gate_reports_rank_ic_turnover_and_regime_slices() -> None:
+    days = [date(2025, 1, 1) + timedelta(days=index) for index in range(120)]
+    rankings = [
+        RankedCrossSection(
+            signal_date=day,
+            scores={"a": 1.0, "b": 2.0, "c": 3.0},
+            forward_returns={"a": 0.01, "b": 0.02, "c": 0.03},
+        )
+        for day in days
+    ]
+    selections = {day: (["a"] if index % 2 == 0 else ["b"]) for index, day in enumerate(days)}
+    regimes = {
+        day: RegimeLabel("trend_down", sector_override=True) for day in days[:35]
+    }
+    result = evaluate_historical_gate(
+        _historical_outcomes(days),
+        coverage_by_date=_coverage(days),
+        rankings=rankings,
+        selections=selections,
+        regimes=regimes,
+    )
+    assert result.metrics["rank_ic"]["mean"] > 0.03
+    assert result.metrics["turnover"]["weekly_mean"] == 1.0
+    assert result.metrics["regime_slices"]["trend_down_sector_override"]["count"] == 35

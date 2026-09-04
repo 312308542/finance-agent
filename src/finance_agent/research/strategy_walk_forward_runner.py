@@ -30,6 +30,7 @@ from finance_agent.research.strategy_walk_forward import (
     MINIMUM_COVERED_ASSET_RATIO,
     SUPPORTED_HORIZONS,
     PointInTimeFactorSnapshot,
+    StructureVerdict,
     WalkForwardOutcome,
     build_price_feature_snapshot,
     evaluate_historical_gate,
@@ -49,7 +50,12 @@ from finance_agent.storage.orm import (
     MarketBarORM,
     RiskFindingORM,
 )
-from finance_agent.storage.repositories import BacktestRepository
+from finance_agent.storage.repositories import (
+    AssetRepository,
+    BacktestRepository,
+    IndicatorFrameRepository,
+    UniverseMembershipHistoryRepository,
+)
 
 JsonDict = dict[str, Any]
 
@@ -131,6 +137,14 @@ class PointInTimeReader(Protocol):
 
     def list_theme_memberships(self, *, asset_id: str) -> list[Any]: ...
 
+    def market_regime_as_of(self, *, signal_date: date) -> JsonDict: ...
+
+    def sector_context_as_of(self, *, asset_id: str, signal_date: date) -> JsonDict: ...
+
+    def structure_frames_as_of(self, *, asset_id: str, signal_date: date) -> tuple[Any, ...]: ...
+
+    def tradability_as_of(self, *, asset_id: str, signal_date: date) -> JsonDict: ...
+
     def data_versions(self) -> JsonDict: ...
 
 
@@ -183,11 +197,13 @@ class SqlPointInTimeReader:
         session: Session,
         *,
         market_bar_source: str = DEFAULT_MARKET_BAR_SOURCE,
+        universe_id: str = DEFAULT_UNIVERSE_ID,
         asset_limit: int | None = None,
         code_commit: str | None = None,
     ) -> None:
         self.session = session
         self.market_bar_source = market_bar_source
+        self.universe_id = universe_id
         self.asset_limit = max(int(asset_limit), 1) if asset_limit is not None else None
         self.code_commit = code_commit
         self._research_start_at: datetime | None = None
@@ -200,6 +216,9 @@ class SqlPointInTimeReader:
         self._events_by_asset: dict[str, list[Any]] = {}
         self._risks_by_asset: dict[str, list[Any]] = {}
         self._theme_memberships_by_asset: dict[str, list[Any]] = {}
+        self._membership_history = UniverseMembershipHistoryRepository(session)
+        self._assets = AssetRepository(session)
+        self._indicators = IndicatorFrameRepository(session)
 
     def list_signal_dates(self, *, start_at: datetime, end_at: datetime) -> list[date]:
         """查询研究窗口内实际存在的 A 股交易日。"""
@@ -239,6 +258,29 @@ class SqlPointInTimeReader:
             tzinfo=ASHARE_TIMEZONE,
         ).astimezone(UTC)
         cutoff = _ashare_close_at(signal_date)
+        history_required = hasattr(self.session, "bind")
+        history_available = True
+        if history_required:
+            try:
+                historical_members = self._membership_history.list_members_as_of(
+                    self.universe_id,
+                    signal_date,
+                )
+            except Exception:
+                # 迁移尚未执行或旧数据库无历史表时，研究必须保持 fail-closed。
+                historical_members = []
+                history_available = False
+        else:
+            # 仅兼容无数据库绑定的纯单元测试替身；生产 SQLAlchemy 会严格依赖历史表。
+            historical_members = []
+        historical_by_asset = {
+            str(row.asset_id): row
+            for row in historical_members
+            if getattr(row, "asset_id", None)
+        }
+        if history_required and (not history_available or not historical_by_asset):
+            self._candidates_by_date[signal_date] = []
+            return []
         statement = (
             select(MarketBarORM.asset_id, MarketBarORM.symbol)
             .where(
@@ -251,6 +293,8 @@ class SqlPointInTimeReader:
         )
         candidates: list[CandidateAsset] = []
         for asset_id, symbol in self.session.execute(statement):
+            if history_required and asset_id not in historical_by_asset:
+                continue
             warmup_at = warmup_timestamps.get(asset_id)
             if (
                 warmup_at is not None
@@ -262,6 +306,118 @@ class SqlPointInTimeReader:
             candidates = candidates[: self.asset_limit]
         self._candidates_by_date[signal_date] = candidates
         return list(candidates)
+
+    def market_regime_as_of(self, *, signal_date: date) -> JsonDict:
+        """读取收盘市场状态快照，超过研究时点的记录一律不可见。"""
+
+        from finance_agent.storage.repositories import DataSnapshotRepository
+
+        cutoff = _ashare_close_at(signal_date)
+        snapshot = DataSnapshotRepository(self.session).get_latest(
+            snapshot_type="market_regime",
+            market="ashare",
+            as_of=cutoff,
+        )
+        if snapshot is None or _ensure_aware(snapshot.as_of) > cutoff:
+            return {
+                "status": "unavailable",
+                "reason": "point_in_time_market_regime_source_missing",
+                "as_of": signal_date.isoformat(),
+                "source_ids": [],
+            }
+        payload = dict(snapshot.payload or {})
+        payload.update(
+            {
+                "status": "available" if snapshot.quality_status == "available" else "unavailable",
+                "as_of": _ensure_aware(snapshot.as_of).isoformat(),
+                "source_ids": [str(snapshot.data_snapshot_id)],
+            }
+        )
+        return payload
+
+    def sector_context_as_of(self, *, asset_id: str, signal_date: date) -> JsonDict:
+        """读取热门板块快照中指定资产的点时事实。"""
+
+        from finance_agent.storage.repositories import DataSnapshotRepository
+
+        cutoff = _ashare_close_at(signal_date)
+        snapshot = DataSnapshotRepository(self.session).get_latest(
+            snapshot_type="sector_opportunities",
+            market="ashare",
+            as_of=cutoff,
+        )
+        if snapshot is None or _ensure_aware(snapshot.as_of) > cutoff:
+            return {
+                "status": "unavailable",
+                "reason": "point_in_time_sector_source_missing",
+                "asset_id": asset_id,
+                "as_of": signal_date.isoformat(),
+                "source_ids": [],
+            }
+        asset = next(
+            (item for item in (snapshot.payload or {}).get("assets", []) if item.get("asset_id") == asset_id),
+            None,
+        )
+        if not asset:
+            return {
+                "status": "unavailable",
+                "reason": "asset_sector_fact_missing",
+                "asset_id": asset_id,
+                "as_of": _ensure_aware(snapshot.as_of).isoformat(),
+                "source_ids": [str(snapshot.data_snapshot_id)],
+            }
+        sectors = asset.get("sectors") or []
+        best = max(sectors, key=lambda item: float(item.get("strength_score") or 0), default=None)
+        return {
+            "group": "sector_strength",
+            "status": "available" if best else "unavailable",
+            "score": float(best.get("strength_score")) if best else None,
+            "factors": {"sectors": sectors, "leadership": asset.get("leadership")},
+            "as_of": _ensure_aware(snapshot.as_of).isoformat(),
+            "source_ids": [str(snapshot.data_snapshot_id), *(asset.get("evidence_ids") or [])],
+        }
+
+    def structure_frames_as_of(self, *, asset_id: str, signal_date: date) -> tuple[Any, ...]:
+        """返回不晚于收盘时点的 structural-lite 结构帧。"""
+
+        return tuple(
+            frame
+            for horizon in ("swings", "smc", "harmonic", "elliott", "ichimoku")
+            if (frame := self._indicators.get_latest_indicator_frame(
+                asset_id=asset_id,
+                timeframe="1d",
+                horizon=horizon,
+                library="structural-lite",
+                as_of=_ashare_close_at(signal_date),
+            )) is not None
+        )
+
+    def tradability_as_of(self, *, asset_id: str, signal_date: date) -> JsonDict:
+        """读取信号日之前最新交易状态；缺失时默认不可交易。"""
+
+        rows = self._assets.list_latest_statuses(
+            asset_ids=[asset_id],
+            as_of=_ashare_close_at(signal_date),
+        )
+        row = rows[0] if rows else None
+        if row is None:
+            return {
+                "status": "unavailable",
+                "tradable": False,
+                "reason": "point_in_time_tradability_source_missing",
+                "asset_id": asset_id,
+                "as_of": signal_date.isoformat(),
+                "source_ids": [],
+            }
+        return {
+            "status": "available",
+            "tradable": bool(row.tradable),
+            "trading_status": row.trading_status,
+            "reason": row.reason,
+            "asset_id": asset_id,
+            "as_of": _ensure_aware(row.as_of).isoformat(),
+            "source_ids": [f"asset-status:{row.asset_id}:{row.as_of.isoformat()}:{row.source}"],
+        }
 
     def list_bars(self, *, asset_id: str, end_at: datetime) -> pd.DataFrame:
         """读取截面前最近一段 canonical 日 K，返回时间升序 DataFrame。"""
@@ -556,6 +712,63 @@ class PointInTimeStrategyDataSource:
                 as_of=as_of,
             )
         )
+        integrity_violations: list[str] = []
+        market_reader = getattr(self.reader, "market_regime_as_of", None)
+        if market_reader is not None:
+            market = dict(market_reader(signal_date=as_of.astimezone(ASHARE_TIMEZONE).date()))
+            market_at = _parse_payload_datetime(market.get("as_of"))
+            if (
+                market_at is not None
+                and market_at.astimezone(ASHARE_TIMEZONE).date()
+                > as_of.astimezone(ASHARE_TIMEZONE).date()
+            ):
+                integrity_violations.append("future_market_fact")
+                market = _unavailable_group("market_regime", "future_market_fact")
+            if market.get("status") == "available":
+                groups["market_regime"] = market
+            if market.get("integrity_violation"):
+                integrity_violations.append(str(market["integrity_violation"]))
+        sector_reader = getattr(self.reader, "sector_context_as_of", None)
+        if sector_reader is not None:
+            sector = dict(
+                sector_reader(
+                    asset_id=asset_id,
+                    signal_date=as_of.astimezone(ASHARE_TIMEZONE).date(),
+                )
+            )
+            sector_at = _parse_payload_datetime(sector.get("as_of"))
+            if (
+                sector_at is not None
+                and sector_at.astimezone(ASHARE_TIMEZONE).date()
+                > as_of.astimezone(ASHARE_TIMEZONE).date()
+            ):
+                integrity_violations.append("future_sector_fact")
+                sector = _unavailable_group("sector_strength", "future_sector_fact")
+            if sector.get("status") == "available":
+                groups["sector_strength"] = sector
+            if sector.get("integrity_violation"):
+                integrity_violations.append(str(sector["integrity_violation"]))
+        structure_verdict = None
+        structure_reader = getattr(self.reader, "structure_frames_as_of", None)
+        if structure_reader is not None:
+            frames = tuple(
+                structure_reader(
+                    asset_id=asset_id,
+                    signal_date=as_of.astimezone(ASHARE_TIMEZONE).date(),
+                )
+            )
+            structure_verdict = {
+                "status": "available" if frames else "unavailable",
+                "reason": None if frames else "structure_source_missing",
+            }
+            if frames:
+                groups["structure"] = _build_structure_group(frames)
+            for frame in frames:
+                input_end_at = getattr(frame, "input_end_at", None)
+                if input_end_at is not None and _ensure_aware(input_end_at) > _ensure_aware(as_of):
+                    integrity_violations.append("future_structure_fact")
+        if integrity_violations:
+            groups.setdefault("structure", _unavailable_group("structure", "integrity_violation"))
         for group_name in EXPECTED_FACTOR_GROUPS:
             groups.setdefault(group_name, _unavailable_group(group_name, "point_in_time_source"))
 
@@ -572,6 +785,19 @@ class PointInTimeStrategyDataSource:
             groups=groups,
             available_weight=available_weight,
             source_ids=source_ids,
+            integrity_violations=tuple(dict.fromkeys(integrity_violations)),
+            structure_verdict=StructureVerdict(
+                status=(
+                    "blocked"
+                    if any(item == "future_structure_fact" for item in integrity_violations)
+                    else (structure_verdict or {"status": "unavailable"}).get("status", "unavailable")
+                ),
+                reason=(
+                    "future_structure_fact"
+                    if "future_structure_fact" in integrity_violations
+                    else (structure_verdict or {}).get("reason")
+                ),
+            ),
         )
 
     def score_snapshot(
@@ -623,6 +849,18 @@ class PointInTimeStrategyDataSource:
     def data_versions(self) -> JsonDict:
         return dict(self.reader.data_versions())
 
+    def market_regime_as_of(self, *, signal_date: date) -> JsonDict:
+        return dict(self.reader.market_regime_as_of(signal_date=signal_date))
+
+    def sector_context_as_of(self, *, asset_id: str, signal_date: date) -> JsonDict:
+        return dict(self.reader.sector_context_as_of(asset_id=asset_id, signal_date=signal_date))
+
+    def structure_frames_as_of(self, *, asset_id: str, signal_date: date) -> tuple[Any, ...]:
+        return tuple(self.reader.structure_frames_as_of(asset_id=asset_id, signal_date=signal_date))
+
+    def tradability_as_of(self, *, asset_id: str, signal_date: date) -> JsonDict:
+        return dict(self.reader.tradability_as_of(asset_id=asset_id, signal_date=signal_date))
+
     def _strategy(self, strategy_id: str) -> JsonDict:
         strategy = self._strategies.get(strategy_id)
         if strategy is None or strategy.get("market") != "ashare":
@@ -655,6 +893,8 @@ class StrategyWalkForwardRunner:
             "no_candidates": 0,
             "unscored_candidates": 0,
             "incomplete_forward_labels": 0,
+            "untradable_candidates": 0,
+            "integrity_violations": 0,
         }
         total_candidates = 0
 
@@ -680,6 +920,22 @@ class StrategyWalkForwardRunner:
                     strategy_id=request.strategy_id,
                 )
                 coverage_by_date[signal_date].append(snapshot.available_weight)
+                if snapshot.integrity_violations:
+                    excluded_counts["integrity_violations"] += len(snapshot.integrity_violations)
+                    continue
+                tradability_reader = getattr(self.source, "tradability_as_of", None)
+                if tradability_reader is not None:
+                    tradability = dict(
+                        tradability_reader(
+                            asset_id=candidate.asset_id,
+                            signal_date=signal_date,
+                        )
+                    )
+                    if tradability.get("status") != "available" or not bool(
+                        tradability.get("tradable")
+                    ):
+                        excluded_counts["untradable_candidates"] += 1
+                        continue
                 if (
                     not math.isfinite(float(snapshot.available_weight))
                     or snapshot.available_weight < MINIMUM_ASSET_AVAILABLE_WEIGHT
@@ -816,6 +1072,12 @@ def run_strategy_walk_forward(
         session,
         asset_limit=asset_limit,
         code_commit=code_commit,
+        reader=SqlPointInTimeReader(
+            session,
+            universe_id=universe_id,
+            asset_limit=asset_limit,
+            code_commit=code_commit,
+        ),
     )
     request = StrategyWalkForwardRequest(
         strategy_id=strategy_id,
@@ -964,6 +1226,45 @@ def _visible_theme_groups(memberships: Sequence[Any], *, as_of: datetime) -> Jso
             if current is None or score > float(current["score"]):
                 selected[group_name] = group
     return selected
+
+
+def _build_structure_group(frames: Sequence[Any]) -> JsonDict:
+    """把 structural-lite 帧收敛为可参与历史评分的结构因子组。"""
+
+    usable: list[JsonDict] = []
+    source_ids: list[str] = []
+    for frame in frames:
+        status = str(getattr(frame, "status", "") or "")
+        payload = dict(getattr(frame, "payload", None) or {})
+        confidence = _finite_or_none(payload.get("confidence"))
+        if confidence is None:
+            confidence = _finite_or_none(payload.get("structure_confidence"))
+        if confidence is None:
+            confidence = 0.5 if status == "available" else 0.0
+        if status not in {"available", "partial"}:
+            continue
+        usable.append(
+            {
+                "horizon": getattr(frame, "horizon", None),
+                "status": status,
+                "confidence": confidence,
+                "input_end_at": _iso_or_none(getattr(frame, "input_end_at", None)),
+            }
+        )
+        frame_id = getattr(frame, "indicator_frame_id", None)
+        if frame_id:
+            source_ids.append(str(frame_id))
+    if not usable:
+        return _unavailable_group("structure", "structure_frames_unavailable")
+    score = float(np.mean([float(item["confidence"]) for item in usable]) * 100)
+    return {
+        "group": "structure",
+        "status": "available" if len(usable) == len(frames) else "partial",
+        "score": round(score, 6),
+        "factors": {"frame_count": len(usable), "frames": usable},
+        "missing_factors": [],
+        "source_ids": source_ids,
+    }
 
 
 def _membership_covers(row: Any, *, as_of: datetime) -> bool:

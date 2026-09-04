@@ -1327,6 +1327,35 @@ class AssetRecommendationORM(Base):
     )
 
 
+class AssetUniverseMembershipHistoryORM(Base):
+    """候选池成员的不可变有效区间历史。"""
+
+    __tablename__ = "asset_universe_membership_history"
+    __table_args__ = (
+        UniqueConstraint(
+            "universe_id", "asset_id", "valid_from", name="uq_universe_membership_history"
+        ),
+        Index("idx_universe_membership_history_as_of", "universe_id", "valid_from", "valid_to"),
+        Index("idx_universe_membership_history_asset", "asset_id", "valid_from"),
+    )
+
+    history_id: Mapped[str] = mapped_column(String(192), primary_key=True)
+    universe_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    valid_from: Mapped[date] = mapped_column(Date, nullable=False)
+    valid_to: Mapped[date | None] = mapped_column(Date)
+    included: Mapped[bool] = mapped_column(nullable=False)
+    status_flags: Mapped[list[str]] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    source_snapshot_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(
+        JSONB, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+
 class StockSetupORM(Base):
     """绑定决策快照的股票交易设置。"""
 
@@ -1445,6 +1474,65 @@ class RecommendationLifecycleEventORM(Base):
     payload: Mapped[JsonDict] = mapped_column(
         JSONB, server_default=text("'{}'::jsonb"), nullable=False
     )
+
+
+class PositionMonitoringStateORM(Base):
+    """活跃持仓的当前盘中监控状态。"""
+
+    __tablename__ = "position_monitoring_states"
+    __table_args__ = (
+        UniqueConstraint("position_id", name="uq_position_monitoring_position"),
+        Index("idx_position_monitoring_owner_action", "owner_id", "current_action"),
+        Index("idx_position_monitoring_quote", "last_quote_at"),
+    )
+
+    monitoring_state_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    position_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    portfolio_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    setup_id: Mapped[str | None] = mapped_column(String(192))
+    decision_snapshot_id: Mapped[str | None] = mapped_column(String(255))
+    current_action: Mapped[str] = mapped_column(String(32), nullable=False)
+    previous_valid_action: Mapped[str] = mapped_column(String(32), nullable=False)
+    cost_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    opened_on: Mapped[date | None] = mapped_column(Date)
+    total_quantity: Mapped[Decimal] = mapped_column(Numeric(24, 8), nullable=False)
+    sellable_quantity: Mapped[Decimal] = mapped_column(Numeric(24, 8), nullable=False)
+    active_days: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
+    planned_horizon_days: Mapped[int] = mapped_column(Integer, server_default=text("10"), nullable=False)
+    invalidation_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    protective_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    highest_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    sector_id: Mapped[str | None] = mapped_column(String(128))
+    sector_regime: Mapped[str] = mapped_column(String(32), server_default=text("'unknown'"), nullable=False)
+    last_quote_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payload: Mapped[JsonDict] = mapped_column(JSONB, server_default=text("'{}'::jsonb"), nullable=False)
+
+
+class PositionMonitoringEventORM(Base):
+    """持仓监控动作变化和异常的追加事件。"""
+
+    __tablename__ = "position_monitoring_events"
+    __table_args__ = (
+        Index("idx_position_monitoring_events_position_time", "position_id", "occurred_at"),
+        Index("idx_position_monitoring_events_state_time", "monitoring_state_id", "occurred_at"),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    monitoring_state_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    position_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    severity: Mapped[str] = mapped_column(String(32), nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_codes: Mapped[list[str]] = mapped_column(JSONB, server_default=text("'[]'::jsonb"), nullable=False)
+    quote_snapshot_id: Mapped[str | None] = mapped_column(String(255))
+    decision_snapshot_id: Mapped[str | None] = mapped_column(String(255))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[JsonDict] = mapped_column(JSONB, server_default=text("'{}'::jsonb"), nullable=False)
 
 
 class AgentAnalysisRunORM(Base):

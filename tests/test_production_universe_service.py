@@ -37,6 +37,35 @@ def test_production_universe_merge_prunes_members_missing_from_latest_run() -> N
     }
 
 
+def test_production_universe_merge_records_point_in_time_membership_snapshot() -> None:
+    """候选池完整刷新后，应同步追加可审计的点时候选池成员快照。"""
+
+    as_of = datetime(2026, 6, 30, tzinfo=UTC)
+    universe_repository = _FakeUniverseRepository(as_of=as_of)
+    history_repository = _FakeMembershipHistoryRepository()
+    service = ProductionUniverseService.__new__(ProductionUniverseService)
+    service.universes = universe_repository
+    service.merge_service = UniverseMergeService()
+    service.membership_history = history_repository
+
+    service.merge_universes(
+        target_universe_id="universe:merged:ashare:recommendation",
+        name="推荐合并池",
+        source_universe_ids=["universe:tradeable:ashare:main_board"],
+        strategy_context="recommendation",
+        as_of=as_of,
+    )
+
+    assert history_repository.snapshots == [
+        {
+            "universe_id": "universe:merged:ashare:recommendation",
+                "as_of": as_of,
+            "source_snapshot_id": "universe:merged:ashare:recommendation:2026-06-30",
+            "asset_ids": ["ashare:000001", "ashare:600519"],
+        }
+    ]
+
+
 class _FakeUniverseRepository:
     def __init__(self, *, as_of: datetime) -> None:
         self.as_of = as_of
@@ -89,3 +118,18 @@ class _FakeUniverseRepository:
             "as_of": as_of,
             "removed_reason": removed_reason,
         }
+
+
+class _FakeMembershipHistoryRepository:
+    def __init__(self) -> None:
+        self.snapshots: list[dict[str, Any]] = []
+
+    def record_snapshot(self, **kwargs: Any) -> None:
+        self.snapshots.append(
+            {
+                "universe_id": kwargs["universe_id"],
+                "as_of": kwargs["as_of"],
+                "source_snapshot_id": kwargs["source_snapshot_id"],
+                "asset_ids": [item["asset_id"] for item in kwargs["members"]],
+            }
+        )

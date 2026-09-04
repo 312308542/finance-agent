@@ -36,6 +36,7 @@ from finance_agent.storage.orm import (
     AssetStatusSnapshotORM,
     AssetThesisORM,
     AssetUniverseMemberORM,
+    AssetUniverseMembershipHistoryORM,
     AssetUniverseORM,
     AssistantChatMessageORM,
     AssistantChatSessionORM,
@@ -372,18 +373,25 @@ class DataSnapshotRepository:
 
         return self.session.get(DataSnapshotORM, data_snapshot_id)
 
-    def get_latest(self, *, snapshot_type: str, market: str) -> DataSnapshotORM | None:
-        """读取指定市场和类型最新捕获的快照。"""
+    def get_latest(
+        self,
+        *,
+        snapshot_type: str,
+        market: str,
+        as_of: datetime | None = None,
+    ) -> DataSnapshotORM | None:
+        """读取指定市场和类型最新捕获的快照，可按点时上限过滤。"""
 
-        statement = (
-            select(DataSnapshotORM)
-            .where(
-                DataSnapshotORM.snapshot_type == snapshot_type,
-                DataSnapshotORM.market == market,
-            )
-            .order_by(DataSnapshotORM.captured_at.desc())
-            .limit(1)
+        statement = select(DataSnapshotORM).where(
+            DataSnapshotORM.snapshot_type == snapshot_type,
+            DataSnapshotORM.market == market,
         )
+        if as_of is not None:
+            statement = statement.where(
+                DataSnapshotORM.as_of <= as_of,
+                DataSnapshotORM.captured_at <= as_of,
+            )
+        statement = statement.order_by(DataSnapshotORM.captured_at.desc()).limit(1)
         return self.session.scalars(statement).first()
 
 
@@ -1951,6 +1959,140 @@ class UniverseRepository:
         if included_only:
             statement = statement.where(AssetUniverseMemberORM.included.is_(True))
         return list(self.session.scalars(statement.order_by(AssetUniverseMemberORM.symbol)))
+
+
+class UniverseMembershipHistoryRepository:
+    """候选池成员历史追加与点时查询仓储。"""
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def append(self, history: Mapping[str, Any]) -> AssetUniverseMembershipHistoryORM:
+        """追加一条有效区间；相同快照重复写入时保持幂等。"""
+
+        values = {
+            "history_id": str(history["history_id"]),
+            "universe_id": str(history["universe_id"]),
+            "asset_id": str(history["asset_id"]),
+            "symbol": str(history["symbol"]),
+            "market": str(history["market"]),
+            "valid_from": history["valid_from"],
+            "valid_to": history.get("valid_to"),
+            "included": bool(history.get("included", True)),
+            "status_flags": _json_safe(history.get("status_flags") or []),
+            "source_snapshot_id": str(history["source_snapshot_id"]),
+            "payload": _json_safe(history.get("payload") or {}),
+        }
+        statement = insert(AssetUniverseMembershipHistoryORM).values(**values)
+        self.session.execute(
+            statement.on_conflict_do_nothing(
+                constraint="uq_universe_membership_history"
+            )
+        )
+        self.session.flush()
+        return self.get_by_key(
+            universe_id=values["universe_id"],
+            asset_id=values["asset_id"],
+            valid_from=values["valid_from"],
+        )
+
+    def record_snapshot(
+        self,
+        *,
+        universe_id: str,
+        members: Sequence[Mapping[str, Any]],
+        as_of: datetime,
+        source_snapshot_id: str,
+    ) -> int:
+        """在一次完整候选池刷新中追加成员有效区间，并关闭已移除区间。
+
+        只允许向前推进有效日期；同一快照重复执行时保持幂等，不从当前成员反推历史。
+        """
+
+        snapshot_date = as_of.date()
+        normalized_members = {
+            str(member["asset_id"]): member
+            for member in members
+            if str(member.get("asset_id") or "").strip()
+        }
+        open_statement = select(AssetUniverseMembershipHistoryORM).where(
+            AssetUniverseMembershipHistoryORM.universe_id == universe_id,
+            AssetUniverseMembershipHistoryORM.included.is_(True),
+            AssetUniverseMembershipHistoryORM.valid_to.is_(None),
+        )
+        open_rows = list(self.session.scalars(open_statement))
+        open_by_asset = {row.asset_id: row for row in open_rows}
+        changed = 0
+
+        for asset_id, member in normalized_members.items():
+            current = open_by_asset.get(asset_id)
+            if current is not None:
+                # 已存在开放区间时只保留原始有效起点，避免每次刷新产生碎片区间。
+                continue
+            self.append(
+                {
+                    "history_id": f"universe_membership:{universe_id}:{asset_id}:{snapshot_date.isoformat()}",
+                    "universe_id": universe_id,
+                    "asset_id": asset_id,
+                    "symbol": str(member.get("symbol") or asset_id.rsplit(":", 1)[-1]),
+                    "market": str(member.get("market") or "ashare"),
+                    "valid_from": snapshot_date,
+                    "included": bool(member.get("included", True)),
+                    "status_flags": list(member.get("status_flags") or []),
+                    "source_snapshot_id": source_snapshot_id,
+                    "payload": dict(member.get("payload") or {}),
+                }
+            )
+            changed += 1
+
+        removed_ids = set(open_by_asset) - set(normalized_members)
+        if removed_ids:
+            close_date = snapshot_date - timedelta(days=1)
+            statement = (
+                update(AssetUniverseMembershipHistoryORM)
+                .where(
+                    AssetUniverseMembershipHistoryORM.universe_id == universe_id,
+                    AssetUniverseMembershipHistoryORM.asset_id.in_(removed_ids),
+                    AssetUniverseMembershipHistoryORM.included.is_(True),
+                    AssetUniverseMembershipHistoryORM.valid_to.is_(None),
+                    AssetUniverseMembershipHistoryORM.valid_from < snapshot_date,
+                )
+                .values(valid_to=close_date)
+            )
+            result = self.session.execute(statement)
+            changed += int(getattr(result, "rowcount", 0) or 0)
+        self.session.flush()
+        return changed
+
+    def list_members_as_of(
+        self, universe_id: str, as_of: date
+    ) -> list[AssetUniverseMembershipHistoryORM]:
+        """只返回有效区间覆盖目标日期的成员。"""
+
+        statement = (
+            select(AssetUniverseMembershipHistoryORM)
+            .where(
+                AssetUniverseMembershipHistoryORM.universe_id == universe_id,
+                AssetUniverseMembershipHistoryORM.valid_from <= as_of,
+                or_(
+                    AssetUniverseMembershipHistoryORM.valid_to.is_(None),
+                    AssetUniverseMembershipHistoryORM.valid_to >= as_of,
+                ),
+                AssetUniverseMembershipHistoryORM.included.is_(True),
+            )
+            .order_by(AssetUniverseMembershipHistoryORM.asset_id)
+        )
+        return list(self.session.scalars(statement))
+
+    def get_by_key(
+        self, *, universe_id: str, asset_id: str, valid_from: date
+    ) -> AssetUniverseMembershipHistoryORM:
+        statement = select(AssetUniverseMembershipHistoryORM).where(
+            AssetUniverseMembershipHistoryORM.universe_id == universe_id,
+            AssetUniverseMembershipHistoryORM.asset_id == asset_id,
+            AssetUniverseMembershipHistoryORM.valid_from == valid_from,
+        )
+        return self.session.scalars(statement).one()
 
 
 class MarketCalendarRepository:
