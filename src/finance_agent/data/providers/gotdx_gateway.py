@@ -23,6 +23,8 @@ from finance_agent.storage.snapshot_contracts import DataSnapshot, build_data_sn
 JsonDict = dict[str, Any]
 RequestPost = Callable[..., Any]
 GOTDX_SOURCE = "gotdx:tdx_main"
+GOTDX_GATEWAY_HARD_LIMIT = 100
+DEFAULT_GOTDX_BATCH_SIZE = 50
 
 
 class GotdxGatewayError(RuntimeError):
@@ -70,6 +72,24 @@ class GotdxPersistenceResult:
 
     snapshot: DataSnapshot
     rows_written: int
+
+
+def split_quote_symbols(
+    symbols: list[str] | tuple[str, ...],
+    *,
+    batch_size: int = DEFAULT_GOTDX_BATCH_SIZE,
+) -> tuple[tuple[str, ...], ...]:
+    """保持输入顺序去重，并按网关安全上限切分行情代码。"""
+
+    if batch_size < 1 or batch_size > GOTDX_GATEWAY_HARD_LIMIT:
+        raise ValueError("GoTDX 行情批次必须在 1 到 100 之间")
+    normalized = tuple(
+        dict.fromkeys(str(item).strip() for item in symbols if str(item).strip())
+    )
+    return tuple(
+        normalized[offset : offset + batch_size]
+        for offset in range(0, len(normalized), batch_size)
+    )
 
 
 def parse_gateway_quotes(payload: JsonDict) -> tuple[GotdxQuote, ...]:
@@ -148,27 +168,43 @@ class GotdxGatewayProvider:
     def fetch_quotes(self, symbols: list[str] | tuple[str, ...]) -> tuple[GotdxQuote, ...]:
         """调用网关并解析重点标的快照。"""
 
-        normalized_symbols = tuple(sorted({str(symbol).strip() for symbol in symbols if str(symbol).strip()}))
-        if not normalized_symbols:
+        batches = split_quote_symbols(symbols)
+        if not batches:
             raise GotdxGatewayError("symbols 不能为空")
-        try:
-            response = self.request_post(
-                f"{self.base_url}/quotes",
-                json={"symbols": list(normalized_symbols)},
-                timeout=self.timeout,
-            )
-        except requests.RequestException as exc:
-            raise GotdxGatewayError(f"网关请求失败: {exc}") from exc
-        status_code = int(getattr(response, "status_code", 0) or 0)
-        if status_code < 200 or status_code >= 300:
-            raise GotdxGatewayError(f"网关 HTTP {status_code}")
-        try:
-            response_payload = response.json()
-        except Exception as exc:  # noqa: BLE001 - Provider 边界需要统一错误类型
-            raise GotdxGatewayError(f"网关响应不是 JSON: {exc}") from exc
-        if not isinstance(response_payload, dict):
-            raise GotdxGatewayError("网关响应必须是 JSON 对象")
-        return parse_gateway_quotes(response_payload)
+        merged_quotes: list[GotdxQuote] = []
+        for batch_index, batch in enumerate(batches):
+            start = batch_index * DEFAULT_GOTDX_BATCH_SIZE + 1
+            end = start + len(batch) - 1
+            try:
+                response = self.request_post(
+                    f"{self.base_url}/quotes",
+                    json={"symbols": list(batch)},
+                    timeout=self.timeout,
+                )
+                status_code = int(getattr(response, "status_code", 0) or 0)
+                if status_code < 200 or status_code >= 300:
+                    raise GotdxGatewayError(f"网关 HTTP {status_code}")
+                try:
+                    response_payload = response.json()
+                except Exception as exc:  # noqa: BLE001 - Provider 边界需要统一错误类型
+                    raise GotdxGatewayError(f"网关响应不是 JSON: {exc}") from exc
+                if not isinstance(response_payload, dict):
+                    raise GotdxGatewayError("网关响应必须是 JSON 对象")
+                parsed = parse_gateway_quotes(response_payload)
+                quotes_by_symbol = {quote.symbol: quote for quote in parsed}
+                ordered = tuple(
+                    quotes_by_symbol[requested.split(".", 1)[0]]
+                    for requested in batch
+                    if requested.split(".", 1)[0] in quotes_by_symbol
+                )
+                if len(ordered) != len(batch):
+                    raise GotdxGatewayError(
+                        f"网关返回不完整: 请求 {len(batch)} 只，收到 {len(ordered)} 只"
+                    )
+                merged_quotes.extend(ordered)
+            except (requests.RequestException, GotdxGatewayError) as exc:
+                raise GotdxGatewayError(f"批次 {start}-{end} 失败: {exc}") from exc
+        return tuple(merged_quotes)
 
     def collect_snapshot_rows(
         self,

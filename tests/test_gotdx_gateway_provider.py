@@ -8,6 +8,7 @@ from finance_agent.data.providers.gotdx_gateway import (
     GotdxGatewayError,
     GotdxGatewayProvider,
     parse_gateway_quotes,
+    split_quote_symbols,
 )
 
 NOW = datetime(2026, 7, 20, 9, 35, tzinfo=UTC)
@@ -39,6 +40,94 @@ def _quote_payload(*, quality_status: str = "available") -> dict[str, Any]:
             }
         ],
     }
+
+
+def _quote_payload_for_symbols(symbols: list[str]) -> dict[str, Any]:
+    """构造与请求标的一一对应的网关响应。"""
+
+    payload = _quote_payload()
+    template = payload["quotes"][0]
+    payload["quotes"] = []
+    for symbol in reversed(symbols):
+        code, market = symbol.split(".", 1)
+        payload["quotes"].append(
+            {
+                **template,
+                "symbol": symbol,
+                "market": market,
+                "code": code,
+            }
+        )
+    return payload
+
+
+def test_split_quote_symbols_caps_each_gateway_request_at_fifty() -> None:
+    symbols = [f"{index:06d}.SZ" for index in range(121)]
+
+    batches = split_quote_symbols(symbols)
+
+    assert [len(batch) for batch in batches] == [50, 50, 21]
+    assert batches[0][0] == "000000.SZ"
+    assert batches[-1][-1] == "000120.SZ"
+
+
+def test_split_quote_symbols_deduplicates_without_reordering() -> None:
+    assert split_quote_symbols(["600000.SH", "000001.SZ", "600000.SH"]) == (
+        ("600000.SH", "000001.SZ"),
+    )
+
+
+def test_provider_batches_requests_and_restores_caller_order() -> None:
+    class _Response:
+        status_code = 200
+
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self.payload = payload
+
+        def json(self) -> dict[str, Any]:
+            return self.payload
+
+    calls: list[list[str]] = []
+
+    def post(_url: str, *, json: dict[str, Any], timeout: float) -> _Response:
+        assert timeout == 3.0
+        requested = list(json["symbols"])
+        calls.append(requested)
+        return _Response(_quote_payload_for_symbols(requested))
+
+    symbols = [f"{index:06d}.SZ" for index in range(120, -1, -1)]
+    provider = GotdxGatewayProvider(request_post=post)
+
+    quotes = provider.fetch_quotes(symbols)
+
+    assert [len(batch) for batch in calls] == [50, 50, 21]
+    assert [quote.symbol for quote in quotes] == [item.removesuffix(".SZ") for item in symbols]
+
+
+def test_provider_failure_identifies_the_failed_batch_range() -> None:
+    class _Response:
+        def __init__(self, status_code: int, payload: dict[str, Any]) -> None:
+            self.status_code = status_code
+            self.payload = payload
+
+        def json(self) -> dict[str, Any]:
+            return self.payload
+
+    call_count = 0
+
+    def post(_url: str, *, json: dict[str, Any], timeout: float) -> _Response:
+        nonlocal call_count
+        assert timeout == 3.0
+        call_count += 1
+        if call_count == 2:
+            return _Response(502, {"error": "bad gateway"})
+        requested = list(json["symbols"])
+        return _Response(200, _quote_payload_for_symbols(requested))
+
+    provider = GotdxGatewayProvider(request_post=post)
+
+    with pytest.raises(GotdxGatewayError, match="批次 51-100.*HTTP 502"):
+        provider.fetch_quotes([f"{index:06d}.SZ" for index in range(121)])
 
 
 def test_parse_gateway_quotes_maps_asset_and_decimal_values() -> None:
