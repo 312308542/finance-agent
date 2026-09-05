@@ -264,11 +264,12 @@ class SqlStrategyObservationSource:
         dates = list(self.session.scalars(statement))
         if len(dates) >= count:
             return dates
+        observed_after = datetime.combine(trade_date, time.max, tzinfo=UTC)
         fallback = (
             select(func.date(MarketBarORM.timestamp))
             .where(
                 *self._bar_predicates(),
-                func.date(MarketBarORM.timestamp) > trade_date,
+                MarketBarORM.timestamp > observed_after,
             )
             .distinct()
             .order_by(func.date(MarketBarORM.timestamp))

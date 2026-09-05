@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import importlib
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy.dialects import postgresql
 
 from finance_agent.research.strategy_observation_service import (
+    SqlStrategyObservationSource,
     SqlStrategyObservationStore,
 )
 from finance_agent.storage import StrategyObservationRepository
@@ -223,6 +224,24 @@ def test_repository_due_and_matured_queries_preserve_pending_history() -> None:
     assert "strategy_observation_outcomes.due_trade_date" in due_sql
     assert matured == 1
     assert "UPDATE strategy_observation_outcomes" in mature_sql
+
+
+def test_future_trade_dates_uses_indexed_timestamp_predicate_for_bar_fallback() -> None:
+    """行情日历不足时，日 K 回退查询仍应命中原始时间戳索引。"""
+
+    session = _FakeSession()
+    source = SqlStrategyObservationSource(session)
+    signal_date = date(2026, 9, 4)
+
+    assert source.future_trade_dates(trade_date=signal_date, count=20) == []
+
+    fallback = session.scalars_statements[1]
+    compiled = fallback.compile(dialect=postgresql.dialect())
+    where_sql = str(fallback.whereclause.compile(dialect=postgresql.dialect())).lower()
+    normalized_where_sql = where_sql.replace('"', "")
+    assert "date(market_bars.timestamp)" not in normalized_where_sql
+    assert "market_bars.timestamp >" in normalized_where_sql
+    assert datetime.combine(signal_date, time.max, tzinfo=UTC) in compiled.params.values()
 
 
 def test_sql_observation_store_only_updates_existing_position_entry() -> None:
