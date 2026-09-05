@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,6 +84,32 @@ def test_frontend_dockerfile_builds_spa_and_nginx_proxies_api() -> None:
     assert "proxy_pass http://$finance_agent_api" in nginx_content
     assert "proxy_buffering off" in nginx_content
     assert "try_files $uri $uri/ /index.html" in nginx_content
+
+
+def test_frontend_nginx_revalidates_html_entry_and_spa_fallback() -> None:
+    """入口 HTML 和路由回退必须重验证，避免发布后仍加载旧版资源。"""
+
+    content = read_template("nginx.agent-office.conf")
+
+    for location in ("= /index.html", "/"):
+        block = re.search(rf"location\s+{re.escape(location)}\s*\{{([^{{}}]*)\}}", content)
+        assert block is not None, f"缺少 HTML 路由配置：{location}"
+        assert 'add_header Cache-Control "no-cache, must-revalidate" always;' in block[1]
+        assert "immutable" not in block[1]
+
+
+def test_frontend_nginx_keeps_hashed_assets_immutable() -> None:
+    """带哈希的构建资源应继续长期缓存，且缺失资源不能回退到 HTML。"""
+
+    content = read_template("nginx.agent-office.conf")
+    block = re.search(r"location\s+/assets/\s*\{([^{}]*)\}", content)
+
+    assert block is not None
+    assert "try_files $uri =404;" in block[1]
+    assert "expires 1y;" in block[1]
+    assert 'add_header Cache-Control "public, immutable";' in block[1]
+    assert "no-cache" not in block[1]
+    assert "no-store" not in block[1]
 
 
 def test_scheduler_compose_mounts_runtime_and_uses_external_services() -> None:

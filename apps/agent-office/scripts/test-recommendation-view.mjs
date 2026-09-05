@@ -183,6 +183,24 @@ const normalized = normalizeRecommendationItem(payload.recommendations[0], decis
 assert.equal(normalized?.assetLabel, "000001 平安银行");
 assert.equal(normalized?.marketLabel, "A 股");
 
+// 动作中文化仅改变展示，候选与持仓生命周期必须保留后端原值。
+for (const [action, label, tone, state] of [
+  ["buy_candidate", "候选待确认", "blue", "setup_confirming"],
+  ["reduce", "建议减仓", "red", "weakening"],
+  ["exit", "建议退出", "red", "exit_pending"],
+]) {
+  assert.equal(actionLabel(action), label);
+  const item = normalizeRecommendationItem({
+    ...payload.recommendations[0],
+    action,
+    payload: { ...payload.recommendations[0].payload, recommendation_state: state },
+  });
+  assert.equal(item?.action, action);
+  assert.equal(item?.actionLabel, label);
+  assert.equal(item?.actionTone, tone);
+  assert.equal(item?.recommendationState, state);
+}
+
 assert.deepEqual(buildDecisionFeedbackPayload("accepted", "确认采纳"), {
   feedback: "accepted",
   comment: "确认采纳",
@@ -301,6 +319,18 @@ assert.match(pageSource, /持续有效/);
 assert.match(pageSource, /等待入场/);
 assert.match(pageSource, /当前持仓建议/);
 assert.match(pageSource, /转弱与退出/);
+
+// 空分组必须保持用户选择；数据刷新不能替用户跳到其他生命周期。
+const pageAst = ts.createSourceFile("RecommendationPage.tsx", pageSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+const recommendationTable = pageAst.statements.find(
+  (statement) => ts.isFunctionDeclaration(statement) && statement.name?.text === "RecommendationTable",
+);
+assert.ok(recommendationTable, "推荐生命周期表格必须存在");
+const tableSource = recommendationTable.getText(pageAst);
+assert.match(tableSource, /useState<LifecycleGroupKey>\("new_opportunities"\)/);
+assert.match(tableSource, /onClick=\{\(\) => setSelectedGroup\(key\)\}/);
+assert.equal(tableSource.match(/\bsetSelectedGroup\s*\(/g)?.length, 1, "仅用户点击可以切换生命周期分组");
+assert.match(tableSource, /model\.items\.length > 0 && !visibleItems\.length/);
 
 assert.match(pageSource, /function StructureEvidenceCard/);
 assert.match(pageSource, /function StructureEvidenceEmptyState/);

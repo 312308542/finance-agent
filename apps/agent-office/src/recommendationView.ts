@@ -137,6 +137,7 @@ const marketLabels: Record<string, string> = {
 };
 
 const actionMeta: Record<string, { label: string; tone: RecommendationTone }> = {
+  buy_candidate: { label: "候选待确认", tone: "blue" },
   buy: { label: "候选买入", tone: "green" },
   strong_buy: { label: "强候选买入", tone: "green" },
   watch: { label: "建议观察", tone: "blue" },
@@ -146,6 +147,8 @@ const actionMeta: Record<string, { label: string; tone: RecommendationTone }> = 
   avoid: { label: "建议回避", tone: "red" },
   reject: { label: "建议回避", tone: "red" },
   sell: { label: "候选减仓", tone: "red" },
+  reduce: { label: "建议减仓", tone: "red" },
+  exit: { label: "建议退出", tone: "red" },
 };
 
 export function formatMarketLabel(market: string | null | undefined): string {

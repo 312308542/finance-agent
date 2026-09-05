@@ -305,16 +305,6 @@ function RecommendationTable({
 }) {
   // 生命周期分组：今日新机会、持续有效、等待入场、当前持仓建议、转弱与退出。
   const [selectedGroup, setSelectedGroup] = React.useState<LifecycleGroupKey>("new_opportunities");
-  React.useEffect(() => {
-    if (!model.lifecycleGroups[selectedGroup].length) {
-      const firstAvailable = (Object.keys(lifecycleGroupLabels) as LifecycleGroupKey[]).find(
-        (key) => model.lifecycleGroups[key].length,
-      );
-      if (firstAvailable) {
-        setSelectedGroup(firstAvailable);
-      }
-    }
-  }, [model.lifecycleGroups, selectedGroup]);
   const visibleItems = model.lifecycleGroups[selectedGroup];
   return (
     <div className="recommendation-table">
