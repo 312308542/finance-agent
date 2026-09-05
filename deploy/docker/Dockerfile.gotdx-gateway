@@ -2,6 +2,9 @@ FROM golang:1.26-alpine AS builder
 
 WORKDIR /src
 
+# 允许网络受限部署通过 --build-arg 覆盖模块代理，仍保留 Go 默认完整性校验。
+ARG GOPROXY=https://proxy.golang.org,direct
+
 COPY prototypes/gotdx-gateway/go.mod prototypes/gotdx-gateway/go.sum ./
 RUN go mod download
 

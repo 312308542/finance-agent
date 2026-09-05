@@ -114,6 +114,16 @@ def test_gotdx_gateway_dockerfile_builds_standalone_go_binary() -> None:
     assert "TDX_GATEWAY_ADDR=0.0.0.0:8790" in content
 
 
+def test_gotdx_gateway_allows_build_time_module_proxy_override() -> None:
+    """网络受限环境可覆盖模块代理，但不能关闭依赖完整性校验。"""
+
+    content = read_template("Dockerfile.gotdx-gateway")
+    declaration = "ARG GOPROXY=https://proxy.golang.org,direct"
+    assert declaration in content
+    assert content.index(declaration) < content.index("RUN go mod download")
+    assert "GOSUMDB=off" not in content
+
+
 def test_dockerignore_excludes_heavy_and_sensitive_paths() -> None:
     """Docker 构建上下文应排除本地环境、运行数据和敏感配置。"""
 
