@@ -3547,7 +3547,8 @@ class StrategyObservationRepository:
             )
         )
         self.session.flush()
-        return self.session.get_one(StrategyTrialStateORM, strategy_id)
+        # Core upsert 不会同步会话中的旧实例，返回前强制重载，避免继续使用旧准入状态。
+        return self.session.get_one(StrategyTrialStateORM, strategy_id, populate_existing=True)
 
     def list_recent_matured_outcomes(
         self,

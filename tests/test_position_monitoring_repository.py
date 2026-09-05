@@ -43,3 +43,17 @@ def test_repository_keeps_previous_valid_action_for_unexecutable() -> None:
     current = repository.get_state("position:owner:600519")
     assert current.current_action == "unexecutable"
     assert current.previous_valid_action == "hold"
+
+
+def test_repository_reports_only_persisted_action_changes() -> None:
+    repository = PositionMonitoringRepository()
+
+    first = repository.save_with_change(_action("hold"))
+    replay = repository.save_with_change(_action("hold"))
+    changed = repository.save_with_change(_action("hold", ("sector_recovered",)))
+
+    assert first.changed is True
+    assert replay.changed is False
+    assert changed.changed is True
+    assert changed.state.current_action == "hold"
+    assert len(repository.list_events("position:owner:600519")) == 2

@@ -1,0 +1,26 @@
+# 与根 docker-compose.yml 合并使用；发布运行仅从镜像读取代码。
+# 跨工作树发布时显式指定原运行目录和原 .env，避免切换持久化配置。
+services:
+  finance-agent-scheduler:
+    volumes: !override
+      - type: bind
+        source: ${FINANCE_AGENT_HOST_RUNTIME_DIR:-./runtime}
+        target: ${FINANCE_AGENT_DOCKER_RUNTIME_DIR:-/app/runtime}
+  finance-agent-realtime-monitor:
+    volumes: !override
+      - type: bind
+        source: ${FINANCE_AGENT_HOST_RUNTIME_DIR:-./runtime}
+        target: ${FINANCE_AGENT_DOCKER_RUNTIME_DIR:-/app/runtime}
+  finance-agent-position-monitor:
+    volumes: !override
+      - type: bind
+        source: ${FINANCE_AGENT_HOST_RUNTIME_DIR:-./runtime}
+        target: ${FINANCE_AGENT_DOCKER_RUNTIME_DIR:-/app/runtime}
+  finance-agent-api:
+    env_file: !override
+      - path: ${FINANCE_AGENT_HOST_ENV_FILE:-.env}
+        required: false
+    volumes: !override
+      - type: bind
+        source: ${FINANCE_AGENT_HOST_RUNTIME_DIR:-./runtime}
+        target: ${FINANCE_AGENT_DOCKER_RUNTIME_DIR:-/app/runtime}

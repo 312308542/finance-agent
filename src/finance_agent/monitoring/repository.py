@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -13,6 +14,14 @@ from sqlalchemy.orm import Session
 
 from finance_agent.monitoring.models import PositionAction, PositionMonitoringState
 from finance_agent.storage.orm import PositionMonitoringEventORM, PositionMonitoringStateORM
+
+
+@dataclass(frozen=True)
+class PositionMonitoringSaveResult:
+    """持仓状态保存结果，变化标记与仓储追加业务事件使用同一判定。"""
+
+    state: Any
+    changed: bool
 
 
 class PositionMonitoringRepository:
@@ -56,6 +65,16 @@ class PositionMonitoringRepository:
         return tuple(self.session.scalars(statement))
 
     def save(self, action: PositionAction, *, state: PositionMonitoringState | None = None) -> Any:
+        """保存动作并保持原有的状态返回约定。"""
+
+        return self.save_with_change(action, state=state).state
+
+    def save_with_change(
+        self,
+        action: PositionAction,
+        *,
+        state: PositionMonitoringState | None = None,
+    ) -> PositionMonitoringSaveResult:
         """更新当前动作，并仅在动作或原因变化时追加事件。"""
 
         current = self.get_state(action.position_id)
@@ -72,7 +91,7 @@ class PositionMonitoringRepository:
                 self._events.setdefault(action.position_id, []).append(
                     {"event_id": event_id, **action.to_dict(), "event_type": "action_changed"}
                 )
-            return next_state
+            return PositionMonitoringSaveResult(next_state, changed)
         values = _orm_values(next_state, action)
         statement = insert(PositionMonitoringStateORM).values(**values)
         self.session.execute(
@@ -105,7 +124,7 @@ class PositionMonitoringRepository:
                 .on_conflict_do_nothing(index_elements=[PositionMonitoringEventORM.event_id])
             )
         self.session.flush()
-        return self.get_state(action.position_id)
+        return PositionMonitoringSaveResult(self.get_state(action.position_id), changed)
 
     def apply_execution(self, **kwargs: Any) -> Any:
         """把外部执行登记同步为当前监控状态，不代表系统自动下单。"""

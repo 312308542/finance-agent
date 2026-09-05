@@ -11,7 +11,7 @@ import hashlib
 import json
 from collections.abc import Sequence
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -37,6 +37,7 @@ from finance_agent.recommendations.portfolio_construction import (
 )
 from finance_agent.recommendations.state_repository import RecommendationStateRepository
 from finance_agent.recommendations.structural_decision import StructuralDecisionEngine
+from finance_agent.research.validation_gate import StrategyValidationGate
 from finance_agent.storage.orm import AssetScoreORM, RiskFindingORM, SignalSnapshotORM
 from finance_agent.storage.repositories import (
     AssetRepository,
@@ -51,6 +52,7 @@ from finance_agent.storage.repositories import (
     RiskRepository,
     ScreeningRepository,
     SignalSnapshotRepository,
+    StrategyObservationRepository,
 )
 
 JsonDict = dict[str, Any]
@@ -185,6 +187,7 @@ class RecommendationService:
         self.portfolios = PortfolioRepository(session)
         self.lifecycle_states = RecommendationStateRepository(session)
         self.adaptive_decisions = AdaptiveRecommendationDecisionEngine()
+        self.trial_states = StrategyObservationRepository(session)
 
     def rank_from_screening(
         self,
@@ -207,13 +210,21 @@ class RecommendationService:
     ) -> RecommendationRunResult:
         """读取一次初筛的评分结果并生成推荐榜单。"""
 
-        validate_trial_audit(
-            trial_state=trial_state,
-            validation_evidence_id=validation_evidence_id,
-        )
-        is_trial = trial_state == "trial"
         screening = self.screenings.get_screening_result(screening_id)
         ensure_recommendation_market(screening.market)
+        validation_state = None
+        if screening.market.startswith("ashare"):
+            repository = getattr(self, "trial_states", None)
+            persisted = repository.get_trial_state(score_strategy_id or strategy) if repository else None
+            validation_state = persisted or {"state": "research"}
+            trial_state = str(getattr(persisted, "state", "research"))
+            validation_evidence_id = getattr(persisted, "historical_evidence_id", None)
+        else:
+            validate_trial_audit(
+                trial_state=trial_state,
+                validation_evidence_id=validation_evidence_id,
+            )
+        is_trial = trial_state == "trial"
         started_at = datetime.now(tz=UTC)
         run_id = build_run_id(
             screening_id=screening_id,
@@ -327,6 +338,7 @@ class RecommendationService:
                 closed_position_events=closed_position_asset_ids,
                 owner_id=owner_id,
                 strategy_id=score_strategy_id,
+                validation_state=validation_state,
             )
             adaptive_by_asset = {
                 item.asset_id: item for item in adaptive_result.decisions
@@ -422,6 +434,20 @@ class RecommendationService:
                     trial_state=trial_state,
                     validation_evidence_id=validation_evidence_id,
                 )
+            if validation_state is not None:
+                original_action = recommendation["action"]
+                decision = StrategyValidationGate().evaluate_runtime(
+                    validation_state, action=original_action,
+                )
+                recommendation["validation_gate"] = (
+                    adaptive_decision.payload.get("validation_gate")
+                    if adaptive_decision is not None
+                    else {**asdict(decision), "original_action": original_action}
+                )
+                if not decision.allowed:
+                    recommendation["action"] = "watch"
+                    recommendation["intended_action"] = original_action
+                    recommendation["execution_status"] = "blocked"
             saved = self.recommendations.upsert_asset_recommendation(
                 recommendation_id=recommendation["recommendation_id"],
                 run_id=run_id,
@@ -2032,9 +2058,7 @@ def build_backtest_evidence(
     metrics = _json_safe(row.metrics or {})
     payload = row.payload if isinstance(row.payload, dict) else {}
     schema_version = str(payload.get("schema_version") or "")
-    gating_eligible = schema_version == "strategy_walk_forward_v2" and bool(
-        metrics.get("gate_passed")
-    )
+    gating_eligible = StrategyValidationGate().evaluate_history(row).allowed
     evidence = {
         "status": row.status,
         "backtest_id": row.backtest_id,

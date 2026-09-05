@@ -384,12 +384,10 @@ def dispatch_data_strategy(args: argparse.Namespace) -> JsonDict:
                         "allow_new_buys": False,
                     },
                 }
-            forward_metrics = dict(getattr(state, "forward_metrics", {}) or {})
-            sample_counts = dict(forward_metrics.get("sample_counts") or {})
             state_name = str(getattr(state, "state", "research"))
-            allow_new_buys = state_name == "validated" and bool(
-                getattr(state, "historical_evidence_id", None)
-            )
+            from finance_agent.research.validation_gate import StrategyValidationGate
+
+            decision = StrategyValidationGate().evaluate_runtime(state, action="buy_ready")
             return {
                 "status": "ok",
                 "data": {
@@ -397,11 +395,9 @@ def dispatch_data_strategy(args: argparse.Namespace) -> JsonDict:
                     "market": args.market,
                     "strategy_state": state_name,
                     "historical_evidence_id": getattr(state, "historical_evidence_id", None),
-                    "matured_t20_count": int(sample_counts.get("20", 0) or 0),
-                    "reason_codes": [
-                        str(getattr(state, "disabled_reason", ""))
-                    ] if getattr(state, "disabled_reason", None) else [],
-                    "allow_new_buys": allow_new_buys,
+                    "matured_t20_count": decision.metrics.get("t20_count", 0),
+                    "reason_codes": list(decision.reason_codes),
+                    "allow_new_buys": decision.allowed,
                 },
             }
         repository = ScoringStrategyRepository(session)

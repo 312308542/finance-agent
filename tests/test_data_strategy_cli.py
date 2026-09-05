@@ -201,3 +201,20 @@ def test_data_strategy_validate_returns_state_and_buy_permission() -> None:
     assert result["data"]["historical_evidence_id"] == "bt:wf:1"
     assert result["data"]["matured_t20_count"] == 42
     assert result["data"]["allow_new_buys"] is False
+
+
+@pytest.mark.parametrize("sample_count", ["bad", float("nan"), float("inf"), 60.5, True])
+def test_strategy_validate_fails_closed_for_malformed_sample_count(sample_count) -> None:
+    _ObservationRepository.state = SimpleNamespace(
+        state="validated", historical_evidence_id="bt:qualified",
+        forward_metrics={
+            "sample_counts": {"20": sample_count},
+            "median_excess": 0.02, "rolling_excess": 0.02,
+        },
+    )
+    result = data_sync.dispatch_data(
+        _args(subcommand="validate", strategy_id="strategy:ashare:adaptive_v1", market="ashare"),
+    )
+    assert result["data"]["allow_new_buys"] is False
+    assert result["data"]["matured_t20_count"] == 0
+    assert "t20_samples_below_60" in result["data"]["reason_codes"]

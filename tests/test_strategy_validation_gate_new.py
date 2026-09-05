@@ -22,6 +22,9 @@ def _passing_metrics() -> dict:
         "t10_block_bootstrap": {"ci_95": [0.01, 0.05]},
         "positive_t10_phase_count": 3,
         "drawdown_gap": 0.01,
+        "rank_ic": {"mean": 0.04},
+        "turnover": {"weekly_mean": 0.2},
+        "execution": {"unexecutable_rate": 0.01},
     }
 
 

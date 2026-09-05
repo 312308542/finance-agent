@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
@@ -29,6 +29,7 @@ from finance_agent.recommendations.structural_decision import (
     StructuralDecisionEngine,
     StructureVerdict,
 )
+from finance_agent.research.validation_gate import StrategyValidationGate
 from finance_agent.scoring.adaptive import AdaptiveAlphaEngine, AdaptiveAssetInput, AlphaEstimate
 
 JsonDict = dict[str, Any]
@@ -92,6 +93,7 @@ class AdaptiveRecommendationDecisionEngine:
         closed_position_events: Mapping[str, datetime] | None = None,
         owner_id: str = "default-owner",
         strategy_id: str = "strategy:ashare:adaptive_v1",
+        validation_state: Any | None = None,
     ) -> AdaptiveRecommendationDecisionResult:
         """从冻结快照一次性产生可持久化决策。"""
 
@@ -211,19 +213,41 @@ class AdaptiveRecommendationDecisionEngine:
                     },
                 ),
             )
+            validation_audit: JsonDict = {}
+            original_action: RecommendationAction = (
+                "buy_candidate" if transition.to_state == "buy_ready"
+                else _state_action(transition.to_state)
+            )
+            if validation_state is not None:
+                gate = StrategyValidationGate().evaluate_runtime(
+                    validation_state, action=transition.to_state,
+                )
+                validation_audit = {
+                    **asdict(gate),
+                    "original_state": transition.to_state,
+                    "original_action": original_action,
+                }
+                # 先阻断新增买入迁移，再分配组合，保留原始建议供研究复核。
+                transition = replace(
+                    transition,
+                    to_state=transition.to_state if gate.allowed else "watch",
+                    reason_codes=tuple(dict.fromkeys((*transition.reason_codes, *gate.reason_codes))),
+                    payload={**transition.payload, "validation_gate": validation_audit},
+                )
+            blocked_by_validation = bool(validation_audit) and not validation_audit["allowed"]
             decision = AdaptiveAssetDecision(
                 asset_id=asset_id,
                 symbol=symbol,
                 decision_snapshot_id=snapshot.decision_snapshot_id,
                 action=_state_action(transition.to_state),
-                intended_action=None,
-                execution_status="not_applicable",
+                intended_action=original_action if blocked_by_validation else None,
+                execution_status="blocked" if blocked_by_validation else "not_applicable",
                 transition=transition,
                 alpha=alpha,
                 structure=structure,
                 reason_codes=transition.reason_codes,
                 data_quality=data_quality,
-                payload=dict(asset),
+                payload={**asset, **({"validation_gate": validation_audit} if validation_audit else {})},
             )
             interim.append(decision)
             if transition.to_state != "buy_ready":

@@ -494,6 +494,13 @@ def _service(
     states = _StateStore(previous)
     service.recommendations = store
     service.lifecycle_states = states
+    service.trial_states = SimpleNamespace(
+        get_trial_state=lambda _: SimpleNamespace(
+            state="validated",
+            historical_evidence_id="bt:qualified",
+            forward_metrics={"t20_count": 60, "median_excess": 0.02, "rolling_excess": 0.02},
+        ),
+    )
     return service, store, states
 
 

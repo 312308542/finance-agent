@@ -359,9 +359,7 @@ class UniverseRecommendationPipeline:
                 trial_states=getattr(self, "trial_states", None),
             )
             strategy_result.update(gate)
-            if not gate["allowed"]:
-                strategy_result["recommendation_status"] = "blocked"
-                continue
+            # 未准入只限制新增买入，仍生成观察记录并维护已持仓状态。
             try:
                 recommendation = self.recommendations.rank_from_screening(
                     screening_id=screening.screening_id,
@@ -561,12 +559,11 @@ def recommendation_strategy_gate(
     strategy_id: str,
     trial_states: Any,
 ) -> JsonDict:
-    """只让历史门槛通过的 A 股新增策略生成推荐。"""
+    """统一判断新增买入准入，不阻止观察与持仓退出记录。"""
 
-    if (
-        not market.startswith("ashare")
-        or strategy_id.endswith(":legacy_default")
-    ):
+    from finance_agent.research.validation_gate import StrategyValidationGate
+
+    if not market.startswith("ashare"):
         return {
             "allowed": True,
             "trial_state": None,
@@ -577,12 +574,15 @@ def recommendation_strategy_gate(
     state = trial_states.get_trial_state(strategy_id) if trial_states is not None else None
     state_name = str(getattr(state, "state", "research"))
     evidence_id = getattr(state, "historical_evidence_id", None)
+    decision = StrategyValidationGate().evaluate_runtime(state, action="buy_ready")
     if state_name == "disabled":
         blocked_reason = "strategy_disabled"
     elif state_name not in {"trial", "validated"}:
         blocked_reason = "historical_gate_not_passed"
     elif not evidence_id:
         blocked_reason = "validation_evidence_missing"
+    elif not decision.allowed:
+        blocked_reason = ",".join(decision.reason_codes)
     else:
         return {
             "allowed": True,
@@ -590,13 +590,15 @@ def recommendation_strategy_gate(
             "trial": state_name == "trial",
             "validation_evidence_id": str(evidence_id),
             "blocked_reason": None,
+            "reason_codes": [],
         }
     return {
         "allowed": False,
         "trial_state": state_name,
-        "trial": False,
+        "trial": state_name == "trial",
         "validation_evidence_id": str(evidence_id) if evidence_id else None,
         "blocked_reason": blocked_reason,
+        "reason_codes": list(decision.reason_codes),
     }
 
 

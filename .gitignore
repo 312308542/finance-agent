@@ -53,6 +53,9 @@ temp/
 runtime/
 !src/finance_agent/runtime/
 !src/finance_agent/runtime/*.py
+!scripts/runtime/
+scripts/runtime/*
+!scripts/runtime/run_position_monitor.py
 
 # 数据库与本地数据
 *.sqlite

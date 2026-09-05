@@ -6,8 +6,6 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
-import pytest
-
 from finance_agent.application.data_production_service import UniverseMergeService
 from finance_agent.pipelines.recommendation import UniverseRecommendationPipeline
 from finance_agent.recommendations.service import RecommendationService
@@ -311,13 +309,19 @@ def test_merged_avoid_strategy_recommendation_pipeline_smoke() -> None:
         limit=5,
     )
 
-    assert result.status == "partial"
+    assert result.status == "available"
     assert result.member_count == 1
-    assert result.recommendation_count == 0
+    assert result.recommendation_count == 1
     assert result.buy_ready_count == 0
     assert result.decision_snapshot_id is None
-    assert recommendations.run_payload is None
-    assert recommendations.recommendation_payloads == []
+    assert recommendations.run_payload is not None
+    assert recommendations.recommendation_payloads[0]["action"] == "watch"
+
+    recommendation_service.trial_states = SimpleNamespace(
+        get_trial_state=lambda _: SimpleNamespace(
+            state="trial", historical_evidence_id="bt:wf:short-passed",
+        ),
+    )
 
     trial_result = recommendation_service.rank_from_screening(
         screening_id="screen:merged:ashare:short_swing",
@@ -340,6 +344,12 @@ def test_merged_avoid_strategy_recommendation_pipeline_smoke() -> None:
     assert trial_payload["validation_state"] == "trial"
     assert trial_payload["validation_evidence_id"] == "bt:wf:short-passed"
 
+    recommendation_service.trial_states = SimpleNamespace(
+        get_trial_state=lambda _: SimpleNamespace(
+            state="validated", historical_evidence_id="bt:wf:short-validated",
+            forward_metrics={"t20_count": 60, "median_excess": 0.02, "rolling_excess": 0.02},
+        ),
+    )
     validated_result = recommendation_service.rank_from_screening(
         screening_id="screen:merged:ashare:short_swing",
         strategy="balanced_swing_v1",
@@ -361,10 +371,13 @@ def test_merged_avoid_strategy_recommendation_pipeline_smoke() -> None:
     assert recommendations.run_payload["trial"] is False
     assert recommendations.run_payload["validation_state"] == "validated"
 
-    with pytest.raises(ValueError, match="validation_evidence_id"):
-        recommendation_service.rank_from_screening(
-            screening_id="screen:merged:ashare:short_swing",
-            score_strategy_id="strategy:ashare:short_swing",
-            trial_state="trial",
-            validation_evidence_id=None,
-        )
+    # 调用参数不是准入授权；证据缺失时照常落观察记录。
+    recommendation_service.trial_states = SimpleNamespace(get_trial_state=lambda _: None)
+    recommendation_service.rank_from_screening(
+        screening_id="screen:merged:ashare:short_swing",
+        score_strategy_id="strategy:ashare:short_swing",
+        trial_state="trial",
+        validation_evidence_id=None,
+    )
+    assert recommendations.recommendation_payloads[-1]["action"] == "watch"
+    assert recommendations.run_payload["validation_state"] == "research"

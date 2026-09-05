@@ -280,7 +280,7 @@ def test_settle_due_backfills_due_date_from_later_realized_trading_days() -> Non
 
 
 def test_historical_pass_moves_new_strategy_to_trial() -> None:
-    """只有真实 available 且 gate_passed 的历史结果允许进入 trial。"""
+    """只有完整且达标的 v2 历史结果允许进入 trial。"""
 
     service, repository, _source = _service()
 
@@ -289,7 +289,18 @@ def test_historical_pass_moves_new_strategy_to_trial() -> None:
         result={
             "status": "available",
             "backtest_id": "bt:wf:passed",
-            "metrics": {"gate_passed": True},
+            "payload": {"schema_version": "strategy_walk_forward_v2"},
+            "metrics": {
+                "gate_passed": True,
+                "valid_cross_sections": 150,
+                "horizon_mean_excess_returns": {"5": 0.01, "10": 0.02, "20": 0.03},
+                "t10_block_bootstrap": {"ci_95": [0.005, 0.03]},
+                "positive_t10_phase_count": 3,
+                "drawdown_gap": 0.01,
+                "rank_ic": {"mean": 0.05},
+                "turnover": {"weekly_mean": 0.20},
+                "execution": {"unexecutable_rate": 0.01},
+            },
             "data_versions": {"code_commit": "abc123"},
         },
     )
@@ -337,8 +348,9 @@ def _trial_state(strategy_id: str = MIXED) -> Any:
 
 def _failing_metrics() -> dict[str, Any]:
     return {
-        "sample_counts": {"5": 30, "10": 30, "20": 20},
+        "sample_counts": {"5": 60, "10": 60, "20": 60},
         "median_excess_returns": {"5": -0.01, "10": 0.0, "20": -0.02},
+        "rolling_excess": 0.0,
         "drawdown_gap": 0.05,
         "data_integrity_violations": [],
         "gate_passed": False,
@@ -413,6 +425,7 @@ def test_sixty_t20_samples_and_revalidated_gate_promote_trial() -> None:
         metrics={
             "sample_counts": {"5": 80, "10": 70, "20": 60},
             "median_excess_returns": {"5": 0.01, "10": 0.02, "20": 0.03},
+            "rolling_excess": 0.02,
             "drawdown_gap": 0.01,
             "data_integrity_violations": [],
             "gate_passed": True,

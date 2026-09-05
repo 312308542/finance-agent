@@ -171,10 +171,10 @@ def test_pipeline_publishes_zero_buy_snapshot_when_no_asset_passes_all_gates() -
         min_factor_coverage_ratio=0.0,
     )
 
-    assert result.status == "partial"
-    assert result.recommendation_count == 0
+    assert result.status == "available"
+    assert result.recommendation_count == 2
     assert result.buy_ready_count == 0
-    assert result.decision_snapshot_id is None
+    assert result.decision_snapshot_id == "decision:ashare:2026-09-08:test"
 
 
 class _TrialStates:
@@ -357,7 +357,8 @@ def test_recommendation_pipeline_passes_strategy_id_to_scoring_service() -> None
             "strategy_id": "strategy:ashare:short_swing",
         }
     ]
-    assert pipeline.recommendations.calls == []
+    assert pipeline.recommendations.calls[0]["score_strategy_id"] == SHORT
+    assert pipeline.recommendations.calls[0]["trial_state"] == "research"
 
 
 def test_pipeline_scores_three_strategies_from_one_screening() -> None:
@@ -409,17 +410,18 @@ def test_pipeline_scores_three_strategies_from_one_screening() -> None:
     assert factors.calls == [item.asset_id for item in members]
     assert [call["strategy_id"] for call in scoring.calls] == [SHORT, THEME, MIXED]
     assert observations.calls[0]["strategy_ids"] == (SHORT, THEME, MIXED)
-    assert [call["score_strategy_id"] for call in recommendations.calls] == [MIXED]
-    assert recommendations.calls[0]["trial_state"] == "trial"
-    assert recommendations.calls[0]["validation_evidence_id"] == "bt:wf:mixed-passed"
+    assert [call["score_strategy_id"] for call in recommendations.calls] == [SHORT, THEME, MIXED]
+    assert recommendations.calls[2]["trial_state"] == "trial"
+    assert recommendations.calls[2]["validation_evidence_id"] == "bt:wf:mixed-passed"
     strategy_results = {item["strategy_id"]: item for item in result.strategy_results}
-    assert strategy_results[THEME]["recommendation_status"] == "blocked"
+    assert strategy_results[THEME]["recommendation_status"] == "available"
+    assert strategy_results[THEME]["allowed"] is False
     assert strategy_results[THEME]["blocked_reason"] == "historical_gate_not_passed"
     assert strategy_results[MIXED]["recommendation_status"] == "available"
 
 
 def test_pipeline_blocks_disabled_and_allows_validated_strategy() -> None:
-    """disabled 停止新推荐，validated 带验证证据生成独立推荐。"""
+    """disabled 保留退出观察，只有合格 validated 允许新增买入。"""
 
     pipeline = UniverseRecommendationPipeline.__new__(UniverseRecommendationPipeline)
     pipeline.universes = _Universes([_Member(asset_id="ashare:000001", symbol="000001")])
@@ -441,6 +443,7 @@ def test_pipeline_blocks_disabled_and_allows_validated_strategy() -> None:
             MIXED: SimpleNamespace(
                 state="validated",
                 historical_evidence_id="bt:wf:mixed-validated",
+                forward_metrics={"t20_count": 60, "median_excess": 0.02, "rolling_excess": 0.02},
             ),
         }
     )
@@ -454,10 +457,11 @@ def test_pipeline_blocks_disabled_and_allows_validated_strategy() -> None:
         min_factor_coverage_ratio=0.0,
     )
 
-    assert len(recommendations.calls) == 1
-    assert recommendations.calls[0]["score_strategy_id"] == MIXED
-    assert recommendations.calls[0]["trial_state"] == "validated"
-    assert recommendations.calls[0]["validation_evidence_id"] == "bt:wf:mixed-validated"
+    assert len(recommendations.calls) == 2
+    assert recommendations.calls[0]["trial_state"] == "disabled"
+    assert recommendations.calls[1]["score_strategy_id"] == MIXED
+    assert recommendations.calls[1]["trial_state"] == "validated"
+    assert recommendations.calls[1]["validation_evidence_id"] == "bt:wf:mixed-validated"
     statuses = {item["strategy_id"]: item for item in result.strategy_results}
     assert statuses[THEME]["blocked_reason"] == "strategy_disabled"
     assert statuses[MIXED]["recommendation_status"] == "available"
@@ -481,6 +485,7 @@ def test_trial_gate_requires_validation_evidence_and_marks_validated_non_trial()
                 MIXED: SimpleNamespace(
                     state="validated",
                     historical_evidence_id="bt:wf:validated",
+                    forward_metrics={"t20_count": 60, "median_excess": 0.02, "rolling_excess": 0.02},
                 )
             }
         ),

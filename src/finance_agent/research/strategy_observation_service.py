@@ -19,8 +19,7 @@ from sqlalchemy.orm import Session
 
 from finance_agent.research.strategy_walk_forward import (
     SUPPORTED_HORIZONS,
-    WalkForwardOutcome,
-    evaluate_historical_gate,
+    _maximum_drawdown,
     label_forward_position,
 )
 from finance_agent.research.strategy_walk_forward_runner import (
@@ -42,8 +41,6 @@ JsonDict = dict[str, Any]
 
 BASELINE_STRATEGY_ID = "strategy:ashare:short_swing"
 DEFAULT_UNIVERSE_ID = "universe:merged:ashare:recommendation"
-MINIMUM_T10_SAMPLES = 30
-MINIMUM_T20_SAMPLES = 20
 VALIDATED_T20_SAMPLES = 60
 IMMEDIATE_DRAWDOWN_GAP = 0.10
 FINAL_SCORE_STATUSES = ("available", "partial")
@@ -639,28 +636,34 @@ class StrategyObservationService:
         """历史门槛通过后把新增策略切换到受控试运行。"""
 
         status = str(_value(result, "status", ""))
-        metrics = dict(_value(result, "metrics", {}) or {})
-        passed = status == "available" and bool(metrics.get("gate_passed"))
         backtest_id = str(_value(result, "backtest_id", "") or "")
         current = self.repository.get_trial_state(strategy_id)
-        if current is not None and str(current.state) in {"disabled", "validated"}:
+        if current is not None and str(current.state) == "disabled":
             return current
+        decision = StrategyValidationGate().evaluate_history(result)
+        result_strategy_id = str(_value(result, "strategy_id", "") or "")
+        reasons = list(decision.reason_codes)
+        if result_strategy_id and result_strategy_id != strategy_id:
+            reasons.append("historical_strategy_mismatch")
+        passed = decision.allowed and not reasons
         payload = dict(getattr(current, "payload", None) or {})
         payload["historical_result"] = {
             "status": status,
             "backtest_id": backtest_id or None,
-            "gate_passed": bool(metrics.get("gate_passed")),
+            "gate_passed": passed,
+            "reason_codes": reasons,
             "data_versions": dict(_value(result, "data_versions", {}) or {}),
         }
+        current_state = str(getattr(current, "state", "research"))
         return self.repository.upsert_trial_state(
             strategy_id=strategy_id,
             strategy_version=_strategy_version(strategy_id),
-            state="trial" if passed else "research",
-            historical_evidence_id=backtest_id if passed else None,
-            forward_metrics={},
-            consecutive_failure_count=0,
+            state="trial" if passed and current_state == "research" else current_state,
+            historical_evidence_id=decision.evidence_id if passed else None,
+            forward_metrics=dict(getattr(current, "forward_metrics", None) or {}),
+            consecutive_failure_count=int(getattr(current, "consecutive_failure_count", 0)),
             disabled_reason=None,
-            last_evaluated_at=None,
+            last_evaluated_at=getattr(current, "last_evaluated_at", None),
             payload=payload,
         )
 
@@ -671,25 +674,24 @@ class StrategyObservationService:
         as_of: datetime,
         metrics: Mapping[str, Any] | None = None,
     ) -> Any:
-        """按周评估试运行策略，执行关闭、保持或晋级。"""
+        """刷新试运行和已验证策略，仅按不同周累计普通失败。"""
 
         current = self.repository.get_trial_state(strategy_id)
         if current is None:
             raise ValueError(f"找不到策略试运行状态：{strategy_id}")
-        if str(current.state) != "trial":
+        if str(current.state) not in {"trial", "validated"}:
             return current
         normalized_as_of = _ensure_aware(as_of)
         last_evaluated_at = getattr(current, "last_evaluated_at", None)
-        if isinstance(last_evaluated_at, datetime) and _same_iso_week(
-            last_evaluated_at,
-            normalized_as_of,
-        ):
+        if isinstance(last_evaluated_at, datetime) and normalized_as_of < _ensure_aware(last_evaluated_at):
             return current
 
-        forward_metrics = dict(metrics or self.build_forward_metrics(strategy_id=strategy_id))
-        integrity_violations = [
-            str(value) for value in forward_metrics.get("data_integrity_violations") or []
-        ]
+        forward_metrics = dict(metrics if metrics is not None else self.build_forward_metrics(strategy_id=strategy_id))
+        gate_decision = StrategyValidationGate().evaluate_forward(
+            state=current,
+            outcomes=forward_metrics,
+        )
+        integrity_violations = [str(value) for value in forward_metrics.get("data_integrity_violations") or []]
         drawdown_gap = _number(forward_metrics.get("drawdown_gap"), default=0.0)
         immediate_reason = None
         if integrity_violations:
@@ -698,7 +700,13 @@ class StrategyObservationService:
             immediate_reason = "drawdown_gap_above_10pct"
 
         payload = dict(getattr(current, "payload", None) or {})
+        payload["forward_validation"] = {
+            "reason_codes": list(gate_decision.reason_codes),
+            "allowed": gate_decision.allowed,
+        }
         if immediate_reason:
+            payload["forward_validation"]["allowed"] = False
+            payload["forward_validation"]["reason_codes"].append(immediate_reason)
             return self._save_state(
                 current=current,
                 state="disabled",
@@ -709,50 +717,44 @@ class StrategyObservationService:
                 payload=payload,
             )
 
-        sample_counts = dict(forward_metrics.get("sample_counts") or {})
-        if int(sample_counts.get("20", 0)) >= VALIDATED_T20_SAMPLES and bool(
-            forward_metrics.get("gate_passed")
-        ):
-            return self._save_state(
-                current=current,
-                state="validated",
-                metrics=forward_metrics,
-                failure_count=0,
-                disabled_reason=None,
-                as_of=normalized_as_of,
-                payload=payload,
+        reason_codes = set(gate_decision.reason_codes)
+        missing_metric_reasons = {
+            "t20_samples_below_60",
+            "rolling_excess_missing_or_invalid",
+            "median_excess_missing_or_invalid",
+        }
+        missing_data = reason_codes.intersection(missing_metric_reasons)
+        failed = not missing_data and "median_excess_not_positive" in reason_codes
+        failure_count = int(current.consecutive_failure_count)
+        calendar = normalized_as_of.isocalendar()
+        evaluation_week = f"{calendar.year}-W{calendar.week:02d}"
+        counted_week = payload.get("last_counted_week")
+        if "last_counted_week" not in payload and isinstance(last_evaluated_at, datetime):
+            # 兼容已有状态：只有此前的完整评估才视为已消费计数周。
+            previous = StrategyValidationGate().evaluate_forward(
+                state=current,
+                outcomes=getattr(current, "forward_metrics", {}),
             )
-
-        enough_samples = (
-            int(sample_counts.get("10", 0)) >= MINIMUM_T10_SAMPLES
-            and int(sample_counts.get("20", 0)) >= MINIMUM_T20_SAMPLES
-        )
-        medians = dict(forward_metrics.get("median_excess_returns") or {})
-        horizon_values = [
-            _optional_number(medians.get(str(horizon))) for horizon in SUPPORTED_HORIZONS
-        ]
-        non_positive_count = sum(value is not None and value <= 0 for value in horizon_values)
-        t10_value = _optional_number(medians.get("10"))
-        failed = (
-            enough_samples
-            and t10_value is not None
-            and t10_value <= 0
-            and non_positive_count >= 2
-        )
-        failure_count = (
-            int(current.consecutive_failure_count) + 1
-            if failed
-            else (0 if enough_samples else int(current.consecutive_failure_count))
-        )
-        state = "disabled" if failure_count >= 3 else str(current.state)
-        disabled_reason = "three_consecutive_forward_failures" if state == "disabled" else None
-        gate_decision = StrategyValidationGate().evaluate_forward(
-            state=current,
-            outcomes=forward_metrics,
-        )
-        if gate_decision.next_state == "disabled":
+            if not missing_metric_reasons.intersection(previous.reason_codes):
+                previous_week = _ensure_aware(last_evaluated_at).isocalendar()
+                counted_week = f"{previous_week.year}-W{previous_week.week:02d}"
+        if not missing_data and counted_week != evaluation_week:
+            if failed:
+                failure_count += 1
+            else:
+                failure_count = 0
+            counted_week = evaluation_week
+        payload["last_counted_week"] = counted_week
+        state = str(current.state)
+        disabled_reason = None
+        if "rolling_excess_negative" in reason_codes:
             state = "disabled"
-            disabled_reason = ",".join(gate_decision.reason_codes) or "forward_validation_failed"
+            disabled_reason = "rolling_excess_negative"
+        elif failed and failure_count >= 3:
+            state = "disabled"
+            disabled_reason = "three_consecutive_forward_failures"
+        elif gate_decision.allowed:
+            state = gate_decision.next_state
         return self._save_state(
             current=current,
             state=state,
@@ -770,9 +772,7 @@ class StrategyObservationService:
             strategy_id=strategy_id,
             limit=5_000,
         )
-        grouped: dict[tuple[date, int], dict[str, list[float]]] = defaultdict(
-            lambda: defaultdict(list)
-        )
+        grouped: dict[tuple[date, int], dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
         integrity_violations: list[str] = []
         for row in rows:
             payload = dict(getattr(row, "payload", None) or {})
@@ -793,9 +793,16 @@ class StrategyObservationService:
             for key, value in metrics.items():
                 grouped[(signal_date, horizon_days)][key].append(float(value))
 
+        # 各期限分别取最近成熟截面，避免未到 T+20 的新信号挤掉成熟样本。
+        recent_keys = {
+            key
+            for horizon in SUPPORTED_HORIZONS
+            for key in sorted(key for key in grouped if key[1] == horizon)[-VALIDATED_T20_SAMPLES:]
+        }
         aggregates: dict[tuple[date, int], dict[str, float]] = {
             key: {metric: float(np.mean(values)) for metric, values in metrics.items()}
             for key, metrics in grouped.items()
+            if key in recent_keys
         }
         sample_counts = {
             str(horizon): sum(1 for _day, item_horizon in aggregates if item_horizon == horizon)
@@ -811,40 +818,20 @@ class StrategyObservationService:
             )
             for horizon in SUPPORTED_HORIZONS
         }
-        complete_dates = sorted(
-            day
-            for day in {item[0] for item in aggregates}
-            if all((day, horizon) in aggregates for horizon in SUPPORTED_HORIZONS)
+        t10 = [aggregates[key] for key in sorted(aggregates) if key[1] == 10]
+        t20_excess = [metrics["excess_return"] for (_day, horizon), metrics in aggregates.items() if horizon == 20]
+        drawdown_gap = (
+            _maximum_drawdown([metrics["benchmark_return"] for metrics in t10])
+            - _maximum_drawdown([metrics["net_return"] for metrics in t10])
+            if t10
+            else None
         )
-        gate_passed = False
-        drawdown_gap = 0.0
-        if complete_dates:
-            gate_outcomes = [
-                WalkForwardOutcome(
-                    signal_date=signal_date,
-                    entry_date=signal_date,
-                    exit_date=signal_date,
-                    horizon_days=horizon,
-                    gross_return=aggregates[(signal_date, horizon)]["gross_return"],
-                    net_return=aggregates[(signal_date, horizon)]["net_return"],
-                    benchmark_return=aggregates[(signal_date, horizon)]["benchmark_return"],
-                    excess_return=aggregates[(signal_date, horizon)]["excess_return"],
-                )
-                for signal_date in complete_dates
-                for horizon in SUPPORTED_HORIZONS
-            ]
-            gate = evaluate_historical_gate(
-                gate_outcomes,
-                coverage_by_date={day: [1.0] * 20 for day in complete_dates},
-            )
-            gate_passed = gate.passed
-            drawdown_gap = float(gate.metrics.get("drawdown_gap") or 0.0)
         return {
             "sample_counts": sample_counts,
             "median_excess_returns": median_excess,
+            "rolling_excess": float(np.mean(t20_excess)) if t20_excess else None,
             "drawdown_gap": drawdown_gap,
             "data_integrity_violations": list(dict.fromkeys(integrity_violations)),
-            "gate_passed": gate_passed,
         }
 
     def _save_state(

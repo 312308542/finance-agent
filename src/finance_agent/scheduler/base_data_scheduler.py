@@ -2856,28 +2856,65 @@ class BaseDataScheduler(RecoverySchedulerMixin):
 
         strategy = str(kwargs.get("strategy") or "factor_score_topn")
         if strategy == "strategy_validation_gate":
+            from finance_agent.research.strategy_observation_service import (
+                create_strategy_observation_service,
+            )
             from finance_agent.research.validation_gate import StrategyValidationGate
-            from finance_agent.storage.repositories import StrategyObservationRepository
 
             session_factory = create_session_factory()
+            as_of = parse_datetime_or_none(kwargs.get("as_of")) or datetime.now(tz=UTC)
             with session_scope(session_factory) as session:
-                state = StrategyObservationRepository(session).get_trial_state(
-                    str(kwargs["strategy_id"])
-                )
-                decision = StrategyValidationGate().evaluate_forward(
-                    state=state or {"state": "research"},
-                    outcomes=(getattr(state, "forward_metrics", {}) if state else {}),
+                observation = create_strategy_observation_service(session)
+                strategy_id = str(kwargs["strategy_id"])
+                if observation.repository.get_trial_state(strategy_id) is None:
+                    observation.apply_historical_result(
+                        strategy_id=strategy_id,
+                        result={"status": "unavailable"},
+                    )
+                state = observation.evaluate_weekly(strategy_id=strategy_id, as_of=as_of)
+                decision = StrategyValidationGate().evaluate_runtime(
+                    state,
+                    action="buy",
                 )
             return {
                 "status": "available",
                 "strategy_id": kwargs["strategy_id"],
                 "state": decision.next_state,
                 "allowed": decision.allowed,
+                "allow_new_buys": decision.allowed,
                 "reason_codes": list(decision.reason_codes),
             }
-        if strategy in {"strategy_forward_settlement", "strategy_walk_forward_v2"}:
-            from datetime import UTC
+        if strategy == "strategy_forward_settlement":
+            from finance_agent.research.strategy_observation_service import (
+                create_strategy_observation_service,
+            )
 
+            session_factory = create_session_factory()
+            as_of = parse_datetime_or_none(kwargs.get("as_of")) or datetime.now(tz=UTC)
+            strategy_ids = kwargs.get("strategy_ids") or [kwargs["strategy_id"]]
+            if isinstance(strategy_ids, str):
+                strategy_ids = [strategy_ids]
+            with session_scope(session_factory) as session:
+                observation = create_strategy_observation_service(session)
+                result = observation.settle_due(
+                    as_of=as_of.date(),
+                    limit=int(kwargs.get("limit") or 500),
+                )
+                states = {}
+                for strategy_id in dict.fromkeys(str(value) for value in strategy_ids):
+                    if observation.repository.get_trial_state(strategy_id) is None:
+                        observation.apply_historical_result(
+                            strategy_id=strategy_id,
+                            result={"status": "unavailable"},
+                        )
+                    state = observation.evaluate_weekly(strategy_id=strategy_id, as_of=as_of)
+                    states[strategy_id] = str(state.state)
+                result["strategy_states"] = states
+            return result
+        if strategy == "strategy_walk_forward_v2":
+            from finance_agent.research.strategy_observation_service import (
+                create_strategy_observation_service,
+            )
             from finance_agent.research.strategy_walk_forward_runner import (
                 run_strategy_walk_forward,
             )
@@ -2900,6 +2937,11 @@ class BaseDataScheduler(RecoverySchedulerMixin):
                     dry_run=bool(kwargs.get("dry_run", False)),
                     asset_limit=kwargs.get("asset_limit"),
                 )
+                if not kwargs.get("dry_run", False):
+                    create_strategy_observation_service(session).apply_historical_result(
+                        strategy_id=str(kwargs["strategy_id"]),
+                        result=result,
+                    )
             return result
         from finance_agent.backtesting.runner import run_factor_score_topn_backtest
 

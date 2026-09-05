@@ -51,7 +51,7 @@ class _FakeSession:
     def flush(self) -> None:
         self.flush_count += 1
 
-    def get_one(self, model: Any, key: Any) -> Any:
+    def get_one(self, model: Any, key: Any, **_kwargs: Any) -> Any:
         if model is StrategyObservationRunORM:
             return SimpleNamespace(observation_id=key)
         if model is StrategyTrialStateORM:

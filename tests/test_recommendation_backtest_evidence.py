@@ -5,7 +5,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
-from finance_agent.recommendations.service import RecommendationService
+from finance_agent.recommendations.service import RecommendationService, build_backtest_evidence
 
 
 class _Screenings:
@@ -175,3 +175,19 @@ def build_service(*, recommendations: _Recommendations, backtests: _Backtests) -
     service.recommendations = recommendations
     service.backtests = backtests
     return service
+
+
+def test_incomplete_v2_backtest_is_not_advertised_as_gating_eligible() -> None:
+    row = SimpleNamespace(
+        backtest_id="bt:incomplete", market="ashare", strategy_id="strategy:test",
+        universe_id="universe:test", start_at=datetime(2025, 1, 1, tzinfo=UTC),
+        end_at=datetime(2026, 1, 1, tzinfo=UTC), created_at=None,
+        rebalance_frequency="daily_close", status="available", data_versions={},
+        metrics={"gate_passed": True}, payload={"schema_version": "strategy_walk_forward_v2"},
+    )
+    evidence = build_backtest_evidence(
+        backtests=_Backtests(row), market="ashare", strategy_id=row.strategy_id,
+        universe_id=row.universe_id,
+    )
+    assert evidence["gating_eligible"] is False
+    assert evidence["research_only"] is True

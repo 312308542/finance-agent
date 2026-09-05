@@ -25,6 +25,7 @@ class PositionMonitoringSummary:
     evaluated_at: datetime
     actions: tuple[PositionAction, ...]
     error_count: int = 0
+    changed_actions: tuple[PositionAction, ...] = ()
 
 
 class PositionMonitoringService:
@@ -52,6 +53,7 @@ class PositionMonitoringService:
         asset_ids = [str(getattr(position, "asset_id", "")) for position in positions]
         quotes = self._list_quotes(asset_ids)
         actions: list[PositionAction] = []
+        changed_actions: list[PositionAction] = []
         error_count = 0
         for position in positions:
             try:
@@ -72,8 +74,10 @@ class PositionMonitoringService:
                 else:
                     snapshot = self._snapshot_from_quote(state, quote, as_of)
                     action = self.engine.evaluate(state, snapshot)
-                self.states.save(action, state=state)
+                saved = self.states.save_with_change(action, state=state)
                 actions.append(action)
+                if saved.changed:
+                    changed_actions.append(action)
             except Exception as exc:  # noqa: BLE001 - 单仓隔离，继续监控其他持仓
                 error_count += 1
                 state = self._state_from_position(position)
@@ -86,9 +90,11 @@ class PositionMonitoringService:
                     evaluated_at=as_of,
                     payload={"error": str(exc)[:240]},
                 )
-                self.states.save(action, state=state)
+                saved = self.states.save_with_change(action, state=state)
                 actions.append(action)
-        return PositionMonitoringSummary(owner_id, as_of, tuple(actions), error_count)
+                if saved.changed:
+                    changed_actions.append(action)
+        return PositionMonitoringSummary(owner_id, as_of, tuple(actions), error_count, tuple(changed_actions))
 
     def _list_positions(self, owner_id: str) -> list[Any]:
         if self.portfolios is None:
