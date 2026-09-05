@@ -71,6 +71,11 @@ def test_split_quote_symbols_caps_each_gateway_request_at_fifty() -> None:
     assert batches[-1][-1] == "000120.SZ"
 
 
+def test_split_quote_symbols_rejects_batch_above_protocol_limit() -> None:
+    with pytest.raises(ValueError, match="1 到 80"):
+        split_quote_symbols(["600000.SH"], batch_size=81)
+
+
 def test_split_quote_symbols_deduplicates_without_reordering() -> None:
     assert split_quote_symbols(["600000.SH", "000001.SZ", "600000.SH"]) == (
         ("600000.SH", "000001.SZ"),

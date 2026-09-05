@@ -23,7 +23,7 @@ from finance_agent.storage.snapshot_contracts import DataSnapshot, build_data_sn
 JsonDict = dict[str, Any]
 RequestPost = Callable[..., Any]
 GOTDX_SOURCE = "gotdx:tdx_main"
-GOTDX_GATEWAY_HARD_LIMIT = 100
+GOTDX_GATEWAY_HARD_LIMIT = 80
 DEFAULT_GOTDX_BATCH_SIZE = 50
 
 
@@ -82,7 +82,9 @@ def split_quote_symbols(
     """保持输入顺序去重，并按网关安全上限切分行情代码。"""
 
     if batch_size < 1 or batch_size > GOTDX_GATEWAY_HARD_LIMIT:
-        raise ValueError("GoTDX 行情批次必须在 1 到 100 之间")
+        raise ValueError(
+            f"GoTDX 行情批次必须在 1 到 {GOTDX_GATEWAY_HARD_LIMIT} 之间"
+        )
     normalized = tuple(
         dict.fromkeys(str(item).strip() for item in symbols if str(item).strip())
     )

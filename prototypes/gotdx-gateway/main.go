@@ -22,7 +22,7 @@ var shanghai = time.FixedZone("Asia/Shanghai", 8*60*60)
 const (
 	defaultListenAddr = "127.0.0.1:8790"
 	defaultTimeoutSec = 3
-	maxQuoteSymbols   = 100
+	maxQuoteSymbols   = 80
 	staleAfter        = 10 * time.Second
 )
 

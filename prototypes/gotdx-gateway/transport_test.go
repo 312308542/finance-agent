@@ -260,8 +260,8 @@ func TestQuotesHandlerRejectsNonAshareInstruments(t *testing.T) {
 	}
 }
 
-func TestQuotesHandlerPreservesAsharePricesAndHundredSymbolBoundary(t *testing.T) {
-	for _, count := range []int{3, 100} {
+func TestQuotesHandlerPreservesAsharePricesAndProtocolBoundary(t *testing.T) {
+	for _, count := range []int{3, 80} {
 		t.Run(fmt.Sprint(count), func(t *testing.T) {
 			f := newQuoteFixture(t, func(_ proto.ReqHeader, body []byte) []byte {
 				stocks := make([]proto.Stock, 0)
@@ -277,7 +277,7 @@ func TestQuotesHandlerPreservesAsharePricesAndHundredSymbolBoundary(t *testing.T
 				}
 			})
 			symbols := []string{"000001.SZ", "600000.SH", "830799.BJ"}
-			if count == 100 {
+			if count == 80 {
 				symbols = nil
 				for index := 1; index <= count; index++ {
 					symbols = append(symbols, fmt.Sprintf("%06d.SZ", index))
@@ -298,6 +298,22 @@ func TestQuotesHandlerPreservesAsharePricesAndHundredSymbolBoundary(t *testing.T
 				}
 			}
 		})
+	}
+}
+
+func TestQuotesHandlerRejectsProtocolOverflow(t *testing.T) {
+	symbols := make([]string, 0, 81)
+	for index := 1; index <= 81; index++ {
+		symbols = append(symbols, fmt.Sprintf("%06d.SZ", index))
+	}
+	payload, _ := json.Marshal(quoteRequest{Symbols: symbols})
+	response := httptest.NewRecorder()
+	(&gateway{timeoutSec: 1}).quotesHandler(
+		response,
+		httptest.NewRequest(http.MethodPost, "/quotes", bytes.NewReader(payload)),
+	)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "1 到 80") {
+		t.Fatalf("超过协议上限的请求应在连接前拒绝: status=%d, body=%s", response.Code, response.Body)
 	}
 }
 
