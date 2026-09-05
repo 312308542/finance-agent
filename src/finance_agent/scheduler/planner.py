@@ -169,12 +169,21 @@ class SchedulerPlanner:
         if any(row.status in (*QUEUED_STATES, "running") for row in downstream):
             return 0
         candidates: dict[str, list[Any]] = {}
+        latest_only = (
+            job.job_type == "decision_context_refresh"
+            and job.params.get("context_type") == "market"
+        )
         for dependency in job.depends_on:
             completed = self.repository.list_tasks(
                 job_name=dependency,
                 statuses=("completed",),
                 limit=1000,
             )
+            if latest_only and completed:
+                # 当前市场快照不回放历史；先选最新再排除已消费代次，失败或重启也不倒退。
+                completed = [
+                    max(completed, key=lambda row: _as_utc(row.scheduled_for or row.created_at))
+                ]
             candidates[dependency] = [
                 row for row in completed if str(row.task_id) not in consumed
             ]

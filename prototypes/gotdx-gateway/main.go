@@ -29,6 +29,7 @@ const (
 type gateway struct {
 	mu         sync.Mutex
 	client     *gotdx.Client
+	newClient  func() *gotdx.Client
 	timeoutSec int
 }
 
@@ -124,16 +125,25 @@ func (g *gateway) quotesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	markets := make([]uint8, 0, len(request.Symbols))
 	codes := make([]string, 0, len(request.Symbols))
-	canonical := make([]string, 0, len(request.Symbols))
+	seen := make(map[string]struct{}, len(request.Symbols))
 	for _, symbol := range request.Symbols {
 		market, code, err := parseSymbol(symbol)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if !isAshareStock(market, code) {
+			writeError(w, http.StatusBadRequest, "仅支持六位代码的沪深北 A 股股票，不支持基金、指数或债券")
+			return
+		}
 		markets = append(markets, market)
 		codes = append(codes, code)
-		canonical = append(canonical, canonicalSymbol(market, code))
+		canonical := canonicalSymbol(market, code)
+		if _, exists := seen[canonical]; exists {
+			writeError(w, http.StatusBadRequest, "symbols 不能包含重复证券")
+			return
+		}
+		seen[canonical] = struct{}{}
 	}
 
 	started := time.Now()
@@ -145,13 +155,10 @@ func (g *gateway) quotesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	receivedAt := time.Now().In(shanghai)
 	items := make([]quoteResponse, 0, len(quotes))
-	for index, quote := range quotes {
+	for _, quote := range quotes {
 		market := quoteMarket(quote.Market)
 		code := quote.Code
 		symbol := canonicalSymbol(quote.Market, code)
-		if index < len(canonical) {
-			symbol = canonical[index]
-		}
 		quality, freshness, serverAt, _ := classifyFreshness(receivedAt, quote.ServerTime)
 		item := quoteResponse{
 			Source:            "gotdx:tdx_main",
@@ -226,8 +233,58 @@ func (g *gateway) unusualHandler(w http.ResponseWriter, r *http.Request) {
 
 func (g *gateway) fetchQuotes(markets []uint8, codes []string) ([]proto.SecurityQuote, error) {
 	return withClient(g, func(client *gotdx.Client) ([]proto.SecurityQuote, error) {
-		return client.StockQuotesDetail(markets, codes)
+		// A 股价格按分解析；不调用会吞掉辅助财务请求超时的高层补全接口。
+		reply, err := client.GetQuotesDetail(markets, codes)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateQuotes(markets, codes, reply.List); err != nil {
+			return nil, err
+		}
+		return reply.List, nil
 	})
+}
+
+func validateQuotes(markets []uint8, codes []string, quotes []proto.SecurityQuote) error {
+	if len(markets) != len(codes) || len(quotes) != len(codes) {
+		return fmt.Errorf("行情数量不匹配: 请求 %d，收到 %d", len(codes), len(quotes))
+	}
+	expected := make(map[proto.Stock]struct{}, len(codes))
+	for index, code := range codes {
+		expected[proto.Stock{Market: markets[index], Code: code}] = struct{}{}
+	}
+	for _, quote := range quotes {
+		key := proto.Stock{Market: quote.Market, Code: quote.Code}
+		if _, ok := expected[key]; !ok {
+			return fmt.Errorf("行情包含非请求或重复证券: %s", canonicalSymbol(quote.Market, quote.Code))
+		}
+		delete(expected, key)
+	}
+	if len(expected) != 0 {
+		return errors.New("行情缺少请求证券")
+	}
+	return nil
+}
+
+func isAshareStock(market uint8, code string) bool {
+	if len(code) != 6 {
+		return false
+	}
+	for _, digit := range code {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	switch market {
+	case types.MarketSH.Uint8():
+		return strings.HasPrefix(code, "60") || strings.HasPrefix(code, "68")
+	case types.MarketSZ.Uint8():
+		return strings.HasPrefix(code, "00") || strings.HasPrefix(code, "30")
+	case types.MarketBJ.Uint8():
+		return code[0] == '4' || code[0] == '8' || strings.HasPrefix(code, "92")
+	default:
+		return false
+	}
 }
 
 func (g *gateway) fetchUnusual(market uint8, start, count uint32) ([]proto.UnusualData, error) {
@@ -239,23 +296,40 @@ func (g *gateway) fetchUnusual(market uint8, start, count uint32) ([]proto.Unusu
 func withClient[T any](g *gateway, call func(*gotdx.Client) (T, error)) (T, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.client == nil {
-		g.client = gotdx.New(
-			gotdx.WithAutoSelectFastest(true),
-			gotdx.WithTimeoutSec(g.timeoutSec),
-		)
+	var zero T
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err := func() (result T, err error) {
+			// 第三方解析器直接切片，异常帧必须转失败并使连接失效，不能返回部分结果。
+			defer func() {
+				if failure := recover(); failure != nil {
+					result = zero
+					err = fmt.Errorf("上游协议解析异常: %v", failure)
+				}
+			}()
+			if g.client == nil {
+				if g.newClient != nil {
+					g.client = g.newClient()
+				} else {
+					g.client = gotdx.New(gotdx.WithAutoSelectFastest(true), gotdx.WithTimeoutSec(g.timeoutSec))
+				}
+				if _, err := g.client.Connect(); err != nil {
+					return zero, err
+				}
+			}
+			return call(g.client)
+		}()
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		// 初次和重试失败都丢弃连接，禁止迟到响应被后续请求消费。
+		if g.client != nil {
+			_ = g.client.Disconnect()
+			g.client = nil
+		}
 	}
-	result, err := call(g.client)
-	if err == nil {
-		return result, nil
-	}
-	// 请求失败时丢弃旧连接，下一次请求重新选择节点；本次只重试一次。
-	g.client.Disconnect()
-	g.client = gotdx.New(
-		gotdx.WithAutoSelectFastest(true),
-		gotdx.WithTimeoutSec(g.timeoutSec),
-	)
-	return call(g.client)
+	return zero, lastErr
 }
 
 func parseSymbol(value string) (uint8, string, error) {

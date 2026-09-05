@@ -320,3 +320,222 @@ def test_barrier_uses_shared_generation_token_when_scheduled_times_differ() -> N
     config = _config(_dependency_job("barrier"))
 
     assert SchedulerPlanner(repo).reconcile(now=NOW, config=config).dependency_created == 1
+
+
+def _market_snapshot_job() -> BaseDataSchedulerJob:
+    return replace(
+        _dependency_job(),
+        name="analytics.snapshot.ashare.close",
+        job_type="decision_context_refresh",
+        depends_on=("source-a",),
+        params={"context_type": "market"},
+    )
+
+
+@pytest.mark.parametrize("terminal_status", ["failed", "completed", "cancelled"])
+@pytest.mark.parametrize("legacy_parent", [False, True])
+def test_market_snapshot_does_not_replay_history_after_terminal_result(
+    terminal_status: str, legacy_parent: bool
+) -> None:
+    repo = _PlannerRepository()
+    job = _market_snapshot_job()
+    config = _config(job)
+    for days_ago in (3, 2, 1):
+        parent = repo.add(
+            job_name="source-a",
+            status="completed",
+            scheduled_for=NOW - timedelta(days=days_ago),
+            task_id=f"source:{days_ago}",
+            payload={"generation_token": f"close:{days_ago}"},
+        )
+        if legacy_parent:
+            parent.scheduled_for = None
+            parent.payload = {"scheduled_at": parent.created_at.isoformat()}
+
+    assert SchedulerPlanner(repo).reconcile(now=NOW, config=config).dependency_created == 1
+    snapshot = next(row for row in repo.rows if row.job_name == job.name)
+    assert snapshot.dependency_generation == ["source:1"]
+    if not legacy_parent:
+        assert snapshot.payload["generation_token"] == "close:1"
+    snapshot.status = terminal_status
+
+    for tick in (1, 2):
+        summary = SchedulerPlanner(repo).reconcile(
+            now=NOW + timedelta(seconds=20 * tick), config=config
+        )
+        assert summary.dependency_created == 0
+    assert len([row for row in repo.rows if row.job_name == job.name]) == 1
+
+
+def test_market_snapshot_ignores_late_older_success_and_accepts_new_generation() -> None:
+    repo = _PlannerRepository()
+    job = _market_snapshot_job()
+    config = _config(job)
+    repo.add(
+        job_name="source-a", status="completed", scheduled_for=NOW, task_id="source:latest"
+    )
+    SchedulerPlanner(repo).reconcile(now=NOW, config=config)
+    snapshot = next(row for row in repo.rows if row.job_name == job.name)
+    snapshot.status = "failed"
+    late_parent = repo.add(
+        job_name="source-a",
+        status="completed",
+        scheduled_for=NOW - timedelta(days=1),
+        task_id="source:late-old",
+    )
+    late_parent.created_at = NOW + timedelta(minutes=1)
+
+    assert SchedulerPlanner(repo).reconcile(now=NOW, config=config).dependency_created == 0
+
+    repo.add(
+        job_name="source-a",
+        status="completed",
+        scheduled_for=NOW + timedelta(days=1),
+        task_id="source:new",
+        payload={"generation_token": "close:new"},
+    )
+    summary = SchedulerPlanner(repo).reconcile(now=NOW + timedelta(days=1), config=config)
+
+    assert summary.dependency_created == 1
+    snapshots = [row for row in repo.rows if row.job_name == job.name]
+    assert len(snapshots) == 2
+    assert snapshots[-1].dependency_generation == ["source:new"]
+    assert snapshots[-1].payload["generation_token"] == "close:new"
+
+
+@pytest.mark.parametrize("parent_status", ["scheduled", "running", "failed"])
+def test_market_snapshot_waits_for_new_success_after_consuming_latest(
+    parent_status: str,
+) -> None:
+    repo = _PlannerRepository()
+    job = _market_snapshot_job()
+    config = _config(job)
+    for days_ago in (2, 1):
+        repo.add(
+            job_name="source-a",
+            status="completed",
+            scheduled_for=NOW - timedelta(days=days_ago),
+            task_id=f"source:{days_ago}",
+        )
+    SchedulerPlanner(repo).reconcile(now=NOW, config=config)
+    snapshot = next(row for row in repo.rows if row.job_name == job.name)
+    snapshot.status = "failed"
+    new_parent = repo.add(
+        job_name="source-a",
+        status=parent_status,
+        scheduled_for=NOW,
+        task_id="source:new",
+    )
+
+    assert SchedulerPlanner(repo).reconcile(now=NOW, config=config).dependency_created == 0
+    new_parent.status = "completed"
+    assert SchedulerPlanner(repo).reconcile(now=NOW, config=config).dependency_created == 1
+    assert repo.rows[-1].dependency_generation == ["source:new"]
+
+
+@pytest.mark.parametrize("active_status", ["scheduled", "blocked", "pending", "running"])
+def test_market_snapshot_waits_for_active_task_before_new_generation(
+    active_status: str,
+) -> None:
+    repo = _PlannerRepository()
+    job = _market_snapshot_job()
+    config = _config(job)
+    repo.add(job_name="source-a", status="completed", scheduled_for=NOW, task_id="source:1")
+    SchedulerPlanner(repo).reconcile(now=NOW, config=config)
+    snapshot = next(row for row in repo.rows if row.job_name == job.name)
+    snapshot.status = active_status
+    repo.add(
+        job_name="source-a",
+        status="completed",
+        scheduled_for=NOW + timedelta(days=1),
+        task_id="source:2",
+    )
+
+    assert SchedulerPlanner(repo).reconcile(now=NOW, config=config).dependency_created == 0
+    snapshot.status = "failed"
+    assert SchedulerPlanner(repo).reconcile(now=NOW, config=config).dependency_created == 1
+    assert repo.rows[-1].dependency_generation == ["source:2"]
+
+
+@pytest.mark.parametrize(
+    ("job_type", "context_type"),
+    [("backtest_run", "market"), ("decision_context_refresh", "sector")],
+)
+def test_non_market_snapshot_keeps_historical_generation_semantics(
+    job_type: str, context_type: str
+) -> None:
+    repo = _PlannerRepository()
+    job = replace(
+        _market_snapshot_job(), job_type=job_type, params={"context_type": context_type}
+    )
+    config = _config(job)
+    for days_ago in (2, 1):
+        repo.add(
+            job_name="source-a",
+            status="completed",
+            scheduled_for=NOW - timedelta(days=days_ago),
+            task_id=f"source:{days_ago}",
+        )
+    SchedulerPlanner(repo).reconcile(now=NOW, config=config)
+    snapshot = next(row for row in repo.rows if row.job_name == job.name)
+    snapshot.status = "failed"
+
+    assert SchedulerPlanner(repo).reconcile(now=NOW, config=config).dependency_created == 1
+    assert repo.rows[-1].dependency_generation == ["source:2"]
+
+
+def test_market_snapshot_preserves_generation_token_for_sector_barrier() -> None:
+    repo = _PlannerRepository()
+    market_job = _market_snapshot_job()
+    sector_job = replace(
+        _dependency_job("barrier"),
+        name="analytics.snapshot.sector.close",
+        job_type="decision_context_refresh",
+        depends_on=(market_job.name, "universe:merge"),
+        params={"context_type": "sector"},
+    )
+    config = _config(market_job, sector_job)
+    for days_ago in (2, 1):
+        repo.add(
+            job_name="source-a",
+            status="completed",
+            scheduled_for=NOW - timedelta(days=days_ago),
+            task_id=f"source:{days_ago}",
+            payload={"generation_token": f"close:{days_ago}"},
+        )
+    repo.add(
+        job_name="universe:merge",
+        status="completed",
+        scheduled_for=NOW,
+        payload={"generation_token": "close:1"},
+    )
+    SchedulerPlanner(repo).reconcile(now=NOW, config=config)
+    snapshot = next(row for row in repo.rows if row.job_name == market_job.name)
+    snapshot.status = "failed"
+
+    assert SchedulerPlanner(repo).reconcile(now=NOW, config=config).dependency_created == 0
+    assert not any(row.job_name == sector_job.name for row in repo.rows)
+
+    repo.add(
+        job_name="source-a",
+        status="completed",
+        scheduled_for=NOW + timedelta(days=1),
+        task_id="source:new",
+        payload={"generation_token": "close:new"},
+    )
+    repo.add(
+        job_name="universe:merge",
+        status="completed",
+        scheduled_for=NOW + timedelta(days=1, minutes=3),
+        payload={"generation_token": "close:new"},
+    )
+    assert SchedulerPlanner(repo).reconcile(now=NOW, config=config).dependency_created == 1
+    latest_snapshot = next(
+        row for row in reversed(repo.rows) if row.job_name == market_job.name
+    )
+    assert latest_snapshot.payload["generation_token"] == "close:new"
+    latest_snapshot.status = "completed"
+
+    assert SchedulerPlanner(repo).reconcile(now=NOW, config=config).dependency_created == 1
+    sector_snapshot = next(row for row in repo.rows if row.job_name == sector_job.name)
+    assert sector_snapshot.payload["generation_token"] == "close:new"

@@ -100,10 +100,14 @@ def parse_gateway_quotes(payload: JsonDict) -> tuple[GotdxQuote, ...]:
         raise GotdxGatewayError("网关 quotes 为空")
     top_received_at = _parse_timestamp(payload.get("received_at"), field_name="received_at")
     quotes: list[GotdxQuote] = []
+    seen_codes: set[str] = set()
     for index, raw in enumerate(raw_quotes):
         if not isinstance(raw, dict):
             raise GotdxGatewayError(f"quotes[{index}] 不是对象")
         symbol, market, code = _normalize_symbol(raw.get("symbol"), raw.get("market"), raw.get("code"))
+        if code in seen_codes:
+            raise GotdxGatewayError(f"网关返回重复证券: {code}")
+        seen_codes.add(code)
         server_timestamp = _parse_timestamp(
             raw.get("server_timestamp"), field_name=f"quotes[{index}].server_timestamp"
         )
@@ -191,16 +195,18 @@ class GotdxGatewayProvider:
                 if not isinstance(response_payload, dict):
                     raise GotdxGatewayError("网关响应必须是 JSON 对象")
                 parsed = parse_gateway_quotes(response_payload)
-                quotes_by_symbol = {quote.symbol: quote for quote in parsed}
-                ordered = tuple(
-                    quotes_by_symbol[requested.split(".", 1)[0]]
-                    for requested in batch
-                    if requested.split(".", 1)[0] in quotes_by_symbol
-                )
-                if len(ordered) != len(batch):
+                requested_identities = tuple(_requested_quote_identity(requested) for requested in batch)
+                quotes_by_identity = {
+                    _quote_identity(
+                        quote.payload.get("symbol"), quote.payload.get("market"), quote.payload.get("code")
+                    ): quote
+                    for quote in parsed
+                }
+                if len(parsed) != len(batch) or set(quotes_by_identity) != set(requested_identities):
                     raise GotdxGatewayError(
-                        f"网关返回不完整: 请求 {len(batch)} 只，收到 {len(ordered)} 只"
+                        f"网关返回证券身份不匹配或不完整: 请求 {len(batch)} 只，收到 {len(parsed)} 只"
                     )
+                ordered = tuple(quotes_by_identity[identity] for identity in requested_identities)
                 merged_quotes.extend(ordered)
             except (requests.RequestException, GotdxGatewayError) as exc:
                 raise GotdxGatewayError(f"批次 {start}-{end} 失败: {exc}") from exc
@@ -299,29 +305,60 @@ class GotdxGatewayProvider:
 
 
 def _normalize_symbol(raw_symbol: Any, raw_market: Any, raw_code: Any) -> tuple[str, str, str]:
+    code, _exchange = _quote_identity(raw_symbol, raw_market, raw_code)
+    return code, "ashare", code
+
+
+def _quote_identity(raw_symbol: Any, raw_market: Any, raw_code: Any) -> tuple[str, str]:
+    """核对所有显式身份字段，禁止用 symbol 覆盖冲突的 code 或 market。"""
+
     value = str(raw_symbol or "").strip().upper()
     code = str(raw_code or "").strip()
-    if "." in value:
-        code, market_token = value.split(".", 1)
-    else:
-        market_token = str(raw_market or "").strip().upper()
-        code = code or value
+    market_token = str(raw_market if raw_market is not None else "").strip().upper()
     market_map = {
-        "SH": "ashare",
-        "SSE": "ashare",
-        "1": "ashare",
-        "SZ": "ashare",
-        "SZSE": "ashare",
-        "0": "ashare",
-        "BJ": "ashare",
-        "BSE": "ashare",
-        "2": "ashare",
+        "SH": "SH", "SSE": "SH", "1": "SH",
+        "SZ": "SZ", "SZSE": "SZ", "0": "SZ",
+        "BJ": "BJ", "BSE": "BJ", "2": "BJ",
     }
-    if not code or market_token not in market_map:
-        raise GotdxGatewayError(f"A 股代码无效: symbol={raw_symbol!r} market={raw_market!r}")
-    if len(code) != 6 or not code.isdigit():
+    if market_token and market_token not in market_map:
+        raise GotdxGatewayError(f"证券身份的市场无效: {raw_market!r}")
+    if "." in value:
+        symbol_code, symbol_market = value.split(".", 1)
+        if symbol_market not in market_map:
+            raise GotdxGatewayError(f"证券身份的市场无效: {raw_symbol!r}")
+        if code and code != symbol_code:
+            raise GotdxGatewayError(f"证券身份不一致: symbol={raw_symbol!r} code={raw_code!r}")
+        if market_token and market_map[market_token] != market_map[symbol_market]:
+            raise GotdxGatewayError(f"证券身份不一致: symbol={raw_symbol!r} market={raw_market!r}")
+        code, market_token = symbol_code, symbol_market
+    else:
+        if value and code and value != code:
+            raise GotdxGatewayError(f"证券身份不一致: symbol={raw_symbol!r} code={raw_code!r}")
+        code = code or value
+    if market_token not in market_map:
+        raise GotdxGatewayError(f"证券身份缺少市场: symbol={raw_symbol!r} market={raw_market!r}")
+    if len(code) != 6 or not code.isascii() or not code.isdigit():
         raise GotdxGatewayError(f"A 股代码无效: {code}")
-    return f"{code}", market_map[market_token], code
+    return code, market_map[market_token]
+
+
+def _requested_quote_identity(value: str) -> tuple[str, str]:
+    """与网关请求格式兼容，同时保留交易所参与响应集合校验。"""
+
+    value = value.strip().upper()
+    if "." in value:
+        return _quote_identity(value, None, None)
+    if value[:2] in {"SH", "SZ", "BJ"}:
+        return _quote_identity(value[2:], value[:2], None)
+    if value.startswith("6"):
+        market = "SH"
+    elif value.startswith(("0", "3")):
+        market = "SZ"
+    elif value.startswith(("4", "8", "92")):
+        market = "BJ"
+    else:
+        raise GotdxGatewayError(f"A 股请求身份无效: {value}")
+    return _quote_identity(value, market, None)
 
 
 def _parse_timestamp(value: Any, *, field_name: str) -> datetime:

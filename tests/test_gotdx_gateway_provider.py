@@ -254,3 +254,97 @@ def test_provider_persists_snapshot_before_quote_rows() -> None:
     assert result.snapshot.data_snapshot_id.startswith("snapshot:")
     assert len(session.executed) == 3
     assert session.flush_count == 3
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"symbol": "600519.SH", "code": "000001", "market": "SH"},
+        {"symbol": "600519.SH", "code": "600519", "market": "SZ"},
+        {"symbol": "600519.SH", "code": "600519", "market": "UNKNOWN"},
+        {"symbol": "600519", "code": "000001", "market": "SH"},
+    ],
+)
+def test_parse_gateway_quotes_rejects_conflicting_identity(identity: dict[str, str]) -> None:
+    payload = _quote_payload()
+    payload["quotes"][0].update(identity)
+
+    with pytest.raises(GotdxGatewayError, match="身份|市场"):
+        parse_gateway_quotes(payload)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"symbol": "600519.SH"},
+        {"symbol": "600519.SH", "market": "SSE", "code": "600519"},
+        {"symbol": "000001.SZ", "market": 0, "code": "000001"},
+        {"code": "600519", "market": "SH"},
+    ],
+)
+def test_parse_gateway_quotes_accepts_complete_unambiguous_identity(identity: dict[str, Any]) -> None:
+    payload = _quote_payload()
+    for field in ("symbol", "market", "code"):
+        payload["quotes"][0].pop(field)
+    payload["quotes"][0].update(identity)
+
+    quote = parse_gateway_quotes(payload)[0]
+
+    assert quote.symbol == str(identity.get("code") or "600519")
+
+
+def test_parse_gateway_quotes_rejects_duplicate_quotes_before_dictionary_collapses_them() -> None:
+    payload = _quote_payload()
+    payload["quotes"].append(dict(payload["quotes"][0]))
+
+    with pytest.raises(GotdxGatewayError, match="重复"):
+        parse_gateway_quotes(payload)
+
+
+@pytest.mark.parametrize("returned", [["600519.SH", "000001.SZ"], ["600519.SZ"], ["600519.SH", "600519.SH"]])
+def test_provider_rejects_extra_duplicate_or_wrong_exchange_response(returned: list[str]) -> None:
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict[str, Any]:
+            return _quote_payload_for_symbols(returned)
+
+    provider = GotdxGatewayProvider(request_post=lambda *_args, **_kwargs: _Response())
+
+    with pytest.raises(GotdxGatewayError, match="批次 1-1"):
+        provider.fetch_quotes(["600519.SH"])
+
+
+@pytest.mark.parametrize("requested", ["600519.SH", "600519", "SH600519", "600519.SSE"])
+def test_provider_compares_complete_identity_for_supported_request_formats(requested: str) -> None:
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict[str, Any]:
+            payload = _quote_payload()
+            payload["quotes"][0].pop("code")
+            payload["quotes"][0].pop("market")
+            return payload
+
+    provider = GotdxGatewayProvider(request_post=lambda *_args, **_kwargs: _Response())
+
+    assert provider.fetch_quotes([requested])[0].symbol == "600519"
+
+
+def test_provider_rejects_conflicting_identity_before_any_persistence() -> None:
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict[str, Any]:
+            payload = _quote_payload()
+            payload["quotes"][0]["code"] = "000001"
+            return payload
+
+    class _Session:
+        def execute(self, *_args: Any, **_kwargs: Any) -> None:
+            pytest.fail("身份冲突响应不得进入数据库写入")
+
+    provider = GotdxGatewayProvider(request_post=lambda *_args, **_kwargs: _Response())
+
+    with pytest.raises(GotdxGatewayError, match="身份"):
+        provider.collect_and_persist(_Session(), ["600519.SH"], now=NOW)
